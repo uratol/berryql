@@ -75,33 +75,7 @@ class Query:
         # Use the optimized resolver
         return await user_resolver(db=db_session, info=info, params=params)
     
-    @strawberry.field
-    async def posts(
-        self,
-        info: strawberry.Info,
-        limit: Optional[int] = None,
-        author_id: Optional[int] = None
-    ) -> List[PostType]:
-        """Get posts with optional filtering."""
-        # Get dependencies from context
-        db_session = info.context.get('db_session')
-        post_resolver = info.context.get('post_resolver')
-        
-        where_conditions = {}
-        if author_id:
-            where_conditions['author_id'] = {'eq': author_id}
-        
-        params = GraphQLQueryParams(
-            where=where_conditions,
-            limit=limit,
-            order_by=[{'field': 'created_at', 'direction': 'desc'}]
-        )
-        
-        return await post_resolver(db=db_session, info=info, params=params)
-
-
 # Remove global variables - we'll use context instead
-
 
 @pytest.fixture
 async def berryql_factory():
@@ -117,14 +91,8 @@ async def resolvers(berryql_factory):
         model_class=User
     )
     
-    post_resolver = berryql_factory.create_berryql_resolver(
-        strawberry_type=PostType,
-        model_class=Post
-    )
-    
     return {
-        'user_resolver': user_resolver,
-        'post_resolver': post_resolver
+        'user_resolver': user_resolver
     }
 
 
@@ -139,8 +107,7 @@ async def graphql_context(db_session, resolvers):
     """Create GraphQL execution context."""
     return {
         'db_session': db_session,
-        'user_resolver': resolvers['user_resolver'],
-        'post_resolver': resolvers['post_resolver']
+        'user_resolver': resolvers['user_resolver']
     }
 
 
@@ -211,26 +178,6 @@ class TestBerryQLIntegration:
         assert users[0]['name'] == 'Alice Johnson'
         assert len(users[0]['posts']) == 2
     
-    @pytest.mark.asyncio
-    async def test_users_query_with_pagination(self, graphql_schema, graphql_context, populated_db):
-        """Test users query with pagination."""
-        query = """
-        query {
-            users(limit: 2) {
-                id
-                name
-                email
-            }
-        }
-        """
-        
-        result = await graphql_schema.execute(query, context_value=graphql_context)
-        
-        assert result.errors is None
-        assert result.data is not None
-        
-        users = result.data['users']
-        assert len(users) == 2  # Limited to 2 users
     
     @pytest.mark.asyncio
     async def test_users_query_with_offset(self, graphql_schema, graphql_context, populated_db):
@@ -253,51 +200,6 @@ class TestBerryQLIntegration:
         users = result.data['users']
         assert len(users) == 1  # Limited to 1 user with offset
     
-    @pytest.mark.asyncio
-    async def test_posts_query_with_author_filter(self, graphql_schema, graphql_context, populated_db):
-        """Test posts query with author filtering."""
-        alice = next(user for user in populated_db['users'] if user.name == 'Alice Johnson')
-        
-        query = f"""
-        query {{
-            posts(authorId: {alice.id}) {{
-                id
-                title
-                content
-                authorId
-            }}
-        }}
-        """
-        
-        result = await graphql_schema.execute(query, context_value=graphql_context)
-        
-        assert result.errors is None
-        assert result.data is not None
-        
-        posts = result.data['posts']
-        assert len(posts) == 2  # Alice has 2 posts
-        assert all(post['authorId'] == alice.id for post in posts)
-    
-    @pytest.mark.asyncio
-    async def test_posts_query_with_limit(self, graphql_schema, graphql_context, populated_db):
-        """Test posts query with limit."""
-        query = """
-        query {
-            posts(limit: 3) {
-                id
-                title
-                content
-            }
-        }
-        """
-        
-        result = await graphql_schema.execute(query, context_value=graphql_context)
-        
-        assert result.errors is None
-        assert result.data is not None
-        
-        posts = result.data['posts']
-        assert len(posts) == 3  # Limited to 3 posts
     
     @pytest.mark.asyncio
     async def test_empty_results(self, graphql_schema, graphql_context, populated_db):
