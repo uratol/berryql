@@ -43,11 +43,28 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
         
         for field_name, field_type in strawberry_fields.items():
             # Check for datetime fields by various indicators
-            is_datetime = (
-                (isinstance(field_type, type) and field_type.__name__ == 'datetime') or
-                (hasattr(field_type, '__name__') and 'datetime' in field_type.__name__.lower()) or
-                field_name in ['created_at', 'updated_at', 'deleted_at', 'published_at', 'timestamp']
-            )
+            is_datetime = False
+            
+            # Direct datetime type
+            if isinstance(field_type, type) and field_type.__name__ == 'datetime':
+                is_datetime = True
+            # Datetime class name check
+            elif hasattr(field_type, '__name__') and 'datetime' in field_type.__name__.lower():
+                is_datetime = True
+            # Check for Optional[datetime] or Union[datetime, None] types
+            elif hasattr(field_type, '__origin__'):
+                from typing import Union, get_args
+                if field_type.__origin__ is Union:
+                    args = get_args(field_type)
+                    for arg in args:
+                        if (isinstance(arg, type) and arg.__name__ == 'datetime') or \
+                           (hasattr(arg, '__name__') and 'datetime' in arg.__name__.lower()):
+                            is_datetime = True
+                            break
+            # Field name pattern matching (covers min_created_at, max_created_at, etc.)
+            elif any(pattern in field_name for pattern in ['created_at', 'updated_at', 'deleted_at', 'published_at', 'timestamp']):
+                is_datetime = True
+            
             if is_datetime:
                 datetime_fields.add(field_name)
         
@@ -61,17 +78,149 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
         # Only do field conversion if there are datetime fields
         for item_data in json_data:
             if isinstance(item_data, dict):
-                # Convert only datetime fields that exist in the data
-                converted_data = {
-                    field_name: DateTimeString(field_value) if (field_name in datetime_fields and isinstance(field_value, str)) else field_value
-                    for field_name, field_value in item_data.items()
-                }
-                strawberry_instances.append(strawberry_type(**converted_data))
+                # Separate constructor fields from relationship/method fields
+                constructor_data = {}
+                resolved_data = {}
+                
+                # Get type hints to understand which fields are constructor parameters
+                type_hints = getattr(strawberry_type, '__annotations__', {})
+                
+                for field_name, field_value in item_data.items():
+                    # Check if this field is a method (relationship field)
+                    is_method = hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name))
+                    
+                    # Check if this field exists in type hints (constructor parameter)
+                    is_constructor_param = field_name in type_hints
+                    
+                    # For strawberry fields with @strawberry.field decorator:
+                    # - They appear in both type_hints AND as callable methods
+                    # - They should be treated as resolved data, not constructor parameters
+                    if is_method:
+                        # This is a relationship/method field - put in resolved data
+                        if '_resolved' not in resolved_data:
+                            resolved_data['_resolved'] = {}
+                        
+                        # For nested relationship data, we need to convert lists of dictionaries
+                        # to proper Strawberry instances recursively
+                        if isinstance(field_value, list) and field_value and isinstance(field_value[0], dict):
+                            # This is a nested relationship field - we need to determine the target type
+                            # and convert the list of dictionaries to Strawberry instances
+                            
+                            # Try to get the target type from the field annotation
+                            target_type = None
+                            if hasattr(strawberry_type, '__annotations__') and field_name in strawberry_type.__annotations__:
+                                field_annotation = strawberry_type.__annotations__[field_name]
+                                # Handle StrawberryAnnotation objects (from @strawberry.field decorated methods)
+                                if hasattr(field_annotation, 'annotation'):
+                                    field_annotation = field_annotation.annotation
+                                    
+                                # Handle List[TargetType] annotations
+                                from typing import get_origin, get_args
+                                if get_origin(field_annotation) is list:
+                                    args = get_args(field_annotation)
+                                    if args and len(args) > 0:
+                                        target_type = args[0]
+                            
+                            # If we found a target type, convert the nested data recursively
+                            if target_type and hasattr(target_type, '__strawberry_definition__'):
+                                # Recursively convert nested relationship data
+                                converted_instances = convert_json_to_strawberry_instances(field_value, target_type)
+                                resolved_data['_resolved'][field_name] = converted_instances
+                            else:
+                                # Fallback - store the raw data
+                                resolved_data['_resolved'][field_name] = field_value
+                        else:
+                            # Not a nested relationship or empty - store as-is
+                            resolved_data['_resolved'][field_name] = field_value
+                    elif is_constructor_param:
+                        # This is a constructor parameter
+                        if field_name in datetime_fields and isinstance(field_value, str):
+                            constructor_data[field_name] = DateTimeString(field_value)
+                        else:
+                            constructor_data[field_name] = field_value
+                    # If it's neither, skip it (shouldn't happen in well-formed data)
+                
+                # Create the instance with constructor data only
+                instance = strawberry_type(**constructor_data)
+                
+                # Set resolved data if any
+                if resolved_data:
+                    for attr_name, attr_value in resolved_data.items():
+                        setattr(instance, attr_name, attr_value)
+                
+                strawberry_instances.append(instance)
     else:
-        # No datetime fields, create instances directly
+        # No datetime fields, but still need to separate constructor from resolved data
         for item_data in json_data:
             if isinstance(item_data, dict):
-                strawberry_instances.append(strawberry_type(**item_data))
+                # Separate constructor fields from relationship/method fields
+                constructor_data = {}
+                resolved_data = {}
+                
+                # Get type hints to understand which fields are constructor parameters
+                type_hints = getattr(strawberry_type, '__annotations__', {})
+                
+                for field_name, field_value in item_data.items():
+                    # Check if this field is a method (relationship field)
+                    is_method = hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name))
+                    
+                    # Check if this field exists in type hints (constructor parameter)
+                    is_constructor_param = field_name in type_hints
+                    
+                    # For strawberry fields with @strawberry.field decorator:
+                    # - They appear in both type_hints AND as callable methods
+                    # - They should be treated as resolved data, not constructor parameters
+                    if is_method:
+                        # This is a relationship/method field - put in resolved data
+                        if '_resolved' not in resolved_data:
+                            resolved_data['_resolved'] = {}
+                        
+                        # For nested relationship data, we need to convert lists of dictionaries
+                        # to proper Strawberry instances recursively
+                        if isinstance(field_value, list) and field_value and isinstance(field_value[0], dict):
+                            # This is a nested relationship field - we need to determine the target type
+                            # and convert the list of dictionaries to Strawberry instances
+                            
+                            # Try to get the target type from the field annotation
+                            target_type = None
+                            if hasattr(strawberry_type, '__annotations__') and field_name in strawberry_type.__annotations__:
+                                field_annotation = strawberry_type.__annotations__[field_name]
+                                # Handle StrawberryAnnotation objects (from @strawberry.field decorated methods)
+                                if hasattr(field_annotation, 'annotation'):
+                                    field_annotation = field_annotation.annotation
+                                    
+                                # Handle List[TargetType] annotations
+                                from typing import get_origin, get_args
+                                if get_origin(field_annotation) is list:
+                                    args = get_args(field_annotation)
+                                    if args and len(args) > 0:
+                                        target_type = args[0]
+                            
+                            # If we found a target type, convert the nested data recursively
+                            if target_type and hasattr(target_type, '__strawberry_definition__'):
+                                # Recursively convert nested relationship data
+                                converted_instances = convert_json_to_strawberry_instances(field_value, target_type)
+                                resolved_data['_resolved'][field_name] = converted_instances
+                            else:
+                                # Fallback - store the raw data
+                                resolved_data['_resolved'][field_name] = field_value
+                        else:
+                            # Not a nested relationship or empty - store as-is
+                            resolved_data['_resolved'][field_name] = field_value
+                    elif is_constructor_param:
+                        # This is a constructor parameter
+                        constructor_data[field_name] = field_value
+                    # If it's neither, skip it (shouldn't happen in well-formed data)
+                
+                # Create the instance with constructor data only
+                instance = strawberry_type(**constructor_data)
+                
+                # Set resolved data if any
+                if resolved_data:
+                    for attr_name, attr_value in resolved_data.items():
+                        setattr(instance, attr_name, attr_value)
+                
+                strawberry_instances.append(instance)
     
     return strawberry_instances
 

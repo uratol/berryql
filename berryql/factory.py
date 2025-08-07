@@ -1123,16 +1123,9 @@ class BerryQLFactory:
             logger.warning(f"No strawberry type found in rel_config for relationship parsing")
             return json_data  # Return raw data if no type info
         
-        # Convert json objects to strawberry instances
-        instances = []
-        for item_data in json_data:
-            if isinstance(item_data, dict):
-                # Recursively parse any nested relationship data within this item
-                parsed_item_data = self._parse_nested_json_relationships(item_data, related_type)
-                instance = self._create_strawberry_instance(related_type, parsed_item_data)
-                instances.append(instance)
-        
-        return instances
+        # Use the common converter for consistency
+        from .resolved_data_helper import convert_json_to_strawberry_instances
+        return convert_json_to_strawberry_instances(json_data, related_type)
 
     def _parse_nested_json_relationships(self, item_data: Dict[str, Any], strawberry_type: Type) -> Dict[str, Any]:
         """Recursively parse nested JSON relationships within an item."""
@@ -1650,6 +1643,13 @@ class BerryQLFactory:
                 elif isinstance(value, dict) and hasattr(actual_field_type, '__strawberry_definition__'):
                     converted_value = self._create_strawberry_instance(actual_field_type, value)
                     filtered_data[actual_field_name] = converted_value
+                # Handle JSON strings that represent custom field objects
+                elif isinstance(value, str) and self._is_custom_field_for_type(strawberry_type, field_name):
+                    converted_value = self._convert_custom_field_value(value, actual_field_type, strawberry_type, field_name)
+                    if converted_value is not None:
+                        filtered_data[actual_field_name] = converted_value
+                    else:
+                        filtered_data[actual_field_name] = value
                 else:
                     filtered_data[actual_field_name] = value
             
@@ -1735,3 +1735,64 @@ class BerryQLFactory:
             logger.warning(f"Could not determine foreign key for relationship: {e}")
         
         return None
+
+    def _convert_custom_field_value(self, value: str, field_type: Type, strawberry_type: Type, field_name: str) -> Any:
+        """Convert a custom field value (JSON string) to the appropriate Strawberry type."""
+        try:
+            # Try to parse as JSON
+            import json
+            parsed_data = json.loads(value)
+            
+            # Check if the field type is a Strawberry type
+            if hasattr(field_type, '__strawberry_definition__'):
+                # Use the common converter for consistency with relationship data
+                from .resolved_data_helper import convert_json_to_strawberry_instances
+                # Convert single object to list format expected by the converter
+                if isinstance(parsed_data, dict):
+                    result_list = convert_json_to_strawberry_instances([parsed_data], field_type)
+                    return result_list[0] if result_list else None
+                elif isinstance(parsed_data, list):
+                    return convert_json_to_strawberry_instances(parsed_data, field_type)
+            
+            # Handle Optional types - extract the actual type
+            if hasattr(field_type, '__origin__') and field_type.__origin__ is Union:
+                args = getattr(field_type, '__args__', ())
+                for arg in args:
+                    if arg is not type(None) and hasattr(arg, '__strawberry_definition__'):
+                        from .resolved_data_helper import convert_json_to_strawberry_instances
+                        if isinstance(parsed_data, dict):
+                            result_list = convert_json_to_strawberry_instances([parsed_data], arg)
+                            return result_list[0] if result_list else None
+                        elif isinstance(parsed_data, list):
+                            return convert_json_to_strawberry_instances(parsed_data, arg)
+            
+            # If no specific type conversion needed, return parsed JSON
+            return parsed_data
+            
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # If JSON parsing fails, return the original value
+            return None
+
+    def _is_custom_field_for_type(self, strawberry_type: Type, field_name: str) -> bool:
+        """Check if a field is a custom field for the given strawberry type."""
+        custom_fields = self._custom_fields_config.get(strawberry_type, {})
+        
+        # Check exact field name
+        if field_name in custom_fields:
+            return True
+        
+        # Check snake_case version
+        snake_case_field = self._camel_to_snake(field_name)
+        if snake_case_field in custom_fields:
+            return True
+        
+        # Check if it's a method with @custom_field decorator
+        try:
+            if hasattr(strawberry_type, field_name):
+                attr = getattr(strawberry_type, field_name)
+                if callable(attr) and hasattr(attr, '_is_custom_field') and hasattr(attr, '_custom_query_builder'):
+                    return True
+        except (AttributeError, TypeError):
+            pass
+        
+        return False

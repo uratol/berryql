@@ -11,14 +11,14 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import GraphQLQueryParams, berryql
-from conftest import User, Post
+from conftest import User, Post, Comment
 from sqlalchemy import func, select
 
 
-# Strawberry GraphQL Types
 @strawberry.type
-class PostAggType:
-    post_count: int
+class CommentAggType:
+    min_created_at: Optional[datetime] = None
+    comments_count: int
 
 
 @strawberry.type
@@ -43,6 +43,12 @@ class PostType:
     async def comments(self, info: strawberry.Info) -> List[CommentType]:
         """Get post's comments using pre-resolved data."""
         pass
+    
+    @strawberry.field
+    @berryql.field
+    async def comments_agg(self, info: strawberry.Info) -> Optional[CommentAggType]:
+        """Get post's comments aggregation using pre-resolved data."""
+        pass
 
 
 @strawberry.type
@@ -53,9 +59,21 @@ class UserType:
     created_at: datetime
     
     @strawberry.field
-    @berryql.field
+    @berryql.field(
+        custom_fields={
+            'comments_agg': lambda model_class, requested_fields: (
+                select(func.json_object(
+                    'min_created_at', func.min(Comment.created_at),
+                    'comments_count', func.count(Comment.id)
+                ))
+                .select_from(Comment)
+                .where(Comment.post_id == model_class.id)
+                .scalar_subquery()
+            )
+        }
+    )
     async def posts(self, info: strawberry.Info) -> List[PostType]:
-        """Get user's posts using pre-resolved data."""
+        """Get user's posts using pre-resolved data with comments aggregation."""
         pass
     
     @strawberry.field
