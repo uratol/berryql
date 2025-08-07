@@ -10,6 +10,56 @@ from sqlalchemy.sql import ColumnElement
 T = TypeVar('T')
 
 
+def find_relationship_name_by_type(parent_model_class: Type, target_strawberry_type: Type) -> Optional[str]:
+    """
+    Find the SQLAlchemy relationship name by matching the target type.
+    
+    Args:
+        parent_model_class: The SQLAlchemy model class (e.g., User)
+        target_strawberry_type: The Strawberry GraphQL type (e.g., PostType)
+    
+    Returns:
+        The relationship name (e.g., 'posts') or None if not found
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if not parent_model_class:
+        return None
+    
+    try:
+        # Map common Strawberry type names to SQLAlchemy model names
+        # This assumes a naming convention like PostType -> Post, UserType -> User, etc.
+        strawberry_type_name = getattr(target_strawberry_type, '__name__', str(target_strawberry_type))
+        
+        # Remove 'Type' suffix if present
+        if strawberry_type_name.endswith('Type'):
+            model_name = strawberry_type_name[:-4]  # Remove 'Type'
+        else:
+            model_name = strawberry_type_name
+        
+        # Look through all relationships on the parent model
+        from sqlalchemy import inspect
+        mapper = inspect(parent_model_class)
+        
+        for relationship_name, relationship_property in mapper.relationships.items():
+            # Get the target model class from the relationship
+            target_model_class = relationship_property.mapper.class_
+            target_model_name = target_model_class.__name__
+            
+            # Check if this relationship points to our target model
+            if target_model_name == model_name:
+                logger.debug(f"Found relationship '{relationship_name}' from {parent_model_class.__name__} to {target_model_name}")
+                return relationship_name
+        
+        logger.warning(f"No relationship found from {parent_model_class.__name__} to model matching {strawberry_type_name}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error finding relationship name: {e}")
+        return None
+
+
 def get_resolved_field_data(instance: Any, info: strawberry.Info, relationship_name: str) -> List[T]:
     """
     Helper function to extract resolved data for a specific relationship field.
@@ -180,15 +230,230 @@ def berryql_field(
                     raise ValueError(f"Could not determine strawberry type from return annotation of {func.__name__}. "
                                    f"Make sure the return type is annotated as List[YourStrawberryType] or YourStrawberryType")
                 
-                # Create the BerryQL resolver using the factory
-                factory = BerryQLFactory()
-                resolver = factory.create_berryql_resolver(
-                    strawberry_type=strawberry_type,
-                    model_class=actual_model_class,
-                    custom_fields=actual_custom_fields,
-                    custom_where=actual_custom_where,
-                    custom_order=actual_custom_order
-                )
+                # Determine if this is a relationship field by checking if we're in a type class
+                # and if the return type suggests a relationship to another model
+                is_relationship_field = False
+                parent_model_class = None
+                relationship_name = None
+                
+                # Get the class that contains this method (the parent GraphQL type)
+                if hasattr(func, '__qualname__'):
+                    parent_class_name = func.__qualname__.split('.')[0] if '.' in func.__qualname__ else None
+                    if parent_class_name:
+                        # Try to find the corresponding SQLAlchemy model for the parent type
+                        try:
+                            # Look for the model class in the same way we determine strawberry types
+                            import importlib
+                            import sys
+                            
+                            # Get the calling frame to find the module where types are defined
+                            calling_frame = sys._getframe(1)
+                            calling_module = calling_frame.f_globals.get('__name__', '')
+                            
+                            if calling_module:
+                                try:
+                                    module = importlib.import_module(calling_module)
+                                    # Try to find parent model by naming convention
+                                    potential_model_names = [
+                                        parent_class_name.replace('Type', ''),  # UserType -> User
+                                        parent_class_name.replace('GraphQL', ''), # UserGraphQL -> User  
+                                        parent_class_name # Exact match
+                                    ]
+                                    
+                                    for model_name in potential_model_names:
+                                        if hasattr(module, model_name):
+                                            potential_parent_model = getattr(module, model_name)
+                                            # Check if it's likely a SQLAlchemy model
+                                            if (hasattr(potential_parent_model, '__tablename__') or 
+                                                hasattr(potential_parent_model, '__table__')):
+                                                parent_model_class = potential_parent_model
+                                                break
+                                except ImportError:
+                                    pass
+                                
+                            # If we have a parent model, try to find the relationship
+                            if parent_model_class and actual_model_class:
+                                relationship_name = find_relationship_name_by_type(parent_model_class, actual_model_class)
+                                if relationship_name:
+                                    is_relationship_field = True
+                        except Exception:
+                            # If we can't determine the parent model, treat as non-relationship field
+                            pass
+                
+                if is_relationship_field and relationship_name:
+                    # For relationship fields, create a special resolver that executes the same query logic
+                    # as the standard BerryQL resolver but applies it to load relationship data
+                    def create_relationship_resolver():
+                        async def relationship_resolver(self, info: strawberry.Info, relationship_name=None, **graphql_kwargs):
+                            # Create a factory instance with our custom configurations
+                            factory = BerryQLFactory()
+                            
+                            # Apply custom configurations to the factory
+                            if actual_custom_where:
+                                factory._custom_where_config.update(actual_custom_where)
+                            if actual_custom_order:
+                                factory._custom_order_config.update(actual_custom_order)
+                            if actual_custom_fields:
+                                factory._custom_fields_config.update(actual_custom_fields)
+                            
+                            # Get the database session from context
+                            db_value = None
+                            if hasattr(info.context, 'get'):
+                                db_value = (info.context.get('db_session') or 
+                                          info.context.get('db') or 
+                                          info.context.get('database') or
+                                          info.context.get('session'))
+                            elif hasattr(info.context, 'db_session'):
+                                db_value = info.context.db_session
+                            elif hasattr(info.context, 'db'):
+                                db_value = info.context.db
+                            
+                            if not db_value:
+                                raise ValueError("Database session not found in GraphQL context")
+                            
+                            # Build GraphQLQueryParams from the GraphQL arguments - same as for root fields
+                            from .factory import GraphQLQueryParams
+                            
+                            # Build where conditions using explicit parameter mappings (same logic as root fields)
+                            where_conditions = {}
+                            other_params = {}
+                            
+                            for param_name, value in graphql_kwargs.items():
+                                if value is not None:
+                                    # Check if this parameter has an explicit mapping
+                                    if actual_parameter_mappings and param_name in actual_parameter_mappings:
+                                        mapping = actual_parameter_mappings[param_name]
+                                        
+                                        if callable(mapping):
+                                            # If mapping is a callable, call it with the value
+                                            where_clause = mapping(value)
+                                            if isinstance(where_clause, dict):
+                                                where_conditions.update(where_clause)
+                                        elif isinstance(mapping, dict):
+                                            # If mapping is a dict, process it
+                                            for field_name, condition in mapping.items():
+                                                if isinstance(condition, dict):
+                                                    # Direct field condition like {'like': '%value%'}
+                                                    if any(callable(v) for v in condition.values()):
+                                                        # Contains callables - process them
+                                                        processed_condition = {}
+                                                        for op, op_value in condition.items():
+                                                            if callable(op_value):
+                                                                processed_condition[op] = op_value(value)
+                                                            else:
+                                                                processed_condition[op] = op_value
+                                                        where_conditions[field_name] = processed_condition
+                                                    else:
+                                                        # Static condition
+                                                        where_conditions[field_name] = condition
+                                                elif callable(condition):
+                                                    # Field condition is a callable
+                                                    where_conditions[field_name] = condition(value)
+                                                else:
+                                                    # Simple field condition
+                                                    where_conditions[field_name] = {'eq': condition}
+                                    else:
+                                        # No explicit mapping - treat as other parameter
+                                        other_params[param_name] = value
+                            
+                            # Build GraphQLQueryParams with where conditions and other parameters
+                            query_params = GraphQLQueryParams(
+                                where=where_conditions if where_conditions else None,
+                                limit=other_params.get('limit'),
+                                offset=other_params.get('offset'),
+                                order_by=other_params.get('order_by')
+                            )
+                            
+                            # Now execute the same unified query logic but for the relationship
+                            # We need to constrain the query to this specific parent instance
+                            
+                            # Get the parent's primary key value
+                            parent_id = getattr(self, 'id', None)
+                            if parent_id is None:
+                                raise ValueError(f"Parent instance does not have 'id' attribute for relationship {relationship_name}")
+                            
+                            # Build a constrained query that only fetches related items for this parent
+                            # Add the relationship constraint to the where conditions
+                            relationship_where = where_conditions.copy() if where_conditions else {}
+                            
+                            # Get the foreign key field name for the relationship
+                            from sqlalchemy import inspect
+                            parent_mapper = inspect(parent_model_class)
+                            if relationship_name in parent_mapper.relationships:
+                                relationship_prop = parent_mapper.relationships[relationship_name]
+                                # Get the foreign key column on the target model that points back to parent
+                                foreign_key_columns = [col for col in relationship_prop.remote_side or relationship_prop.local_columns]
+                                if relationship_prop.direction.name == 'ONETOMANY':
+                                    # For one-to-many, the foreign key is on the target model
+                                    target_fk_attr = None
+                                    for local_col in relationship_prop.local_columns:
+                                        for remote_col in relationship_prop.remote_side:
+                                            if local_col.table == parent_mapper.local_table:
+                                                # Find the attribute name for the foreign key on target model
+                                                target_mapper = inspect(actual_model_class)
+                                                for attr_name, attr in target_mapper.attrs.items():
+                                                    if hasattr(attr, 'columns') and remote_col in attr.columns:
+                                                        target_fk_attr = attr_name
+                                                        break
+                                    
+                                    if target_fk_attr:
+                                        relationship_where[target_fk_attr] = {'eq': parent_id}
+                            
+                            # Update query params with relationship constraint
+                            query_params_with_relationship = GraphQLQueryParams(
+                                where=relationship_where,
+                                limit=query_params.limit,
+                                offset=query_params.offset,
+                                order_by=query_params.order_by
+                            )
+                            
+                            # Execute the unified query for the target model with relationship constraints
+                            result = await factory._execute_unified_query(
+                                strawberry_type=strawberry_type,
+                                model_class=actual_model_class,
+                                db=db_value,
+                                info=info,
+                                params=query_params_with_relationship,
+                                is_root=False  # This is a relationship query, not root
+                            )
+                            
+                            # The result from _execute_unified_query for nested queries is raw JSON
+                            # We need to parse it into proper strawberry type instances
+                            if isinstance(result, str):
+                                # Parse JSON string result
+                                import json
+                                try:
+                                    json_data = json.loads(result) if result and result != '[]' else []
+                                except (json.JSONDecodeError, TypeError):
+                                    json_data = []
+                            elif isinstance(result, list):
+                                json_data = result
+                            else:
+                                json_data = []
+                            
+                            # Convert JSON data to strawberry type instances
+                            strawberry_instances = []
+                            for item_data in json_data:
+                                if isinstance(item_data, dict):
+                                    # Create strawberry type instance from the data
+                                    strawberry_instance = strawberry_type(**item_data)
+                                    strawberry_instances.append(strawberry_instance)
+                            
+                            return strawberry_instances
+                        
+                        return relationship_resolver
+                    
+                    resolver = create_relationship_resolver()
+                else:
+                    # For non-relationship fields, use the standard factory resolver
+                    factory = BerryQLFactory()
+                    resolver = factory.create_berryql_resolver(
+                        strawberry_type=strawberry_type,
+                        model_class=actual_model_class,
+                        custom_fields=actual_custom_fields,
+                        custom_where=actual_custom_where,
+                        custom_order=actual_custom_order
+                    )
                 
                 # Extract the original function's signature for the resolver wrapper
                 import inspect as insp
@@ -298,7 +563,12 @@ def berryql_field(
                             resolver_params[param_name] = value
                     
                     # Call the resolver with extracted parameters
-                    return await resolver(info=info, **resolver_params)
+                    if is_relationship_field and relationship_name:
+                        # For relationship fields, pass self to the resolver
+                        return await resolver(self, info, relationship_name)
+                    else:
+                        # For root fields, don't pass self
+                        return await resolver(info=info, **resolver_params)
                 
                 # Copy all essential metadata from the original function
                 new_resolver_func.__name__ = func.__name__
@@ -326,8 +596,37 @@ def berryql_field(
             
             else:
                 # This is a relationship field - use resolved data
-                # Determine the relationship name from the function name
-                relationship_name = func.__name__
+                # Determine the relationship name from the return type instead of function name
+                relationship_name = func.__name__  # Fallback to function name
+                
+                # Try to determine relationship name from return type
+                if return_type:
+                    # Extract the target strawberry type from List[TargetType] or TargetType
+                    target_strawberry_type = None
+                    origin = get_origin(return_type)
+                    if origin is list:
+                        args = get_args(return_type)
+                        if args and len(args) > 0:
+                            target_strawberry_type = args[0]
+                    else:
+                        target_strawberry_type = return_type
+                    
+                    # If we have a target type, try to map it to a relationship name
+                    if target_strawberry_type and hasattr(target_strawberry_type, '__name__'):
+                        type_name = target_strawberry_type.__name__
+                        
+                        # Simple mapping: PostType -> posts, CommentType -> comments, etc.
+                        if type_name.endswith('Type'):
+                            base_name = type_name[:-4].lower()  # PostType -> post
+                            # Try plural form first (most common)
+                            potential_relationship_name = base_name + 's'  # post -> posts
+                            
+                            import logging
+                            logger = logging.getLogger(__name__)
+                            logger.debug(f"Inferring relationship name '{potential_relationship_name}' for field '{func.__name__}' "
+                                       f"based on return type {type_name}")
+                            
+                            relationship_name = potential_relationship_name
                 
                 @wraps(func)
                 async def resolved_data_func(self, info: strawberry.Info, *args, **kwargs):

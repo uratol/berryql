@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import BerryQLFactory
 from schema import schema, UserType  # Import schema from separate file
+from conftest import User, Post, Comment  # Import models for direct database operations
 @pytest.fixture
 async def berryql_factory():
     """Create BerryQL factory."""
@@ -294,6 +295,91 @@ class TestBerryQLIntegration:
                     assert 'id' in comment
                     assert 'content' in comment
                     assert 'authorId' in comment
+    
+    @pytest.mark.asyncio
+    async def test_new_posts_filter(self, graphql_schema, graphql_context, populated_db):
+        """Test new_posts field that filters posts created within the last hour and sorts by created_at desc."""
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select, update
+        
+        # Get a database session for manual manipulation
+        session = graphql_context['db_session']
+        
+        # Get Alice's user ID
+        alice_result = await session.execute(
+            select(User).where(User.name == "Alice Johnson")
+        )
+        alice = alice_result.scalar_one()
+        
+        # Update one of Alice's posts to be older than 1 hour
+        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        await session.execute(
+            update(Post)
+            .where(Post.author_id == alice.id)
+            .where(Post.title == "First Post")
+            .values(created_at=old_time)
+        )
+        await session.commit()
+        
+        # Test regular posts field (should include all posts)
+        query_regular_posts = """
+        query {
+            users(nameFilter: "Alice Johnson") {
+                id
+                name
+                posts {
+                    id
+                    title
+                }
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query_regular_posts, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['users']
+        assert len(users) == 1
+        alice_data = users[0]
+        
+        all_posts = alice_data['posts']
+        print(f"Alice's all posts: {all_posts}")
+        assert len(all_posts) == 2  # Alice has 2 posts total
+        
+        # Test new_posts field (should exclude old posts)
+        query_new_posts = """
+        query {
+            users(nameFilter: "Alice Johnson") {
+                id
+                name
+                newPosts {
+                    id
+                    title
+                }
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query_new_posts, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['users']
+        assert len(users) == 1
+        alice_data = users[0]
+        
+        new_posts = alice_data['newPosts']
+        print(f"Alice's new posts: {new_posts}")
+        
+        # new_posts should only include posts from the last hour (excluding "First Post")
+        assert len(new_posts) == 1  # Should only have the recent post
+        assert new_posts[0]['title'] == "GraphQL is Great"  # Should be the newer post
+        
+        # Verify that the time filtering is working - old post should not be included
+        post_titles = [post['title'] for post in new_posts]
+        assert "First Post" not in post_titles  # The old post should be filtered out
+        assert "GraphQL is Great" in post_titles  # The new post should be included
 
 
 @pytest.mark.integration

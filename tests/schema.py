@@ -7,7 +7,7 @@ It demonstrates the enhanced @berryql.field decorator with various parameter map
 
 import strawberry
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import BerryQLFactory, GraphQLQueryParams, berryql
@@ -56,6 +56,16 @@ class UserType:
     @berryql.field
     async def comments(self, info: strawberry.Info) -> List[CommentType]:
         """Get user's comments using pre-resolved data."""
+        pass
+    
+    @strawberry.field
+    @berryql.field(
+        model_class=Post,
+        custom_where={PostType: lambda: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}}},
+        custom_order={PostType: ['created_at desc']}
+    )
+    async def new_posts(self, info: strawberry.Info) -> List[PostType]:
+        """Get user's posts created within the last hour, sorted by created_at descending."""
         pass
 
 
