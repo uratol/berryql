@@ -738,8 +738,8 @@ class BerryQLFactory:
         strawberry_type: Type[T],
         model_class: Type,
         custom_fields: Optional[Dict[str, callable]] = None,
-        custom_where: Optional[Dict[Type, Union[Dict[str, Any], callable]]] = None,
-        custom_order: Optional[Dict[Type, List[str]]] = None
+        custom_where: Optional[Union[Dict[str, Any], callable]] = None,
+        custom_order: Optional[List[str]] = None
     ) -> Callable[..., Awaitable[List[T]]]:
         """
         Create a unified BerryQL resolver with global configurations.
@@ -748,19 +748,19 @@ class BerryQLFactory:
             strawberry_type: The root Strawberry GraphQL type class
             model_class: The corresponding root SQLAlchemy model class  
             custom_fields: Dict mapping {field_name: query_builder}
-            custom_where: Dict mapping {strawberry_type: where_conditions_or_function}
-            custom_order: Dict mapping {strawberry_type: default_order_list}
+            custom_where: where_conditions_or_function (simplified, no strawberry type key needed)
+            custom_order: default_order_list (simplified, no strawberry type key needed)
             
         Returns:
             Async resolver function that returns List[strawberry_type]
         """
-        # Store global configurations
+        # Store configurations directly for the strawberry type
         if custom_fields:
             self.custom_field_manager.register_custom_fields(strawberry_type, custom_fields)
         if custom_where:
-            self._custom_where_config.update(custom_where)
+            self._custom_where_config[strawberry_type] = custom_where
         if custom_order:
-            self._custom_order_config.update(custom_order)
+            self._custom_order_config[strawberry_type] = custom_order
             
         async def resolver(
             db: AsyncSession,

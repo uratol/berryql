@@ -342,9 +342,9 @@ def berryql_field(
     *, 
     converter: Optional[Callable] = None,
     model_class: Optional[Type] = None,
-    custom_fields: Optional[Dict[Type, Dict[str, callable]]] = None,
-    custom_where: Optional[Dict[Type, Union[Dict[str, Any], callable]]] = None,
-    custom_order: Optional[Dict[Type, List[str]]] = None,
+    custom_fields: Optional[Dict[str, callable]] = None,
+    custom_where: Optional[Union[Dict[str, Any], callable]] = None,
+    custom_order: Optional[List[str]] = None,
     **parameter_mappings  # Any named parameter will map to where conditions
 ):
     """
@@ -364,9 +364,9 @@ def berryql_field(
                           or a converter function (when used as @berryql_field(converter=...))
         converter: Optional converter function to transform raw data
         model_class: SQLAlchemy model class for resolver creation
-        custom_fields: Dict mapping {strawberry_type: {field_name: query_builder}}
-        custom_where: Dict mapping {strawberry_type: where_conditions_or_function}
-        custom_order: Dict mapping {strawberry_type: default_order_list}
+        custom_fields: Dict mapping {field_name: query_builder}
+        custom_where: where_conditions_or_function (simplified, no strawberry type key needed)
+        custom_order: default_order_list (simplified, no strawberry type key needed)
         **parameter_mappings: Named parameters that map GraphQL parameters to where conditions
                             Format: parameter_name={'field': {'operator': 'value'}} or callable
         
@@ -503,13 +503,16 @@ def berryql_field(
                             # Create a factory instance with our custom configurations
                             factory = BerryQLFactory()
                             
-                            # Apply custom configurations to the factory
+                            # Apply custom configurations to the factory - simplified structure
                             if actual_custom_where:
-                                factory._custom_where_config.update(actual_custom_where)
+                                # Store as direct mapping to the strawberry type
+                                factory._custom_where_config[strawberry_type] = actual_custom_where
                             if actual_custom_order:
-                                factory._custom_order_config.update(actual_custom_order)
+                                # Store as direct mapping to the strawberry type  
+                                factory._custom_order_config[strawberry_type] = actual_custom_order
                             if actual_custom_fields:
-                                factory._custom_fields_config.update(actual_custom_fields)
+                                # Store custom fields for the strawberry type
+                                factory.custom_field_manager.register_custom_fields(strawberry_type, actual_custom_fields)
                             
                             # Get the database session from context
                             db_value = None

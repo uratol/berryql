@@ -91,8 +91,8 @@ class UserType:
     @strawberry.field
     @berryql.field(
         model_class=Post,
-        custom_where={PostType: lambda: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}}},
-        custom_order={PostType: ['created_at desc']}
+        custom_where=lambda: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}},
+        custom_order=['created_at desc']
     )
     async def new_posts(self, info: strawberry.Info) -> List[PostType]:
         """Get user's posts created within the last hour, sorted by created_at descending."""
@@ -131,8 +131,8 @@ class Query:
     @strawberry.field
     @berryql.field(
         model_class=User,
-        custom_where={UserType: {'email': {'ne': None}}},  # Only users with email
-        custom_order={UserType: ['name', 'created_at desc']}  # Default ordering
+        custom_where={'email': {'ne': None}},  # Only users with email
+        custom_order=['name', 'created_at desc']  # Default ordering
     )
     async def active_users(
         self,
@@ -147,6 +147,7 @@ class Query:
         # The decorator automatically applies the custom_where and custom_order
         # Additional where/order_by parameters will be processed by the decorator
         pass  # Implementation handled by the decorator
+    
 
 
 # Create the schema instance
