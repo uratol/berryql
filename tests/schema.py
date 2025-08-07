@@ -94,14 +94,12 @@ class Query:
         model_class=User,
         name_filter={'name': {'like': lambda value: f'%{value}%'}},
         custom_fields={
-            UserType: {
-                'post_count': lambda model_class, requested_fields: func.coalesce(
-                    select(func.count(Post.id))
-                    .where(Post.author_id == model_class.id)
-                    .scalar_subquery(),
-                    0
-                )
-            }
+            'post_count': lambda model_class, requested_fields: func.coalesce(
+                select(func.count(Post.id))
+                .where(Post.author_id == model_class.id)
+                .scalar_subquery(),
+                0
+            )
         }
     )
     async def users(

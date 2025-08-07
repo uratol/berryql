@@ -104,7 +104,7 @@ class BerryQLFactory:
         self,
         strawberry_type: Type[T],
         model_class: Type,
-        custom_fields: Optional[Dict[Type, Dict[str, callable]]] = None,
+        custom_fields: Optional[Dict[str, callable]] = None,
         custom_where: Optional[Dict[Type, Union[Dict[str, Any], callable]]] = None,
         custom_order: Optional[Dict[Type, List[str]]] = None
     ) -> Callable[..., Awaitable[List[T]]]:
@@ -114,7 +114,7 @@ class BerryQLFactory:
         Args:
             strawberry_type: The root Strawberry GraphQL type class
             model_class: The corresponding root SQLAlchemy model class  
-            custom_fields: Dict mapping {strawberry_type: {field_name: query_builder}}
+            custom_fields: Dict mapping {field_name: query_builder}
             custom_where: Dict mapping {strawberry_type: where_conditions_or_function}
             custom_order: Dict mapping {strawberry_type: default_order_list}
             
@@ -123,7 +123,7 @@ class BerryQLFactory:
         """
         # Store global configurations
         if custom_fields:
-            self._custom_fields_config.update(custom_fields)
+            self._custom_fields_config[strawberry_type] = custom_fields
         if custom_where:
             self._custom_where_config.update(custom_where)
         if custom_order:
