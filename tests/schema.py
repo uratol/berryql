@@ -149,17 +149,21 @@ class Query:
         pass  # Implementation handled by the decorator
 
     @strawberry.field
-    async def current_user(self, info: strawberry.Info) -> Optional[UserType]:
-        """Get the current user from context."""
-        current_user = info.context.get('current_user')
-        if current_user:
-            return UserType(
-                id=current_user.id,
-                name=current_user.name,
-                email=current_user.email,
-                created_at=current_user.created_at
-            )
-        return None
+    @berryql.field(
+        model_class=User,
+        custom_where=lambda info=None: (
+            {'id': {'eq': info.context.get('user_id', 0)}} 
+            if info and hasattr(info, 'context')
+            else {'id': {'eq': None}}  # Return condition that matches no users when no user_id
+        )
+    )
+    async def current_user(
+        self, 
+        info: strawberry.Info,
+        db: AsyncSession
+    ) -> Optional[UserType]:
+        """Get the current user from context using BerryQL."""
+        pass  # Implementation handled by the decorator
 
     @strawberry.field
     @berryql.field(

@@ -750,8 +750,9 @@ class BerryQLFactory:
         model_class: Type,
         custom_fields: Optional[Dict[str, callable]] = None,
         custom_where: Optional[Union[Dict[str, Any], callable]] = None,
-        custom_order: Optional[List[str]] = None
-    ) -> Callable[..., Awaitable[List[T]]]:
+        custom_order: Optional[List[str]] = None,
+        return_single: bool = False
+    ) -> Callable[..., Awaitable[Union[List[T], Optional[T]]]]:
         """
         Create a unified BerryQL resolver with global configurations.
         
@@ -761,9 +762,10 @@ class BerryQLFactory:
             custom_fields: Dict mapping {field_name: query_builder}
             custom_where: where_conditions_or_function (simplified, no strawberry type key needed)
             custom_order: default_order_list (simplified, no strawberry type key needed)
+            return_single: If True, return a single object (or None) instead of a list
             
         Returns:
-            Async resolver function that returns List[strawberry_type]
+            Async resolver function that returns List[strawberry_type] or Optional[strawberry_type]
         """
         # Store configurations directly for the strawberry type
         if custom_fields:
@@ -778,7 +780,7 @@ class BerryQLFactory:
             info=None,
             params: Optional[GraphQLQueryParams] = None,
             **kwargs
-        ) -> List[T]:
+        ) -> Union[List[T], Optional[T]]:
             result = await self._execute_unified_query(
                 strawberry_type=strawberry_type,
                 model_class=model_class,
@@ -788,7 +790,13 @@ class BerryQLFactory:
                 is_root=True,
                 **kwargs
             )
-            return cast(List[T], result)
+            
+            if return_single:
+                # For single object queries, return the first result or None
+                return cast(Optional[T], result[0] if result and len(result) > 0 else None)
+            else:
+                # For list queries, return the full list
+                return cast(List[T], result)
         
         return resolver
 

@@ -414,6 +414,7 @@ def berryql_field(
                 
                 # Extract strawberry type from return type annotation
                 strawberry_type = None
+                return_single = False  # Determine if we should return a single object vs list
                 if return_type:
                     # Handle List[SomeType] - extract the inner type
                     origin = get_origin(return_type)
@@ -424,26 +425,48 @@ def berryql_field(
                             # Validate that the inner type is a proper Strawberry type
                             if hasattr(inner_type, '__strawberry_definition__') or hasattr(inner_type, '__strawberry_type__'):
                                 strawberry_type = inner_type
+                                return_single = False  # List return type
                             else:
                                 import logging
                                 logger = logging.getLogger(__name__)
                                 logger.error(f"Invalid inner type in List annotation for {func.__name__}: {inner_type}")
                                 logger.error(f"Return type was: {return_type}")
                                 raise ValueError(f"Return type List[{inner_type}] is not a valid Strawberry type for {func.__name__}")
+                    elif origin is Union:
+                        # Handle Optional[SomeType] which is Union[SomeType, type(None)]
+                        args = get_args(return_type)
+                        if args and len(args) == 2 and type(None) in args:
+                            # This is Optional[SomeType]
+                            inner_type = args[0] if args[1] is type(None) else args[1]
+                            if hasattr(inner_type, '__strawberry_definition__') or hasattr(inner_type, '__strawberry_type__'):
+                                strawberry_type = inner_type
+                                return_single = True  # Single object return type (can be None)
+                            else:
+                                import logging
+                                logger = logging.getLogger(__name__)
+                                logger.error(f"Invalid inner type in Optional annotation for {func.__name__}: {inner_type}")
+                                logger.error(f"Return type was: {return_type}")
+                                raise ValueError(f"Return type Optional[{inner_type}] is not a valid Strawberry type for {func.__name__}")
+                        else:
+                            import logging
+                            logger = logging.getLogger(__name__)
+                            logger.error(f"Unsupported Union type for {func.__name__}: {return_type}")
+                            raise ValueError(f"Union types other than Optional are not supported for {func.__name__}")
                     else:
                         # Check if it's a valid Strawberry type
                         if hasattr(return_type, '__strawberry_definition__') or hasattr(return_type, '__strawberry_type__'):
                             strawberry_type = return_type
+                            return_single = True  # Single object return type
                         else:
                             import logging
                             logger = logging.getLogger(__name__)
                             logger.error(f"Invalid return type annotation for {func.__name__}: {return_type}")
-                            logger.error(f"Expected a Strawberry type or List[StrawberryType]")
+                            logger.error(f"Expected a Strawberry type, List[StrawberryType], or Optional[StrawberryType]")
                             raise ValueError(f"Return type {return_type} is not a valid Strawberry type for {func.__name__}")
                 
                 if strawberry_type is None:
                     raise ValueError(f"Could not determine strawberry type from return annotation of {func.__name__}. "
-                                   f"Make sure the return type is annotated as List[YourStrawberryType] or YourStrawberryType")
+                                   f"Make sure the return type is annotated as List[YourStrawberryType], YourStrawberryType, or Optional[YourStrawberryType]")
                 
                 # Determine if this is a relationship field by checking if we're in a type class
                 # and if the return type suggests a relationship to another model
@@ -650,7 +673,13 @@ def berryql_field(
                                 json_data = []
                             
                             # Convert JSON data to strawberry type instances
-                            return convert_json_to_strawberry_instances(json_data, strawberry_type)
+                            converted_instances = convert_json_to_strawberry_instances(json_data, strawberry_type)
+                            
+                            # Return single object or list based on return type
+                            if return_single:
+                                return converted_instances[0] if converted_instances else None
+                            else:
+                                return converted_instances
                         
                         return relationship_resolver
                     
@@ -663,7 +692,8 @@ def berryql_field(
                         model_class=actual_model_class,
                         custom_fields=actual_custom_fields,
                         custom_where=actual_custom_where,
-                        custom_order=actual_custom_order
+                        custom_order=actual_custom_order,
+                        return_single=return_single
                     )
                 
                 # Extract the original function's signature for the resolver wrapper
