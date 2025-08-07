@@ -80,48 +80,73 @@ class TestBerryQLIntegration:
     @pytest.mark.asyncio
     async def test_users_with_posts_and_comments(self, graphql_schema, graphql_context, populated_db):
         """Test users query with nested posts and comments."""
-        query = """
-        query {
-            users {
-                id
-                name
-                email
-                posts {
+        from sqlalchemy import event
+        
+        # Set up SQL query counting
+        query_count = {'count': 0}
+        
+        def count_queries(conn, cursor, statement, parameters, context, executemany):
+            query_count['count'] += 1
+        
+        # Get the engine from the session
+        engine = graphql_context['db_session'].get_bind()
+        
+        # Add event listener to count SQL queries
+        event.listen(engine, "before_cursor_execute", count_queries)
+        
+        try:
+            query = """
+            query {
+                users {
                     id
-                    title
-                    content
+                    name
+                    email
+                    posts {
+                        id
+                        title
+                        content
+                        comments {
+                            id
+                            content
+                            authorId
+                        }
+                    }
                     comments {
                         id
                         content
-                        authorId
+                        postId
                     }
                 }
-                comments {
-                    id
-                    content
-                    postId
-                }
             }
-        }
-        """
-        
-        result = await graphql_schema.execute(query, context_value=graphql_context)
-        
-        assert result.errors is None
-        assert result.data is not None
-        assert 'users' in result.data
-        
-        users = result.data['users']
-        assert len(users) == 3  # We have 3 sample users
-        
-        # Check that Alice's posts have comments
-        alice = next(user for user in users if user['name'] == 'Alice Johnson')
-        first_post = next(post for post in alice['posts'] if post['title'] == 'First Post')
-        assert len(first_post['comments']) == 2  # First post has 2 comments
-        
-        # Check that users have their own comments
-        bob = next(user for user in users if user['name'] == 'Bob Smith')
-        assert len(bob['comments']) >= 1  # Bob has made comments
+            """
+            
+            # Reset counter before executing GraphQL query
+            query_count['count'] = 0
+            
+            result = await graphql_schema.execute(query, context_value=graphql_context)
+            
+            assert result.errors is None
+            assert result.data is not None
+            assert 'users' in result.data
+            
+            users = result.data['users']
+            assert len(users) == 3  # We have 3 sample users
+            
+            # Check that Alice's posts have comments
+            alice = next(user for user in users if user['name'] == 'Alice Johnson')
+            first_post = next(post for post in alice['posts'] if post['title'] == 'First Post')
+            assert len(first_post['comments']) == 2  # First post has 2 comments
+            
+            # Check that users have their own comments
+            bob = next(user for user in users if user['name'] == 'Bob Smith')
+            assert len(bob['comments']) >= 1  # Bob has made comments
+            
+            # Assert that the SQL query was executed only once (N+1 prevention)
+            assert query_count['count'] == 1, f"Expected 1 SQL query, but {query_count['count']} were executed"
+            
+        finally:
+            # Clean up event listener
+            event.remove(engine, "before_cursor_execute", count_queries)
     
     
     @pytest.mark.asyncio
