@@ -713,14 +713,67 @@ def berryql_field(
                 
                 # Create the new function with the modified signature
                 async def new_resolver_func(self, info: strawberry.Info, **graphql_kwargs):
-                    # Build the complete arguments for the original function
-                    original_kwargs = {}
+                    # First, try to call the original function to see if it has custom logic
+                    try:
+                        # Build the complete arguments for the original function
+                        original_kwargs = {}
+                        
+                        # Add all GraphQL arguments
+                        original_kwargs.update(graphql_kwargs)
+                        
+                        # Add info
+                        original_kwargs['info'] = info
+                        
+                        # Add database session from context if the original function expects it
+                        if 'db' in sig.parameters or 'database' in sig.parameters or 'session' in sig.parameters:
+                            db_value = None
+                            if hasattr(info.context, 'get'):
+                                db_value = (info.context.get('db_session') or 
+                                          info.context.get('db') or 
+                                          info.context.get('database') or
+                                          info.context.get('session'))
+                            elif hasattr(info.context, 'db_session'):
+                                db_value = info.context.db_session
+                            elif hasattr(info.context, 'db'):
+                                db_value = info.context.db
+                            
+                            if db_value:
+                                if 'db' in sig.parameters:
+                                    original_kwargs['db'] = db_value
+                                elif 'database' in sig.parameters:
+                                    original_kwargs['database'] = db_value
+                                elif 'session' in sig.parameters:
+                                    original_kwargs['session'] = db_value
+                        
+                        # Filter kwargs to only include parameters the original function expects
+                        filtered_kwargs = {}
+                        for param_name, value in original_kwargs.items():
+                            if param_name in sig.parameters:
+                                filtered_kwargs[param_name] = value
+                        
+                        # Call the original function
+                        custom_result = await func(self, **filtered_kwargs)
+                        
+                        # If the original function returned something other than None, use it
+                        if custom_result is not None:
+                            return custom_result
+                        
+                    except Exception as e:
+                        # If the original function raises an exception, let it propagate
+                        # This allows custom validation, authorization, etc.
+                        raise e
+                    
+                    # If we reach here, the original function returned None or passed
+                    # Fall back to BerryQL resolver
+                    
+                    # Build the complete arguments for the BerryQL resolver
+                    berryql_kwargs = {}
                     
                     # Add all GraphQL arguments
-                    original_kwargs.update(graphql_kwargs)
+                    berryql_kwargs.update(graphql_kwargs)
                     
                     # Add info
-                    original_kwargs['info'] = info
+                    berryql_kwargs['info'] = info
                     
                     # Add database session from context
                     db_value = None
@@ -735,7 +788,7 @@ def berryql_field(
                         db_value = info.context.db
                     
                     if db_value:
-                        original_kwargs['db'] = db_value
+                        berryql_kwargs['db'] = db_value
                     
                     # Prepare resolver parameters - pass all arguments to the resolver
                     resolver_params = {
@@ -749,7 +802,7 @@ def berryql_field(
                     where_conditions = {}
                     other_params = {}
                     
-                    for param_name, value in original_kwargs.items():
+                    for param_name, value in berryql_kwargs.items():
                         if param_name not in ['info', 'db', 'database', 'session'] and value is not None:
                             # Check if this parameter has an explicit mapping
                             if actual_parameter_mappings and param_name in actual_parameter_mappings:

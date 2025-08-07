@@ -163,7 +163,7 @@ class Query:
         db: AsyncSession
     ) -> Optional[UserType]:
         """Get the current user from context using BerryQL."""
-        pass  # Implementation handled by the decorator
+        return None  # Falls back to BerryQL resolver
 
     @strawberry.field
     @berryql.field(

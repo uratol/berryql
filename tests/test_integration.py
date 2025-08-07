@@ -646,6 +646,95 @@ class TestBerryQLIntegration:
         assert "Charlie Brown" in user_names
         assert "Alice Johnson" not in user_names  # Alice should be excluded (current user)
 
+    @pytest.mark.asyncio
+    async def test_custom_logic_execution_in_berryql_field(self, graphql_schema, db_session, sample_users):
+        """Test that custom logic in @berryql.field decorated methods executes."""
+        # Create context that should trigger custom logic
+        test_context = {
+            'db_session': db_session,
+            'user_id': 1  # Alice's user ID
+        }
+        
+        query = """
+        query {
+            currentUser {
+                id
+                name
+                email
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=test_context)
+        
+        # Should work normally since custom logic just returns None (falls back to BerryQL)
+        assert result.errors is None
+        assert result.data is not None
+        assert result.data['currentUser'] is not None
+        assert result.data['currentUser']['id'] == 1
+
+    @pytest.mark.asyncio
+    async def test_post_count_custom_logic_with_exception(self, graphql_schema, db_session, sample_users):
+        """Test that custom logic in postCount field executes and can throw exceptions."""
+        # First test normal behavior - should work fine
+        normal_context = {
+            'db_session': db_session,
+            'user_id': 1
+        }
+        
+        query = """
+        query {
+            users {
+                id
+                name
+                postCount
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=normal_context)
+        
+        # Should work normally
+        assert result.errors is None
+        assert result.data is not None
+        users = result.data['users']
+        assert len(users) > 0
+        
+        # Check that Alice has post count
+        alice = next(user for user in users if user['name'] == 'Alice Johnson')
+        assert 'postCount' in alice
+        assert isinstance(alice['postCount'], int)
+        assert alice['postCount'] >= 0
+        
+        # Now test what happens if we manually create a user with ID 999
+        # We'll simulate this by modifying the resolved data, but this would
+        # normally happen if there was a user with ID 999 in the database
+        # For this test, let's modify one of the existing users to have ID 999
+        from sqlalchemy import update
+        
+        session = db_session
+        # Temporarily change Alice's ID to 999 to trigger the exception
+        await session.execute(
+            update(User).where(User.name == "Alice Johnson").values(id=999)
+        )
+        await session.commit()
+        
+        try:
+            result_with_exception = await graphql_schema.execute(query, context_value=normal_context)
+            
+            # Should have an error due to the custom logic
+            assert result_with_exception.errors is not None
+            assert len(result_with_exception.errors) > 0
+            error_message = str(result_with_exception.errors[0])
+            assert "User 999 is not allowed to view post count" in error_message
+            
+        finally:
+            # Restore Alice's original ID
+            await session.execute(
+                update(User).where(User.name == "Alice Johnson").values(id=1)
+            )
+            await session.commit()
+
 
 @pytest.mark.integration
 class TestBerryQLErrorHandling:
