@@ -110,3 +110,7 @@ testpaths = [
     "tests",
 ]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests as integration tests",
+    "performance: marks tests as performance tests"
+]

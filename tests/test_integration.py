@@ -114,6 +114,7 @@ async def graphql_context(db_session, resolvers):
 # Remove the function-scoped fixtures since we're using session-scoped ones from conftest.py
 
 
+@pytest.mark.integration
 class TestBerryQLIntegration:
     """Integration tests for BerryQL functionality."""
     
@@ -265,6 +266,7 @@ class TestBerryQLIntegration:
                 assert 'content' in post
 
 
+@pytest.mark.performance
 class TestBerryQLPerformance:
     """Performance-focused integration tests."""
     
@@ -328,6 +330,7 @@ class TestBerryQLPerformance:
             assert len(user['posts']) == 3
 
 
+@pytest.mark.integration
 class TestBerryQLErrorHandling:
     """Test error handling scenarios."""
     
