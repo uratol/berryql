@@ -24,6 +24,7 @@ from sqlalchemy import select, func, text, asc, desc, inspect, literal
 from sqlalchemy.sql import ColumnElement
 from datetime import datetime
 from .query_analyzer import query_analyzer
+from .database_adapters import get_database_adapter, DatabaseAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +86,20 @@ class BerryQLFactory:
         self._custom_fields_config = {}  # Type -> {field_name: query_builder}
         self._custom_where_config = {}   # Type -> where_function_or_dict  
         self._custom_order_config = {}   # Type -> default_order_list
+        # Database adapter for cross-database compatibility
+        self._db_adapter: Optional[DatabaseAdapter] = None
 
     def _camel_to_snake(self, name: str) -> str:
         """Convert camelCase GraphQL field names to snake_case database column names."""
         # Handle cases like projectId -> project_id
         s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
         return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+    def _get_db_adapter(self, db: AsyncSession) -> DatabaseAdapter:
+        """Get or initialize the database adapter for the current session."""
+        if self._db_adapter is None:
+            self._db_adapter = get_database_adapter(db.bind)
+        return self._db_adapter
 
     def create_berryql_resolver(
         self,
@@ -326,7 +335,8 @@ class BerryQLFactory:
         else:
             # For nested queries, return json_agg
             final_query = self._build_nested_lateral_query(
-                entity_subquery, relationship_aggregations, custom_order, params
+                entity_subquery, relationship_aggregations, custom_order, params, 
+                self._get_db_adapter(db)
             )
         
         # Execute query
@@ -693,16 +703,18 @@ class BerryQLFactory:
             else:
                 logger.info(f"No nested relationships to process for {strawberry_type.__name__}")
             
-            json_object = func.json_build_object(*json_columns)
+            # Get database adapter for cross-database compatibility
+            db_adapter = self._get_db_adapter(db)
+            json_object = db_adapter.json_build_object(*json_columns)
             
             json_agg_query = select(
-                func.coalesce(
-                    func.json_agg(json_object),
-                    text("'[]'::json")
+                db_adapter.coalesce_json(
+                    db_adapter.json_agg(json_object),
+                    db_adapter.json_empty_array()
                 )
             ).select_from(filtered_subquery)  # Only select from the subquery, not the original table
             
-            return json_agg_query.as_scalar()
+            return json_agg_query.scalar_subquery()
             
         except Exception as e:
             logger.error(f"Error building relationship SQL subquery: {e}")
@@ -776,7 +788,8 @@ class BerryQLFactory:
         entity_subquery,
         relationship_aggregations: List[ColumnElement],
         custom_order: List[str],
-        params: GraphQLQueryParams
+        params: GraphQLQueryParams,
+        db_adapter: DatabaseAdapter
     ):
         """Build the final query for nested entities using json_agg - SIMPLIFIED VERSION."""
         # Get entity columns
@@ -791,12 +804,12 @@ class BerryQLFactory:
             json_items.append(text(f"'{col.name}'"))
             json_items.append(col)
         
-        entity_json = func.json_build_object(*json_items)
+        entity_json = db_adapter.json_build_object(*json_items)
         
         # Wrap in json_agg for multiple results - only select the aggregate, not individual columns
-        final_agg = func.coalesce(
-            func.json_agg(entity_json),
-            text("'[]'::json")
+        final_agg = db_adapter.coalesce_json(
+            db_adapter.json_agg(entity_json),
+            db_adapter.json_empty_array()
         )
         
         query = select(final_agg).select_from(entity_subquery)
@@ -806,9 +819,9 @@ class BerryQLFactory:
             order_clauses = self._build_order_clauses(entity_subquery, params.order_by)
             if order_clauses:
                 # Re-build with ordering
-                ordered_agg = func.coalesce(
-                    func.json_agg(entity_json.order_by(*order_clauses)),
-                    text("'[]'::json")
+                ordered_agg = db_adapter.coalesce_json(
+                    db_adapter.json_agg(entity_json.order_by(*order_clauses)),
+                    db_adapter.json_empty_array()
                 )
                 query = select(ordered_agg).select_from(entity_subquery)
         
@@ -1042,6 +1055,15 @@ class BerryQLFactory:
             
             # Parse the json data into strawberry instances
             if json_data:
+                # Parse JSON string if needed (for SQLite and other databases that return JSON as strings)
+                if isinstance(json_data, str):
+                    try:
+                        import json
+                        json_data = json.loads(json_data)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"Failed to parse JSON string: {json_data}")
+                        json_data = []
+                
                 parsed_relationships = self._parse_json_relationship_data(json_data, rel_config)
                 
                 # Store data in the nested structure expected by get_relationship_data

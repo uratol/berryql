@@ -16,7 +16,7 @@ from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, create_eng
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, relationship
 
-from berryql import BerryQLFactory, GraphQLQueryParams, get_resolved_field_data
+from berryql import BerryQLFactory, GraphQLQueryParams, get_resolved_field_data, berryql
 
 
 # SQLAlchemy Models
@@ -67,9 +67,10 @@ class UserType:
     created_at: datetime
     
     @strawberry.field
+    @berryql.field
     async def posts(self, info: strawberry.Info) -> List[PostType]:
         """Get user's posts using pre-resolved data."""
-        return get_resolved_field_data(self, info, 'posts')
+        pass
 
 
 # GraphQL Schema Setup
@@ -81,7 +82,7 @@ class Query:
         info: strawberry.Info,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        name_filter: Optional[str] = None
+        name_filter: Optional[str] = strawberry.field(name="nameFilter", default=None)
     ) -> List[UserType]:
         """Get users with optional filtering and pagination."""
         # Build query parameters
@@ -154,8 +155,9 @@ async def setup_database():
         async_engine, class_=AsyncSession, expire_on_commit=False
     )
     
-    # Create tables
+    # Drop and recreate tables
     async with async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     
     # Add sample data
@@ -200,7 +202,7 @@ async def main():
     # Example GraphQL query
     query = """
     query {
-        users(limit: 2, name_filter: "Alice") {
+        users(limit: 2, nameFilter: "Alice") {
             id
             name
             email

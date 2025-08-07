@@ -7,46 +7,13 @@ proper handling of fragments, inline fragments, aliases, and multiple field node
 
 import logging
 from typing import Dict, Set, List, Any, Type, get_type_hints, Union, Optional
-from graphql import GraphQLResolveInfo, FieldNode, InlineFragmentNode, FragmentSpreadNode
-from graphql.language.ast import ObjectValueNode, ListValueNode, ValueNode
+from graphql import GraphQLResolveInfo
 
 logger = logging.getLogger(__name__)
 
 
 class QueryFieldAnalyzer:
-    """Analyzes GraphQL query fields with support for fragments and aliases."""
-    
-    def _ast_value_to_python(self, value_node: ValueNode, info: GraphQLResolveInfo = None) -> Any:
-        """Convert a GraphQL AST value node to a Python object."""
-        if hasattr(value_node, 'value'):
-            # Simple literal value (StringValue, IntValue, BooleanValue, etc.)
-            return value_node.value
-        elif isinstance(value_node, ObjectValueNode):
-            # Object literal - convert to dictionary
-            result = {}
-            for field in value_node.fields:
-                field_name = field.name.value
-                field_value = self._ast_value_to_python(field.value, info)
-                result[field_name] = field_value
-            logger.debug(f"Converted ObjectValueNode to dict: {result}")
-            return result
-        elif isinstance(value_node, ListValueNode):
-            # Array literal - convert to list
-            return [self._ast_value_to_python(item, info) for item in value_node.values]
-        elif hasattr(value_node, 'name'):
-            # Variable reference - resolve from execution context
-            variable_name = value_node.name.value
-            if info and hasattr(info, 'variable_values') and variable_name in info.variable_values:
-                logger.debug(f"Resolving variable ${variable_name} to: {info.variable_values[variable_name]}")
-                return info.variable_values[variable_name]
-            else:
-                # Fallback to variable reference string if we can't resolve it
-                logger.warning(f"Could not resolve variable ${variable_name}, treating as literal string")
-                return f"${variable_name}"
-        else:
-            # Fallback - convert to string representation
-            logger.warning(f"Unknown value node type: {type(value_node)} - falling back to string conversion")
-            return str(value_node)
+    """Analyzes GraphQL query fields using Strawberry's selected_fields API."""
     
     def analyze_query_fields(
         self, 
@@ -80,14 +47,28 @@ class QueryFieldAnalyzer:
         
         logger.debug(f"Analyzing query fields for {strawberry_type.__name__}")
         
-        # Process all field nodes (not just the first one)
+        # Process all field selections using the new selected_fields API
         all_selections = []
-        for field_node in info.field_nodes:
-            if hasattr(field_node, 'selection_set') and field_node.selection_set:
-                all_selections.extend(field_node.selection_set.selections)
         
-        # Analyze all selections
-        analysis_result = self._analyze_selections(
+        # Use selected_fields (new Strawberry API)
+        if hasattr(info, 'selected_fields') and info.selected_fields:
+            logger.debug(f"Using selected_fields API for {strawberry_type.__name__}")
+            # selected_fields gives us a direct list of SelectedField objects
+            current_field = info.selected_fields[0]  # Usually just one field for our resolver
+            if hasattr(current_field, 'selections') and current_field.selections:
+                # Use SelectedField objects directly in our analysis
+                all_selections = current_field.selections
+        else:
+            logger.warning(f"selected_fields not available on info object for {strawberry_type.__name__}")
+            return {
+                'scalar_fields': set(),
+                'relationship_fields': {},
+                'aliases': {},
+                'fragments': []
+            }
+        
+        # Analyze all selections (now SelectedField objects)
+        analysis_result = self._analyze_selected_fields(
             all_selections, 
             strawberry_type, 
             info,
@@ -100,56 +81,27 @@ class QueryFieldAnalyzer:
         
         return analysis_result
     
-    def _analyze_selections(
+    def _analyze_selected_fields(
         self, 
-        selections: List[Any], 
+        selected_fields: List[Any], 
         strawberry_type: Type,
         info: GraphQLResolveInfo,
         depth_limit: int
     ) -> Dict[str, Any]:
-        """Analyze a list of GraphQL selections (fields, fragments, inline fragments)."""
+        """Analyze a list of Strawberry SelectedField objects."""
         scalar_fields = set()
         relationship_fields = {}
         aliases = {}
         fragments = []
         
-        for selection in selections:
-            if isinstance(selection, FieldNode):
-                # Handle regular field selection
-                field_result = self._analyze_field_node(
-                    selection, strawberry_type, info, depth_limit
-                )
-                scalar_fields.update(field_result['scalar_fields'])
-                relationship_fields.update(field_result['relationship_fields'])
-                aliases.update(field_result['aliases'])
-                
-            elif isinstance(selection, InlineFragmentNode):
-                # Handle inline fragment (... on TypeName { fields })
-                fragment_result = self._analyze_inline_fragment(
-                    selection, strawberry_type, info, depth_limit
-                )
-                scalar_fields.update(fragment_result['scalar_fields'])
-                relationship_fields.update(fragment_result['relationship_fields'])
-                aliases.update(fragment_result['aliases'])
-                fragments.append({
-                    'type': 'inline',
-                    'type_condition': selection.type_condition.name.value if selection.type_condition else None,
-                    'fields': fragment_result['scalar_fields'].union(set(fragment_result['relationship_fields'].keys()))
-                })
-                
-            elif isinstance(selection, FragmentSpreadNode):
-                # Handle fragment spread (...FragmentName)
-                fragment_result = self._analyze_fragment_spread(
-                    selection, strawberry_type, info, depth_limit
-                )
-                scalar_fields.update(fragment_result['scalar_fields'])
-                relationship_fields.update(fragment_result['relationship_fields'])
-                aliases.update(fragment_result['aliases'])
-                fragments.append({
-                    'type': 'spread',
-                    'name': selection.name.value,
-                    'fields': fragment_result['scalar_fields'].union(set(fragment_result['relationship_fields'].keys()))
-                })
+        for selected_field in selected_fields:
+            # Handle SelectedField objects directly
+            field_result = self._analyze_selected_field(
+                selected_field, strawberry_type, info, depth_limit
+            )
+            scalar_fields.update(field_result['scalar_fields'])
+            relationship_fields.update(field_result['relationship_fields'])
+            aliases.update(field_result['aliases'])
         
         return {
             'scalar_fields': scalar_fields,
@@ -158,28 +110,23 @@ class QueryFieldAnalyzer:
             'fragments': fragments
         }
     
-    def _analyze_field_node(
+    def _analyze_selected_field(
         self, 
-        field_node: FieldNode, 
+        selected_field, 
         strawberry_type: Type,
         info: GraphQLResolveInfo,
         depth_limit: int
     ) -> Dict[str, Any]:
-        """Analyze a single field node."""
-        field_name = field_node.name.value
-        alias = field_node.alias.value if field_node.alias else None
+        """Analyze a single SelectedField object."""
+        field_name = selected_field.name
+        alias = selected_field.alias
         
         scalar_fields = set()
         relationship_fields = {}
         aliases = {}
         
-        # Extract field arguments
-        field_arguments = {}
-        if hasattr(field_node, 'arguments') and field_node.arguments:
-            for arg in field_node.arguments:
-                arg_name = arg.name.value
-                # Convert GraphQL AST value to Python object
-                field_arguments[arg_name] = self._ast_value_to_python(arg.value, info)
+        # Extract field arguments (they're already a dict in SelectedField)
+        field_arguments = selected_field.arguments or {}
         
         # Handle alias
         if alias:
@@ -197,10 +144,10 @@ class QueryFieldAnalyzer:
                 relationship_fields[display_name] = inner_type
                 
                 # If the field has sub-selections, analyze them recursively
-                if hasattr(field_node, 'selection_set') and field_node.selection_set and depth_limit > 0:
+                if selected_field.selections and depth_limit > 0:
                     logger.debug(f"Analyzing sub-selections for {display_name}, depth_limit: {depth_limit}")
-                    sub_analysis = self._analyze_selections(
-                        field_node.selection_set.selections,
+                    sub_analysis = self._analyze_selected_fields(
+                        selected_field.selections,
                         inner_type,
                         info,
                         depth_limit - 1
@@ -237,9 +184,7 @@ class QueryFieldAnalyzer:
                 scalar_fields.add(display_name)
                 
                 # Even scalar fields can have arguments that need validation
-                # For example, scalar field computed fields with parameters
                 if field_arguments:
-                    # Validate field arguments for scalar fields too
                     self._validate_field_arguments(field_arguments, field_name)
         
         return {
@@ -266,78 +211,6 @@ class QueryFieldAnalyzer:
                     raise InvalidFieldError(f"Invalid JSON in where clause for field '{field_name}': {where_value}. Error: {e}")
         
         # Add other argument validations as needed
-    
-    def _analyze_inline_fragment(
-        self, 
-        inline_fragment: InlineFragmentNode, 
-        strawberry_type: Type,
-        info: GraphQLResolveInfo,
-        depth_limit: int
-    ) -> Dict[str, Any]:
-        """Analyze an inline fragment."""
-        # For inline fragments, we need to check the type condition
-        target_type = strawberry_type  # Default to current type
-        
-        if inline_fragment.type_condition:
-            type_name = inline_fragment.type_condition.name.value
-            # Try to resolve the target type - for now, use the current type
-            # In a more sophisticated implementation, you'd resolve the actual type
-            logger.debug(f"Inline fragment for type: {type_name}")
-        
-        # Analyze the fragment's selections
-        if inline_fragment.selection_set:
-            return self._analyze_selections(
-                inline_fragment.selection_set.selections,
-                target_type,
-                info,
-                depth_limit
-            )
-        
-        return {
-            'scalar_fields': set(),
-            'relationship_fields': {},
-            'aliases': {},
-            'fragments': []
-        }
-    
-    def _analyze_fragment_spread(
-        self, 
-        fragment_spread: FragmentSpreadNode, 
-        strawberry_type: Type,
-        info: GraphQLResolveInfo,
-        depth_limit: int
-    ) -> Dict[str, Any]:
-        """Analyze a fragment spread."""
-        fragment_name = fragment_spread.name.value
-        
-        # Get the fragment definition from the document
-        fragment_def = None
-        if info.fragments and fragment_name in info.fragments:
-            fragment_def = info.fragments[fragment_name]
-        
-        if fragment_def and fragment_def.selection_set:
-            # Determine target type from fragment
-            target_type = strawberry_type  # Default fallback
-            if fragment_def.type_condition:
-                type_name = fragment_def.type_condition.name.value
-                logger.debug(f"Fragment spread '{fragment_name}' for type: {type_name}")
-                # In a more sophisticated implementation, resolve the actual type
-            
-            # Analyze the fragment's selections
-            return self._analyze_selections(
-                fragment_def.selection_set.selections,
-                target_type,
-                info,
-                depth_limit
-            )
-        
-        logger.warning(f"Fragment '{fragment_name}' not found or has no selections")
-        return {
-            'scalar_fields': set(),
-            'relationship_fields': {},
-            'aliases': {},
-            'fragments': []
-        }
     
     def _is_relationship_field_by_name(self, field_name: str, strawberry_type: Type) -> bool:
         """Check if a field is a relationship field by analyzing the Strawberry type."""
@@ -514,14 +387,17 @@ class QueryFieldAnalyzer:
             singular_name = inflection.singularize(field_name)
             type_name = singular_name.capitalize()
             
-            # Try to import from the types module
+            # Try to import from the types module (optional)
             try:
-                from app.graphql import types
-                if hasattr(types, type_name):
-                    resolved_type = getattr(types, type_name)
+                # This is a fallback for cases where types are defined in a separate module
+                # Import path may vary based on project structure
+                import importlib
+                types_module = importlib.import_module('types')  # Generic types module
+                if hasattr(types_module, type_name):
+                    resolved_type = getattr(types_module, type_name)
                     logger.debug(f"Dynamically resolved {field_name} -> {type_name}")
                     return resolved_type
-            except ImportError:
+            except (ImportError, ModuleNotFoundError):
                 logger.debug("Could not import types module for dynamic resolution")
             
             # If not found, log and return None

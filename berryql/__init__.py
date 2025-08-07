@@ -30,6 +30,15 @@ from .input_types import (
     PaginationInput,
     ComparisonValue
 )
+from .database_adapters import (
+    DatabaseAdapter,
+    PostgreSQLAdapter,
+    SQLiteAdapter,
+    MSSQLAdapter,
+    LegacySQLiteAdapter,
+    get_database_adapter,
+    check_sqlite_json_support
+)
 
 __version__ = "0.1.0"
 __author__ = "BerryQL Contributors"
@@ -67,4 +76,13 @@ __all__ = [
     "OrderByInput",
     "PaginationInput",
     "ComparisonValue",
+    
+    # Database adapters
+    "DatabaseAdapter",
+    "PostgreSQLAdapter", 
+    "SQLiteAdapter",
+    "MSSQLAdapter",
+    "LegacySQLiteAdapter",
+    "get_database_adapter",
+    "check_sqlite_json_support",
 ]

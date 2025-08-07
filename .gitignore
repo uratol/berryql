@@ -50,6 +50,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+example.db
 
 # Translations
 *.mo
@@ -175,3 +176,4 @@ Desktop.ini
 
 # Pre-commit
 .pre-commit-config.yaml
+
