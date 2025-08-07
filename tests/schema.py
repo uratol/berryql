@@ -147,6 +147,38 @@ class Query:
         # The decorator automatically applies the custom_where and custom_order
         # Additional where/order_by parameters will be processed by the decorator
         pass  # Implementation handled by the decorator
+
+    @strawberry.field
+    async def current_user(self, info: strawberry.Info) -> Optional[UserType]:
+        """Get the current user from context."""
+        current_user = info.context.get('current_user')
+        if current_user:
+            return UserType(
+                id=current_user.id,
+                name=current_user.name,
+                email=current_user.email,
+                created_at=current_user.created_at
+            )
+        return None
+
+    @strawberry.field
+    @berryql.field(
+        model_class=User,
+        custom_where=lambda info=None: (
+            {'id': {'ne': info.context.get('user_id', 0)}} 
+            if info and hasattr(info, 'context') and info.context.get('user_id') 
+            else {}
+        )
+    )
+    async def other_users(
+        self,
+        info: strawberry.Info,
+        db: AsyncSession,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None
+    ) -> List[UserType]:
+        """Get all users except the current user (using custom_where with context)."""
+        pass  # Implementation handled by the decorator
     
 
 

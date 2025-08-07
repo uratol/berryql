@@ -659,7 +659,8 @@ class QueryBuilder:
         requested_fields: Set[str],
         custom_where: Any,
         params: GraphQLQueryParams,
-        parent_id_column = None
+        parent_id_column = None,
+        info = None
     ):
         """Build the base entity subquery with all scalar fields."""
         essential_fields = {'id'}
@@ -700,7 +701,17 @@ class QueryBuilder:
         
         # Apply where conditions
         if custom_where:
-            subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, custom_where)
+            # Check if custom_where is callable and needs info/context
+            if callable(custom_where):
+                try:
+                    # Try calling with info parameter first
+                    resolved_custom_where = custom_where(info) if info else custom_where()
+                except TypeError:
+                    # Fallback to calling without parameters if it fails
+                    resolved_custom_where = custom_where()
+                subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, resolved_custom_where)
+            else:
+                subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, custom_where)
         if params.where:
             subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, params.where)
         
@@ -883,7 +894,7 @@ class BerryQLFactory:
         
         # Build entity subquery with all required fields
         entity_subquery = self.query_builder.build_entity_subquery(
-            strawberry_type, model_class, requested_fields, custom_where, params, parent_id_column
+            strawberry_type, model_class, requested_fields, custom_where, params, parent_id_column, info
         )
         
         # Build relationship aggregations
@@ -919,10 +930,7 @@ class BerryQLFactory:
 
     def _get_custom_config(self, strawberry_type: Type, config_dict: Dict[Type, Any], default=None):
         """Get custom configuration for a strawberry type."""
-        config = config_dict.get(strawberry_type, default)
-        if callable(config):
-            return config()
-        return config
+        return config_dict.get(strawberry_type, default)
 
     async def _build_relationship_aggregations(
         self,

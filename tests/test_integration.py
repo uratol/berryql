@@ -30,10 +30,13 @@ async def graphql_schema():
 
 
 @pytest.fixture
-async def graphql_context(db_session):
+async def graphql_context(db_session, sample_users):
     """Create GraphQL execution context."""
+    current_user = sample_users[0] if sample_users else None  # Use Alice as current user
     return {
-        'db_session': db_session
+        'db_session': db_session,
+        'user_id': 1,
+        'current_user': current_user
     }
 
 
@@ -555,6 +558,93 @@ class TestBerryQLIntegration:
         post_titles = [post['title'] for post in new_posts]
         assert "First Post" not in post_titles  # The old post should be filtered out
         assert "GraphQL is Great" in post_titles  # The new post should be included
+
+    @pytest.mark.asyncio
+    async def test_current_user_query(self, graphql_schema, graphql_context, populated_db):
+        """Test current_user query returns the user from context."""
+        query = """
+        query {
+            currentUser {
+                id
+                name
+                email
+                createdAt
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        current_user = result.data['currentUser']
+        assert current_user is not None
+        
+        # Should match the current_user from context (Alice, the first user)
+        expected_user = graphql_context['current_user']
+        assert current_user['id'] == expected_user.id
+        assert current_user['name'] == expected_user.name
+        assert current_user['email'] == expected_user.email
+        assert current_user['createdAt'] is not None
+
+    @pytest.mark.asyncio
+    async def test_current_user_with_no_context(self, graphql_schema, db_session):
+        """Test current_user query when no current_user is in context."""
+        # Create context without current_user
+        context_without_user = {
+            'db_session': db_session,
+            'user_id': None
+        }
+        
+        query = """
+        query {
+            currentUser {
+                id
+                name
+                email
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=context_without_user)
+        
+        assert result.errors is None
+        assert result.data is not None
+        assert result.data['currentUser'] is None
+
+    @pytest.mark.asyncio
+    async def test_custom_where_with_context(self, graphql_schema, graphql_context, populated_db):
+        """Test custom_where callable that accesses GraphQL context."""
+        query = """
+        query {
+            otherUsers {
+                id
+                name
+                email
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        other_users = result.data['otherUsers']
+        assert other_users is not None
+        assert len(other_users) >= 2  # Should have at least 2 users (excluding current user)
+        
+        # Verify the current user (user_id = 1) is excluded
+        current_user_id = graphql_context.get('user_id', 1)
+        user_ids = [user['id'] for user in other_users]
+        assert current_user_id not in user_ids
+        
+        # Verify we get the other users (Bob and Charlie)
+        user_names = [user['name'] for user in other_users]
+        assert "Bob Smith" in user_names
+        assert "Charlie Brown" in user_names
+        assert "Alice Johnson" not in user_names  # Alice should be excluded (current user)
 
 
 @pytest.mark.integration
