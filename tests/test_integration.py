@@ -25,9 +25,9 @@ from conftest import User, Post, Comment  # Import models from conftest to avoid
 class CommentType:
     id: int
     content: str
-    post_id: int = strawberry.field(name="postId")
-    author_id: int = strawberry.field(name="authorId")
-    created_at: datetime = strawberry.field(name="createdAt")
+    post_id: int
+    author_id: int
+    created_at: datetime
 
 
 @strawberry.type
@@ -35,8 +35,8 @@ class PostType:
     id: int
     title: str
     content: Optional[str] = None
-    author_id: int = strawberry.field(name="authorId")
-    created_at: datetime = strawberry.field(name="createdAt")
+    author_id: int
+    created_at: datetime
     
     @strawberry.field
     @berryql.field
@@ -50,7 +50,7 @@ class UserType:
     id: int
     name: str
     email: str
-    created_at: datetime = strawberry.field(name="createdAt")
+    created_at: datetime
     
     @strawberry.field
     @berryql.field
