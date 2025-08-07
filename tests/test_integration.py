@@ -356,6 +356,11 @@ class TestBerryQLIntegration:
                 newPosts {
                     id
                     title
+                    createdAt
+                }
+                posts {
+                    id
+                    createdAt
                 }
             }
         }
