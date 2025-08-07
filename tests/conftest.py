@@ -1,4 +1,15 @@
-"""Test configuration for BerryQL."""
+"""Test configuraticlass User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    email = Column(String(255), unique=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    # Relationship to posts
+    posts = relationship("Post", back_populates="author")
+    # Relationship to comments
+    comments = relationship("Comment", back_populates="author")ryQL."""
 
 import pytest
 import asyncio
@@ -27,6 +38,8 @@ class User(Base):
     
     # Relationship to posts
     posts = relationship("Post", back_populates="author")
+    # Relationship to comments
+    comments = relationship("Comment", back_populates="author")
 
 
 class Post(Base):
@@ -40,6 +53,22 @@ class Post(Base):
     
     # Relationship to user
     author = relationship("User", back_populates="posts")
+    # Relationship to comments
+    comments = relationship("Comment", back_populates="post")
+
+
+class Comment(Base):
+    __tablename__ = 'comments'
+    
+    id = Column(Integer, primary_key=True)
+    content = Column(String(1000), nullable=False)
+    post_id = Column(Integer, ForeignKey('posts.id'), nullable=False)
+    author_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    # Relationships
+    post = relationship("Post", back_populates="comments")
+    author = relationship("User", back_populates="comments")
 
 
 @pytest.fixture(scope="session")
@@ -122,9 +151,36 @@ async def sample_posts(db_session, sample_users):
 
 
 @pytest.fixture(scope="session")
-async def populated_db(sample_users, sample_posts):
+async def sample_comments(db_session, sample_users, sample_posts):
+    """Create sample comments for testing once for all tests."""
+    user1, user2, user3 = sample_users
+    post1, post2, post3, post4, post5 = sample_posts
+    
+    comments = [
+        Comment(content="Great post!", post_id=post1.id, author_id=user2.id),
+        Comment(content="Thanks for sharing!", post_id=post1.id, author_id=user3.id),
+        Comment(content="I agree completely!", post_id=post2.id, author_id=user2.id),
+        Comment(content="Very helpful tips", post_id=post3.id, author_id=user1.id),
+        Comment(content="Nice work!", post_id=post3.id, author_id=user3.id),
+        Comment(content="Looking forward to more", post_id=post4.id, author_id=user1.id),
+        Comment(content="This helped me a lot", post_id=post5.id, author_id=user2.id),
+    ]
+    
+    db_session.add_all(comments)
+    await db_session.commit()
+    
+    # Refresh to get IDs
+    for comment in comments:
+        await db_session.refresh(comment)
+    
+    return comments
+
+
+@pytest.fixture(scope="session")
+async def populated_db(sample_users, sample_posts, sample_comments):
     """Fixture that ensures database is populated with sample data once for all tests."""
     return {
         'users': sample_users,
-        'posts': sample_posts
+        'posts': sample_posts,
+        'comments': sample_comments
     }
