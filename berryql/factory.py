@@ -1,8 +1,5 @@
 """
-Refactored BerryQL Factory for GraphQL queries.
-
-This module provides a refactored BerryQL factory with improved structure,
-separation of concerns, and maintainability.
+BerryQL Factory for GraphQL queries.
 
 Features:
 - Modular design with separate classes for different responsibilities
