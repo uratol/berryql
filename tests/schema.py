@@ -15,11 +15,6 @@ from conftest import User, Post
 from sqlalchemy import func, select
 
 
-def build_post_count_query(model_class, requested_fields):
-    """Build post count aggregation query."""
-    return func.count(Post.id).filter(Post.author_id == model_class.id).label('post_count')
-
-
 # Strawberry GraphQL Types
 @strawberry.type
 class PostAggType:
