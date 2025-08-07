@@ -12,9 +12,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import GraphQLQueryParams, berryql
 from conftest import User, Post
+from sqlalchemy import func, select
+
+
+def build_post_count_query(model_class, requested_fields):
+    """Build post count aggregation query."""
+    return func.count(Post.id).filter(Post.author_id == model_class.id).label('post_count')
 
 
 # Strawberry GraphQL Types
+@strawberry.type
+class PostAggType:
+    post_count: int
+
+
 @strawberry.type
 class CommentType:
     id: int
@@ -59,6 +70,12 @@ class UserType:
         pass
     
     @strawberry.field
+    @berryql.field
+    async def post_count(self, info: strawberry.Info) -> int:
+        """Get user's post count using pre-resolved data."""
+        pass
+    
+    @strawberry.field
     @berryql.field(
         model_class=Post,
         custom_where={PostType: lambda: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}}},
@@ -75,7 +92,17 @@ class Query:
     @strawberry.field
     @berryql.field(
         model_class=User,
-        name_filter={'name': {'like': lambda value: f'%{value}%'}}
+        name_filter={'name': {'like': lambda value: f'%{value}%'}},
+        custom_fields={
+            UserType: {
+                'post_count': lambda model_class, requested_fields: func.coalesce(
+                    select(func.count(Post.id))
+                    .where(Post.author_id == model_class.id)
+                    .scalar_subquery(),
+                    0
+                )
+            }
+        }
     )
     async def users(
         self,

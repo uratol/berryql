@@ -300,6 +300,65 @@ class TestBerryQLIntegration:
     
     
     @pytest.mark.asyncio
+    async def test_users_with_post_aggregation(self, graphql_schema, graphql_context, populated_db):
+        """Test users query with postCount aggregation field."""
+        # Start with a simple test - just query users without custom fields first
+        query1 = """
+        query {
+            users {
+                id
+                name
+                email
+            }
+        }
+        """
+        
+        result1 = await graphql_schema.execute(query1, context_value=graphql_context)
+        assert result1.errors is None, f"Basic query failed: {result1.errors}"
+        assert result1.data is not None
+        assert 'users' in result1.data
+        users1 = result1.data['users']
+        assert len(users1) > 0, "No users found in basic query"
+        
+        # Now test with the custom field
+        query2 = """
+        query {
+            users {
+                id
+                name
+                email
+                postCount
+            }
+        }
+        """
+        
+        result2 = await graphql_schema.execute(query2, context_value=graphql_context)
+        
+        # Print result for debugging
+        print(f"Result data: {result2.data}")
+        print(f"Result errors: {result2.errors}")
+        
+        if result2.errors:
+            for error in result2.errors:
+                print(f"Error: {error}")
+                print(f"Error path: {error.path if hasattr(error, 'path') else 'No path'}")
+        
+        assert result2.errors is None, f"Custom field query failed: {result2.errors}"
+        assert result2.data is not None
+        assert 'users' in result2.data
+        
+        users2 = result2.data['users']
+        assert len(users2) > 0, "No users found with custom field"
+        
+        # Check that all users have postCount data
+        for user in users2:
+            assert 'postCount' in user, f"User missing postCount: {user}"
+            post_count = user['postCount']
+            assert isinstance(post_count, int), f"postCount should be int, got {type(post_count)}: {post_count}"
+            assert post_count >= 0, f"postCount should be non-negative: {post_count}"
+    
+    
+    @pytest.mark.asyncio
     async def test_empty_results(self, graphql_schema, graphql_context, populated_db):
         """Test queries that return no results."""
         query = """

@@ -427,12 +427,25 @@ class BerryQLFactory:
         """Check if a field is a custom field for the given strawberry type."""
         # Check explicit custom field configuration
         custom_fields = self._custom_fields_config.get(strawberry_type, {})
+        
+        # Try exact field name first
         if field_name in custom_fields:
+            return True
+        
+        # Convert camelCase to snake_case and try again
+        snake_case_field = self._camel_to_snake(field_name)
+        if snake_case_field in custom_fields:
             return True
         
         # Check for @custom_field decorator
         if hasattr(strawberry_type, field_name):
             attr = getattr(strawberry_type, field_name)
+            if callable(attr) and hasattr(attr, '_is_custom_field'):
+                return True
+                
+        # Also check snake_case version for decorator
+        if hasattr(strawberry_type, snake_case_field):
+            attr = getattr(strawberry_type, snake_case_field)
             if callable(attr) and hasattr(attr, '_is_custom_field'):
                 return True
         
@@ -878,13 +891,26 @@ class BerryQLFactory:
         
         # Build columns for all custom fields
         for field_name in requested_fields:
+            # Try exact field name first
+            query_builder = None
+            custom_field_name = None
+            
             if field_name in custom_fields:
                 query_builder = custom_fields[field_name]
-                
+                custom_field_name = field_name
+            else:
+                # Convert camelCase to snake_case and try again
+                snake_case_field = self._camel_to_snake(field_name)
+                if snake_case_field in custom_fields:
+                    query_builder = custom_fields[snake_case_field]
+                    custom_field_name = snake_case_field
+            
+            if query_builder:
                 try:
                     custom_column = query_builder(model_class, requested_fields)
                     if hasattr(custom_column, 'label'):
-                        custom_column = custom_column.label(field_name)
+                        # Use the original GraphQL field name for the label
+                        custom_column = custom_column.label(custom_field_name)
                     custom_columns.append(custom_column)
                 except Exception as e:
                     logger.error(f"Error building custom field {field_name} for {strawberry_type.__name__}: {e}")
@@ -1006,11 +1032,16 @@ class BerryQLFactory:
         """Extract entity data from a row, including custom fields."""
         entity_data = {}
         
+        logger.debug(f"Extracting entity data from row with {len(row)} columns")
+        logger.debug(f"Row data: {list(row)}")
+        logger.debug(f"Requested fields: {requested_fields}")
+        
         # Use the field order that was stored during subquery building
         if hasattr(self, '_last_field_order'):
             field_order = self._last_field_order
             regular_fields = field_order['regular_fields']
             custom_fields = field_order['custom_fields']
+            logger.debug(f"Using stored field order - regular: {regular_fields}, custom: {custom_fields}")
         else:
             # Fallback to the old method if field order is not available
             sorted_fields = sorted(requested_fields)
@@ -1531,13 +1562,18 @@ class BerryQLFactory:
         if not data:
             return None
         
+        logger.debug(f"Creating Strawberry instance for {strawberry_type.__name__} with data: {data}")
+        
         try:
             # Get type hints for proper field mapping
             type_hints = get_type_hints(strawberry_type)
+            logger.debug(f"Type hints for {strawberry_type.__name__}: {list(type_hints.keys())}")
             filtered_data = {}
             private_data = {}
+            processed_fields = set()  # Track processed fields to avoid duplicates
             
             for field_name, value in data.items():
+                
                 # Handle the special _resolved dictionary 
                 if field_name == '_resolved':
                     private_data[field_name] = value
@@ -1549,26 +1585,40 @@ class BerryQLFactory:
                     continue
                 
                 # Skip if field doesn't exist in type hints - move to _resolved instead
+                actual_field_name = field_name
                 if field_name not in type_hints:
-                    # Check if this is relationship data that should go in _resolved
-                    if isinstance(value, (list, dict)):
-                        if '_resolved' not in private_data:
-                            private_data['_resolved'] = {}
-                        private_data['_resolved'][field_name] = {field_name: value}
+                    # Try snake_case version of the field name
+                    snake_case_field = self._camel_to_snake(field_name)
+                    if snake_case_field in type_hints:
+                        actual_field_name = snake_case_field
+                    else:
+                        # Check if this is relationship data that should go in _resolved
+                        if isinstance(value, (list, dict)):
+                            if '_resolved' not in private_data:
+                                private_data['_resolved'] = {}
+                            private_data['_resolved'][field_name] = {field_name: value}
+                        continue
+                
+                # Skip if we've already processed this field (avoid snake_case/camelCase duplicates)
+                if actual_field_name in processed_fields:
                     continue
+                processed_fields.add(actual_field_name)
                 
                 # Check if field is a method (not a constructor parameter)
                 # Methods decorated with @strawberry.field should not be passed to constructor
-                if hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name)):
-                    # This is a method, move to _resolved
-                    # For custom fields that use @generic_field, we need to store the raw data directly
+                # Check both camelCase and snake_case versions
+                is_method = (hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name))) or \
+                           (hasattr(strawberry_type, actual_field_name) and callable(getattr(strawberry_type, actual_field_name)))
+                
+                if is_method:
+                    # This is a method field, should not be passed to constructor
+                    # Instead, set it as a private attribute for method resolution
                     if '_resolved' not in private_data:
                         private_data['_resolved'] = {}
-                    # Store the data with the field name as key, and the field name as nested key for compatibility
                     private_data['_resolved'][field_name] = {field_name: value}
                     continue
-                    
-                field_type = type_hints[field_name]
+                else:
+                    field_type = type_hints[actual_field_name]
                 
                 # Handle Optional types - extract the actual type
                 actual_field_type = field_type
@@ -1593,15 +1643,15 @@ class BerryQLFactory:
                                     converted_items.append(converted_item)
                             else:
                                 converted_items.append(item)
-                        filtered_data[field_name] = converted_items
+                        filtered_data[actual_field_name] = converted_items
                     else:
-                        filtered_data[field_name] = value
+                        filtered_data[actual_field_name] = value
                 # Handle single Strawberry type instances
                 elif isinstance(value, dict) and hasattr(actual_field_type, '__strawberry_definition__'):
                     converted_value = self._create_strawberry_instance(actual_field_type, value)
-                    filtered_data[field_name] = converted_value
+                    filtered_data[actual_field_name] = converted_value
                 else:
-                    filtered_data[field_name] = value
+                    filtered_data[actual_field_name] = value
             
             # Create the instance
             instance = strawberry_type(**filtered_data)
