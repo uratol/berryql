@@ -18,9 +18,8 @@ import re
 import dataclasses
 import inflection
 from typing import Optional, List, Dict, Any, Type, Set, Union, get_type_hints, cast, TypeVar, Callable, Awaitable
-from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, asc, desc, inspect, literal
+from sqlalchemy import select, text, asc, desc, inspect
 from sqlalchemy.sql import ColumnElement
 from datetime import datetime
 from .query_analyzer import query_analyzer
@@ -1313,6 +1312,8 @@ class BerryQLFactory:
         for order_field in order_fields:
             if isinstance(order_field, str):
                 parts = order_field.strip().split()
+                if not parts:  # Skip empty strings
+                    continue
                 field_name = parts[0]
                 direction = 'desc' if len(parts) > 1 and parts[1].lower() == 'desc' else 'asc'
                 
@@ -1348,6 +1349,8 @@ class BerryQLFactory:
         for order_field in order_fields:
             if isinstance(order_field, str):
                 parts = order_field.strip().split()
+                if not parts:  # Skip empty strings
+                    continue
                 field_name = parts[0]
                 direction = 'desc' if len(parts) > 1 and parts[1].lower() == 'desc' else 'asc'
                 

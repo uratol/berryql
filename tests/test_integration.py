@@ -212,6 +212,92 @@ class TestBerryQLIntegration:
         users = result.data['users']
         assert len(users) == 1  # Limited to 1 user with offset
     
+    @pytest.mark.asyncio
+    async def test_active_users_with_query_params(self, graphql_schema, graphql_context, populated_db):
+        """Test activeUsers with GraphQL query where and order parameters."""
+        
+        # Test with simple where condition using string escaping 
+        query1 = '''
+        query {
+            activeUsers(where: "{\\"name\\": {\\"like\\": \\"%Alice%\\"}}", orderBy: "[{\\"field\\": \\"created_at\\", \\"direction\\": \\"desc\\"}]") {
+                id
+                name
+                email
+                createdAt
+                posts {
+                    id
+                    title
+                }
+            }
+        }
+        '''
+        
+        result = await graphql_schema.execute(query1, context_value=graphql_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['activeUsers']
+        
+        # Should find Alice (filtered by name) and she should have an email (from custom_where)
+        assert len(users) >= 1
+        alice = next((user for user in users if "Alice" in user['name']), None)
+        assert alice is not None
+        assert alice['email'] is not None
+        assert alice['email'] != ''
+        
+        # Test with different where condition (no name filter, test id > 0)
+        query2 = '''
+        query {
+            activeUsers(where: "{\\"id\\": {\\"gt\\": 0}}") {
+                id
+                name
+                email
+                createdAt
+            }
+        }
+        '''
+        
+        result_all = await graphql_schema.execute(query2, context_value=graphql_context)
+        
+        assert result_all.errors is None
+        assert result_all.data is not None
+        
+        all_active_users = result_all.data['activeUsers']
+        
+        # Should have all users with email (from custom_where condition)
+        assert len(all_active_users) >= 3  # We have 3 sample users, all should have email
+        
+        # Verify all users have email (due to custom_where condition)
+        for user in all_active_users:
+            assert user['email'] is not None
+            assert user['email'] != ''
+        
+        # Test order by functionality 
+        query3 = '''
+        query {
+            activeUsers(orderBy: "[{\\"field\\": \\"name\\", \\"direction\\": \\"asc\\"}]") {
+                id
+                name
+                email
+            }
+        }
+        '''
+        
+        result_ordered = await graphql_schema.execute(query3, context_value=graphql_context)
+        
+        assert result_ordered.errors is None
+        assert result_ordered.data is not None
+        
+        ordered_users = result_ordered.data['activeUsers']
+        
+        # Verify ordering - should be in alphabetical order by name
+        if len(ordered_users) > 1:
+            for i in range(len(ordered_users) - 1):
+                current_name = ordered_users[i]['name']
+                next_name = ordered_users[i + 1]['name']
+                assert current_name <= next_name  # Should be in alphabetical order
+    
     
     @pytest.mark.asyncio
     async def test_empty_results(self, graphql_schema, graphql_context, populated_db):

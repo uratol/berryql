@@ -54,10 +54,27 @@ class QueryFieldAnalyzer:
         if hasattr(info, 'selected_fields') and info.selected_fields:
             logger.debug(f"Using selected_fields API for {strawberry_type.__name__}")
             # selected_fields gives us a direct list of SelectedField objects
-            current_field = info.selected_fields[0]  # Usually just one field for our resolver
-            if hasattr(current_field, 'selections') and current_field.selections:
-                # Use SelectedField objects directly in our analysis
-                all_selections = current_field.selections
+            if len(info.selected_fields) > 0:
+                current_field = info.selected_fields[0]  # Usually just one field for our resolver
+                if hasattr(current_field, 'selections') and current_field.selections:
+                    # Use SelectedField objects directly in our analysis
+                    all_selections = current_field.selections
+                else:
+                    logger.warning(f"No selections found in current field for {strawberry_type.__name__}")
+                    return {
+                        'scalar_fields': set(),
+                        'relationship_fields': {},
+                        'aliases': {},
+                        'fragments': []
+                    }
+            else:
+                logger.warning(f"Empty selected_fields for {strawberry_type.__name__}")
+                return {
+                    'scalar_fields': set(),
+                    'relationship_fields': {},
+                    'aliases': {},
+                    'fragments': []
+                }
         else:
             logger.warning(f"selected_fields not available on info object for {strawberry_type.__name__}")
             return {

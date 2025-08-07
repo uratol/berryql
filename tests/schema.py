@@ -10,8 +10,8 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from berryql import BerryQLFactory, GraphQLQueryParams, berryql
-from conftest import User, Post, Comment  # Import models from conftest
+from berryql import GraphQLQueryParams, berryql
+from conftest import User, Post
 
 
 # Strawberry GraphQL Types
@@ -100,10 +100,14 @@ class Query:
         self,
         info: strawberry.Info,
         db: AsyncSession,
-        params: Optional[GraphQLQueryParams] = None
+        where: Optional[str] = None,  # JSON string for additional where conditions
+        order_by: Optional[str] = None,  # JSON string for order conditions
+        limit: Optional[int] = None,
+        offset: Optional[int] = None
     ) -> List[UserType]:
         """Get active users with custom default conditions using @berryql.field decorator."""
         # The decorator automatically applies the custom_where and custom_order
+        # Additional where/order_by parameters will be processed by the decorator
         pass  # Implementation handled by the decorator
 
 
