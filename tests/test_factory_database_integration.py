@@ -87,6 +87,10 @@ class TestFactoryDatabaseIntegration:
         """Create a mock database session."""
         mock_session = Mock(spec=AsyncSession)
         mock_bind = Mock()
+        mock_dialect = Mock()
+        mock_bind.dialect = mock_dialect
+        # Configure the bind to NOT have sync_engine attribute
+        del mock_bind.sync_engine
         mock_session.bind = mock_bind
         return mock_session
     
@@ -185,7 +189,13 @@ class TestCrossDatabaseCompatibility:
     def test_postgresql_json_functions(self, factory):
         """Test PostgreSQL-specific JSON function generation."""
         mock_session = Mock(spec=AsyncSession)
-        mock_session.bind.dialect.name = 'postgresql'
+        mock_engine = Mock()
+        mock_dialect = Mock()
+        mock_dialect.name = 'postgresql'
+        mock_engine.dialect = mock_dialect
+        # Configure the engine to NOT have sync_engine attribute
+        del mock_engine.sync_engine
+        mock_session.bind = mock_engine
         
         adapter = factory._get_db_adapter(mock_session)
         
@@ -202,7 +212,13 @@ class TestCrossDatabaseCompatibility:
     def test_sqlite_json_functions(self, factory):
         """Test SQLite-specific JSON function generation."""
         mock_session = Mock(spec=AsyncSession)
-        mock_session.bind.dialect.name = 'sqlite'
+        mock_engine = Mock()
+        mock_dialect = Mock()
+        mock_dialect.name = 'sqlite'
+        mock_engine.dialect = mock_dialect
+        # Configure the engine to NOT have sync_engine attribute
+        del mock_engine.sync_engine
+        mock_session.bind = mock_engine
         
         adapter = factory._get_db_adapter(mock_session)
         
@@ -219,7 +235,13 @@ class TestCrossDatabaseCompatibility:
     def test_mssql_json_functions(self, factory):
         """Test MSSQL-specific JSON function generation."""
         mock_session = Mock(spec=AsyncSession)
-        mock_session.bind.dialect.name = 'mssql'
+        mock_engine = Mock()
+        mock_dialect = Mock()
+        mock_dialect.name = 'mssql'
+        mock_engine.dialect = mock_dialect
+        # Configure the engine to NOT have sync_engine attribute
+        del mock_engine.sync_engine
+        mock_session.bind = mock_engine
         
         adapter = factory._get_db_adapter(mock_session)
         
@@ -237,10 +259,22 @@ class TestCrossDatabaseCompatibility:
         """Test that factory can switch between different adapters."""
         # Create sessions for different databases
         pg_session = Mock(spec=AsyncSession)
-        pg_session.bind.dialect.name = 'postgresql'
+        pg_engine = Mock()
+        pg_dialect = Mock()
+        pg_dialect.name = 'postgresql'
+        pg_engine.dialect = pg_dialect
+        # Configure the engine to NOT have sync_engine attribute
+        del pg_engine.sync_engine
+        pg_session.bind = pg_engine
         
         sqlite_session = Mock(spec=AsyncSession)
-        sqlite_session.bind.dialect.name = 'sqlite'
+        sqlite_engine = Mock()
+        sqlite_dialect = Mock()
+        sqlite_dialect.name = 'sqlite'
+        sqlite_engine.dialect = sqlite_dialect
+        # Configure the engine to NOT have sync_engine attribute
+        del sqlite_engine.sync_engine
+        sqlite_session.bind = sqlite_engine
         
         # Factory should cache adapter per instance, but we can test
         # that it would get the right adapter for different engines
@@ -262,7 +296,13 @@ class TestErrorHandlingIntegration:
         """Test that factory handles unknown database types gracefully."""
         factory = BerryQLFactory()
         mock_session = Mock(spec=AsyncSession)
-        mock_session.bind.dialect.name = 'unknown_db'
+        mock_engine = Mock()
+        mock_dialect = Mock()
+        mock_dialect.name = 'unknown_db'
+        mock_engine.dialect = mock_dialect
+        # Configure the engine to NOT have sync_engine attribute
+        del mock_engine.sync_engine
+        mock_session.bind = mock_engine
         
         # Should fall back to PostgreSQL adapter
         adapter = factory._get_db_adapter(mock_session)
@@ -286,16 +326,18 @@ class TestErrorHandlingIntegration:
         # Get all adapter classes
         adapter_classes = [PostgreSQLAdapter, SQLiteAdapter, MSSQLAdapter]
         
-        # Get base class methods
+        # Get base class abstract methods
         base_methods = {
             name: method for name, method in inspect.getmembers(DatabaseAdapter, predicate=inspect.isfunction)
-            if not name.startswith('_')
+            if not name.startswith('_') and hasattr(method, '__isabstractmethod__')
         }
         
         # Check each adapter implements all base methods
         for adapter_class in adapter_classes:
+            # Create instance to check implemented methods
+            adapter_instance = adapter_class()
             adapter_methods = {
-                name: method for name, method in inspect.getmembers(adapter_class, predicate=inspect.ismethod)
+                name: method for name, method in inspect.getmembers(adapter_instance, predicate=inspect.ismethod)
                 if not name.startswith('_')
             }
             

@@ -97,8 +97,9 @@ class MSSQLAdapter(DatabaseAdapter):
         # For MSSQL, we need to use a subquery with FOR JSON PATH
         # This is more complex and may need to be handled differently in the calling code
         # For now, we'll use a simpler approach with STRING_AGG and manual JSON formatting
+        from sqlalchemy import String
         return func.string_agg(
-            func.cast(expression, literal_column("NVARCHAR(MAX)")), 
+            func.cast(expression, String()), 
             literal_column("','")
         )
     
