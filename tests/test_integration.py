@@ -96,35 +96,6 @@ class Query:
         # Use the optimized resolver
         return await user_resolver(db=db_session, info=info, params=params)
     
-    @strawberry.field
-    async def posts(
-        self,
-        info: strawberry.Info,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-        title_filter: Optional[str] = None
-    ) -> List[PostType]:
-        """Get posts with optional filtering and pagination."""
-        # Get db_session from context
-        db_session = info.context.get('db_session')
-        post_resolver = info.context.get('post_resolver')
-        
-        # Build query parameters
-        where_conditions = {}
-        if title_filter:
-            where_conditions['title'] = {'like': f'%{title_filter}%'}
-        
-        params = GraphQLQueryParams(
-            where=where_conditions,
-            limit=limit,
-            offset=offset,
-            order_by=[{'field': 'created_at', 'direction': 'desc'}]
-        )
-        
-        # Use the optimized resolver
-        return await post_resolver(db=db_session, info=info, params=params)
-    
-# Remove global variables - we'll use context instead
 
 @pytest.fixture
 async def berryql_factory():
@@ -140,20 +111,9 @@ async def resolvers(berryql_factory):
         model_class=User
     )
     
-    post_resolver = berryql_factory.create_berryql_resolver(
-        strawberry_type=PostType,
-        model_class=Post
-    )
-    
-    comment_resolver = berryql_factory.create_berryql_resolver(
-        strawberry_type=CommentType,
-        model_class=Comment
-    )
     
     return {
-        'user_resolver': user_resolver,
-        'post_resolver': post_resolver,
-        'comment_resolver': comment_resolver
+        'user_resolver': user_resolver
     }
 
 
@@ -168,9 +128,7 @@ async def graphql_context(db_session, resolvers):
     """Create GraphQL execution context."""
     return {
         'db_session': db_session,
-        'user_resolver': resolvers['user_resolver'],
-        'post_resolver': resolvers['post_resolver'],
-        'comment_resolver': resolvers['comment_resolver']
+        'user_resolver': resolvers['user_resolver']
     }
 
 
@@ -260,42 +218,6 @@ class TestBerryQLIntegration:
         bob = next(user for user in users if user['name'] == 'Bob Smith')
         assert len(bob['comments']) >= 1  # Bob has made comments
     
-    @pytest.mark.asyncio
-    async def test_posts_query_with_comments(self, graphql_schema, graphql_context, populated_db):
-        """Test posts query with nested comments."""
-        query = """
-        query {
-            posts {
-                id
-                title
-                content
-                comments {
-                    id
-                    content
-                    authorId
-                }
-            }
-        }
-        """
-        
-        result = await graphql_schema.execute(query, context_value=graphql_context)
-        
-        assert result.errors is None
-        assert result.data is not None
-        assert 'posts' in result.data
-        
-        posts = result.data['posts']
-        assert len(posts) == 5  # We have 5 sample posts
-        
-        # Check that the first post has comments
-        first_post = next(post for post in posts if post['title'] == 'First Post')
-        assert len(first_post['comments']) == 2  # First post has 2 comments
-        
-        # Verify comment structure
-        for comment in first_post['comments']:
-            assert 'id' in comment
-            assert 'content' in comment
-            assert 'authorId' in comment
     
     @pytest.mark.asyncio
     async def test_users_query_with_filtering(self, graphql_schema, graphql_context, populated_db):
@@ -522,39 +444,6 @@ class TestBerryQLPerformance:
                 # Comments should be loaded
                 assert isinstance(post['comments'], list)
 
-
-@pytest.mark.integration
-class TestBerryQLComments:
-    """Integration tests specifically for Comments functionality."""
-    
-    @pytest.mark.asyncio
-    async def test_comments_filtering_by_post(self, graphql_schema, graphql_context, populated_db):
-        """Test that we can filter comments by post efficiently."""
-        # This would typically be implemented as a separate query or parameter
-        # For this test, we'll verify the data structure supports it
-        query = """
-        query {
-            posts(titleFilter: "First") {
-                id
-                title
-                comments {
-                    id
-                    content
-                    authorId
-                }
-            }
-        }
-        """
-        
-        result = await graphql_schema.execute(query, context_value=graphql_context)
-        
-        assert result.errors is None
-        assert result.data is not None
-        
-        posts = result.data['posts']
-        assert len(posts) == 1  # Only "First Post" should match
-        assert posts[0]['title'] == 'First Post'
-        assert len(posts[0]['comments']) == 2  # First post has 2 comments
     
     @pytest.mark.asyncio
     async def test_user_comments_relationship(self, graphql_schema, graphql_context, populated_db):
