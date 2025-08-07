@@ -9,6 +9,72 @@ from sqlalchemy.sql import ColumnElement
 
 T = TypeVar('T')
 
+# Custom string class that has isoformat method for GraphQL datetime serialization
+class DateTimeString(str):
+    """String subclass that has isoformat method for GraphQL datetime serialization."""
+    def isoformat(self):
+        """Return the string as-is for GraphQL datetime serialization."""
+        return str(self)
+
+
+def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type: Type) -> List[Any]:
+    """
+    Efficiently convert JSON data to Strawberry type instances.
+    
+    Args:
+        json_data: List of dictionaries from JSON
+        strawberry_type: The Strawberry GraphQL type to convert to
+        
+    Returns:
+        List of Strawberry type instances
+    """
+    if not json_data:
+        return []
+    
+    # Cache field type analysis for performance
+    if not hasattr(convert_json_to_strawberry_instances, '_field_cache'):
+        convert_json_to_strawberry_instances._field_cache = {}
+    
+    type_key = strawberry_type.__name__
+    if type_key not in convert_json_to_strawberry_instances._field_cache:
+        # Analyze field types once per strawberry type
+        strawberry_fields = getattr(strawberry_type, '__annotations__', {})
+        datetime_fields = set()
+        
+        for field_name, field_type in strawberry_fields.items():
+            # Check for datetime fields by various indicators
+            is_datetime = (
+                (isinstance(field_type, type) and field_type.__name__ == 'datetime') or
+                (hasattr(field_type, '__name__') and 'datetime' in field_type.__name__.lower()) or
+                field_name in ['created_at', 'updated_at', 'deleted_at', 'published_at', 'timestamp']
+            )
+            if is_datetime:
+                datetime_fields.add(field_name)
+        
+        convert_json_to_strawberry_instances._field_cache[type_key] = datetime_fields
+    
+    datetime_fields = convert_json_to_strawberry_instances._field_cache[type_key]
+    
+    # Convert data efficiently
+    strawberry_instances = []
+    if datetime_fields:
+        # Only do field conversion if there are datetime fields
+        for item_data in json_data:
+            if isinstance(item_data, dict):
+                # Convert only datetime fields that exist in the data
+                converted_data = {
+                    field_name: DateTimeString(field_value) if (field_name in datetime_fields and isinstance(field_value, str)) else field_value
+                    for field_name, field_value in item_data.items()
+                }
+                strawberry_instances.append(strawberry_type(**converted_data))
+    else:
+        # No datetime fields, create instances directly
+        for item_data in json_data:
+            if isinstance(item_data, dict):
+                strawberry_instances.append(strawberry_type(**item_data))
+    
+    return strawberry_instances
+
 
 def find_relationship_name_by_type(parent_model_class: Type, target_strawberry_type: Type) -> Optional[str]:
     """
@@ -432,14 +498,7 @@ def berryql_field(
                                 json_data = []
                             
                             # Convert JSON data to strawberry type instances
-                            strawberry_instances = []
-                            for item_data in json_data:
-                                if isinstance(item_data, dict):
-                                    # Create strawberry type instance from the data
-                                    strawberry_instance = strawberry_type(**item_data)
-                                    strawberry_instances.append(strawberry_instance)
-                            
-                            return strawberry_instances
+                            return convert_json_to_strawberry_instances(json_data, strawberry_type)
                         
                         return relationship_resolver
                     
