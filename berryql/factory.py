@@ -338,9 +338,6 @@ class QueryConditionProcessor:
             # Handle different comparison types
             if isinstance(value, dict):
                 for op, op_value in value.items():
-                    if op_value is None:
-                        continue
-                    
                     if op not in supported_operators:
                         raise InvalidFieldError(f"Unsupported operator '{op}'. Supported: {supported_operators}")
                     

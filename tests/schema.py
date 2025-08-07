@@ -10,7 +10,7 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from berryql import GraphQLQueryParams, berryql
+from berryql import berryql
 from conftest import User, Post, Comment
 from sqlalchemy import func, select
 
