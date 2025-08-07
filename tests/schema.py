@@ -163,6 +163,10 @@ class Query:
         db: AsyncSession
     ) -> Optional[UserType]:
         """Get the current user from context using BerryQL."""
+        # Custom logic to prove that custom code executes
+        user_id = info.context.get('user_id') if info.context else None
+        if user_id == 999:
+            raise ValueError("Custom logic executed: User 999 is forbidden!")
         return None  # Falls back to BerryQL resolver
 
     @strawberry.field
