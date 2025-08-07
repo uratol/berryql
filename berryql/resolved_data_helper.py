@@ -79,7 +79,8 @@ def berryql_field(
     model_class: Optional[Type] = None,
     custom_fields: Optional[Dict[Type, Dict[str, callable]]] = None,
     custom_where: Optional[Dict[Type, Union[Dict[str, Any], callable]]] = None,
-    custom_order: Optional[Dict[Type, List[str]]] = None
+    custom_order: Optional[Dict[Type, List[str]]] = None,
+    **parameter_mappings  # Any named parameter will map to where conditions
 ):
     """
     Enhanced decorator for BerryQL GraphQL field methods.
@@ -101,27 +102,32 @@ def berryql_field(
         custom_fields: Dict mapping {strawberry_type: {field_name: query_builder}}
         custom_where: Dict mapping {strawberry_type: where_conditions_or_function}
         custom_order: Dict mapping {strawberry_type: default_order_list}
+        **parameter_mappings: Named parameters that map GraphQL parameters to where conditions
+                            Format: parameter_name={'field': {'operator': 'value'}} or callable
         
-    Example (resolver field - replaces direct factory.create_berryql_resolver usage):
+    Example (resolver field with parameter mappings):
         @strawberry.field
         @berryql.field(
             model_class=User,
-            custom_fields={UserType: {'post_count': build_post_count_query}},
-            custom_where={UserType: {'status': 'active'}},
+            name_filter={'name': {'like': lambda value: f'%{value}%'}},
+            status_filter={'status': {'eq': lambda value: value}},
             custom_order={UserType: ['created_at desc']}
         )
         async def users(
             self, 
             info: strawberry.Info, 
             db: AsyncSession,
-            params: Optional[GraphQLQueryParams] = None
+            name_filter: Optional[str] = None,
+            status_filter: Optional[str] = None,
+            limit: Optional[int] = None,
+            offset: Optional[int] = None
         ) -> List[UserType]:
-            pass  # Implementation handled by decorator using BerryQL resolver
+            pass  # Implementation handled by decorator
     """
     
     def create_decorator(actual_converter=None, actual_model_class=None, 
                         actual_custom_fields=None, actual_custom_where=None, 
-                        actual_custom_order=None):
+                        actual_custom_order=None, actual_parameter_mappings=None):
         """Create the actual decorator function."""
         
         def decorator(func):
@@ -233,17 +239,46 @@ def berryql_field(
                     # Build GraphQLQueryParams from the GraphQL arguments
                     from .factory import GraphQLQueryParams
                     
-                    # Build where conditions from filter parameters
+                    # Build where conditions using explicit parameter mappings
                     where_conditions = {}
                     other_params = {}
                     
                     for param_name, value in original_kwargs.items():
                         if param_name not in ['info', 'db', 'database', 'session'] and value is not None:
-                            # Handle filter parameters (like name_filter -> name LIKE %value%)
-                            if param_name.endswith('_filter'):
-                                field_name = param_name[:-7]  # Remove '_filter' suffix
-                                where_conditions[field_name] = {'like': f'%{value}%'}
+                            # Check if this parameter has an explicit mapping
+                            if actual_parameter_mappings and param_name in actual_parameter_mappings:
+                                mapping = actual_parameter_mappings[param_name]
+                                
+                                if callable(mapping):
+                                    # If mapping is a callable, call it with the value
+                                    where_clause = mapping(value)
+                                    if isinstance(where_clause, dict):
+                                        where_conditions.update(where_clause)
+                                elif isinstance(mapping, dict):
+                                    # If mapping is a dict, process it
+                                    for field_name, condition in mapping.items():
+                                        if isinstance(condition, dict):
+                                            # Direct field condition like {'like': '%value%'}
+                                            if any(callable(v) for v in condition.values()):
+                                                # Contains callables - process them
+                                                processed_condition = {}
+                                                for op, op_value in condition.items():
+                                                    if callable(op_value):
+                                                        processed_condition[op] = op_value(value)
+                                                    else:
+                                                        processed_condition[op] = op_value
+                                                where_conditions[field_name] = processed_condition
+                                            else:
+                                                # Static condition
+                                                where_conditions[field_name] = condition
+                                        elif callable(condition):
+                                            # Field condition is a callable
+                                            where_conditions[field_name] = condition(value)
+                                        else:
+                                            # Simple field condition
+                                            where_conditions[field_name] = {'eq': condition}
                             else:
+                                # No explicit mapping - treat as other parameter
                                 other_params[param_name] = value
                     
                     # Build GraphQLQueryParams with where conditions and other parameters
@@ -314,7 +349,8 @@ def berryql_field(
             actual_model_class=model_class,
             actual_custom_fields=custom_fields,
             actual_custom_where=custom_where,
-            actual_custom_order=custom_order
+            actual_custom_order=custom_order,
+            actual_parameter_mappings=parameter_mappings
         )
 
 
