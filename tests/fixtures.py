@@ -17,11 +17,10 @@ async def sample_users(db_session: AsyncSession):
     ]
     
     db_session.add_all(users)
+    # Flush to persist and populate primary keys without issuing per-row refreshes
+    await db_session.flush()
+    # Commit once after IDs are populated
     await db_session.commit()
-    
-    # Refresh to get IDs
-    for user in users:
-        await db_session.refresh(user)
     
     return users
 
@@ -40,11 +39,10 @@ async def sample_posts(db_session: AsyncSession, sample_users):
     ]
     
     db_session.add_all(posts)
+    # Flush to persist and populate primary keys without issuing per-row refreshes
+    await db_session.flush()
+    # Commit once after IDs are populated
     await db_session.commit()
-    
-    # Refresh to get IDs
-    for post in posts:
-        await db_session.refresh(post)
     
     return posts
 
@@ -66,11 +64,10 @@ async def sample_comments(db_session: AsyncSession, sample_users, sample_posts):
     ]
     
     db_session.add_all(comments)
+    # Flush to persist and populate primary keys without issuing per-row refreshes
+    await db_session.flush()
+    # Commit once after IDs are populated
     await db_session.commit()
-    
-    # Refresh to get IDs
-    for comment in comments:
-        await db_session.refresh(comment)
     
     return comments
 

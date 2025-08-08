@@ -902,45 +902,34 @@ def berryql_field(
                 return new_resolver_func
             
             else:
-                # This is a relationship field - use resolved data
-                # Determine the relationship name from the return type instead of function name
-                relationship_name = func.__name__  # Fallback to function name
-                
-                # Try to determine relationship name from return type
+                # Determine if this field returns a list (relationship) or a scalar
+                is_list_return = False
+                relationship_name = func.__name__  # default
                 if return_type:
-                    # Extract the target strawberry type from List[TargetType] or TargetType
-                    target_strawberry_type = None
                     origin = get_origin(return_type)
                     if origin is list:
+                        is_list_return = True
                         args = get_args(return_type)
                         if args and len(args) > 0:
                             target_strawberry_type = args[0]
-                    else:
-                        target_strawberry_type = return_type
-                    
-                    # If we have a target type, try to map it to a relationship name
-                    if target_strawberry_type and hasattr(target_strawberry_type, '__name__'):
-                        type_name = target_strawberry_type.__name__
-                        
-                        # Simple mapping: PostType -> posts, CommentType -> comments, etc.
-                        if type_name.endswith('Type'):
-                            base_name = type_name[:-4].lower()  # PostType -> post
-                            # Try plural form first (most common)
-                            potential_relationship_name = base_name + 's'  # post -> posts
-                            
-                            import logging
-                            logger = logging.getLogger(__name__)
-                            logger.debug(f"Inferring relationship name '{potential_relationship_name}' for field '{func.__name__}' "
-                                       f"based on return type {type_name}")
-                            
-                            relationship_name = potential_relationship_name
+                            if hasattr(target_strawberry_type, '__name__'):
+                                type_name = target_strawberry_type.__name__
+                                if type_name.endswith('Type'):
+                                    base_name = type_name[:-4].lower()
+                                    relationship_name = base_name + 's'
                 
-                @wraps(func)
-                async def resolved_data_func(self, info: strawberry.Info, *args, **kwargs):
-                    """Return pre-resolved relationship data."""
-                    return get_resolved_field_data(self, info, relationship_name)
-                
-                return resolved_data_func
+                if is_list_return:
+                    @wraps(func)
+                    async def resolved_data_func(self, info: strawberry.Info, *args, **kwargs):
+                        """Return pre-resolved relationship data."""
+                        return get_resolved_field_data(self, info, relationship_name)
+                    return resolved_data_func
+                else:
+                    # Scalar custom field: return attribute set during instance creation
+                    @wraps(func)
+                    async def scalar_data_func(self, info: strawberry.Info, *args, **kwargs):
+                        return getattr(self, func.__name__, None)
+                    return scalar_data_func
         
         return decorator
     

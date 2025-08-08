@@ -15,11 +15,12 @@ import dataclasses
 import asyncio
 from typing import Optional, List, Dict, Any, Type, Set, Union, get_type_hints, cast, TypeVar, Callable, Awaitable
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, asc, desc, inspect
+from sqlalchemy import select, text, asc, desc, inspect, literal_column
 from sqlalchemy.sql import ColumnElement
 from datetime import datetime
 from .query_analyzer import query_analyzer
 from .database_adapters import get_database_adapter, DatabaseAdapter
+from .database_adapters import MSSQLAdapter
 from .resolved_data_helper import convert_json_to_strawberry_instances
 
 logger = logging.getLogger(__name__)
@@ -510,9 +511,14 @@ class InstanceCreator:
                            (hasattr(strawberry_type, actual_field_name) and callable(getattr(strawberry_type, actual_field_name)))
                 
                 if is_method:
-                    if '_resolved' not in private_data:
-                        private_data['_resolved'] = {}
-                    private_data['_resolved'][field_name] = {field_name: value}
+                    # For relationship-like methods (lists/dicts), store in _resolved
+                    if isinstance(value, (list, dict)):
+                        if '_resolved' not in private_data:
+                            private_data['_resolved'] = {}
+                        private_data['_resolved'][field_name] = value
+                    else:
+                        # For scalar custom fields, store directly as attribute
+                        private_data[field_name] = value
                     continue
                 
                 field_type = type_hints[actual_field_name]
@@ -656,14 +662,25 @@ class QueryBuilder:
         available_columns = {col.name: getattr(model_class, col.name) for col in inspector.columns}
         
         columns = []
+        seen_keys = set()
         sorted_fields = sorted(fields)
         for field_name in sorted_fields:
             db_column_name = FieldMapper.map_graphql_field_to_db_column(field_name, strawberry_type)
             
             if db_column_name in available_columns:
-                columns.append(available_columns[db_column_name])
+                col = available_columns[db_column_name]
+                key = getattr(col, 'key', None) or getattr(col, 'name', None) or db_column_name
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                columns.append(col)
             elif field_name in available_columns:
-                columns.append(available_columns[field_name])
+                col = available_columns[field_name]
+                key = getattr(col, 'key', None) or getattr(col, 'name', None) or field_name
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                columns.append(col)
         
         return columns
     
@@ -705,10 +722,12 @@ class QueryBuilder:
         
         all_columns = columns + custom_columns
         
-        # Store the field order for later extraction
+        # Store the actual selected column order for later extraction
+        regular_field_names = [getattr(col, 'name', None) or getattr(col, 'key', None) for col in columns]
+        custom_field_names = [getattr(col, 'name', None) or getattr(col, 'key', None) for col in custom_columns]
         self._last_field_order = {
-            'regular_fields': sorted(regular_fields),
-            'custom_fields': sorted(custom_fields_requested)
+            'regular_fields': regular_field_names,
+            'custom_fields': custom_field_names
         }
         
         # Build the subquery
@@ -1101,6 +1120,8 @@ class BerryQLFactory:
             
             # Build JSON object for each row using subquery columns
             json_columns = []
+            # Track MSSQL nested JSON columns to include in SELECT list
+            mssql_nested_columns = []  # List[Tuple[str, ColumnElement]]
             for col in related_columns:
                 # Reference the column from the subquery, not the original table
                 subquery_col = getattr(filtered_subquery.c, col.name)
@@ -1172,6 +1193,8 @@ class BerryQLFactory:
                         logger.info(f"Successfully built nested subquery for {display_name}")
                         # Add the nested relationship to the JSON object
                         json_columns.extend([text(f"'{display_name}'"), nested_subquery])
+                        # Also record it for MSSQL FOR JSON PATH path
+                        mssql_nested_columns.append((display_name, nested_subquery))
                     else:
                         logger.warning(f"Failed to build nested subquery for {display_name}")
             else:
@@ -1179,15 +1202,59 @@ class BerryQLFactory:
             
             # Get database adapter for cross-database compatibility
             db_adapter = self._get_db_adapter(db)
-            json_object = db_adapter.json_build_object(*json_columns)
+
+            # Special handling for MSSQL: use FOR JSON PATH for correct JSON arrays
+            if isinstance(db_adapter, MSSQLAdapter):
+                try:
+                    # Build column list "alias.[col] as [col], ..."
+                    alias_name = current_alias or "rel"
+                    alias_ref = f"[{alias_name}]"
+                    col_clauses = [
+                        f"{alias_ref}.[{col.name}] as [{col.name}]" for col in related_columns
+                    ]
+                    # Add nested JSON columns as scalar subqueries
+                    if mssql_nested_columns:
+                        from sqlalchemy.dialects import mssql as mssql_dialect
+                        for display_name, col_expr in mssql_nested_columns:
+                            nested_sql = str(
+                                col_expr.compile(
+                                    dialect=mssql_dialect.dialect(),
+                                    compile_kwargs={"literal_binds": True}
+                                )
+                            )
+                            col_clauses.append(f"{nested_sql} AS [{display_name}]")
+                    col_list = ", ".join(col_clauses)
+                    # Compile the filtered subquery to MSSQL SQL and embed as FROM source with alias
+                    from sqlalchemy.dialects import mssql as mssql_dialect
+                    subquery_sql = str(
+                        filtered_subquery.compile(
+                            dialect=mssql_dialect.dialect(),
+                            compile_kwargs={"literal_binds": True}
+                        )
+                    )
+                    # MSSQL DATETIME doesn't support microseconds; trim to milliseconds in literals
+                    try:
+                        import re as _re
+                        subquery_sql = _re.sub(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.)(\d{1,6})", lambda m: m.group(1) + m.group(2)[:3], subquery_sql)
+                    except Exception:
+                        pass
+                    # Construct SQL: SELECT ISNULL((SELECT col_list FROM (<subquery>) AS alias FOR JSON PATH), '[]')
+                    final_sql = (
+                        f"SELECT ISNULL((SELECT {col_list} FROM ({subquery_sql}) AS {alias_ref} FOR JSON PATH), '[]')"
+                    )
+                    # Return as a column expression
+                    return literal_column(f"({final_sql})")
+                except Exception as e:
+                    logger.warning(f"MSSQL JSON fallback failed, reverting to generic path: {e}")
             
+            # Generic path for PostgreSQL/SQLite and as fallback
+            json_object = db_adapter.json_build_object(*json_columns)
             json_agg_query = select(
                 db_adapter.coalesce_json(
                     db_adapter.json_agg(json_object),
                     db_adapter.json_empty_array()
                 )
             ).select_from(filtered_subquery)
-            
             return json_agg_query.scalar_subquery()
             
         except Exception as e:
@@ -1322,31 +1389,42 @@ class BerryQLFactory:
         db_adapter: DatabaseAdapter
     ):
         """Build the final query for nested entities using json_agg."""
-        entity_columns = [c for c in entity_subquery.c]
+        # MSSQL: use FOR JSON PATH to build proper JSON arrays
+        if isinstance(db_adapter, MSSQLAdapter):
+            try:
+                from sqlalchemy.dialects import mssql as mssql_dialect
+                alias_name = "entities"
+                alias_ref = f"[{alias_name}]"
+                col_list = ", ".join([f"{alias_ref}.[{col.name}] as [{col.name}]" for col in entity_subquery.c])
+                subquery_sql = str(
+                    entity_subquery.compile(
+                        dialect=mssql_dialect.dialect(),
+                        compile_kwargs={"literal_binds": True}
+                    )
+                )
+                # Trim microseconds to milliseconds for MSSQL DATETIME compatibility
+                try:
+                    import re as _re
+                    subquery_sql = _re.sub(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.)(\d{1,6})", lambda m: m.group(1) + m.group(2)[:3], subquery_sql)
+                except Exception:
+                    pass
+                final_sql = f"SELECT ISNULL((SELECT {col_list} FROM ({subquery_sql}) AS {alias_ref} FOR JSON PATH), '[]')"
+                return select(literal_column(f"({final_sql})"))
+            except Exception as e:
+                logger.warning(f"MSSQL nested JSON build failed, falling back to generic: {e}")
         
+        # Generic path for PostgreSQL/SQLite
+        entity_columns = [c for c in entity_subquery.c]
         json_items = []
         for col in entity_columns:
             json_items.append(text(f"'{col.name}'"))
             json_items.append(col)
-        
         entity_json = db_adapter.json_build_object(*json_items)
-        
         final_agg = db_adapter.coalesce_json(
             db_adapter.json_agg(entity_json),
             db_adapter.json_empty_array()
         )
-        
         query = select(final_agg).select_from(entity_subquery)
-        
-        if params.order_by:
-            order_clauses = QueryConditionProcessor.build_order_clauses_for_model(entity_subquery, params.order_by)
-            if order_clauses:
-                ordered_agg = db_adapter.coalesce_json(
-                    db_adapter.json_agg(entity_json.order_by(*order_clauses)),
-                    db_adapter.json_empty_array()
-                )
-                query = select(ordered_agg).select_from(entity_subquery)
-        
         return query
 
     def _parse_root_results(
@@ -1403,7 +1481,7 @@ class BerryQLFactory:
         
         col_index = 0
         
-        # Extract regular fields first
+        # Extract regular fields first using stored selected column names
         for field_name in regular_fields:
             if col_index < len(row):
                 entity_data[field_name] = row[col_index]
@@ -1412,7 +1490,7 @@ class BerryQLFactory:
             else:
                 logger.warning(f"Column index {col_index} out of range for field {field_name}, row has {len(row)} columns")
         
-        # Extract custom fields after regular fields
+        # Extract custom fields after regular fields using stored selected column names
         for field_name in custom_fields:
             if col_index < len(row):
                 entity_data[field_name] = row[col_index]
