@@ -920,6 +920,52 @@ class TestBerryQLIntegration:
         assert result_with_error.errors is not None
         assert "Custom logic executed: User 999 is forbidden!" in str(result_with_error.errors[0])
 
+    @pytest.mark.asyncio
+    async def test_posts_comments_agg(self, graphql_schema, graphql_context, populated_db):
+        """Verify commentsAgg provides minCreatedAt and commentsCount per post."""
+        query = """
+        query {
+            users {
+                id
+                name
+                posts {
+                    id
+                    title
+                    commentsAgg {
+                        minCreatedAt
+                        commentsCount
+                    }
+                }
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+
+        users = result.data['users']
+        # Build a map of user -> {post title -> (minCreatedAt, commentsCount)}
+        for user in users:
+            for post in user['posts']:
+                agg = post.get('commentsAgg')
+                assert agg is not None
+                # minCreatedAt should be present (stringified datetime) and commentsCount non-negative
+                assert agg['minCreatedAt'] is not None
+                assert isinstance(agg['commentsCount'], int)
+                assert agg['commentsCount'] >= 0
+
+        # Spot-check known counts from fixtures
+        alice = next(u for u in users if u['name'] == 'Alice Johnson')
+        alice_counts = {p['title']: p['commentsAgg']['commentsCount'] for p in alice['posts']}
+        assert alice_counts.get('First Post') == 2
+        assert alice_counts.get('GraphQL is Great') == 1
+
+        bob = next(u for u in users if u['name'] == 'Bob Smith')
+        bob_counts = {p['title']: p['commentsAgg']['commentsCount'] for p in bob['posts']}
+        assert bob_counts.get('SQLAlchemy Tips') == 2
+        assert bob_counts.get('Python Best Practices') == 1
+
 
 @pytest.mark.integration
 class TestBerryQLErrorHandling:

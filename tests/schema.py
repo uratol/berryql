@@ -45,7 +45,15 @@ class PostType:
         pass
     
     @strawberry.field
-    @berryql.field
+    @berryql.field(query: lambda model_class, requested_fields: (
+                select(func.json_object(
+                    'min_created_at', func.min(Comment.created_at),
+                    'comments_count', func.count(Comment.id)
+                ))
+                .select_from(Comment)
+                .where(Comment.post_id == model_class.id)
+                .scalar_subquery()
+            ))
     async def comments_agg(self, info: strawberry.Info) -> Optional[CommentAggType]:
         """Get post's comments aggregation using pre-resolved data."""
         pass
@@ -60,19 +68,7 @@ class UserType:
     created_at: datetime
     
     @strawberry.field
-    @berryql.field(
-        custom_fields={
-            'comments_agg': lambda model_class, requested_fields: (
-                select(func.json_object(
-                    'min_created_at', func.min(Comment.created_at),
-                    'comments_count', func.count(Comment.id)
-                ))
-                .select_from(Comment)
-                .where(Comment.post_id == model_class.id)
-                .scalar_subquery()
-            )
-        }
-    )
+    @berryql.field
     async def posts(self, info: strawberry.Info) -> List[PostType]:
         """Get user's posts using pre-resolved data with comments aggregation."""
         pass
