@@ -154,13 +154,14 @@ class TestBerryQLIntegration:
     
     @pytest.mark.asyncio
     async def test_users_query_with_filtering(self, graphql_schema, graphql_context, populated_db):
-        """Test users query with name filtering."""
+        """Test users query with name filtering for admin user."""
         query = """
         query {
             users(nameFilter: "Alice") {
                 id
                 name
                 email
+                isAdmin
                 posts {
                     id
                     title
@@ -178,7 +179,140 @@ class TestBerryQLIntegration:
         users = result.data['users']
         assert len(users) == 1
         assert users[0]['name'] == 'Alice Johnson'
+        assert users[0]['isAdmin'] == True  # Alice is admin
         assert len(users[0]['posts']) == 2
+    
+    @pytest.mark.asyncio
+    async def test_admin_users_can_see_all_users(self, graphql_schema, graphql_context, populated_db):
+        """Test that admin users can see all users."""
+        query = """
+        query {
+            users {
+                id
+                name
+                email
+                isAdmin
+            }
+        }
+        """
+        
+        # graphql_context uses Alice (user_id=1) who is admin
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['users']
+        assert len(users) == 3  # Admin can see all 3 users
+        
+        # Verify we have all users including admin status
+        user_names = [user['name'] for user in users]
+        assert 'Alice Johnson' in user_names
+        assert 'Bob Smith' in user_names
+        assert 'Charlie Brown' in user_names
+        
+        # Verify admin status
+        alice = next(user for user in users if user['name'] == 'Alice Johnson')
+        bob = next(user for user in users if user['name'] == 'Bob Smith')
+        charlie = next(user for user in users if user['name'] == 'Charlie Brown')
+        
+        assert alice['isAdmin'] == True
+        assert bob['isAdmin'] == False
+        assert charlie['isAdmin'] == False
+    
+    @pytest.mark.asyncio
+    async def test_non_admin_users_see_only_themselves(self, graphql_schema, db_session, sample_users, populated_db):
+        """Test that non-admin users can only see themselves."""
+        # Create context for Bob (non-admin user)
+        bob = sample_users[1]  # Bob Smith is at index 1
+        non_admin_context = {
+            'db_session': db_session,
+            'user_id': bob.id,
+            'current_user': bob
+        }
+        
+        query = """
+        query {
+            users {
+                id
+                name
+                email
+                isAdmin
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=non_admin_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['users']
+        assert len(users) == 1  # Non-admin can only see themselves
+        assert users[0]['name'] == 'Bob Smith'
+        assert users[0]['id'] == bob.id
+        assert users[0]['isAdmin'] == False
+    
+    @pytest.mark.asyncio
+    async def test_non_admin_users_filtering_still_restricted(self, graphql_schema, db_session, sample_users, populated_db):
+        """Test that non-admin users can't see other users even with name filtering."""
+        # Create context for Bob (non-admin user)
+        bob = sample_users[1]  # Bob Smith is at index 1
+        non_admin_context = {
+            'db_session': db_session,
+            'user_id': bob.id,
+            'current_user': bob
+        }
+        
+        # Try to filter for Alice while logged in as Bob
+        query = """
+        query {
+            users(nameFilter: "Alice") {
+                id
+                name
+                email
+                isAdmin
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=non_admin_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['users']
+        # Non-admin should get no results when trying to filter for someone else
+        assert len(users) == 0
+    
+    @pytest.mark.asyncio
+    async def test_no_user_context_returns_empty(self, graphql_schema, db_session, populated_db):
+        """Test that queries with no user context return empty results."""
+        # Create context without current_user
+        no_user_context = {
+            'db_session': db_session,
+            'user_id': None,
+            'current_user': None
+        }
+        
+        query = """
+        query {
+            users {
+                id
+                name
+                email
+                isAdmin
+            }
+        }
+        """
+        
+        result = await graphql_schema.execute(query, context_value=no_user_context)
+        
+        assert result.errors is None
+        assert result.data is not None
+        
+        users = result.data['users']
+        assert len(users) == 0  # No user context means no results
     
     @pytest.mark.asyncio
     async def test_active_users_with_custom_conditions(self, graphql_schema, graphql_context, populated_db):

@@ -56,6 +56,7 @@ class UserType:
     id: int
     name: str
     email: str
+    is_admin: bool
     created_at: datetime
     
     @strawberry.field
@@ -106,6 +107,13 @@ class Query:
     @berryql.field(
         model_class=User,
         name_filter={'name': {'like': lambda value: f'%{value}%'}},
+        custom_where=lambda info=None: (
+            {}  # Admins can see all users
+            if info and hasattr(info, 'context') and info.context.get('current_user') and info.context['current_user'].is_admin
+            else {'id': {'eq': info.context.get('user_id', 0)}}  # Non-admins see only themselves
+            if info and hasattr(info, 'context') and info.context.get('user_id')
+            else {'id': {'eq': None}}  # No user context means no results
+        ),
         custom_fields={
             'post_count': lambda model_class, requested_fields: func.coalesce(
                 select(func.count(Post.id))
@@ -123,8 +131,9 @@ class Query:
         offset: Optional[int] = None,
         name_filter: Optional[str] = None
     ) -> List[UserType]:
-        """Get users with optional filtering and pagination using @berryql.field decorator."""
+        """Get users with admin-based filtering and optional name filtering using @berryql.field decorator."""
         # The decorator handles the resolver creation and execution automatically
+        # Admins can see all users, non-admins can only see themselves
         # The BerryQL resolver will process the name_filter parameter based on the mapping
         pass  # Implementation handled by the decorator
     

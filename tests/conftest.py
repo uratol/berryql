@@ -15,7 +15,7 @@ import pytest
 import asyncio
 from datetime import datetime, timezone
 from typing import AsyncGenerator
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, relationship
 import tempfile
@@ -34,6 +34,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False)
+    is_admin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Relationship to posts
@@ -112,9 +113,9 @@ async def db_session(engine) -> AsyncGenerator[AsyncSession, None]:
 async def sample_users(db_session):
     """Create sample users for testing once for all tests."""
     users = [
-        User(name="Alice Johnson", email="alice@example.com"),
-        User(name="Bob Smith", email="bob@example.com"),
-        User(name="Charlie Brown", email="charlie@example.com"),
+        User(name="Alice Johnson", email="alice@example.com", is_admin=True),
+        User(name="Bob Smith", email="bob@example.com", is_admin=False),
+        User(name="Charlie Brown", email="charlie@example.com", is_admin=False),
     ]
     
     db_session.add_all(users)
