@@ -371,20 +371,31 @@ class TestRealDatabaseIntegration:
         
         await engine.dispose()
     
-    @pytest.mark.skipif(True, reason="Requires PostgreSQL server")
     @pytest.mark.asyncio
     async def test_postgresql_database(self):
         """Test with an actual PostgreSQL database (requires server)."""
-        # This test would require a running PostgreSQL server
-        # Skip by default, but can be enabled for full integration testing
         
-        # engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/test")
-        # factory = BerryQLFactory()
-        # 
-        # async with async_sessionmaker(engine, class_=AsyncSession)() as session:
-        #     adapter = factory._get_db_adapter(session)
-        #     assert isinstance(adapter, PostgreSQLAdapter)
-        pass
+        engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/test")
+        factory = BerryQLFactory()
+        
+        async with async_sessionmaker(engine, class_=AsyncSession)() as session:
+            adapter = factory._get_db_adapter(session)
+            assert isinstance(adapter, PostgreSQLAdapter)
+
+    @pytest.mark.asyncio
+    async def test_mssqlsql_database(self):
+        """Test with an actual MSSQL database (requires server)."""
+        dsn = "Driver=ODBC Driver 17 for SQL Server;Server=localhost;Database=test;Trusted_Connection=yes;"
+        conn_str = f"mssql+aioodbc:///?odbc_connect={dsn}"
+
+        engine = create_async_engine(conn_str)
+        factory = BerryQLFactory()
+
+        async with async_sessionmaker(engine, class_=AsyncSession)() as session:
+            adapter = factory._get_db_adapter(session)
+            assert isinstance(adapter, MSSQLAdapter)
+
+        await engine.dispose()
 
 
 if __name__ == '__main__':

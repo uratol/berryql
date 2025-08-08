@@ -304,12 +304,18 @@ class QueryConditionProcessor:
             try:
                 where_conditions = json.loads(where_conditions.strip())
                 if not isinstance(where_conditions, dict):
-                    raise InvalidFieldError(f"Where conditions must be a JSON object, got: {type(where_conditions).__name__}")
+                    raise InvalidFieldError(
+                        f"Where conditions must be a JSON object, got: {type(where_conditions).__name__}"
+                    )
             except json.JSONDecodeError as e:
-                raise InvalidFieldError(f"Invalid JSON format in where conditions: {where_conditions}. Error: {e}")
+                raise InvalidFieldError(
+                    f"Invalid JSON format in where conditions: {where_conditions}. Error: {e}"
+                )
         
         if not isinstance(where_conditions, dict):
-            raise InvalidFieldError(f"Where conditions must be a dict or JSON string, got: {type(where_conditions).__name__}")
+            raise InvalidFieldError(
+                f"Where conditions must be a dict or JSON string, got: {type(where_conditions).__name__}"
+            )
         
         # Get valid model columns for validation
         inspector = inspect(model_class)
@@ -329,25 +335,33 @@ class QueryConditionProcessor:
                 column_name = field_name
             else:
                 raise InvalidFieldError(
-                    f"Where field '{field_name}' (converted: '{db_field_name}') not found in model {model_class.__name__}. "
-                    f"Valid columns: {sorted(valid_columns)}"
+                    (
+                        f"Where field '{field_name}' (converted: '{db_field_name}') not found in model "
+                        f"{model_class.__name__}. Valid columns: {sorted(valid_columns)}"
+                    )
                 )
             
-            logger.info(f"Processing where condition: {field_name} = {value}, using column: {column_name}")
+            logger.info(
+                f"Processing where condition: {field_name} = {value}, using column: {column_name}"
+            )
             column = getattr(model_class, column_name)
-                
+            
             # Handle different comparison types
             if isinstance(value, dict):
                 for op, op_value in value.items():
                     if op not in supported_operators:
-                        raise InvalidFieldError(f"Unsupported operator '{op}'. Supported: {supported_operators}")
+                        raise InvalidFieldError(
+                            f"Unsupported operator '{op}'. Supported: {supported_operators}"
+                        )
                     
+                    # Normalize 'in' values to list/tuple
+                    if op == 'in' and op_value is not None and not isinstance(op_value, (list, tuple)):
+                        op_value = [op_value]
                     converted_value = QueryConditionProcessor._convert_value_for_column(column, op_value)
                     query = QueryConditionProcessor._apply_operator(query, column, op, converted_value)
             else:
                 if value is None:
                     continue
-                    
                 converted_value = QueryConditionProcessor._convert_value_for_column(column, value)
                 query = query.where(column == converted_value)
         
