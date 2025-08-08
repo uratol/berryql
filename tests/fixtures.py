@@ -2,6 +2,7 @@
 
 import pytest
 from typing import AsyncGenerator
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import User, Post, Comment
@@ -34,10 +35,22 @@ async def sample_posts(db_session: AsyncSession, sample_users):
     user1 = sample_users[0]
     user2 = sample_users[1]
     user3 = sample_users[2]
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     
     posts = [
-        Post(title="First Post", content="Hello world!", author_id=user1.id),
-        Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id),
+        # Stagger Alice's posts to have deterministic created_at ordering
+        Post(
+            title="First Post",
+            content="Hello world!",
+            author_id=user1.id,
+            created_at=now - timedelta(minutes=45),
+        ),
+        Post(
+            title="GraphQL is Great",
+            content="I love GraphQL!",
+            author_id=user1.id,
+            created_at=now - timedelta(minutes=15),
+        ),
         Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id),
         Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id),
         Post(title="Getting Started", content="A beginner's guide", author_id=user3.id),

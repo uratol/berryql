@@ -351,6 +351,47 @@ class TestBerryQLIntegration:
                 current_name = users[i]['name']
                 next_name = users[i + 1]['name']
                 assert current_name <= next_name  # Should be in alphabetical order
+
+    @pytest.mark.asyncio
+    async def test_active_users_default_custom_order(self, graphql_schema, graphql_context, populated_db):
+        """Ensure activeUsers uses default custom_order when no orderBy is provided (name asc, created_at desc)."""
+        query = """
+        query {
+            activeUsers {
+                id
+                name
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        users = result.data['activeUsers']
+        assert len(users) == 4
+        names = [u['name'] for u in users]
+        # Expect alphabetical by name (custom_order default)
+        assert names == sorted(names)
+        assert names == [
+            'Alice Johnson', 'Bob Smith', 'Charlie Brown', 'Dave NoPosts'
+        ]
+
+    @pytest.mark.asyncio
+    async def test_active_users_order_by_param_overrides_default(self, graphql_schema, graphql_context, populated_db):
+        """Ensure activeUsers(orderBy: ...) overrides the default custom_order."""
+        query = """
+        query {
+            activeUsers(orderBy: "[{\\\"field\\\": \\\"id\\\", \\\"direction\\\": \\\"desc\\\"}]") {
+                id
+                name
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        users = result.data['activeUsers']
+        ids = [u['id'] for u in users]
+        assert ids == sorted(ids, reverse=True)  # id desc
     
     
     @pytest.mark.asyncio
@@ -654,6 +695,16 @@ class TestBerryQLIntegration:
         print(f"Alice's all posts: {all_posts}")
         assert len(all_posts) == 2  # Alice has 2 posts total
         
+        # Add another recent post for Alice to ensure multiple new posts are available
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        await session.merge(Post(
+            title="Async SQLAlchemy Rocks",
+            content="Async sessions are great!",
+            author_id=alice.id,
+            created_at=now - timedelta(minutes=5),
+        ))
+        await session.commit()
+
         # Test new_posts field (should exclude old posts)
         query_new_posts = """
         query {
@@ -684,14 +735,20 @@ class TestBerryQLIntegration:
         new_posts = alice_data['newPosts']
         print(f"Alice's new posts: {new_posts}")
         
-        # new_posts should only include posts from the last hour (excluding "First Post")
-        assert len(new_posts) == 1  # Should only have the recent post
-        assert new_posts[0]['title'] == "GraphQL is Great"  # Should be the newer post
+        # new_posts should include posts from the last hour (excluding "First Post")
+        assert len(new_posts) >= 2  # Now there should be at least two recent posts
         
         # Verify that the time filtering is working - old post should not be included
         post_titles = [post['title'] for post in new_posts]
         assert "First Post" not in post_titles  # The old post should be filtered out
-        assert "GraphQL is Great" in post_titles  # The new post should be included
+        assert "GraphQL is Great" in post_titles  # Existing recent post should be included
+        assert "Async SQLAlchemy Rocks" in post_titles  # Newly added recent post should be included
+
+        # Ensure newPosts are ordered by createdAt desc
+        created_times = [p['createdAt'] for p in new_posts]
+        assert created_times == sorted(created_times, reverse=True)
+        # Newest title should be the one we just added
+        assert new_posts[0]['title'] == "Async SQLAlchemy Rocks"
 
     @pytest.mark.asyncio
     async def test_current_user_query(self, graphql_schema, graphql_context, populated_db):

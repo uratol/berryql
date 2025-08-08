@@ -146,6 +146,7 @@ class Query:
         db: AsyncSession,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        order_by: Optional[str] = None,
         name_filter: Optional[str] = None
     ) -> List[UserType]:
         """Get users with admin-based filtering and optional name filtering using @berryql.field decorator."""
