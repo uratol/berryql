@@ -1199,14 +1199,33 @@ class BerryQLNamespace:
                 return berryql_field(*args, **kwargs)
         return decorator_caller
 
-    def custom_field(self, query_builder: Callable):
+    def custom_field(self, builder_or_expr: Any):
         """Decorator for a custom SQL-backed scalar/object field.
-        It registers the SQL builder and returns a resolver that reads
-        the pre-resolved attribute set during instance creation.
-        Usage: @berryql.custom_field(lambda model_class, info: <sqlalchemy expr>)
+        Accepts either:
+        - a callable: (model_class, info) -> SQLAlchemy ColumnElement/ScalarSelect
+        - a direct SQLAlchemy expression or Select (we'll wrap it for you)
+
+        Usage:
+            @berryql.custom_field(lambda model_class, info: <expr>)
+            @berryql.custom_field(select(...).scalar_subquery())
         """
-        if not callable(query_builder):
-            raise TypeError("@berryql.custom_field expects a callable query builder")
+        # Normalize to a callable builder(model_class, info) -> ColumnElement
+        query_builder: Callable
+        if callable(builder_or_expr):
+            query_builder = builder_or_expr
+        else:
+            expr = builder_or_expr
+            # If it's a selectable, convert to scalar subquery; otherwise use as-is
+            try:
+                if hasattr(expr, 'scalar_subquery') and callable(getattr(expr, 'scalar_subquery')):
+                    expr = expr.scalar_subquery()
+            except Exception:
+                pass
+
+            def _static_builder(model_class, info):
+                return expr
+
+            query_builder = _static_builder
 
         def decorator(func):
             # Attach flags so factory can detect custom fields

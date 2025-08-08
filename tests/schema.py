@@ -52,14 +52,13 @@ class PostType:
         ))
         .select_from(Comment)
         .where(Comment.post_id == model_class.id)
-        .scalar_subquery()
     ))
     async def comments_agg(self, info: strawberry.Info) -> Optional[CommentAggType]:
         """Get post's comments aggregation using pre-resolved data."""
         pass
 
     @strawberry.field
-    @berryql.custom_field(lambda model_class, info: (
+    @berryql.custom_field(
         select(func.json_object(
             'id', Comment.id,
             'content', Comment.content,
@@ -68,11 +67,10 @@ class PostType:
             'created_at', Comment.created_at
         ))
         .select_from(Comment)
-        .where(Comment.post_id == model_class.id)
+        .where(Comment.post_id == Post.id)
         .order_by(Comment.created_at.desc().nullslast(), Comment.id.desc())
         .limit(1)
-        .scalar_subquery()
-    ))
+    )
     async def last_comment(self, info: strawberry.Info) -> Optional[CommentType]:
         """Get post's last comment using pre-resolved data."""
         pass
