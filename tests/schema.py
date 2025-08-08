@@ -91,7 +91,7 @@ class UserType:
     @strawberry.field
     @berryql.field(
         model_class=Post,
-        custom_where=lambda: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}},
+        custom_where=lambda info=None: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}},
         custom_order=['created_at desc']
     )
     async def new_posts(self, info: strawberry.Info) -> List[PostType]:
