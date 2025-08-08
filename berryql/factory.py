@@ -22,6 +22,11 @@ from .query_analyzer import query_analyzer
 from .database_adapters import get_database_adapter, DatabaseAdapter
 from .database_adapters import MSSQLAdapter
 from .resolved_data_helper import convert_json_to_strawberry_instances
+try:
+    # SQLAlchemy 1.4/2.0 Select type for isinstance checks
+    from sqlalchemy.sql import Select
+except Exception:  # pragma: no cover
+    Select = None  # Fallback if import path changes; we'll use duck-typing
 
 logger = logging.getLogger(__name__)
 
@@ -355,9 +360,22 @@ class QueryConditionProcessor:
                             f"Unsupported operator '{op}'. Supported: {supported_operators}"
                         )
                     
-                    # Normalize 'in' values to list/tuple
-                    if op == 'in' and op_value is not None and not isinstance(op_value, (list, tuple)):
-                        op_value = [op_value]
+                    # Normalize 'in' values to list/tuple, but allow SQLAlchemy subqueries/expressions
+                    if op == 'in' and op_value is not None:
+                        is_select_like = False
+                        try:
+                            # Accept SQLAlchemy Select/ScalarSelect/ColumnElement as-is
+                            if Select is not None and isinstance(op_value, Select):
+                                is_select_like = True
+                            elif isinstance(op_value, ColumnElement):
+                                is_select_like = True
+                            else:
+                                # Duck-typing: compiled SQL attribute is common
+                                is_select_like = hasattr(op_value, "compile") and not isinstance(op_value, (str, bytes))
+                        except Exception:
+                            is_select_like = False
+                        if not is_select_like and not isinstance(op_value, (list, tuple)):
+                            op_value = [op_value]
                     converted_value = QueryConditionProcessor._convert_value_for_column(column, op_value)
                     query = QueryConditionProcessor._apply_operator(query, column, op, converted_value)
             else:

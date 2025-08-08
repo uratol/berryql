@@ -781,6 +781,41 @@ class TestBerryQLIntegration:
         assert "Alice Johnson" not in user_names  # Alice should be excluded (current user)
 
     @pytest.mark.asyncio
+    async def test_bloggers_excludes_users_with_no_posts(self, graphql_schema, graphql_context, db_session, populated_db):
+        """Add a user with no posts and verify bloggers returns only users with posts."""
+        # Arrange: add a new user without any posts
+        from .models import User
+        newbie = User(name="Dave NoPosts", email="dave@example.com", is_admin=False)
+        db_session.add(newbie)
+        await db_session.flush()
+        await db_session.commit()
+
+        # Act: query bloggers
+        query = """
+        query {
+            bloggers(orderBy: "[{\\\"field\\\": \\\"id\\\", \\\"direction\\\": \\\"asc\\\"}]") {
+                id
+                name
+                email
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+
+        # Assert: no errors and bloggers exist
+        assert result.errors is None
+        assert result.data is not None
+        bloggers = result.data['bloggers']
+        assert isinstance(bloggers, list)
+        # From fixtures: Alice, Bob, Charlie all have posts; newbie has none
+        blogger_names = [u['name'] for u in bloggers]
+        assert "Alice Johnson" in blogger_names
+        assert "Bob Smith" in blogger_names
+        assert "Charlie Brown" in blogger_names
+        assert "Dave NoPosts" not in blogger_names
+
+    @pytest.mark.asyncio
     async def test_custom_logic_execution_in_berryql_field(self, graphql_schema, db_session, sample_users):
         """Test that custom logic in @berryql.field decorated methods executes."""
         # Create context that should trigger custom logic

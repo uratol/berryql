@@ -214,6 +214,27 @@ class Query:
         """Get all users except the current user (using custom_where with context)."""
         pass  # Implementation handled by the decorator
     
+    @strawberry.field
+    @berryql.field(
+        model_class=User,
+        custom_where=lambda info=None: {
+            'id': {
+                'in': select(Post.author_id).distinct().scalar_subquery()
+            }
+        }
+    )
+    async def bloggers(
+        self,
+        info: strawberry.Info,
+        db: AsyncSession,
+        where: Optional[str] = None,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None
+    ) -> List[UserType]:
+        """Get users who have at least one post (bloggers)."""
+        pass  # Implementation handled by the decorator
+    
 
 
 # Create the schema instance
