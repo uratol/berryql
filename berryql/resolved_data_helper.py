@@ -531,8 +531,9 @@ def berryql_field(
                                 # Store as direct mapping to the strawberry type
                                 factory._custom_where_config[strawberry_type] = actual_custom_where
                             if actual_custom_order:
-                                # Store as direct mapping to the strawberry type  
-                                factory._custom_order_config[strawberry_type] = actual_custom_order
+                                # Normalize scalar string to list and store
+                                normalized_order = [actual_custom_order] if isinstance(actual_custom_order, str) else actual_custom_order
+                                factory._custom_order_config[strawberry_type] = normalized_order
                             if actual_custom_fields:
                                 # Store custom fields for the strawberry type
                                 factory.custom_field_manager.register_custom_fields(strawberry_type, actual_custom_fields)

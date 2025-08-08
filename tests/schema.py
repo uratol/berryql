@@ -93,7 +93,7 @@ class UserType:
     @berryql.field(
         model_class=Post,
         custom_where=lambda info=None: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None).isoformat()}},
-        custom_order=['created_at desc']
+        custom_order='created_at desc'
     )
     async def new_posts(self, info: strawberry.Info) -> List[PostType]:
         """Get user's posts created within the last hour, sorted by created_at descending."""

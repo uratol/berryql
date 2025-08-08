@@ -830,7 +830,9 @@ class BerryQLFactory:
         if custom_where:
             self._custom_where_config[strawberry_type] = custom_where
         if custom_order:
-            self._custom_order_config[strawberry_type] = custom_order
+            # Normalize scalar string to list
+            normalized_order = [custom_order] if isinstance(custom_order, str) else custom_order
+            self._custom_order_config[strawberry_type] = normalized_order
             
         async def resolver(
             db: AsyncSession,
