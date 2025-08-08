@@ -15,8 +15,8 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import BerryQLFactory
-from schema import schema, UserType  # Import schema from separate file
-from conftest import User, Post, Comment  # Import models for direct database operations
+from .schema import schema
+from .models import User, Post
 @pytest.fixture
 async def berryql_factory():
     """Create BerryQL factory."""
