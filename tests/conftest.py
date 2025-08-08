@@ -56,8 +56,10 @@ async def engine():
                     pool_pre_ping=True
                 )
             
-            # Test if we can create the engine (this will fail if driver is missing)
+            # Ensure a clean slate before tests: drop then create all tables
+            # This also validates the connection/driver early.
             async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
                 await conn.run_sync(Base.metadata.create_all)
             
             is_external_db = True
