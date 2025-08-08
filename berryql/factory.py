@@ -1407,6 +1407,14 @@ class BerryQLFactory:
         db_adapter: DatabaseAdapter
     ):
         """Build the final query for nested entities using json_agg."""
+        # If ordering is requested (explicit or custom), apply it to the entity subquery
+        # so that the aggregated JSON array preserves the intended order.
+        order_fields = params.order_by or custom_order or []
+        if order_fields:
+            # Build a selectable over the subquery and apply ordering using subquery columns
+            ordered_query = select(entity_subquery)
+            ordered_query = QueryConditionProcessor.apply_ordering(ordered_query, entity_subquery, order_fields)
+            entity_subquery = ordered_query.subquery()
         # MSSQL: use FOR JSON PATH to build proper JSON arrays
         if isinstance(db_adapter, MSSQLAdapter):
             try:
