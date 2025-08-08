@@ -2,12 +2,49 @@
 Helper utilities for working with resolved data in GraphQL types.
 """
 
-from typing import List, TypeVar, Any, Optional, Callable, Union, Dict, Type, get_origin, get_args, get_type_hints
+from typing import List, TypeVar, Any, Optional, Callable, Union, Dict, Type, get_origin, get_args, get_type_hints, Tuple
 import strawberry
 from functools import wraps
 from sqlalchemy.sql import ColumnElement
 
 T = TypeVar('T')
+
+# Registry for custom query builders declared on GraphQL fields via @berryql.field(query=...)
+# Keyed by (module_name, class_name, field_name) to avoid reliance on class object availability at decoration time
+CUSTOM_QUERY_REGISTRY: Dict[Tuple[str, str, str], Callable] = {}
+
+def _is_registered_custom_field(strawberry_type: Type, field_name: str) -> bool:
+    """Check if a field on a Strawberry type is a registered custom field.
+    This accounts for decorator flags and the global registry, using both
+    exact and snake_case field names.
+    """
+    try:
+        # Check attribute flags on the type for both exact and snake_case
+        snake = None
+        if hasattr(strawberry_type, field_name):
+            attr = getattr(strawberry_type, field_name)
+            if hasattr(attr, '_is_custom_field') and hasattr(attr, '_custom_query_builder'):
+                return True
+        # Try snake_case variant on the type
+        try:
+            from .factory import FieldMapper  # local import to avoid cycle on module load
+            snake = FieldMapper.camel_to_snake(field_name)
+        except Exception:
+            pass
+        if snake and hasattr(strawberry_type, snake):
+            attr2 = getattr(strawberry_type, snake)
+            if hasattr(attr2, '_is_custom_field') and hasattr(attr2, '_custom_query_builder'):
+                return True
+        # Check global registry by module/class/name
+        module = getattr(strawberry_type, '__module__', '')
+        class_name = getattr(strawberry_type, '__name__', '')
+        if (module, class_name, field_name) in CUSTOM_QUERY_REGISTRY:
+            return True
+        if snake and (module, class_name, snake) in CUSTOM_QUERY_REGISTRY:
+            return True
+    except Exception:
+        pass
+    return False
 
 # Custom string class that has isoformat method for GraphQL datetime serialization
 class DateTimeString(str):
@@ -81,13 +118,26 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 # Separate constructor fields from relationship/method fields
                 constructor_data = {}
                 resolved_data = {}
+                direct_attrs = {}
                 
                 # Get type hints to understand which fields are constructor parameters
                 type_hints = getattr(strawberry_type, '__annotations__', {})
                 
                 for field_name, field_value in item_data.items():
-                    # Check if this field is a method (relationship field)
-                    is_method = hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name))
+                    # Check if this field is a method (relationship field) or a registered custom field
+                    is_method = False
+                    try:
+                        attr = getattr(strawberry_type, field_name, None)
+                        is_method = callable(attr)
+                    except Exception:
+                        is_method = False
+                    # Treat registered custom fields as method-like even if not callable (e.g., strawberry field wrappers)
+                    if not is_method:
+                        try:
+                            if _is_registered_custom_field(strawberry_type, field_name):
+                                is_method = True
+                        except Exception:
+                            pass
                     
                     # Check if this field exists in type hints (constructor parameter)
                     is_constructor_param = field_name in type_hints
@@ -96,6 +146,71 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                     # - They appear in both type_hints AND as callable methods
                     # - They should be treated as resolved data, not constructor parameters
                     if is_method:
+                        # Check if this method returns a Strawberry type to set directly
+                        target_type = None
+                        try:
+                            method_obj = getattr(strawberry_type, field_name, None)
+                            if callable(method_obj) and hasattr(method_obj, '__annotations__'):
+                                rt = method_obj.__annotations__.get('return')
+                                if rt is not None:
+                                    origin = get_origin(rt)
+                                    if origin is Union:
+                                        args = get_args(rt)
+                                        for arg in args:
+                                            if arg is not type(None):
+                                                rt = arg
+                                                break
+                                if rt is not None and (hasattr(rt, '__strawberry_definition__') or hasattr(rt, '__strawberry_type__')):
+                                    target_type = rt
+                        except Exception:
+                            target_type = None
+                        # Direct scalar/object custom field
+                        if target_type:
+                            # Convert JSON string to dict if needed
+                            data_obj = None
+                            if isinstance(field_value, str):
+                                try:
+                                    import json as _json
+                                    data_obj = _json.loads(field_value)
+                                except Exception:
+                                    data_obj = None
+                            elif isinstance(field_value, dict):
+                                data_obj = field_value
+                            # Convert to a Strawberry instance and set as direct attribute
+                            if isinstance(data_obj, dict):
+                                try:
+                                    converted_list = convert_json_to_strawberry_instances([data_obj], target_type)
+                                    direct_attrs[field_name] = converted_list[0] if converted_list else None
+                                except Exception:
+                                    direct_attrs[field_name] = data_obj
+                            else:
+                                direct_attrs[field_name] = field_value
+                            continue
+                        else:
+                            # Fallback: if method returns an object-like JSON, set it directly as a simple namespace
+                            data_obj = None
+                            if isinstance(field_value, str):
+                                try:
+                                    import json as _json
+                                    data_obj = _json.loads(field_value)
+                                except Exception:
+                                    data_obj = None
+                            elif isinstance(field_value, dict):
+                                data_obj = field_value
+                            if isinstance(data_obj, dict):
+                                # Convert likely datetime-looking fields
+                                processed = {}
+                                for k, v in data_obj.items():
+                                    if isinstance(v, str) and any(p in k for p in ['created_at', 'updated_at', 'deleted_at', 'published_at', 'timestamp']):
+                                        processed[k] = DateTimeString(v)
+                                    else:
+                                        processed[k] = v
+                                try:
+                                    from types import SimpleNamespace as _NS
+                                    direct_attrs[field_name] = _NS(**processed)
+                                except Exception:
+                                    direct_attrs[field_name] = processed
+                                continue
                         # This is a relationship/method field - put in resolved data
                         if '_resolved' not in resolved_data:
                             resolved_data['_resolved'] = {}
@@ -147,6 +262,10 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 if resolved_data:
                     for attr_name, attr_value in resolved_data.items():
                         setattr(instance, attr_name, attr_value)
+                # Set any direct attributes (custom object/scalar fields)
+                if direct_attrs:
+                    for attr_name, attr_value in direct_attrs.items():
+                        setattr(instance, attr_name, attr_value)
                 
                 strawberry_instances.append(instance)
     else:
@@ -156,31 +275,108 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 # Separate constructor fields from relationship/method fields
                 constructor_data = {}
                 resolved_data = {}
-                
+                direct_attrs = {}
+
                 # Get type hints to understand which fields are constructor parameters
                 type_hints = getattr(strawberry_type, '__annotations__', {})
-                
+
                 for field_name, field_value in item_data.items():
                     # Check if this field is a method (relationship field)
-                    is_method = hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name))
-                    
-                    # Check if this field exists in type hints (constructor parameter)
+                    is_method = False
+                    try:
+                        attr = getattr(strawberry_type, field_name, None)
+                        is_method = callable(attr)
+                    except Exception:
+                        is_method = False
+                    if not is_method:
+                        try:
+                            if _is_registered_custom_field(strawberry_type, field_name):
+                                is_method = True
+                        except Exception:
+                            pass
+
+                    # Check if this field exists in type_hints (constructor parameter)
                     is_constructor_param = field_name in type_hints
-                    
+
                     # For strawberry fields with @strawberry.field decorator:
                     # - They appear in both type_hints AND as callable methods
                     # - They should be treated as resolved data, not constructor parameters
                     if is_method:
+                        # Check if this method returns a Strawberry type to set directly
+                        target_type = None
+                        try:
+                            method_obj = getattr(strawberry_type, field_name, None)
+                            if callable(method_obj) and hasattr(method_obj, '__annotations__'):
+                                rt = method_obj.__annotations__.get('return')
+                                if rt is not None:
+                                    origin = get_origin(rt)
+                                    if origin is Union:
+                                        args = get_args(rt)
+                                        for arg in args:
+                                            if arg is not type(None):
+                                                rt = arg
+                                                break
+                                if rt is not None and (hasattr(rt, '__strawberry_definition__') or hasattr(rt, '__strawberry_type__')):
+                                    target_type = rt
+                        except Exception:
+                            target_type = None
+                        # Direct scalar/object custom field
+                        if target_type:
+                            # Convert JSON string to dict if needed
+                            data_obj = None
+                            if isinstance(field_value, str):
+                                try:
+                                    import json as _json
+                                    data_obj = _json.loads(field_value)
+                                except Exception:
+                                    data_obj = None
+                            elif isinstance(field_value, dict):
+                                data_obj = field_value
+                            # Convert to a Strawberry instance and set as direct attribute
+                            if isinstance(data_obj, dict):
+                                try:
+                                    converted_list = convert_json_to_strawberry_instances([data_obj], target_type)
+                                    direct_attrs[field_name] = converted_list[0] if converted_list else None
+                                except Exception:
+                                    direct_attrs[field_name] = data_obj
+                            else:
+                                direct_attrs[field_name] = field_value
+                            continue
+                        else:
+                            # Fallback: if method returns an object-like JSON, set it directly as a simple namespace
+                            data_obj = None
+                            if isinstance(field_value, str):
+                                try:
+                                    import json as _json
+                                    data_obj = _json.loads(field_value)
+                                except Exception:
+                                    data_obj = None
+                            elif isinstance(field_value, dict):
+                                data_obj = field_value
+                            if isinstance(data_obj, dict):
+                                # Convert likely datetime-looking fields
+                                processed = {}
+                                for k, v in data_obj.items():
+                                    if isinstance(v, str) and any(p in k for p in ['created_at', 'updated_at', 'deleted_at', 'published_at', 'timestamp']):
+                                        processed[k] = DateTimeString(v)
+                                    else:
+                                        processed[k] = v
+                                try:
+                                    from types import SimpleNamespace as _NS
+                                    direct_attrs[field_name] = _NS(**processed)
+                                except Exception:
+                                    direct_attrs[field_name] = processed
+                                continue
                         # This is a relationship/method field - put in resolved data
                         if '_resolved' not in resolved_data:
                             resolved_data['_resolved'] = {}
-                        
+
                         # For nested relationship data, we need to convert lists of dictionaries
                         # to proper Strawberry instances recursively
                         if isinstance(field_value, list) and field_value and isinstance(field_value[0], dict):
                             # This is a nested relationship field - we need to determine the target type
                             # and convert the list of dictionaries to Strawberry instances
-                            
+
                             # Try to get the target type from the field annotation
                             target_type = None
                             if hasattr(strawberry_type, '__annotations__') and field_name in strawberry_type.__annotations__:
@@ -188,14 +384,14 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                                 # Handle StrawberryAnnotation objects (from @strawberry.field decorated methods)
                                 if hasattr(field_annotation, 'annotation'):
                                     field_annotation = field_annotation.annotation
-                                    
+
                                 # Handle List[TargetType] annotations
                                 from typing import get_origin, get_args
                                 if get_origin(field_annotation) is list:
                                     args = get_args(field_annotation)
                                     if args and len(args) > 0:
                                         target_type = args[0]
-                            
+
                             # If we found a target type, convert the nested data recursively
                             if target_type and hasattr(target_type, '__strawberry_definition__'):
                                 # Recursively convert nested relationship data
@@ -211,15 +407,19 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                         # This is a constructor parameter
                         constructor_data[field_name] = field_value
                     # If it's neither, skip it (shouldn't happen in well-formed data)
-                
+
                 # Create the instance with constructor data only
                 instance = strawberry_type(**constructor_data)
-                
+
                 # Set resolved data if any
                 if resolved_data:
                     for attr_name, attr_value in resolved_data.items():
                         setattr(instance, attr_name, attr_value)
-                
+                # Set any direct attributes (custom object/scalar fields)
+                if direct_attrs:
+                    for attr_name, attr_value in direct_attrs.items():
+                        setattr(instance, attr_name, attr_value)
+
                 strawberry_instances.append(instance)
     
     return strawberry_instances
@@ -918,7 +1118,7 @@ def berryql_field(
                                 if type_name.endswith('Type'):
                                     base_name = type_name[:-4].lower()
                                     relationship_name = base_name + 's'
-                
+
                 if is_list_return:
                     @wraps(func)
                     async def resolved_data_func(self, info: strawberry.Info, *args, **kwargs):
@@ -929,7 +1129,39 @@ def berryql_field(
                     # Scalar custom field: return attribute set during instance creation
                     @wraps(func)
                     async def scalar_data_func(self, info: strawberry.Info, *args, **kwargs):
-                        return getattr(self, func.__name__, None)
+                        value = getattr(self, func.__name__, None)
+                        # If the field returns a Strawberry type, and value is JSON/dict, convert it
+                        target_type = None
+                        try:
+                            if return_type and (hasattr(return_type, '__strawberry_definition__') or hasattr(return_type, '__strawberry_type__')):
+                                target_type = return_type
+                        except Exception:
+                            target_type = None
+                        if target_type and value is not None:
+                            # Attempt to parse JSON string
+                            data_obj = None
+                            if isinstance(value, str):
+                                try:
+                                    import json as _json
+                                    data_obj = _json.loads(value)
+                                except Exception:
+                                    data_obj = None
+                            elif isinstance(value, dict):
+                                data_obj = value
+                            # Convert to Strawberry instance if possible
+                            if isinstance(data_obj, dict):
+                                try:
+                                    converted = convert_json_to_strawberry_instances([data_obj], target_type)
+                                    return converted[0] if converted else None
+                                except Exception:
+                                    return data_obj
+                        return value
+                    # Preserve return type annotation for downstream converters
+                    try:
+                        if hasattr(func, '__annotations__'):
+                            scalar_data_func.__annotations__ = func.__annotations__.copy()
+                    except Exception:
+                        pass
                     return scalar_data_func
         
         return decorator
@@ -950,12 +1182,6 @@ def berryql_field(
         )
 
 
-def custom_field(*args, **kwargs):
-    """Decorator for custom field methods that return SQLAlchemy expressions."""
-    # For backward compatibility, delegate to berryql_field
-    return berryql_field(*args, **kwargs)
-
-
 # Create a berryql namespace object
 class BerryQLNamespace:
     """Namespace object for BerryQL decorators."""
@@ -972,5 +1198,46 @@ class BerryQLNamespace:
                 # Called with arguments: @berryql.field(...) 
                 return berryql_field(*args, **kwargs)
         return decorator_caller
+
+    def custom_field(self, query_builder: Callable):
+        """Decorator for a custom SQL-backed scalar/object field.
+        It registers the SQL builder and returns a resolver that reads
+        the pre-resolved attribute set during instance creation.
+        Usage: @berryql.custom_field(lambda model_class, info: <sqlalchemy expr>)
+        """
+        if not callable(query_builder):
+            raise TypeError("@berryql.custom_field expects a callable query builder")
+
+        def decorator(func):
+            # Attach flags so factory can detect custom fields
+            try:
+                setattr(func, '_is_custom_field', True)
+                setattr(func, '_custom_query_builder', query_builder)
+            except Exception:
+                pass
+            # Register in global registry by module/class/field to survive wrapping
+            try:
+                mod = getattr(func, '__module__', '')
+                cls_name = func.__qualname__.split('.')[0] if hasattr(func, '__qualname__') else ''
+                CUSTOM_QUERY_REGISTRY[(mod, cls_name, func.__name__)] = query_builder
+            except Exception:
+                pass
+
+            # Wrap into a resolver that returns the value populated by the factory
+            @wraps(func)
+            async def resolver(self, info: strawberry.Info, *args, **kwargs):
+                # Read the attribute directly; conversion to Strawberry type
+                # is handled earlier in JSON->instance conversion when possible.
+                return getattr(self, func.__name__, None)
+
+            # Preserve original annotations so Strawberry sees the right return type
+            try:
+                if hasattr(func, '__annotations__'):
+                    resolver.__annotations__ = func.__annotations__.copy()
+            except Exception:
+                pass
+            return resolver
+
+        return decorator
 
 berryql = BerryQLNamespace()

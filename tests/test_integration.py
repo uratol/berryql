@@ -966,6 +966,48 @@ class TestBerryQLIntegration:
         assert bob_counts.get('SQLAlchemy Tips') == 2
         assert bob_counts.get('Python Best Practices') == 1
 
+    @pytest.mark.asyncio
+    async def test_posts_last_comment(self, graphql_schema, graphql_context, populated_db):
+        """Verify lastComment returns the latest comment per post (by created_at then id)."""
+        query = """
+        query {
+            users {
+                id
+                name
+                posts {
+                    id
+                    title
+                    lastComment {
+                        id
+                        content
+                        authorId
+                        postId
+                        createdAt
+                    }
+                }
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+
+        users = result.data['users']
+        # Build mapping post title -> last comment content for quick checks
+        def last_content_of(user_name, post_title):
+            u = next(u for u in users if u['name'] == user_name)
+            p = next(p for p in u['posts'] if p['title'] == post_title)
+            lc = p.get('lastComment')
+            return lc['content'] if lc else None
+
+        # From fixtures, each post with comments should have a last comment
+        assert last_content_of('Alice Johnson', 'First Post') is not None
+        assert last_content_of('Alice Johnson', 'GraphQL is Great') is not None
+        assert last_content_of('Bob Smith', 'SQLAlchemy Tips') is not None
+        assert last_content_of('Bob Smith', 'Python Best Practices') is not None
+        assert last_content_of('Charlie Brown', 'Getting Started') is not None
+
 
 @pytest.mark.integration
 class TestBerryQLErrorHandling:

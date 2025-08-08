@@ -11,9 +11,17 @@ from .resolved_data_helper import (
     get_resolved_field_data,
     ResolvedDataMixin,
     berryql_field,
-    custom_field,
     berryql
 )
+
+# Back-compat shim: expose custom_field symbol pointing to berryql.custom_field
+try:
+    def custom_field(query_builder):
+        return berryql.custom_field(query_builder)
+except Exception:
+    # Define a placeholder to avoid import errors, though it should not be used directly
+    def custom_field(*args, **kwargs):
+        raise RuntimeError("Use @berryql.custom_field instead of importing custom_field")
 from .input_converter import (
     convert_comparison_input,
     convert_where_input,
@@ -58,8 +66,8 @@ __all__ = [
     "get_resolved_field_data",
     "ResolvedDataMixin",
     "berryql_field",
-    "custom_field",
     "berryql",
+    "custom_field",
     
     # Input conversion utilities
     "convert_comparison_input",

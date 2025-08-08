@@ -21,7 +21,7 @@ from datetime import datetime
 from .query_analyzer import query_analyzer
 from .database_adapters import get_database_adapter, DatabaseAdapter
 from .database_adapters import MSSQLAdapter
-from .resolved_data_helper import convert_json_to_strawberry_instances
+from .resolved_data_helper import convert_json_to_strawberry_instances, CUSTOM_QUERY_REGISTRY
 try:
     # SQLAlchemy 1.4/2.0 Select type for isinstance checks
     from sqlalchemy.sql import Select
@@ -230,13 +230,29 @@ class CustomFieldManager:
         if snake_case_field in custom_fields:
             return True
         
-        # Check for @custom_field decorator
+        # Check for @custom_field decorator or @berryql.field(query=...)
         try:
             if hasattr(strawberry_type, field_name):
                 attr = getattr(strawberry_type, field_name)
                 if callable(attr) and hasattr(attr, '_is_custom_field') and hasattr(attr, '_custom_query_builder'):
                     return True
+            # Also check snake_case attribute on the type
+            if hasattr(strawberry_type, snake_case_field):
+                attr2 = getattr(strawberry_type, snake_case_field)
+                if callable(attr2) and hasattr(attr2, '_is_custom_field') and hasattr(attr2, '_custom_query_builder'):
+                    return True
         except (AttributeError, TypeError):
+            pass
+
+        # Check registry by module/class/field
+        try:
+            module = getattr(strawberry_type, '__module__', '')
+            class_name = getattr(strawberry_type, '__name__', '')
+            if (module, class_name, field_name) in CUSTOM_QUERY_REGISTRY:
+                return True
+            if (module, class_name, snake_case_field) in CUSTOM_QUERY_REGISTRY:
+                return True
+        except Exception:
             pass
         
         return False
@@ -245,11 +261,12 @@ class CustomFieldManager:
         self,
         strawberry_type: Type,
         requested_fields: Set[str],
-        model_class: Type
+        model_class: Type,
+        info = None
     ) -> List[ColumnElement]:
         """Build custom field columns using configuration and decorators."""
         custom_columns = []
-        custom_fields = self._custom_fields_config.get(strawberry_type, {})
+        custom_fields = self._custom_fields_config.get(strawberry_type, {}).copy()
         
         # Scan for methods with @custom_field decorator
         for attr_name in dir(strawberry_type):
@@ -259,10 +276,26 @@ class CustomFieldManager:
             try:
                 attr = getattr(strawberry_type, attr_name)
                 if callable(attr) and hasattr(attr, '_is_custom_field') and hasattr(attr, '_custom_query_builder'):
-                    if attr_name in requested_fields:
-                        custom_fields[attr_name] = attr._custom_query_builder
+                    # Register all discovered builders; selection will filter later
+                    custom_fields[attr_name] = attr._custom_query_builder
             except (AttributeError, TypeError):
                 continue
+
+        # Merge in registry-defined builders (supports Strawberry wrappers)
+        try:
+            module = getattr(strawberry_type, '__module__', '')
+            class_name = getattr(strawberry_type, '__name__', '')
+            for field_name in list(requested_fields):
+                registry_key = (module, class_name, field_name)
+                if registry_key in CUSTOM_QUERY_REGISTRY:
+                    custom_fields[field_name] = CUSTOM_QUERY_REGISTRY[registry_key]
+                else:
+                    # Try snake_case
+                    snake_key = (module, class_name, FieldMapper.camel_to_snake(field_name))
+                    if snake_key in CUSTOM_QUERY_REGISTRY:
+                        custom_fields[FieldMapper.camel_to_snake(field_name)] = CUSTOM_QUERY_REGISTRY[snake_key]
+        except Exception:
+            pass
         
         # Build columns for all custom fields
         for field_name in requested_fields:
@@ -280,7 +313,8 @@ class CustomFieldManager:
             
             if query_builder:
                 try:
-                    custom_column = query_builder(model_class, requested_fields)
+                    # New signature: (model_class, info)
+                    custom_column = query_builder(model_class, info)
                     if hasattr(custom_column, 'label'):
                         custom_column = custom_column.label(custom_field_name)
                     custom_columns.append(custom_column)
@@ -515,18 +549,19 @@ class InstanceCreator:
                     private_data[field_name] = value
                     continue
                 
-                actual_field_name = field_name
-                if field_name not in type_hints:
-                    snake_case_field = FieldMapper.camel_to_snake(field_name)
-                    if snake_case_field in type_hints:
-                        actual_field_name = snake_case_field
-                    else:
-                        logger.debug(f"Field {field_name} not found in {strawberry_type.__name__} type hints")
-                        continue
-                
-                # Check if field is a method
-                is_method = (hasattr(strawberry_type, field_name) and callable(getattr(strawberry_type, field_name))) or \
-                           (hasattr(strawberry_type, actual_field_name) and callable(getattr(strawberry_type, actual_field_name)))
+                # Detect method-backed fields (strawberry.field or resolvers) first, before type hints filtering
+                is_method = False
+                try:
+                    if hasattr(strawberry_type, field_name):
+                        attr = getattr(strawberry_type, field_name)
+                        is_method = callable(attr)
+                    if not is_method:
+                        snake_attr = FieldMapper.camel_to_snake(field_name)
+                        if hasattr(strawberry_type, snake_attr):
+                            attr2 = getattr(strawberry_type, snake_attr)
+                            is_method = callable(attr2)
+                except Exception:
+                    is_method = False
                 
                 if is_method:
                     # For relationship-like methods (lists/dicts), store in _resolved
@@ -535,9 +570,54 @@ class InstanceCreator:
                             private_data['_resolved'] = {}
                         private_data['_resolved'][field_name] = value
                     else:
-                        # For scalar custom fields, store directly as attribute
-                        private_data[field_name] = value
+                        # For scalar custom fields, attempt conversion if return type is a Strawberry type
+                        method_obj = getattr(strawberry_type, field_name, None)
+                        target_type = None
+                        try:
+                            if callable(method_obj) and hasattr(method_obj, '__annotations__'):
+                                rt = method_obj.__annotations__.get('return')
+                                # Handle Optional[T]
+                                origin = getattr(rt, '__origin__', None)
+                                if origin is Union:
+                                    args = getattr(rt, '__args__', ())
+                                    for arg in args:
+                                        if arg is not type(None):
+                                            rt = arg
+                                            break
+                                if rt is not None and (hasattr(rt, '__strawberry_definition__') or hasattr(rt, '__strawberry_type__')):
+                                    target_type = rt
+                        except Exception:
+                            target_type = None
+                        if target_type:
+                            # Parse JSON string to dict if needed and convert
+                            data_obj = None
+                            if isinstance(value, str):
+                                try:
+                                    data_obj = json.loads(value)
+                                except Exception:
+                                    data_obj = None
+                            elif isinstance(value, dict):
+                                data_obj = value
+                            if isinstance(data_obj, dict):
+                                converted = InstanceCreator.create_strawberry_instance(target_type, data_obj)
+                                private_data[field_name] = converted
+                            else:
+                                private_data[field_name] = value
+                        else:
+                            # For scalar custom fields, store directly as attribute
+                            private_data[field_name] = value
                     continue
+                
+                # Map to constructor field name if present
+                actual_field_name = field_name
+                if field_name not in type_hints:
+                    snake_case_field = FieldMapper.camel_to_snake(field_name)
+                    if snake_case_field in type_hints:
+                        actual_field_name = snake_case_field
+                    else:
+                        # Unknown non-method field: assign directly to instance later
+                        private_data[field_name] = value
+                        continue
                 
                 field_type = type_hints[actual_field_name]
                 
@@ -735,7 +815,7 @@ class QueryBuilder:
         
         # Add custom field columns
         custom_columns = self.custom_field_manager.build_custom_field_columns(
-            strawberry_type, custom_fields_requested, model_class
+            strawberry_type, custom_fields_requested, model_class, info
         )
         
         all_columns = columns + custom_columns
@@ -1098,10 +1178,27 @@ class BerryQLFactory:
             required_fields = TypeAnalyzer.get_required_fields(strawberry_type)
             all_scalar_fields = scalar_fields | required_fields
             
-            # Build the base query for the related model
+            # Build the base query for the related model, including custom fields
+            # Separate regular vs custom fields for the related strawberry type
+            regular_fields: Set[str] = set()
+            custom_fields_requested: Set[str] = set()
+            for field_name in all_scalar_fields:
+                if self.custom_field_manager.is_custom_field(strawberry_type, field_name):
+                    custom_fields_requested.add(field_name)
+                else:
+                    regular_fields.add(field_name)
+
+        # Regular model columns
             related_columns = self.query_builder.build_columns_for_fields(
-                model_class, all_scalar_fields, strawberry_type
+                model_class, regular_fields, strawberry_type
             )
+
+        # Custom field columns provided via decorators/registry (use (model_class, info) signature)
+            if custom_fields_requested:
+                custom_cols = self.custom_field_manager.build_custom_field_columns(
+            strawberry_type, custom_fields_requested, model_class, info
+                )
+                related_columns = related_columns + custom_cols
             
             if not related_columns:
                 return None
@@ -1266,7 +1363,7 @@ class BerryQLFactory:
                     return literal_column(f"({final_sql})")
                 except Exception as e:
                     logger.warning(f"MSSQL JSON fallback failed, reverting to generic path: {e}")
-            
+
             # Generic path for PostgreSQL/SQLite and as fallback
             json_object = db_adapter.json_build_object(*json_columns)
             json_agg_query = select(
