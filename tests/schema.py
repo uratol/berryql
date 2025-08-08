@@ -92,12 +92,35 @@ class UserType:
     @strawberry.field
     @berryql.field(
         model_class=Post,
-        custom_where=lambda info=None: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}},
+        custom_where=lambda info=None: {'created_at': {'gt': (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None).isoformat()}},
         custom_order=['created_at desc']
     )
     async def new_posts(self, info: strawberry.Info) -> List[PostType]:
         """Get user's posts created within the last hour, sorted by created_at descending."""
         pass
+
+
+def _get_user_filter(info):
+    """Helper function to determine user filtering based on context."""
+    if not info or not hasattr(info, 'context'):
+        # No context means no access - use impossible condition
+        return {'id': -1}
+    
+    context = info.context
+    current_user = context.get('current_user')
+    user_id = context.get('user_id')
+    
+    # Check if user is admin
+    if current_user and getattr(current_user, 'is_admin', False):
+        # Admins can see all users
+        return {}
+    
+    # Non-admin users can only see themselves
+    if user_id:
+        return {'id': user_id}
+    
+    # No user context means no results - use impossible condition
+    return {'id': -1}
 
 
 # GraphQL Schema Setup
@@ -107,13 +130,7 @@ class Query:
     @berryql.field(
         model_class=User,
         name_filter={'name': {'like': lambda value: f'%{value}%'}},
-        custom_where=lambda info=None: (
-            {}  # Admins can see all users
-            if info and hasattr(info, 'context') and info.context.get('current_user') and info.context['current_user'].is_admin
-            else {'id': {'eq': info.context.get('user_id', 0)}}  # Non-admins see only themselves
-            if info and hasattr(info, 'context') and info.context.get('user_id')
-            else {'id': {'eq': None}}  # No user context means no results
-        ),
+        custom_where=lambda info=None: _get_user_filter(info),
         custom_fields={
             'post_count': lambda model_class, requested_fields: func.coalesce(
                 select(func.count(Post.id))

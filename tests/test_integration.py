@@ -619,7 +619,7 @@ class TestBerryQLIntegration:
         alice = alice_result.scalar_one()
         
         # Update one of Alice's posts to be older than 1 hour
-        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(tzinfo=None)
         await session.execute(
             update(Post)
             .where(Post.author_id == alice.id)

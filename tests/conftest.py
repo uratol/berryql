@@ -1,26 +1,28 @@
-"""Test configuraticlass User(Base):
-    __tablename__ = 'users'
-    
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(255), unique=True, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    
-    # Relationship to posts
-    posts = relationship("Post", back_populates="author")
-    # Relationship to comments
-    comments = relationship("Comment", back_populates="author")ryQL."""
+"""Test configuration and fixtures for BerryQL."""
 
+from dotenv import load_dotenv
 import pytest
 import asyncio
+import os
+import sys
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, relationship
 import tempfile
-import os
 
+# Try to load environment variables from .env file
+load_dotenv()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def event_loop_policy():
+    """Set event loop policy for Windows compatibility."""
+    if sys.platform.startswith("win"):
+        # Use SelectorEventLoop instead of ProactorEventLoop on Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    yield
 
 class Base(DeclarativeBase):
     """Base class for test models."""
@@ -35,7 +37,7 @@ class User(Base):
     name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     
     # Relationship to posts
     posts = relationship("Post", back_populates="author")
@@ -50,7 +52,7 @@ class Post(Base):
     title = Column(String(200), nullable=False)
     content = Column(String(5000))
     author_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     
     # Relationship to user
     author = relationship("User", back_populates="posts")
@@ -65,42 +67,93 @@ class Comment(Base):
     content = Column(String(1000), nullable=False)
     post_id = Column(Integer, ForeignKey('posts.id'), nullable=False)
     author_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     
     # Relationships
     post = relationship("Post", back_populates="comments")
     author = relationship("User", back_populates="comments")
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def engine():
-    """Create a test database engine for the entire test session."""
-    # Use in-memory SQLite for tests
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        echo=True,  # Enable SQL logging for debugging
-        future=True
-    )
+    """Create a test database engine for each test function."""
+    # Check for TEST_DATABASE_URL environment variable
+    test_db_url = os.getenv('TEST_DATABASE_URL')
     
-    # Create all tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if test_db_url:
+        # Try to use the provided database URL
+        try:
+            if test_db_url.startswith("postgresql"):
+                # PostgreSQL with asyncpg - use minimal connection args to avoid event loop issues
+                engine = create_async_engine(
+                    test_db_url,
+                    echo=False,
+                    future=True,
+                    # Minimal configuration to avoid connection pool issues in tests
+                    pool_size=1,
+                    max_overflow=0,
+                    pool_pre_ping=False,
+                    pool_recycle=-1
+                )
+            else:
+                # Other databases 
+                engine = create_async_engine(
+                    test_db_url,
+                    echo=False,
+                    future=True,
+                    pool_size=5,
+                    max_overflow=10,
+                    pool_recycle=3600,
+                    pool_pre_ping=True
+                )
+            
+            # Test if we can create the engine (this will fail if driver is missing)
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            
+            is_external_db = True
+            print(f"Using external database: {test_db_url}")
+            
+        except Exception as e:
+            print(f"Failed to connect to external database ({test_db_url}): {e}")
+            print("Falling back to SQLite in-memory database")
+            # Fall back to SQLite
+            engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                echo=True,  # Enable SQL logging for debugging with SQLite
+                future=True
+            )
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            is_external_db = False
+    else:
+        # Use in-memory SQLite for tests
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            echo=True,  # Enable SQL logging for debugging with SQLite
+            future=True
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        is_external_db = False
+        print("Using SQLite in-memory database")
     
     yield engine
+    
+    # Clean up: for external databases, drop all tables
+    if is_external_db:
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+        except Exception as e:
+            print(f"Failed to clean up external database: {e}")
+    
     await engine.dispose()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def db_session(engine) -> AsyncGenerator[AsyncSession, None]:
-    """Create a single database session for all tests."""
+    """Create a new database session for each test function."""
     async_session = async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False
     )
@@ -109,9 +162,9 @@ async def db_session(engine) -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def sample_users(db_session):
-    """Create sample users for testing once for all tests."""
+    """Create sample users for testing for each test function."""
     users = [
         User(name="Alice Johnson", email="alice@example.com", is_admin=True),
         User(name="Bob Smith", email="bob@example.com", is_admin=False),
@@ -128,9 +181,9 @@ async def sample_users(db_session):
     return users
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def sample_posts(db_session, sample_users):
-    """Create sample posts for testing once for all tests."""
+    """Create sample posts for testing for each test function."""
     user1, user2, user3 = sample_users
     
     posts = [
@@ -151,9 +204,9 @@ async def sample_posts(db_session, sample_users):
     return posts
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def sample_comments(db_session, sample_users, sample_posts):
-    """Create sample comments for testing once for all tests."""
+    """Create sample comments for testing for each test function."""
     user1, user2, user3 = sample_users
     post1, post2, post3, post4, post5 = sample_posts
     
@@ -177,9 +230,9 @@ async def sample_comments(db_session, sample_users, sample_posts):
     return comments
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def populated_db(sample_users, sample_posts, sample_comments):
-    """Fixture that ensures database is populated with sample data once for all tests."""
+    """Fixture that ensures database is populated with sample data for each test function."""
     return {
         'users': sample_users,
         'posts': sample_posts,

@@ -1,0 +1,25 @@
+# Development dependencies for BerryQL
+# Include core dependencies
+-r requirements-core.txt
+
+# Async database adapters
+aiosqlite>=0.17.0
+# asyncpg>=0.28.0  # PostgreSQL adapter (commented due to event loop compatibility issues in testing)
+
+# Environment variable support
+python-dotenv>=1.0.0
+
+# Testing framework
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+
+# Code quality and formatting
+black>=22.0.0
+isort>=5.10.0
+mypy>=1.0.0
+flake8>=4.0.0
+pre-commit>=2.15.0
+
+# Type stubs for better type checking
+types-setuptools
