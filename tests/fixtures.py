@@ -14,6 +14,8 @@ async def sample_users(db_session: AsyncSession):
         User(name="Alice Johnson", email="alice@example.com", is_admin=True),
         User(name="Bob Smith", email="bob@example.com", is_admin=False),
         User(name="Charlie Brown", email="charlie@example.com", is_admin=False),
+        # User with no posts
+        User(name="Dave NoPosts", email="dave@example.com", is_admin=False),
     ]
     
     db_session.add_all(users)
@@ -28,7 +30,10 @@ async def sample_users(db_session: AsyncSession):
 @pytest.fixture(scope="function")
 async def sample_posts(db_session: AsyncSession, sample_users):
     """Create sample posts for testing for each test function."""
-    user1, user2, user3 = sample_users
+    # Use the first three users to create posts; the 4th (Dave) has no posts
+    user1 = sample_users[0]
+    user2 = sample_users[1]
+    user3 = sample_users[2]
     
     posts = [
         Post(title="First Post", content="Hello world!", author_id=user1.id),
@@ -50,7 +55,10 @@ async def sample_posts(db_session: AsyncSession, sample_users):
 @pytest.fixture(scope="function")
 async def sample_comments(db_session: AsyncSession, sample_users, sample_posts):
     """Create sample comments for testing for each test function."""
-    user1, user2, user3 = sample_users
+    # Use the first three users for comments
+    user1 = sample_users[0]
+    user2 = sample_users[1]
+    user3 = sample_users[2]
     post1, post2, post3, post4, post5 = sample_posts
     
     comments = [

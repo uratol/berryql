@@ -64,16 +64,16 @@ class TestBerryQLIntegration:
             }
         }
         """
-        
+
         result = await graphql_schema.execute(query, context_value=graphql_context)
-        
+
         assert result.errors is None
         assert result.data is not None
         assert 'users' in result.data
-        
+
         users = result.data['users']
-        assert len(users) == 3  # We have 3 sample users
-        
+        assert len(users) == 4  # We have 4 sample users
+
         # Check that relationships are properly loaded
         alice = next(user for user in users if user['name'] == 'Alice Johnson')
         assert len(alice['posts']) == 2  # Alice has 2 posts
@@ -133,7 +133,7 @@ class TestBerryQLIntegration:
             assert 'users' in result.data
             
             users = result.data['users']
-            assert len(users) == 3  # We have 3 sample users
+            assert len(users) == 4  # We have 4 sample users
             
             # Check that Alice's posts have comments
             alice = next(user for user in users if user['name'] == 'Alice Johnson')
@@ -195,27 +195,27 @@ class TestBerryQLIntegration:
             }
         }
         """
-        
+
         # graphql_context uses Alice (user_id=1) who is admin
         result = await graphql_schema.execute(query, context_value=graphql_context)
-        
+
         assert result.errors is None
         assert result.data is not None
-        
+
         users = result.data['users']
-        assert len(users) == 3  # Admin can see all 3 users
-        
+        assert len(users) == 4  # Admin can see all 4 users
+
         # Verify we have all users including admin status
         user_names = [user['name'] for user in users]
         assert 'Alice Johnson' in user_names
         assert 'Bob Smith' in user_names
         assert 'Charlie Brown' in user_names
-        
+
         # Verify admin status
         alice = next(user for user in users if user['name'] == 'Alice Johnson')
         bob = next(user for user in users if user['name'] == 'Bob Smith')
         charlie = next(user for user in users if user['name'] == 'Charlie Brown')
-        
+
         assert alice['isAdmin'] == True
         assert bob['isAdmin'] == False
         assert charlie['isAdmin'] == False
@@ -781,14 +781,9 @@ class TestBerryQLIntegration:
         assert "Alice Johnson" not in user_names  # Alice should be excluded (current user)
 
     @pytest.mark.asyncio
-    async def test_bloggers_excludes_users_with_no_posts(self, graphql_schema, graphql_context, db_session, populated_db):
+    async def test_bloggers_excludes_users_with_no_posts(self, graphql_schema, graphql_context, populated_db):
         """Add a user with no posts and verify bloggers returns only users with posts."""
-        # Arrange: add a new user without any posts
-        from .models import User
-        newbie = User(name="Dave NoPosts", email="dave@example.com", is_admin=False)
-        db_session.add(newbie)
-        await db_session.flush()
-        await db_session.commit()
+        # Dave NoPosts is included in common fixtures with no posts
 
         # Act: query bloggers
         query = """
@@ -808,7 +803,7 @@ class TestBerryQLIntegration:
         assert result.data is not None
         bloggers = result.data['bloggers']
         assert isinstance(bloggers, list)
-        # From fixtures: Alice, Bob, Charlie all have posts; newbie has none
+        # From fixtures: Alice, Bob, Charlie all have posts; user_no_posts has none
         blogger_names = [u['name'] for u in bloggers]
         assert "Alice Johnson" in blogger_names
         assert "Bob Smith" in blogger_names
