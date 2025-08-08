@@ -804,6 +804,19 @@ def berryql_field(
                     
                     for param_name, value in berryql_kwargs.items():
                         if param_name not in ['info', 'db', 'database', 'session'] and value is not None:
+                            # Special handling for 'where' parameter
+                            if param_name == 'where':
+                                # Convert Strawberry input type to dictionary format
+                                from .input_converter import convert_where_input
+                                if hasattr(value, '__dict__'):
+                                    # This is a Strawberry input type - convert it
+                                    converted_where = convert_where_input(value.__dict__)
+                                    where_conditions.update(converted_where)
+                                elif isinstance(value, dict):
+                                    # Already a dictionary - use directly
+                                    where_conditions.update(value)
+                                continue
+                            
                             # Check if this parameter has an explicit mapping
                             if actual_parameter_mappings and param_name in actual_parameter_mappings:
                                 mapping = actual_parameter_mappings[param_name]

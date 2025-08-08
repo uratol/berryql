@@ -711,9 +711,8 @@ class QueryBuilder:
                 else:
                     resolved_where = custom_where(info)
                 
-                # Double-check if we still have a coroutine (shouldn't happen but let's be safe)
+                # Double-check if we still have a coroutine
                 if asyncio.iscoroutine(resolved_where):
-                    logger.warning(f"custom_where returned a coroutine despite being awaited: {custom_where}")
                     resolved_where = await resolved_where
             else:
                 resolved_where = custom_where
