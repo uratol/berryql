@@ -12,6 +12,7 @@ import logging
 import json
 import re
 import dataclasses
+import asyncio
 from typing import Optional, List, Dict, Any, Type, Set, Union, get_type_hints, cast, TypeVar, Callable, Awaitable
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, asc, desc, inspect
@@ -652,7 +653,7 @@ class QueryBuilder:
         
         return columns
     
-    def build_entity_subquery(
+    async def build_entity_subquery(
         self,
         strawberry_type: Type,
         model_class: Type,
@@ -701,17 +702,23 @@ class QueryBuilder:
         
         # Apply where conditions
         if custom_where:
-            # Check if custom_where is callable and needs info/context
+            
             if callable(custom_where):
-                try:
-                    # Try calling with info parameter first
-                    resolved_custom_where = custom_where(info) if info else custom_where()
-                except TypeError:
-                    # Fallback to calling without parameters if it fails
-                    resolved_custom_where = custom_where()
-                subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, resolved_custom_where)
+                
+                # Check if the callable is async
+                if asyncio.iscoroutinefunction(custom_where):
+                    resolved_where = await custom_where(info)
+                else:
+                    resolved_where = custom_where(info)
+                
+                # Double-check if we still have a coroutine (shouldn't happen but let's be safe)
+                if asyncio.iscoroutine(resolved_where):
+                    logger.warning(f"custom_where returned a coroutine despite being awaited: {custom_where}")
+                    resolved_where = await resolved_where
             else:
-                subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, custom_where)
+                resolved_where = custom_where
+                
+            subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, resolved_where)
         if params.where:
             subquery = QueryConditionProcessor.apply_where_conditions(subquery, model_class, params.where)
         
@@ -901,7 +908,7 @@ class BerryQLFactory:
         custom_order = self._get_custom_config(strawberry_type, self._custom_order_config, default=["id"])
         
         # Build entity subquery with all required fields
-        entity_subquery = self.query_builder.build_entity_subquery(
+        entity_subquery = await self.query_builder.build_entity_subquery(
             strawberry_type, model_class, requested_fields, custom_where, params, parent_id_column, info
         )
         
