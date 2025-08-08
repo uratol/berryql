@@ -4,7 +4,9 @@
 
 # Async database adapters
 aiosqlite>=0.17.0
-# asyncpg>=0.28.0  # PostgreSQL adapter (commented due to event loop compatibility issues in testing)
+asyncpg>=0.28.0  # PostgreSQL adapter (now working with Windows event loop policy)
+aioodbc>=0.5.0  # SQL Server adapter
+pyodbc>=5.2.0   # ODBC driver for SQL Server
 
 # Environment variable support
 python-dotenv>=1.0.0

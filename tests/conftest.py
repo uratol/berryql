@@ -65,16 +65,7 @@ async def engine():
             
         except Exception as e:
             print(f"Failed to connect to external database ({test_db_url}): {e}")
-            print("Falling back to SQLite in-memory database")
-            # Fall back to SQLite
-            engine = create_async_engine(
-                "sqlite+aiosqlite:///:memory:",
-                echo=True,  # Enable SQL logging for debugging with SQLite
-                future=True
-            )
-            async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            is_external_db = False
+            raise  # Re-raise the exception to fail the test
     else:
         # Use in-memory SQLite for tests
         engine = create_async_engine(
