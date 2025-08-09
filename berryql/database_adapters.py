@@ -7,7 +7,7 @@ and other database-specific operations to support PostgreSQL, SQLite, and MSSQL.
 
 import logging
 from abc import ABC, abstractmethod
-from sqlalchemy import func, text, literal_column
+from sqlalchemy import func, text, literal_column, literal
 from sqlalchemy.sql import ColumnElement
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -104,34 +104,78 @@ class MSSQLAdapter(DatabaseAdapter):
     
     def json_build_object(self, *args) -> ColumnElement:
         """
-        Build JSON object using SQL Server 2016+ JSON functions.
-        Since MSSQL doesn't have a direct json_build_object equivalent,
-        we need to construct JSON manually or use FOR JSON PATH.
+        Emulate JSON object using safe string concatenation for SQL Server.
+        Handles strings, numbers, booleans (bit), and datetime/date to ISO8601.
         """
         if len(args) % 2 != 0:
             raise ValueError("json_build_object requires an even number of arguments (key-value pairs)")
-        
+
         if len(args) == 0:
             return text("'{}'")
-        
-        # Build JSON object manually using string concatenation
-        # This is a simplified approach - in production, you might want more robust JSON escaping
-        json_parts = []
+
+        from sqlalchemy import case, cast
+        from sqlalchemy.types import String as SAString, Integer as SAInteger
+        from sqlalchemy.types import DateTime, Date, Numeric, Float, Integer, Boolean
+
+        def _json_quote(expr):
+            # Quote and JSON-escape string content
+            # STRING_ESCAPE(expr, 'json') is available on SQL Server 2016+
+            return func.concat(literal('"'), func.STRING_ESCAPE(cast(expr, SAString()), literal('json')), literal('"'))
+
+        def _is_number(sqltype):
+            try:
+                return isinstance(sqltype, (Numeric, Float, Integer))
+            except Exception:
+                return False
+
+        def _is_boolean(sqltype):
+            try:
+                return isinstance(sqltype, Boolean)
+            except Exception:
+                return False
+
+        def _is_datetime(sqltype):
+            try:
+                return isinstance(sqltype, (DateTime, Date))
+            except Exception:
+                return False
+
+        def _json_value(expr):
+            sqltype = getattr(expr, 'type', None)
+            # booleans -> true/false
+            if _is_boolean(sqltype):
+                return case((cast(expr, SAInteger()) == literal(1), literal('true')), else_=literal('false'))
+            # numbers -> no quotes
+            if _is_number(sqltype):
+                return cast(expr, SAString())
+            # datetimes -> ISO 8601 and quote
+            if _is_datetime(sqltype):
+                # CONVERT requires a type token and style literal, not bound params.
+                # Use literal_column to render without binds.
+                iso = func.convert(literal_column("varchar(33)"), expr, literal_column("126"))
+                return _json_quote(iso)
+            # default: string quoted
+            return _json_quote(expr)
+
+        parts = []
         for i in range(0, len(args), 2):
             key = args[i]
-            value = args[i + 1]
-            # Convert key to string literal if it's not already
+            val = args[i + 1]
+            # Derive key name (string literal)
             if hasattr(key, 'text'):
-                key_str = key.text.strip("'\"")
+                key_name = key.text.strip("'\"")
             else:
-                key_str = str(key).strip("'\"")
-            
-            # Create a simple concatenated string for the key-value pair
-            json_parts.append(f'"{key_str}":"' + str(value) + '"')
-        
-        # Join with commas and wrap in braces
-        json_content = ','.join(json_parts)
-        return text(f"'{{{json_content}}}'")
+                key_name = str(key).strip("'\"")
+            key_prefix = func.concat(literal('"'), literal(key_name), literal('":'))
+            pair = func.concat(key_prefix, _json_value(val))
+            parts.append(pair)
+
+        # Join all pairs with commas
+        content = parts[0]
+        for p in parts[1:]:
+            content = func.concat(content, literal(','), p)
+
+        return func.concat(literal('{'), content, literal('}'))
     
     def json_empty_array(self) -> ColumnElement:
         """Return MSSQL JSON empty array literal."""

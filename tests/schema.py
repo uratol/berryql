@@ -46,10 +46,13 @@ class PostType:
     
     @strawberry.field
     @berryql.custom_field(lambda model_class, info: (
-        select(func.json_object(
-            'min_created_at', func.min(Comment.created_at),
-            'comments_count', func.count(Comment.id)
-        ))
+        select(
+            berryql.json_object(
+                info,
+                'min_created_at', func.min(Comment.created_at),
+                'comments_count', func.count(Comment.id)
+            )
+        )
         .select_from(Comment)
         .where(Comment.post_id == model_class.id)
     ))
@@ -58,24 +61,31 @@ class PostType:
         pass
 
     @strawberry.field
-    @berryql.custom_field(
-        select(func.json_object(
-            'id', Comment.id,
-            'content', Comment.content,
-            'post_id', Comment.post_id,
-            'author_id', Comment.author_id,
-            'created_at', Comment.created_at
-        ))
+    @berryql.custom_field(lambda model_class, info: (
+        select(
+            berryql.json_object(
+                info,
+                'id', Comment.id,
+                'content', Comment.content,
+                'post_id', Comment.post_id,
+                'author_id', Comment.author_id,
+                'created_at', Comment.created_at
+            )
+        )
         .select_from(Comment)
-        .where(Comment.post_id == Post.id)
+        .where(Comment.post_id == model_class.id)
         .order_by(Comment.created_at.desc().nullslast(), Comment.id.desc())
         .limit(1)
-    )
+    ))
     async def last_comment(self, info: strawberry.Info) -> Optional[CommentType]:
         """Get post's last comment using pre-resolved data."""
         pass
 
 
+
+@strawberry.type
+class PostAggType:
+    count: Optional[int] = None
 
 
 @strawberry.type
@@ -100,14 +110,16 @@ class UserType:
     
     @strawberry.field
     @berryql.custom_field(lambda model_class, info: (
-        func.coalesce(
-            select(func.count(Post.id))
-            .where(Post.author_id == model_class.id)
-            .scalar_subquery(),
-            0
+        select(
+            berryql.json_object(
+                info,
+                'count', func.count(Post.id)
+            )
         )
+        .select_from(Post)
+        .where(Post.author_id == model_class.id)
     ))
-    async def post_count(self, info: strawberry.Info) -> int:
+    async def post_agg(self, info: strawberry.Info) -> Optional[PostAggType]:
         """Get user's post count using pre-resolved data."""
         pass
     

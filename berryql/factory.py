@@ -315,6 +315,14 @@ class CustomFieldManager:
                 try:
                     # New signature: (model_class, info)
                     custom_column = query_builder(model_class, info)
+                    # If builder returned a selectable, convert to scalar subquery
+                    try:
+                        if hasattr(custom_column, 'scalar_subquery') and callable(getattr(custom_column, 'scalar_subquery')):
+                            # Avoid double-wrapping for already-scalar selects
+                            # SQLAlchemy's ScalarSelect also has scalar_subquery, but calling it again is idempotent
+                            custom_column = custom_column.scalar_subquery()
+                    except Exception:
+                        pass
                     if hasattr(custom_column, 'label'):
                         custom_column = custom_column.label(custom_field_name)
                     custom_columns.append(custom_column)
@@ -564,48 +572,60 @@ class InstanceCreator:
                     is_method = False
                 
                 if is_method:
-                    # For relationship-like methods (lists/dicts), store in _resolved
-                    if isinstance(value, (list, dict)):
+                    # Inspect return type to decide how to handle value
+                    method_obj = getattr(strawberry_type, field_name, None)
+                    rt = None
+                    try:
+                        if callable(method_obj) and hasattr(method_obj, '__annotations__'):
+                            rt = method_obj.__annotations__.get('return')
+                    except Exception:
+                        rt = None
+
+                    # Unwrap Optional[T]
+                    origin = getattr(rt, '__origin__', None)
+                    if origin is Union:
+                        args = getattr(rt, '__args__', ())
+                        for arg in args:
+                            if arg is not type(None):
+                                rt = arg
+                                break
+
+                    # Relationship field if return type is List[...] of Strawberry types
+                    is_list = False
+                    inner_type = None
+                    try:
+                        if hasattr(rt, '__origin__') and rt.__origin__ is list and hasattr(rt, '__args__') and rt.__args__:
+                            is_list = True
+                            inner_type = rt.__args__[0]
+                    except Exception:
+                        is_list = False
+
+                    if is_list:
+                        # Store relationship data under _resolved
                         if '_resolved' not in private_data:
                             private_data['_resolved'] = {}
                         private_data['_resolved'][field_name] = value
-                    else:
-                        # For scalar custom fields, attempt conversion if return type is a Strawberry type
-                        method_obj = getattr(strawberry_type, field_name, None)
-                        target_type = None
-                        try:
-                            if callable(method_obj) and hasattr(method_obj, '__annotations__'):
-                                rt = method_obj.__annotations__.get('return')
-                                # Handle Optional[T]
-                                origin = getattr(rt, '__origin__', None)
-                                if origin is Union:
-                                    args = getattr(rt, '__args__', ())
-                                    for arg in args:
-                                        if arg is not type(None):
-                                            rt = arg
-                                            break
-                                if rt is not None and (hasattr(rt, '__strawberry_definition__') or hasattr(rt, '__strawberry_type__')):
-                                    target_type = rt
-                        except Exception:
-                            target_type = None
-                        if target_type:
-                            # Parse JSON string to dict if needed and convert
-                            data_obj = None
-                            if isinstance(value, str):
-                                try:
-                                    data_obj = json.loads(value)
-                                except Exception:
-                                    data_obj = None
-                            elif isinstance(value, dict):
-                                data_obj = value
-                            if isinstance(data_obj, dict):
-                                converted = InstanceCreator.create_strawberry_instance(target_type, data_obj)
-                                private_data[field_name] = converted
-                            else:
-                                private_data[field_name] = value
+                        continue
+
+                    # Custom object field if return type is a Strawberry type
+                    if rt is not None and (hasattr(rt, '__strawberry_definition__') or hasattr(rt, '__strawberry_type__')):
+                        data_obj = None
+                        if isinstance(value, str):
+                            try:
+                                data_obj = json.loads(value)
+                            except Exception:
+                                data_obj = None
+                        elif isinstance(value, dict):
+                            data_obj = value
+                        if isinstance(data_obj, dict):
+                            converted = InstanceCreator.create_strawberry_instance(rt, data_obj)
+                            private_data[field_name] = converted
                         else:
-                            # For scalar custom fields, store directly as attribute
                             private_data[field_name] = value
+                        continue
+
+                    # Fallback: store scalar directly
+                    private_data[field_name] = value
                     continue
                 
                 # Map to constructor field name if present
@@ -1068,11 +1088,19 @@ class BerryQLFactory:
         
         if is_root:
             rows = result.all()
+            try:
+                result.close()
+            except Exception:
+                pass
             logger.info(f"Root query found {len(rows)} rows")
             active_relationships = relationships if relationship_aggregations else {}
             return self._parse_root_results(rows, strawberry_type, requested_fields, active_relationships)
         else:
             row = result.first()
+            try:
+                result.close()
+            except Exception:
+                pass
             return row[0] if row and row[0] else []
 
     def _get_custom_config(self, strawberry_type: Type, config_dict: Dict[Type, Any], default=None):
@@ -1355,6 +1383,33 @@ class BerryQLFactory:
                         subquery_sql = _re.sub(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.)(\d{1,6})", lambda m: m.group(1) + m.group(2)[:3], subquery_sql)
                     except Exception:
                         pass
+                    # Remove unsupported NULLS LAST/FIRST syntax in ORDER BY for MSSQL
+                    try:
+                        import re as _re
+                        subquery_sql = _re.sub(r"\s+NULLS\s+(LAST|FIRST)", "", subquery_sql, flags=_re.IGNORECASE)
+                    except Exception:
+                        pass
+                    # MSSQL forbids ORDER BY in derived tables unless TOP/OFFSET present;
+                    # append OFFSET 0 ROWS only if a top-level ORDER BY exists (not inside nested parentheses)
+                    try:
+                        def _has_top_level_order_by(sql: str) -> bool:
+                            lvl = 0
+                            i = 0
+                            s = sql.lower()
+                            while i < len(s):
+                                ch = s[i]
+                                if ch == '(': lvl += 1; i += 1; continue
+                                if ch == ')': lvl = max(0, lvl - 1); i += 1; continue
+                                if lvl == 0 and s.startswith('order by', i):
+                                    return True
+                                i += 1
+                            return False
+                        import re as _re
+                        has_offset = _re.search(r"\bOFFSET\s+\d+\s+ROWS\b", subquery_sql, flags=_re.IGNORECASE)
+                        if _has_top_level_order_by(subquery_sql) and not has_offset:
+                            subquery_sql = subquery_sql.rstrip() + " OFFSET 0 ROWS"
+                    except Exception:
+                        pass
                     # Construct SQL: SELECT ISNULL((SELECT col_list FROM (<subquery>) AS alias FOR JSON PATH), '[]')
                     final_sql = (
                         f"SELECT ISNULL((SELECT {col_list} FROM ({subquery_sql}) AS {alias_ref} FOR JSON PATH), '[]')"
@@ -1531,6 +1586,31 @@ class BerryQLFactory:
                 try:
                     import re as _re
                     subquery_sql = _re.sub(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.)(\d{1,6})", lambda m: m.group(1) + m.group(2)[:3], subquery_sql)
+                except Exception:
+                    pass
+                # Remove unsupported NULLS LAST/FIRST syntax in ORDER BY for MSSQL
+                try:
+                    import re as _re
+                    subquery_sql = _re.sub(r"\s+NULLS\s+(LAST|FIRST)", "", subquery_sql, flags=_re.IGNORECASE)
+                except Exception:
+                    pass
+                # MSSQL requires TOP/OFFSET when a top-level ORDER BY exists in derived tables
+                try:
+                    def _has_top_level_order_by(sql: str) -> bool:
+                        lvl = 0
+                        i = 0
+                        s = sql.lower()
+                        while i < len(s):
+                            ch = s[i]
+                            if ch == '(': lvl += 1; i += 1; continue
+                            if ch == ')': lvl = max(0, lvl - 1); i += 1; continue
+                            if lvl == 0 and s.startswith('order by', i):
+                                return True
+                            i += 1
+                        return False
+                    import re as _re
+                    if _has_top_level_order_by(subquery_sql) and not _re.search(r"\bOFFSET\s+\d+\s+ROWS\b", subquery_sql, flags=_re.IGNORECASE):
+                        subquery_sql = subquery_sql.rstrip() + " OFFSET 0 ROWS"
                 except Exception:
                     pass
                 final_sql = f"SELECT ISNULL((SELECT {col_list} FROM ({subquery_sql}) AS {alias_ref} FOR JSON PATH), '[]')"

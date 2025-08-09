@@ -6,6 +6,7 @@ from typing import List, TypeVar, Any, Optional, Callable, Union, Dict, Type, ge
 import strawberry
 from functools import wraps
 from sqlalchemy.sql import ColumnElement
+from sqlalchemy import func
 
 T = TypeVar('T')
 
@@ -1247,7 +1248,12 @@ class BerryQLNamespace:
             async def resolver(self, info: strawberry.Info, *args, **kwargs):
                 # Read the attribute directly; conversion to Strawberry type
                 # is handled earlier in JSON->instance conversion when possible.
-                return getattr(self, func.__name__, None)
+                value = getattr(self, func.__name__, None)
+                # If the attribute wasn't populated, it'll still be the bound method;
+                # return None in that case to avoid leaking a function to GraphQL.
+                if callable(value):
+                    return None
+                return value
 
             # Preserve original annotations so Strawberry sees the right return type
             try:
@@ -1258,5 +1264,25 @@ class BerryQLNamespace:
             return resolver
 
         return decorator
+
+    def json_object(self, info: Any, *args: Any):
+        """Return a dialect-aware JSON object expression.
+        Uses the database adapter detected from info.context['db_session'|'db'].
+        Falls back to SQLite-style json_object if context is missing.
+        """
+        try:
+            db = None
+            if info is not None and hasattr(info, 'context') and info.context:
+                db = info.context.get('db_session') or info.context.get('db') or info.context.get('session')
+            bind = getattr(db, 'bind', None) if db is not None else None
+            if bind is not None:
+                # Lazy import to avoid cycles
+                from .database_adapters import get_database_adapter
+                adapter = get_database_adapter(bind)
+                return adapter.json_build_object(*args)
+        except Exception:
+            pass
+        # Fallback: SQLite-style
+        return func.json_object(*args)
 
 berryql = BerryQLNamespace()

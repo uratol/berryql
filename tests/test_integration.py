@@ -530,7 +530,7 @@ class TestBerryQLIntegration:
                 id
                 name
                 email
-                postCount
+                postAgg { count }
             }
         }
         """
@@ -555,8 +555,8 @@ class TestBerryQLIntegration:
         
         # Check that all users have postCount data
         for user in users2:
-            assert 'postCount' in user, f"User missing postCount: {user}"
-            post_count = user['postCount']
+            assert 'postAgg' in user, f"User missing postAgg: {user}"
+            post_count = user['postAgg']['count']
             assert isinstance(post_count, int), f"postCount should be int, got {type(post_count)}: {post_count}"
             assert post_count >= 0, f"postCount should be non-negative: {post_count}"
     
