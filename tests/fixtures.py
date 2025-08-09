@@ -75,13 +75,14 @@ async def sample_comments(db_session: AsyncSession, sample_users, sample_posts):
     post1, post2, post3, post4, post5 = sample_posts
     
     comments = [
-        Comment(content="Great post!", post_id=post1.id, author_id=user2.id),
-        Comment(content="Thanks for sharing!", post_id=post1.id, author_id=user3.id),
-        Comment(content="I agree completely!", post_id=post2.id, author_id=user2.id),
-        Comment(content="Very helpful tips", post_id=post3.id, author_id=user1.id),
-        Comment(content="Nice work!", post_id=post3.id, author_id=user3.id),
-        Comment(content="Looking forward to more", post_id=post4.id, author_id=user1.id),
-        Comment(content="This helped me a lot", post_id=post5.id, author_id=user2.id),
+        # Assign rates so that default ordering by rate asc is deterministic
+        Comment(content="Great post!", post_id=post1.id, author_id=user2.id, rate=2),
+        Comment(content="Thanks for sharing!", post_id=post1.id, author_id=user3.id, rate=1),
+        Comment(content="I agree completely!", post_id=post2.id, author_id=user2.id, rate=3),
+        Comment(content="Very helpful tips", post_id=post3.id, author_id=user1.id, rate=1),
+        Comment(content="Nice work!", post_id=post3.id, author_id=user3.id, rate=2),
+        Comment(content="Looking forward to more", post_id=post4.id, author_id=user1.id, rate=1),
+        Comment(content="This helped me a lot", post_id=post5.id, author_id=user2.id, rate=5),
     ]
     
     db_session.add_all(comments)

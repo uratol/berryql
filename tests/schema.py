@@ -25,6 +25,7 @@ class CommentAggType:
 class CommentType:
     id: int
     content: str
+    rate: int
     post_id: int
     author_id: int
     created_at: datetime
@@ -40,7 +41,9 @@ class PostType:
     
     @strawberry.field
     @berryql.field
-    async def comments(self, info: strawberry.Info) -> List[CommentType]:
+    async def comments(self, 
+                       info: strawberry.Info,
+                       order_by: Optional[str] = 'rate') -> List[CommentType]:
         """Get post's comments using pre-resolved data."""
         pass
     

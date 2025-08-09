@@ -800,11 +800,15 @@ def berryql_field(
                                         other_params[param_name] = value
                             
                             # Build GraphQLQueryParams with where conditions and other parameters
+                            # Support both snake_case and camelCase argument names from GraphQL
+                            _order_by_arg = other_params.get('order_by')
+                            if _order_by_arg is None:
+                                _order_by_arg = other_params.get('orderBy')
                             query_params = GraphQLQueryParams(
                                 where=where_conditions if where_conditions else None,
-                                limit=other_params.get('limit'),
-                                offset=other_params.get('offset'),
-                                order_by=other_params.get('order_by')
+                                limit=other_params.get('limit') or other_params.get('Limit') or other_params.get('LIMIT'),
+                                offset=other_params.get('offset') or other_params.get('Offset') or other_params.get('OFFSET'),
+                                order_by=_order_by_arg
                             )
                             
                             # Now execute the same unified query logic but for the relationship
@@ -1056,11 +1060,14 @@ def berryql_field(
                                 other_params[param_name] = value
                     
                     # Build GraphQLQueryParams with where conditions and other parameters
+                    _order_by_arg = other_params.get('order_by')
+                    if _order_by_arg is None:
+                        _order_by_arg = other_params.get('orderBy')
                     query_params = GraphQLQueryParams(
                         where=where_conditions if where_conditions else None,
-                        limit=other_params.get('limit'),
-                        offset=other_params.get('offset'),
-                        order_by=other_params.get('order_by')
+                        limit=other_params.get('limit') or other_params.get('Limit') or other_params.get('LIMIT'),
+                        offset=other_params.get('offset') or other_params.get('Offset') or other_params.get('OFFSET'),
+                        order_by=_order_by_arg
                     )
                     
                     # Set the params in resolver_params
@@ -1073,8 +1080,8 @@ def berryql_field(
                     
                     # Call the resolver with extracted parameters
                     if is_relationship_field and relationship_name:
-                        # For relationship fields, pass self to the resolver
-                        return await resolver(self, info, relationship_name)
+                        # For relationship fields, pass through GraphQL args to enable where/order/limit/offset
+                        return await resolver(self, info, relationship_name, **graphql_kwargs)
                     else:
                         # For root fields, don't pass self
                         return await resolver(info=info, **resolver_params)
@@ -1125,6 +1132,18 @@ def berryql_field(
                     async def resolved_data_func(self, info: strawberry.Info, *args, **kwargs):
                         """Return pre-resolved relationship data."""
                         return get_resolved_field_data(self, info, relationship_name)
+                    # Expose the original resolver's signature and annotations so Strawberry
+                    # can generate GraphQL arguments (e.g., orderBy) for relationship fields.
+                    try:
+                        import inspect as _insp
+                        resolved_data_func.__signature__ = _insp.signature(func)
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(func, '__annotations__'):
+                            resolved_data_func.__annotations__ = func.__annotations__.copy()
+                    except Exception:
+                        pass
                     return resolved_data_func
                 else:
                     # Scalar custom field: return attribute set during instance creation

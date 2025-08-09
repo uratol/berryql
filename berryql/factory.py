@@ -85,12 +85,36 @@ class GraphQLQueryParams:
                     return [parsed]
                 else:
                     logger.warning(f"Unexpected order_by format after JSON parsing: {parsed}")
-                    return []
+                    # Fallback to simple parser
+                    return self._parse_simple_order_by(order_by)
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse order_by condition '{order_by}': {e}")
-                return []
+                # Fallback to simple parser like "field desc"
+                return self._parse_simple_order_by(order_by)
         
         return []
+
+    def _parse_simple_order_by(self, order_by_str: str) -> List[Dict[str, str]]:
+        """Parse simple order by string like 'name desc' or multiple comma-separated fields."""
+        if not order_by_str:
+            return []
+        parts = order_by_str.strip().split()
+        if len(parts) == 1:
+            return [{'field': parts[0], 'direction': 'asc'}]
+        elif len(parts) == 2:
+            return [{'field': parts[0], 'direction': parts[1].lower()}]
+        # Support multiple fields: "name asc, id desc"
+        fields = []
+        for field_spec in order_by_str.split(','):
+            field_spec = field_spec.strip()
+            if not field_spec:
+                continue
+            parts = field_spec.split()
+            if len(parts) == 1:
+                fields.append({'field': parts[0], 'direction': 'asc'})
+            elif len(parts) == 2:
+                fields.append({'field': parts[0], 'direction': parts[1].lower()})
+        return fields
 
 
 class FieldMapper:
@@ -693,6 +717,29 @@ class RelationshipProcessor:
     
     def __init__(self, custom_field_manager: CustomFieldManager):
         self.custom_field_manager = custom_field_manager
+
+    def apply_default_arguments(self, strawberry_type: Type, field_name: str, field_arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply default argument values from the Strawberry field method signature.
+        If order_by (or orderBy) is missing but the method defines a default, inject it.
+        """
+        try:
+            updated = dict(field_arguments or {})
+            method = getattr(strawberry_type, field_name, None)
+            if callable(method):
+                import inspect as _insp
+                sig = _insp.signature(method)
+                for pname, param in sig.parameters.items():
+                    # Skip typical non-GraphQL params
+                    if pname in ('self', 'info', 'db', 'database', 'session', 'params'):
+                        continue
+                    if param.default is not _insp._empty:
+                        # For orderBy/order_by, inject if missing
+                        if pname == 'order_by' and 'order_by' not in updated and 'orderBy' not in updated:
+                            updated['order_by'] = param.default
+                        # Optionally, we could support other defaults similarly if needed
+            return updated
+        except Exception:
+            return field_arguments or {}
     
     def process_relationship_fields(
         self, 
@@ -708,6 +755,8 @@ class RelationshipProcessor:
             
             # Create a unique key based on display name + field name + parameters
             field_arguments = field_info.get('field_arguments', {}) if isinstance(field_info, dict) else {}
+            # Apply default arguments from the Strawberry field signature if not provided explicitly
+            field_arguments = self.apply_default_arguments(strawberry_type, actual_field_name, field_arguments)
             field_args_key = self._make_hashable(field_arguments) if field_arguments else ()
             unique_key = (display_name, actual_field_name, field_args_key)
             
@@ -1142,11 +1191,17 @@ class BerryQLFactory:
             rel_config['type'] = related_strawberry_type
             
             # Build nested query parameters
-            field_arguments = rel_config.get('_field_arguments', {})
+            # Field arguments may be stored as '_field_arguments' on processed root relationships
+            # or as 'field_arguments' on nested relationships directly from the analyzer
+            field_arguments = rel_config.get('_field_arguments') or rel_config.get('field_arguments', {})
             
+            # Support both snake_case and camelCase argument names from GraphQL
+            _order_by_arg = field_arguments.get('order_by')
+            if _order_by_arg is None:
+                _order_by_arg = field_arguments.get('orderBy')
             nested_params = GraphQLQueryParams(
                 where=self._parse_where_from_string(field_arguments.get('where')),
-                order_by=self._parse_order_by_from_string(field_arguments.get('order_by')),
+                order_by=self._parse_order_by_from_string(_order_by_arg),
                 offset=field_arguments.get('offset'),
                 limit=field_arguments.get('limit')
             )
@@ -1300,11 +1355,20 @@ class BerryQLFactory:
                     logger.info(f"Nested strawberry type: {nested_related_strawberry_type.__name__}")
                     
                     # Build nested query parameters
-                    field_arguments = rel_config.get('_field_arguments', {})
+                    # Support both processed and raw analyzer keys for nested relationships
+                    field_arguments = rel_config.get('_field_arguments') or rel_config.get('field_arguments', {})
+                    # Apply default args from the Strawberry field method if not provided
+                    field_arguments = self.relationship_processor.apply_default_arguments(
+                        strawberry_type, actual_field_name, field_arguments
+                    )
                     
+                    # Support both snake_case and camelCase argument names from GraphQL
+                    _nested_order_by = field_arguments.get('order_by')
+                    if _nested_order_by is None:
+                        _nested_order_by = field_arguments.get('orderBy')
                     nested_params = GraphQLQueryParams(
                         where=self._parse_where_from_string(field_arguments.get('where')),
-                        order_by=self._parse_order_by_from_string(field_arguments.get('order_by')),
+                        order_by=self._parse_order_by_from_string(_nested_order_by),
                         offset=field_arguments.get('offset'),
                         limit=field_arguments.get('limit')
                     )
@@ -1410,9 +1474,28 @@ class BerryQLFactory:
                             subquery_sql = subquery_sql.rstrip() + " OFFSET 0 ROWS"
                     except Exception:
                         pass
-                    # Construct SQL: SELECT ISNULL((SELECT col_list FROM (<subquery>) AS alias FOR JSON PATH), '[]')
+                    # Build ORDER BY for the outer SELECT (required by MSSQL to preserve JSON array order)
+                    order_by_sql = ""
+                    try:
+                        if params.order_by:
+                            order_elems = []
+                            from .factory import FieldMapper as _FM  # local alias without cycle
+                            for ob in params.order_by:
+                                field = ob.get('field')
+                                direction = ob.get('direction', 'asc').upper()
+                                if field:
+                                    # Map GraphQL field to DB column name using strawberry_type context
+                                    mapped = _FM.map_graphql_field_to_db_column(field, strawberry_type)
+                                    # Quote with alias
+                                    order_elems.append(f"{alias_ref}.[{mapped}] {direction}")
+                            if order_elems:
+                                order_by_sql = " ORDER BY " + ", ".join(order_elems)
+                    except Exception:
+                        # Best-effort; if mapping fails, skip explicit ORDER BY
+                        order_by_sql = ""
+                    # Construct SQL: SELECT ISNULL((SELECT col_list FROM (<subquery>) AS alias [ORDER BY ...] FOR JSON PATH), '[]')
                     final_sql = (
-                        f"SELECT ISNULL((SELECT {col_list} FROM ({subquery_sql}) AS {alias_ref} FOR JSON PATH), '[]')"
+                        f"SELECT ISNULL((SELECT {col_list} FROM ({subquery_sql}) AS {alias_ref}{order_by_sql} FOR JSON PATH), '[]')"
                     )
                     # Return as a column expression
                     return literal_column(f"({final_sql})")
@@ -1565,8 +1648,8 @@ class BerryQLFactory:
         # so that the aggregated JSON array preserves the intended order.
         order_fields = params.order_by or custom_order or []
         if order_fields:
-            # Build a selectable over the subquery and apply ordering using subquery columns
-            ordered_query = select(entity_subquery)
+            # Build a selectable over the subquery's columns and apply ordering
+            ordered_query = select(*[c for c in entity_subquery.c])
             ordered_query = QueryConditionProcessor.apply_ordering(ordered_query, entity_subquery, order_fields)
             entity_subquery = ordered_query.subquery()
         # MSSQL: use FOR JSON PATH to build proper JSON arrays

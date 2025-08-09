@@ -45,6 +45,8 @@ class Comment(Base):
     
     id = Column(Integer, primary_key=True)
     content = Column(String(1000), nullable=False)
+    # Simple rating field used for default ordering in tests
+    rate = Column(Integer, nullable=False, default=0)
     post_id = Column(Integer, ForeignKey('posts.id'), nullable=False)
     author_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))

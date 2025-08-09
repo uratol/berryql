@@ -1008,6 +1008,110 @@ class TestBerryQLIntegration:
         assert last_content_of('Bob Smith', 'Python Best Practices') is not None
         assert last_content_of('Charlie Brown', 'Getting Started') is not None
 
+    @pytest.mark.asyncio
+    async def test_post_comments_order_by_content_desc(self, graphql_schema, graphql_context, populated_db):
+        """Ensure PostType.comments(orderBy: "content desc") sorts comments by content descending."""
+        query = """
+        query {
+            users(nameFilter: "Alice Johnson") {
+                id
+                name
+                posts {
+                    id
+                    title
+                    comments(orderBy: "content desc") {
+                        id
+                        content
+                    }
+                }
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+
+        users = result.data['users']
+        assert len(users) == 1
+        alice = users[0]
+        first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
+        contents = [c['content'] for c in first_post['comments']]
+        # From fixtures for Alice's "First Post":
+        # - "Great post!"
+        # - "Thanks for sharing!"
+        # Descending by content should put "Thanks for sharing!" first
+        assert contents == sorted(contents, reverse=True)
+        assert contents[0] == "Thanks for sharing!"
+
+    @pytest.mark.asyncio
+    async def test_post_comments_order_by_content_asc(self, graphql_schema, graphql_context, populated_db):
+        """Ensure PostType.comments(orderBy: "content asc") sorts comments by content ascending."""
+        query = """
+        query {
+            users(nameFilter: "Alice Johnson") {
+                id
+                name
+                posts {
+                    id
+                    title
+                    comments(orderBy: "content asc") {
+                        id
+                        content
+                    }
+                }
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+
+        users = result.data['users']
+        assert len(users) == 1
+        alice = users[0]
+        first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
+        contents = [c['content'] for c in first_post['comments']]
+        # Ascending by content should put "Great post!" first
+        assert contents == sorted(contents)
+        assert contents[0] == "Great post!"
+
+    @pytest.mark.asyncio
+    async def test_post_comments_default_order_by_rate(self, graphql_schema, graphql_context, populated_db):
+        """Ensure PostType.comments (without orderBy) defaults to order by rate (ascending)."""
+        query = """
+        query {
+            users(nameFilter: "Alice Johnson") {
+                id
+                name
+                posts {
+                    id
+                    title
+                    comments {
+                        id
+                        content
+                        rate
+                    }
+                }
+            }
+        }
+        """
+
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None
+        assert result.data is not None
+
+        users = result.data['users']
+        assert len(users) == 1
+        alice = users[0]
+        first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
+        rates = [c['rate'] for c in first_post['comments']]
+        # With rates [1,2] for Alice's first post, default asc ordering should keep [1,2]
+        assert rates == sorted(rates)
+        # Also check the first is the lower-rated "Great post!"
+        assert first_post['comments'][0]['content'] == "Thanks for sharing!"
+
 
 @pytest.mark.integration
 class TestBerryQLErrorHandling:
