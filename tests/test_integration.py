@@ -181,6 +181,64 @@ class TestBerryQLIntegration:
         assert users[0]['name'] == 'Alice Johnson'
         assert users[0]['isAdmin'] == True  # Alice is admin
         assert len(users[0]['posts']) == 2
+
+    @pytest.mark.asyncio
+    async def test_posts_content_filtering(self, graphql_schema, graphql_context, populated_db):
+        """Test posts field contentFilter argument filters posts by content (ILIKE %value%)."""
+        # Filter Alice's posts for those whose content contains 'GraphQL'
+        query_graphql = """
+        query {
+            users(nameFilter: "Alice") {
+                id
+                name
+                posts(contentFilter: "GraphQL") {
+                    id
+                    title
+                    content
+                }
+            }
+        }
+        """
+        result_graphql = await graphql_schema.execute(query_graphql, context_value=graphql_context)
+        assert result_graphql.errors is None, f"Errors: {result_graphql.errors}"
+        users_graphql = result_graphql.data['users']
+        assert len(users_graphql) == 1
+        alice_graphql = users_graphql[0]
+        filtered_posts = alice_graphql['posts']
+        assert len(filtered_posts) == 1, "Should return only the post whose content includes 'GraphQL'"
+        assert filtered_posts[0]['title'] == 'GraphQL is Great'
+
+        # Case-insensitive check: search with lowercase should still match (ILIKE)
+        query_lower = """
+        query {
+            users(nameFilter: "Alice") {
+                id
+                name
+                posts(contentFilter: "hello") {
+                    title
+                    content
+                }
+            }
+        }
+        """
+        result_lower = await graphql_schema.execute(query_lower, context_value=graphql_context)
+        assert result_lower.errors is None, f"Errors: {result_lower.errors}"
+        posts_lower = result_lower.data['users'][0]['posts']
+        # 'Hello world!' should match
+        assert len(posts_lower) == 1
+        assert posts_lower[0]['title'] == 'First Post'
+
+        # Unmatched filter should return empty list
+        query_none = """
+        query {
+            users(nameFilter: "Alice") {
+                posts(contentFilter: "NoMatchSubstring") { id }
+            }
+        }
+        """
+        result_none = await graphql_schema.execute(query_none, context_value=graphql_context)
+        assert result_none.errors is None, f"Errors: {result_none.errors}"
+        assert result_none.data['users'][0]['posts'] == []
     
     @pytest.mark.asyncio
     async def test_admin_users_can_see_all_users(self, graphql_schema, graphql_context, populated_db):
