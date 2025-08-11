@@ -40,10 +40,14 @@ class PostType:
     created_at: datetime
     
     @strawberry.field
-    @berryql.field
+    @berryql.field(
+        rate_less_than={'rate': {'lt': lambda value: value}}
+    )
     async def comments(self, 
                        info: strawberry.Info,
-                       order_by: Optional[str] = 'rate') -> List[CommentType]:
+                       order_by: Optional[str] = 'rate',
+                       rate_less_than: Optional[int] = None,
+                       ) -> List[CommentType]:
         """Get post's comments using pre-resolved data."""
         pass
     
