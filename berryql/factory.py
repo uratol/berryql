@@ -1233,27 +1233,49 @@ class BerryQLFactory:
             # Parameter mappings now applied at analysis stage (query_analyzer) and merged into 'where' JSON string.
             merged_where = base_where
             try:
-                # Fallback heuristic: auto-convert *Filter / *_filter arguments to ILIKE conditions
-                if isinstance(field_arguments, dict):
-                    for _arg, _val in list(field_arguments.items()):
-                        if _val is None:
+                # 1. Apply explicit parameter mappings set on resolver (runtime lambdas supported)
+                consumed_args = set()
+                resolver_fn = getattr(strawberry_type, actual_field_name, None)
+                explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
+                if explicit_mappings and isinstance(field_arguments, dict):
+                    for _arg, _val in field_arguments.items():
+                        if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
                             continue
-                        if _arg in ['where','order_by','orderBy','limit','offset']:
+                        # Lookup mapping by original or snake_case name
+                        snake_arg = FieldMapper.camel_to_snake(_arg)
+                        mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
+                        if not mapping:
                             continue
-                        base_field = None
-                        if _arg.endswith('_filter') and len(_arg) > 7:
-                            base_field = _arg[:-7]
-                        elif _arg.endswith('Filter') and len(_arg) > 6:
-                            # Convert camelCase base to snake_case
-                            base_field = FieldMapper.camel_to_snake(_arg[:-6])
-                        if base_field:
-                            if merged_where is None or not isinstance(merged_where, dict):
-                                merged_where = {}
-                            existing = merged_where.get(base_field, {}) if isinstance(merged_where.get(base_field), dict) else {}
-                            # Only add ilike if not already specified
-                            if 'ilike' not in existing:
-                                existing['ilike'] = f"%{_val}%"
-                            merged_where[base_field] = existing
+                        if merged_where is None or not isinstance(merged_where, dict):
+                            merged_where = {}
+                        # mapping forms: callable -> dict, or dict structure {field: {op: callable/value}}
+                        if callable(mapping):
+                            produced = mapping(_val)
+                            if isinstance(produced, dict):
+                                for fld, cond in produced.items():
+                                    if isinstance(cond, dict):
+                                        existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
+                                        for op, op_val in cond.items():
+                                            existing[op] = op_val
+                                        merged_where[fld] = existing
+                                    else:
+                                        merged_where[fld] = {'eq': cond}
+                        elif isinstance(mapping, dict):
+                            for fld, cond in mapping.items():
+                                if callable(cond):
+                                    cond = cond(_val)
+                                if isinstance(cond, dict):
+                                    # Operators mapping
+                                    existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
+                                    for op, op_val in cond.items():
+                                        if callable(op_val):
+                                            op_val = op_val(_val)
+                                        existing[op] = op_val
+                                    merged_where[fld] = existing
+                                else:
+                                    merged_where[fld] = {'eq': cond}
+                        consumed_args.add(_arg)
+                # Heuristic fallback removed per design decision: only explicit mappings are honored.
             except Exception:
                 pass
 
@@ -1424,8 +1446,54 @@ class BerryQLFactory:
                     _nested_order_by = field_arguments.get('order_by')
                     if _nested_order_by is None:
                         _nested_order_by = field_arguments.get('orderBy')
+                    # Start with explicit 'where' argument (string) if provided
+                    nested_base_where = self._parse_where_from_string(field_arguments.get('where'))
+                    nested_merged_where = nested_base_where
+                    try:
+                        # Apply explicit parameter mappings (runtime lambdas) for nested relationship field
+                        consumed_args = set()
+                        resolver_fn = getattr(strawberry_type, actual_field_name, None)
+                        explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
+                        if explicit_mappings and isinstance(field_arguments, dict):
+                            for _arg, _val in field_arguments.items():
+                                if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
+                                    continue
+                                snake_arg = FieldMapper.camel_to_snake(_arg)
+                                mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
+                                if not mapping:
+                                    continue
+                                if nested_merged_where is None or not isinstance(nested_merged_where, dict):
+                                    nested_merged_where = {}
+                                if callable(mapping):
+                                    produced = mapping(_val)
+                                    if isinstance(produced, dict):
+                                        for fld, cond in produced.items():
+                                            if isinstance(cond, dict):
+                                                existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
+                                                for op, op_val in cond.items():
+                                                    existing[op] = op_val
+                                                nested_merged_where[fld] = existing
+                                            else:
+                                                nested_merged_where[fld] = {'eq': cond}
+                                elif isinstance(mapping, dict):
+                                    for fld, cond in mapping.items():
+                                        if callable(cond):
+                                            cond = cond(_val)
+                                        if isinstance(cond, dict):
+                                            existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
+                                            for op, op_val in cond.items():
+                                                if callable(op_val):
+                                                    op_val = op_val(_val)
+                                                existing[op] = op_val
+                                            nested_merged_where[fld] = existing
+                                        else:
+                                            nested_merged_where[fld] = {'eq': cond}
+                                consumed_args.add(_arg)
+                        # Heuristic fallback removed; ignore unmapped filter-like arguments.
+                    except Exception:
+                        pass
                     nested_params = GraphQLQueryParams(
-                        where=self._parse_where_from_string(field_arguments.get('where')),
+                        where=nested_merged_where,
                         order_by=self._parse_order_by_from_string(_nested_order_by),
                         offset=field_arguments.get('offset'),
                         limit=field_arguments.get('limit')

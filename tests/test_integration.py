@@ -239,6 +239,62 @@ class TestBerryQLIntegration:
         result_none = await graphql_schema.execute(query_none, context_value=graphql_context)
         assert result_none.errors is None, f"Errors: {result_none.errors}"
         assert result_none.data['users'][0]['posts'] == []
+
+    @pytest.mark.asyncio
+    async def test_post_comments_rate_less_than_filter(self, graphql_schema, graphql_context, populated_db):
+        """Test nested comments(rateLessThan) argument filters comments by rate (< value)."""
+        # Query Alice's posts and filter comments with rateLessThan: 3 (should exclude rate >=3)
+        query_rate_lt = """
+        query {
+            users(nameFilter: "Alice") {
+                id
+                posts {
+                    id
+                    title
+                    comments(rateLessThan: 3) {
+                        id
+                        rate
+                        content
+                    }
+                }
+            }
+        }
+        """
+        result_rate_lt = await graphql_schema.execute(query_rate_lt, context_value=graphql_context)
+        assert result_rate_lt.errors is None, f"Errors: {result_rate_lt.errors}"
+        users = result_rate_lt.data['users']
+        assert len(users) == 1
+        alice = users[0]
+        for post in alice['posts']:
+            if post['title'] == 'First Post':
+                # First Post has comment rates 2 and 1 in fixtures; both are <3
+                comment_rates = sorted(c['rate'] for c in post['comments'])
+                assert comment_rates == [1, 2]
+            elif post['title'] == 'GraphQL is Great':
+                # GraphQL is Great has one comment rate 3 (==3) so with <3 filter should exclude it
+                assert post['comments'] == []
+
+        # Stricter filter (rateLessThan: 2) should remove the rate 2 comment as well
+        query_rate_lt_2 = """
+        query {
+            users(nameFilter: "Alice") {
+                posts {
+                    id
+                    title
+                    comments(rateLessThan: 2) { id rate }
+                }
+            }
+        }
+        """
+        result_rate_lt_2 = await graphql_schema.execute(query_rate_lt_2, context_value=graphql_context)
+        assert result_rate_lt_2.errors is None, f"Errors: {result_rate_lt_2.errors}"
+        for post in result_rate_lt_2.data['users'][0]['posts']:
+            if post['title'] == 'First Post':
+                # <2 should keep only rate 1
+                rates = sorted(c['rate'] for c in post['comments'])
+                assert rates == [1]
+            else:
+                assert post['comments'] == []
     
     @pytest.mark.asyncio
     async def test_admin_users_can_see_all_users(self, graphql_schema, graphql_context, populated_db):
