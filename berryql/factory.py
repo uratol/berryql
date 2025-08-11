@@ -76,18 +76,23 @@ class GraphQLQueryParams:
         if isinstance(order_by, str):
             if not order_by.strip():
                 return []
-            try:
-                parsed = json.loads(order_by.strip())
-                if isinstance(parsed, list):
-                    return parsed
-                elif isinstance(parsed, dict):
-                    return [parsed]
-                else:
-                    logger.warning(f"Unexpected order_by format after JSON parsing: {parsed}")
-                    # Fallback to simple parser
-                    return self._parse_simple_order_by(order_by)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid order_by JSON: {e}: {order_by}")
+            s = order_by.strip()
+            # Heuristic: only attempt JSON parsing if the string appears to be JSON
+            if s.startswith('{') or s.startswith('['):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return parsed
+                    elif isinstance(parsed, dict):
+                        return [parsed]
+                    else:
+                        logger.warning(f"Unexpected order_by JSON structure: {parsed}")
+                        return []
+                except json.JSONDecodeError as e:
+                    # User intended JSON (starts with { or [) – raise to surface real parsing error
+                    raise ValueError(f"Invalid order_by JSON: {e}: {order_by}")
+            # Treat as simple order-by expression(s) (e.g., "name desc", "name asc, id desc")
+            return self._parse_simple_order_by(s)
         
         return []
 
