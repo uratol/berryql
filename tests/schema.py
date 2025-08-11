@@ -100,8 +100,13 @@ class UserType:
     created_at: datetime
     
     @strawberry.field
-    @berryql.field
-    async def posts(self, info: strawberry.Info) -> List[PostType]:
+    @berryql.field(
+        content_filter={'content': {'ilike': lambda value: f'%{value}%'}},
+    )
+    async def posts(self, 
+                    info: strawberry.Info,
+                    content_filter: Optional[str] = None
+                    ) -> List[PostType]:
         """Get user's posts using pre-resolved data with comments aggregation."""
         pass
     
@@ -167,7 +172,7 @@ class Query:
     @berryql.field(
         model_class=User,
         name_filter={'name': {'like': lambda value: f'%{value}%'}},
-    custom_where=lambda info=None: _get_user_filter(info)
+        custom_where=lambda info=None: _get_user_filter(info)
     )
     async def users(
         self,
