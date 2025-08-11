@@ -62,8 +62,7 @@ class GraphQLQueryParams:
             try:
                 return json.loads(where.strip())
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse where condition '{where}': {e}")
-                return {}
+                raise ValueError(f"Invalid where JSON: {e}: {where}")
         return where or {}
     
     def _parse_order_by_parameter(self, order_by: Optional[Union[List[Dict[str, str]], str]]) -> List[Dict[str, str]]:
@@ -88,9 +87,7 @@ class GraphQLQueryParams:
                     # Fallback to simple parser
                     return self._parse_simple_order_by(order_by)
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse order_by condition '{order_by}': {e}")
-                # Fallback to simple parser like "field desc"
-                return self._parse_simple_order_by(order_by)
+                raise ValueError(f"Invalid order_by JSON: {e}: {order_by}")
         
         return []
 
@@ -991,12 +988,20 @@ class BerryQLFactory:
             params: Optional[GraphQLQueryParams] = None,
             **kwargs
         ) -> Union[List[T], Optional[T]]:
+            # Build params from kwargs if not explicitly provided
+            effective_params = params
+            if effective_params is None:
+                where_arg = kwargs.get('where')
+                order_by_arg = kwargs.get('order_by') or kwargs.get('orderBy')
+                limit_arg = kwargs.get('limit')
+                offset_arg = kwargs.get('offset')
+                effective_params = GraphQLQueryParams(where=where_arg, order_by=order_by_arg, limit=limit_arg, offset=offset_arg)
             result = await self._execute_unified_query(
                 strawberry_type=strawberry_type,
                 model_class=model_class,
                 db=db,
                 info=info,
-                params=params or GraphQLQueryParams(),
+                params=effective_params,
                 is_root=True,
                 **kwargs
             )
@@ -1057,29 +1062,25 @@ class BerryQLFactory:
 
         # Populate missing relationship field arguments using selected_fields (avoid deprecated field_nodes)
         if info and hasattr(info, 'selected_fields') and info.selected_fields:
-            try:
-                # selected_fields[0] corresponds to the root resolver field
-                root_sel = info.selected_fields[0] if len(info.selected_fields) > 0 else None
-                if root_sel and getattr(root_sel, 'selections', None):
-                    for sel in root_sel.selections:
-                        # sel is a SelectedField; extract name and arguments
-                        field_name = getattr(sel, 'name', None)
-                        if not field_name:
-                            continue
-                        arg_dict = getattr(sel, 'arguments', None) or {}
-                        if arg_dict:
-                            rel_entry = query_analysis['relationship_fields'].get(field_name)
-                            if isinstance(rel_entry, dict):
-                                existing_args = rel_entry.get('field_arguments') or {}
-                                if not existing_args:
-                                    rel_entry['field_arguments'] = arg_dict
-                            elif rel_entry is not None:
-                                query_analysis['relationship_fields'][field_name] = {
-                                    'type': rel_entry,
-                                    'field_arguments': arg_dict
-                                }
-            except Exception:
-                pass
+            # selected_fields[0] corresponds to the root resolver field
+            root_sel = info.selected_fields[0] if len(info.selected_fields) > 0 else None
+            if root_sel and getattr(root_sel, 'selections', None):
+                for sel in root_sel.selections:
+                    field_name = getattr(sel, 'name', None)
+                    if not field_name:
+                        continue
+                    arg_dict = getattr(sel, 'arguments', None) or {}
+                    if arg_dict:
+                        rel_entry = query_analysis['relationship_fields'].get(field_name)
+                        if isinstance(rel_entry, dict):
+                            existing_args = rel_entry.get('field_arguments') or {}
+                            if not existing_args:
+                                rel_entry['field_arguments'] = arg_dict
+                        elif rel_entry is not None:
+                            query_analysis['relationship_fields'][field_name] = {
+                                'type': rel_entry,
+                                'field_arguments': arg_dict
+                            }
         
         # Get alias mapping to resolve display names to actual field names
         alias_mapping = query_analyzer.get_aliased_field_mapping(query_analysis) if info else {}
@@ -1232,52 +1233,45 @@ class BerryQLFactory:
 
             # Parameter mappings now applied at analysis stage (query_analyzer) and merged into 'where' JSON string.
             merged_where = base_where
-            try:
-                # 1. Apply explicit parameter mappings set on resolver (runtime lambdas supported)
-                consumed_args = set()
-                resolver_fn = getattr(strawberry_type, actual_field_name, None)
-                explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
-                if explicit_mappings and isinstance(field_arguments, dict):
-                    for _arg, _val in field_arguments.items():
-                        if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
-                            continue
-                        # Lookup mapping by original or snake_case name
-                        snake_arg = FieldMapper.camel_to_snake(_arg)
-                        mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
-                        if not mapping:
-                            continue
-                        if merged_where is None or not isinstance(merged_where, dict):
-                            merged_where = {}
-                        # mapping forms: callable -> dict, or dict structure {field: {op: callable/value}}
-                        if callable(mapping):
-                            produced = mapping(_val)
-                            if isinstance(produced, dict):
-                                for fld, cond in produced.items():
-                                    if isinstance(cond, dict):
-                                        existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
-                                        for op, op_val in cond.items():
-                                            existing[op] = op_val
-                                        merged_where[fld] = existing
-                                    else:
-                                        merged_where[fld] = {'eq': cond}
-                        elif isinstance(mapping, dict):
-                            for fld, cond in mapping.items():
-                                if callable(cond):
-                                    cond = cond(_val)
+            # 1. Apply explicit parameter mappings set on resolver (runtime lambdas supported)
+            consumed_args = set()
+            resolver_fn = getattr(strawberry_type, actual_field_name, None)
+            explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
+            if explicit_mappings and isinstance(field_arguments, dict):
+                for _arg, _val in field_arguments.items():
+                    if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
+                        continue
+                    snake_arg = FieldMapper.camel_to_snake(_arg)
+                    mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
+                    if not mapping:
+                        continue
+                    if merged_where is None or not isinstance(merged_where, dict):
+                        merged_where = {}
+                    if callable(mapping):
+                        produced = mapping(_val)
+                        if isinstance(produced, dict):
+                            for fld, cond in produced.items():
                                 if isinstance(cond, dict):
-                                    # Operators mapping
                                     existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
                                     for op, op_val in cond.items():
-                                        if callable(op_val):
-                                            op_val = op_val(_val)
                                         existing[op] = op_val
                                     merged_where[fld] = existing
                                 else:
                                     merged_where[fld] = {'eq': cond}
-                        consumed_args.add(_arg)
-                # Heuristic fallback removed per design decision: only explicit mappings are honored.
-            except Exception:
-                pass
+                    elif isinstance(mapping, dict):
+                        for fld, cond in mapping.items():
+                            if callable(cond):
+                                cond = cond(_val)
+                            if isinstance(cond, dict):
+                                existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
+                                for op, op_val in cond.items():
+                                    if callable(op_val):
+                                        op_val = op_val(_val)
+                                    existing[op] = op_val
+                                merged_where[fld] = existing
+                            else:
+                                merged_where[fld] = {'eq': cond}
+                    consumed_args.add(_arg)
 
             nested_params = GraphQLQueryParams(
                 where=merged_where,
@@ -1449,49 +1443,45 @@ class BerryQLFactory:
                     # Start with explicit 'where' argument (string) if provided
                     nested_base_where = self._parse_where_from_string(field_arguments.get('where'))
                     nested_merged_where = nested_base_where
-                    try:
-                        # Apply explicit parameter mappings (runtime lambdas) for nested relationship field
-                        consumed_args = set()
-                        resolver_fn = getattr(strawberry_type, actual_field_name, None)
-                        explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
-                        if explicit_mappings and isinstance(field_arguments, dict):
-                            for _arg, _val in field_arguments.items():
-                                if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
-                                    continue
-                                snake_arg = FieldMapper.camel_to_snake(_arg)
-                                mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
-                                if not mapping:
-                                    continue
-                                if nested_merged_where is None or not isinstance(nested_merged_where, dict):
-                                    nested_merged_where = {}
-                                if callable(mapping):
-                                    produced = mapping(_val)
-                                    if isinstance(produced, dict):
-                                        for fld, cond in produced.items():
-                                            if isinstance(cond, dict):
-                                                existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
-                                                for op, op_val in cond.items():
-                                                    existing[op] = op_val
-                                                nested_merged_where[fld] = existing
-                                            else:
-                                                nested_merged_where[fld] = {'eq': cond}
-                                elif isinstance(mapping, dict):
-                                    for fld, cond in mapping.items():
-                                        if callable(cond):
-                                            cond = cond(_val)
+                    # Apply explicit parameter mappings (runtime lambdas) for nested relationship field
+                    consumed_args = set()
+                    resolver_fn = getattr(strawberry_type, actual_field_name, None)
+                    explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
+                    if explicit_mappings and isinstance(field_arguments, dict):
+                        for _arg, _val in field_arguments.items():
+                            if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
+                                continue
+                            snake_arg = FieldMapper.camel_to_snake(_arg)
+                            mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
+                            if not mapping:
+                                continue
+                            if nested_merged_where is None or not isinstance(nested_merged_where, dict):
+                                nested_merged_where = {}
+                            if callable(mapping):
+                                produced = mapping(_val)
+                                if isinstance(produced, dict):
+                                    for fld, cond in produced.items():
                                         if isinstance(cond, dict):
                                             existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
                                             for op, op_val in cond.items():
-                                                if callable(op_val):
-                                                    op_val = op_val(_val)
                                                 existing[op] = op_val
                                             nested_merged_where[fld] = existing
                                         else:
                                             nested_merged_where[fld] = {'eq': cond}
-                                consumed_args.add(_arg)
-                        # Heuristic fallback removed; ignore unmapped filter-like arguments.
-                    except Exception:
-                        pass
+                            elif isinstance(mapping, dict):
+                                for fld, cond in mapping.items():
+                                    if callable(cond):
+                                        cond = cond(_val)
+                                    if isinstance(cond, dict):
+                                        existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
+                                        for op, op_val in cond.items():
+                                            if callable(op_val):
+                                                op_val = op_val(_val)
+                                            existing[op] = op_val
+                                        nested_merged_where[fld] = existing
+                                    else:
+                                        nested_merged_where[fld] = {'eq': cond}
+                            consumed_args.add(_arg)
                     nested_params = GraphQLQueryParams(
                         where=nested_merged_where,
                         order_by=self._parse_order_by_from_string(_nested_order_by),

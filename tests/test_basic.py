@@ -75,9 +75,10 @@ def test_graphql_query_params_json_where():
     params = GraphQLQueryParams(where='')
     assert params.where == {}
     
-    # Test with invalid JSON
-    params = GraphQLQueryParams(where='invalid json')
-    assert params.where == {}
+    # Test with invalid JSON now raises ValueError (strict parsing)
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        GraphQLQueryParams(where='invalid json')
 
 
 @pytest.mark.asyncio

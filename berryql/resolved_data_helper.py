@@ -795,7 +795,11 @@ def berryql_field(
                                                 else:
                                                     where_conditions[field_name] = {'eq': condition}
                                     else:
-                                        other_params[param_name] = value
+                                        # Preserve raw where string for validation in GraphQLQueryParams
+                                        if param_name == 'where' and isinstance(value, str):
+                                            other_params[param_name] = value
+                                        else:
+                                            other_params[param_name] = value
                             
                             # Build GraphQLQueryParams with where conditions and other parameters
                             # Support both snake_case and camelCase argument names from GraphQL
@@ -803,7 +807,7 @@ def berryql_field(
                             if _order_by_arg is None:
                                 _order_by_arg = other_params.get('orderBy')
                             query_params = GraphQLQueryParams(
-                                where=where_conditions if where_conditions else None,
+                                where=where_conditions if where_conditions else other_params.get('where'),
                                 limit=other_params.get('limit') or other_params.get('Limit') or other_params.get('LIMIT'),
                                 offset=other_params.get('offset') or other_params.get('Offset') or other_params.get('OFFSET'),
                                 order_by=_order_by_arg
@@ -1014,6 +1018,8 @@ def berryql_field(
                             if param_name == 'where':
                                 # Convert Strawberry input type to dictionary format
                                 from .input_converter import convert_where_input
+                                # Track raw where string to allow JSON parsing/validation later
+                                raw_where_value = None
                                 if hasattr(value, '__dict__'):
                                     # This is a Strawberry input type - convert it
                                     converted_where = convert_where_input(value.__dict__)
@@ -1021,6 +1027,9 @@ def berryql_field(
                                 elif isinstance(value, dict):
                                     # Already a dictionary - use directly
                                     where_conditions.update(value)
+                                elif isinstance(value, str):
+                                    # Defer JSON parsing/validation to GraphQLQueryParams by passing raw string
+                                    raw_where_value = value
                                 continue
                             
                             # Check if this parameter has an explicit mapping (support camelCase GraphQL arg names)
@@ -1072,7 +1081,7 @@ def berryql_field(
                     if _order_by_arg is None:
                         _order_by_arg = other_params.get('orderBy')
                     query_params = GraphQLQueryParams(
-                        where=where_conditions if where_conditions else None,
+                        where=where_conditions if where_conditions else (raw_where_value if 'raw_where_value' in locals() else None),
                         limit=other_params.get('limit') or other_params.get('Limit') or other_params.get('LIMIT'),
                         offset=other_params.get('offset') or other_params.get('Offset') or other_params.get('OFFSET'),
                         order_by=_order_by_arg
