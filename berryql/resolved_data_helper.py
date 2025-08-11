@@ -530,6 +530,7 @@ def get_resolved_field_data(instance: Any, info: strawberry.Info, relationship_n
     return result if result is not None else []
 
 
+
 class ResolvedDataMixin:
     """Mixin class that provides convenient methods for accessing resolved data."""
     
@@ -763,40 +764,37 @@ def berryql_field(
                             
                             for param_name, value in graphql_kwargs.items():
                                 if value is not None:
-                                    # Check if this parameter has an explicit mapping
-                                    if actual_parameter_mappings and param_name in actual_parameter_mappings:
-                                        mapping = actual_parameter_mappings[param_name]
-                                        
+                                    mapping = None
+                                    if actual_parameter_mappings:
+                                        # Direct lookup first
+                                        if param_name in actual_parameter_mappings:
+                                            mapping = actual_parameter_mappings[param_name]
+                                        else:
+                                            # Attempt camelCase -> snake_case conversion
+                                            import re
+                                            snake_candidate = re.sub(r'(?<!^)(?=[A-Z])', '_', param_name).lower()
+                                            if snake_candidate in actual_parameter_mappings:
+                                                mapping = actual_parameter_mappings[snake_candidate]
+                                    if mapping is not None:
                                         if callable(mapping):
-                                            # If mapping is a callable, call it with the value
                                             where_clause = mapping(value)
                                             if isinstance(where_clause, dict):
                                                 where_conditions.update(where_clause)
                                         elif isinstance(mapping, dict):
-                                            # If mapping is a dict, process it
                                             for field_name, condition in mapping.items():
                                                 if isinstance(condition, dict):
-                                                    # Direct field condition like {'like': '%value%'}
                                                     if any(callable(v) for v in condition.values()):
-                                                        # Contains callables - process them
                                                         processed_condition = {}
                                                         for op, op_value in condition.items():
-                                                            if callable(op_value):
-                                                                processed_condition[op] = op_value(value)
-                                                            else:
-                                                                processed_condition[op] = op_value
+                                                            processed_condition[op] = op_value(value) if callable(op_value) else op_value
                                                         where_conditions[field_name] = processed_condition
                                                     else:
-                                                        # Static condition
                                                         where_conditions[field_name] = condition
                                                 elif callable(condition):
-                                                    # Field condition is a callable
                                                     where_conditions[field_name] = condition(value)
                                                 else:
-                                                    # Simple field condition
                                                     where_conditions[field_name] = {'eq': condition}
                                     else:
-                                        # No explicit mapping - treat as other parameter
                                         other_params[param_name] = value
                             
                             # Build GraphQLQueryParams with where conditions and other parameters
@@ -890,6 +888,8 @@ def berryql_field(
                         return relationship_resolver
                     
                     resolver = create_relationship_resolver()
+                    if actual_parameter_mappings:
+                        setattr(resolver, '_berryql_parameter_mappings', actual_parameter_mappings)
                 else:
                     # For non-relationship fields, use the standard factory resolver
                     factory = BerryQLFactory()
@@ -1023,9 +1023,17 @@ def berryql_field(
                                     where_conditions.update(value)
                                 continue
                             
-                            # Check if this parameter has an explicit mapping
-                            if actual_parameter_mappings and param_name in actual_parameter_mappings:
-                                mapping = actual_parameter_mappings[param_name]
+                            # Check if this parameter has an explicit mapping (support camelCase GraphQL arg names)
+                            mapping = None
+                            if actual_parameter_mappings:
+                                if param_name in actual_parameter_mappings:
+                                    mapping = actual_parameter_mappings[param_name]
+                                else:
+                                    import re
+                                    snake_candidate = re.sub(r'(?<!^)(?=[A-Z])', '_', param_name).lower()
+                                    if snake_candidate in actual_parameter_mappings:
+                                        mapping = actual_parameter_mappings[snake_candidate]
+                            if mapping is not None:
                                 
                                 if callable(mapping):
                                     # If mapping is a callable, call it with the value
@@ -1091,6 +1099,13 @@ def berryql_field(
                 new_resolver_func.__qualname__ = func.__qualname__
                 new_resolver_func.__module__ = func.__module__
                 new_resolver_func.__doc__ = func.__doc__
+
+                # Propagate parameter mappings to the final resolver for analyzer/factory
+                try:
+                    if actual_parameter_mappings:
+                        setattr(new_resolver_func, '_berryql_parameter_mappings', actual_parameter_mappings)
+                except Exception:
+                    pass
                 
                 # Most importantly, copy the return type annotation exactly
                 # This is crucial for Strawberry to understand the correct type
@@ -1142,6 +1157,12 @@ def berryql_field(
                     try:
                         if hasattr(func, '__annotations__'):
                             resolved_data_func.__annotations__ = func.__annotations__.copy()
+                    except Exception:
+                        pass
+                    # Propagate parameter mappings for relationship fields defined without model_class
+                    try:
+                        if actual_parameter_mappings:
+                            setattr(resolved_data_func, '_berryql_parameter_mappings', actual_parameter_mappings)
                     except Exception:
                         pass
                     return resolved_data_func
@@ -1305,3 +1326,5 @@ class BerryQLNamespace:
         return func.json_object(*args)
 
 berryql = BerryQLNamespace()
+
+# Removed REL_PARAM_MAP registry during cleanup (heuristic filtering in factory handles *_filter args)

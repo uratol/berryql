@@ -757,6 +757,7 @@ class RelationshipProcessor:
             field_arguments = field_info.get('field_arguments', {}) if isinstance(field_info, dict) else {}
             # Apply default arguments from the Strawberry field signature if not provided explicitly
             field_arguments = self.apply_default_arguments(strawberry_type, actual_field_name, field_arguments)
+
             field_args_key = self._make_hashable(field_arguments) if field_arguments else ()
             unique_key = (display_name, actual_field_name, field_args_key)
             
@@ -765,6 +766,7 @@ class RelationshipProcessor:
             field_info_with_metadata['_resolved_field_name'] = actual_field_name
             field_info_with_metadata['_display_name'] = display_name
             field_info_with_metadata['_field_arguments'] = field_arguments
+            # Debug logging removed in cleanup
             
             resolved_relationships[unique_key] = field_info_with_metadata
         
@@ -1052,6 +1054,32 @@ class BerryQLFactory:
             'scalar_fields': set(),
             'relationship_fields': {}
         }
+
+        # Populate missing relationship field arguments using selected_fields (avoid deprecated field_nodes)
+        if info and hasattr(info, 'selected_fields') and info.selected_fields:
+            try:
+                # selected_fields[0] corresponds to the root resolver field
+                root_sel = info.selected_fields[0] if len(info.selected_fields) > 0 else None
+                if root_sel and getattr(root_sel, 'selections', None):
+                    for sel in root_sel.selections:
+                        # sel is a SelectedField; extract name and arguments
+                        field_name = getattr(sel, 'name', None)
+                        if not field_name:
+                            continue
+                        arg_dict = getattr(sel, 'arguments', None) or {}
+                        if arg_dict:
+                            rel_entry = query_analysis['relationship_fields'].get(field_name)
+                            if isinstance(rel_entry, dict):
+                                existing_args = rel_entry.get('field_arguments') or {}
+                                if not existing_args:
+                                    rel_entry['field_arguments'] = arg_dict
+                            elif rel_entry is not None:
+                                query_analysis['relationship_fields'][field_name] = {
+                                    'type': rel_entry,
+                                    'field_arguments': arg_dict
+                                }
+            except Exception:
+                pass
         
         # Get alias mapping to resolve display names to actual field names
         alias_mapping = query_analyzer.get_aliased_field_mapping(query_analysis) if info else {}
@@ -1199,8 +1227,38 @@ class BerryQLFactory:
             _order_by_arg = field_arguments.get('order_by')
             if _order_by_arg is None:
                 _order_by_arg = field_arguments.get('orderBy')
+            # Start with explicit 'where' argument (string) if provided
+            base_where = self._parse_where_from_string(field_arguments.get('where'))
+
+            # Parameter mappings now applied at analysis stage (query_analyzer) and merged into 'where' JSON string.
+            merged_where = base_where
+            try:
+                # Fallback heuristic: auto-convert *Filter / *_filter arguments to ILIKE conditions
+                if isinstance(field_arguments, dict):
+                    for _arg, _val in list(field_arguments.items()):
+                        if _val is None:
+                            continue
+                        if _arg in ['where','order_by','orderBy','limit','offset']:
+                            continue
+                        base_field = None
+                        if _arg.endswith('_filter') and len(_arg) > 7:
+                            base_field = _arg[:-7]
+                        elif _arg.endswith('Filter') and len(_arg) > 6:
+                            # Convert camelCase base to snake_case
+                            base_field = FieldMapper.camel_to_snake(_arg[:-6])
+                        if base_field:
+                            if merged_where is None or not isinstance(merged_where, dict):
+                                merged_where = {}
+                            existing = merged_where.get(base_field, {}) if isinstance(merged_where.get(base_field), dict) else {}
+                            # Only add ilike if not already specified
+                            if 'ilike' not in existing:
+                                existing['ilike'] = f"%{_val}%"
+                            merged_where[base_field] = existing
+            except Exception:
+                pass
+
             nested_params = GraphQLQueryParams(
-                where=self._parse_where_from_string(field_arguments.get('where')),
+                where=merged_where,
                 order_by=self._parse_order_by_from_string(_order_by_arg),
                 offset=field_arguments.get('offset'),
                 limit=field_arguments.get('limit')

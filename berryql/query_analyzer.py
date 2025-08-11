@@ -10,57 +10,31 @@ from typing import Dict, Set, List, Any, Type, get_type_hints, Union, Optional
 from graphql import GraphQLResolveInfo
 
 logger = logging.getLogger(__name__)
-
-
+ 
 class QueryFieldAnalyzer:
     """Analyzes GraphQL query fields using Strawberry's selected_fields API."""
-    
+
     def analyze_query_fields(
-        self, 
-        info: GraphQLResolveInfo, 
+        self,
+        info: GraphQLResolveInfo,
         strawberry_type: Type,
-        depth_limit: int = 10  # Increased from 3 to support deeper nesting
+        depth_limit: int = 10,
     ) -> Dict[str, Any]:
-        """
-        Analyze all requested fields from GraphQL query including fragments and aliases.
-        
-        Args:
-            info: GraphQL resolve info containing field nodes
-            strawberry_type: The Strawberry GraphQL type being resolved
-            depth_limit: Maximum depth to analyze (prevents infinite recursion)
-            
-        Returns:
-            Dict containing:
-            - 'scalar_fields': Set of scalar field names
-            - 'relationship_fields': Dict mapping field names to their inner types
-            - 'aliases': Dict mapping aliases to actual field names
-            - 'fragments': List of fragment information
-        """
         if depth_limit <= 0:
-            logger.warning("Depth limit reached in query analysis")
             return {
                 'scalar_fields': set(),
                 'relationship_fields': {},
                 'aliases': {},
                 'fragments': []
             }
-        
-        logger.debug(f"Analyzing query fields for {strawberry_type.__name__}")
-        
-        # Process all field selections using the new selected_fields API
-        all_selections = []
-        
-        # Use selected_fields (new Strawberry API)
+
+        all_selections: List[Any] = []
         if hasattr(info, 'selected_fields') and info.selected_fields:
-            logger.debug(f"Using selected_fields API for {strawberry_type.__name__}")
-            # selected_fields gives us a direct list of SelectedField objects
             if len(info.selected_fields) > 0:
-                current_field = info.selected_fields[0]  # Usually just one field for our resolver
+                current_field = info.selected_fields[0]
                 if hasattr(current_field, 'selections') and current_field.selections:
-                    # Use SelectedField objects directly in our analysis
                     all_selections = current_field.selections
                 else:
-                    logger.warning(f"No selections found in current field for {strawberry_type.__name__}")
                     return {
                         'scalar_fields': set(),
                         'relationship_fields': {},
@@ -68,7 +42,6 @@ class QueryFieldAnalyzer:
                         'fragments': []
                     }
             else:
-                logger.warning(f"Empty selected_fields for {strawberry_type.__name__}")
                 return {
                     'scalar_fields': set(),
                     'relationship_fields': {},
@@ -76,158 +49,207 @@ class QueryFieldAnalyzer:
                     'fragments': []
                 }
         else:
-            logger.warning(f"selected_fields not available on info object for {strawberry_type.__name__}")
             return {
                 'scalar_fields': set(),
                 'relationship_fields': {},
                 'aliases': {},
                 'fragments': []
             }
-        
-        # Analyze all selections (now SelectedField objects)
+
         analysis_result = self._analyze_selected_fields(
-            all_selections, 
-            strawberry_type, 
+            all_selections,
+            strawberry_type,
             info,
-            depth_limit - 1
+            depth_limit - 1,
         )
-        
-        logger.debug(f"Analysis result for {strawberry_type.__name__}: "
-                    f"scalar_fields={analysis_result['scalar_fields']}, "
-                    f"relationship_fields={list(analysis_result['relationship_fields'].keys())}")
-        
         return analysis_result
-    
+
     def _analyze_selected_fields(
-        self, 
-        selected_fields: List[Any], 
+        self,
+        selected_fields: List[Any],
         strawberry_type: Type,
         info: GraphQLResolveInfo,
-        depth_limit: int
+        depth_limit: int,
     ) -> Dict[str, Any]:
-        """Analyze a list of Strawberry SelectedField objects."""
-        scalar_fields = set()
-        relationship_fields = {}
-        aliases = {}
-        fragments = []
-        
+        scalar_fields: Set[str] = set()
+        relationship_fields: Dict[str, Any] = {}
+        aliases: Dict[str, str] = {}
+        fragments: List[Any] = []
         for selected_field in selected_fields:
-            # Handle SelectedField objects directly
-            field_result = self._analyze_selected_field(
-                selected_field, strawberry_type, info, depth_limit
-            )
+            field_result = self._analyze_selected_field(selected_field, strawberry_type, info, depth_limit)
             scalar_fields.update(field_result['scalar_fields'])
             relationship_fields.update(field_result['relationship_fields'])
             aliases.update(field_result['aliases'])
-        
         return {
             'scalar_fields': scalar_fields,
             'relationship_fields': relationship_fields,
             'aliases': aliases,
-            'fragments': fragments
+            'fragments': fragments,
         }
-    
+
     def _analyze_selected_field(
-        self, 
-        selected_field, 
+        self,
+        selected_field: Any,
         strawberry_type: Type,
         info: GraphQLResolveInfo,
-        depth_limit: int
+        depth_limit: int,
     ) -> Dict[str, Any]:
-        """Analyze a single SelectedField object."""
         field_name = selected_field.name
-        alias = selected_field.alias
-        
-        scalar_fields = set()
-        relationship_fields = {}
-        aliases = {}
-        
-        # Extract field arguments (they're already a dict in SelectedField)
-        field_arguments = selected_field.arguments or {}
-        
-        # Handle alias
+        alias = getattr(selected_field, 'alias', None)
+        field_arguments = getattr(selected_field, 'arguments', {}) or {}
+
+        scalar_fields: Set[str] = set()
+        relationship_fields: Dict[str, Any] = {}
+        aliases: Dict[str, str] = {}
+        display_name = alias or field_name
         if alias:
             aliases[alias] = field_name
-            display_name = alias
-        else:
-            display_name = field_name
-        
-        # Check if this is a relationship field
+
         if self._is_relationship_field_by_name(field_name, strawberry_type):
-            logger.debug(f"Field {field_name} detected as relationship field")
-            # Get the inner type for the relationship
             inner_type = self._get_relationship_inner_type(field_name, strawberry_type)
             if inner_type:
-                relationship_fields[display_name] = inner_type
-                
-                # If the field has sub-selections, analyze them recursively
                 if selected_field.selections and depth_limit > 0:
-                    logger.debug(f"Analyzing sub-selections for {display_name}, depth_limit: {depth_limit}")
                     sub_analysis = self._analyze_selected_fields(
-                        selected_field.selections,
-                        inner_type,
-                        info,
-                        depth_limit - 1
+                        selected_field.selections, inner_type, info, depth_limit - 1
                     )
-                    logger.debug(f"Sub-analysis for {display_name}: scalar_fields={sub_analysis['scalar_fields']}, relationship_fields={list(sub_analysis['relationship_fields'].keys())}")
-                    # Store nested field info in the relationship
                     relationship_fields[display_name] = {
                         'type': inner_type,
                         'nested_fields': sub_analysis,
-                        'field_arguments': field_arguments
+                        'field_arguments': field_arguments,
                     }
                 else:
-                    logger.debug(f"No sub-selections for {display_name} or depth limit reached")
                     relationship_fields[display_name] = {
                         'type': inner_type,
-                        'field_arguments': field_arguments
+                        'field_arguments': field_arguments,
                     }
             else:
-                # Fallback: treat as scalar if we can't determine the type
-                logger.debug(f"Field {field_name} relationship detected but no inner type found, treating as scalar")
                 scalar_fields.add(display_name)
-                
-                # Validate field arguments even for fallback scalar fields
                 if field_arguments:
                     self._validate_field_arguments(field_arguments, field_name)
         else:
-            # Regular scalar field - but skip GraphQL meta fields
-            if field_name.startswith('__'):
-                # All GraphQL meta fields start with __ (like __typename, __schema, __type)
-                # These are handled by GraphQL execution engine, not database
-                logger.debug(f"Skipping GraphQL meta field: {field_name}")
-            else:
-                logger.debug(f"Field {field_name} detected as scalar field")
+            if not field_name.startswith('__'):
                 scalar_fields.add(display_name)
-                
-                # Even scalar fields can have arguments that need validation
                 if field_arguments:
                     self._validate_field_arguments(field_arguments, field_name)
-        
+
         return {
             'scalar_fields': scalar_fields,
             'relationship_fields': relationship_fields,
-            'aliases': aliases
+            'aliases': aliases,
         }
-    
+
     def _validate_field_arguments(self, field_arguments: Dict[str, Any], field_name: str):
-        """Validate field arguments and throw InvalidFieldError for invalid JSON."""
-        # Import here to avoid circular imports
         from .factory import InvalidFieldError
-        
-        # Check if there's a 'where' argument that needs JSON validation
         if 'where' in field_arguments:
             where_value = field_arguments['where']
             if isinstance(where_value, str):
+                import json
                 try:
-                    import json
                     parsed = json.loads(where_value.strip()) if where_value.strip() else {}
                     if not isinstance(parsed, dict):
-                        raise InvalidFieldError(f"Where clause in field '{field_name}' must be a JSON object, got: {type(parsed).__name__}")
+                        raise InvalidFieldError(
+                            f"Where clause in field '{field_name}' must be a JSON object"
+                        )
                 except json.JSONDecodeError as e:
-                    raise InvalidFieldError(f"Invalid JSON in where clause for field '{field_name}': {where_value}. Error: {e}")
-        
-        # Add other argument validations as needed
+                    raise InvalidFieldError(
+                        f"Invalid JSON in where clause for field '{field_name}': {e}"
+                    )
+
+    def _is_relationship_field_by_name(self, field_name: str, strawberry_type: Type) -> bool:
+        try:
+            type_hints = get_type_hints(strawberry_type)
+            if field_name in type_hints:
+                return self._is_relationship_field_type(type_hints[field_name])
+            if hasattr(strawberry_type, '__strawberry_definition__'):
+                definition = strawberry_type.__strawberry_definition__
+                for f in getattr(definition, 'fields', []):
+                    if f.python_name == field_name:
+                        method = getattr(strawberry_type, field_name, None)
+                        if method and hasattr(method, '__annotations__') and 'return' in method.__annotations__:
+                            return self._is_relationship_field_type(method.__annotations__['return'])
+            if hasattr(strawberry_type, field_name):
+                attr = getattr(strawberry_type, field_name)
+                if callable(attr) and hasattr(attr, '__annotations__') and 'return' in attr.__annotations__:
+                    return self._is_relationship_field_type(attr.__annotations__['return'])
+            return self._is_special_relationship_field(field_name)
+        except Exception:
+            return False
+
+    def _is_relationship_field_type(self, field_type) -> bool:
+        if not field_type:
+            return False
+        if hasattr(field_type, 'annotation'):
+            return self._is_relationship_field_type(field_type.annotation)
+        origin = getattr(field_type, '__origin__', None)
+        if origin is list:
+            return True
+        if origin is Union:
+            args = getattr(field_type, '__args__', ())
+            if len(args) == 2 and type(None) in args:
+                non_none = args[0] if args[1] is type(None) else args[1]
+                return getattr(non_none, '__origin__', None) is list
+        return False
+
+    def _is_special_relationship_field(self, field_name: str) -> bool:
+        import inflection
+        singular = inflection.singularize(field_name)
+        if singular != field_name:
+            return True
+        return any(field_name.endswith(s) for s in ['_list', '_items', '_collection', '_set'])
+
+    def _get_relationship_inner_type(self, field_name: str, strawberry_type: Type) -> Optional[Type]:
+        try:
+            type_hints = get_type_hints(strawberry_type)
+            if field_name in type_hints:
+                return self._extract_inner_type(type_hints[field_name])
+            if hasattr(strawberry_type, '__strawberry_definition__'):
+                definition = strawberry_type.__strawberry_definition__
+                for f in getattr(definition, 'fields', []):
+                    if f.python_name == field_name:
+                        method = getattr(strawberry_type, field_name, None)
+                        if method and hasattr(method, '__annotations__') and 'return' in method.__annotations__:
+                            return self._extract_inner_type(method.__annotations__['return'])
+            if hasattr(strawberry_type, field_name):
+                attr = getattr(strawberry_type, field_name)
+                if callable(attr) and hasattr(attr, '__annotations__') and 'return' in attr.__annotations__:
+                    return self._extract_inner_type(attr.__annotations__['return'])
+        except Exception:
+            return None
+        return None
+
+    def _extract_inner_type(self, field_type):
+        if not field_type:
+            return None
+        if hasattr(field_type, 'annotation'):
+            return self._extract_inner_type(field_type.annotation)
+        origin = getattr(field_type, '__origin__', None)
+        if origin is Union:
+            args = getattr(field_type, '__args__', ())
+            if len(args) == 2 and type(None) in args:
+                non_none = args[0] if args[1] is type(None) else args[1]
+                if getattr(non_none, '__origin__', None) is list:
+                    inner = getattr(non_none, '__args__', ())
+                    return inner[0] if inner else None
+        if origin is list:
+            args = getattr(field_type, '__args__', ())
+            return args[0] if args else None
+        return None
+
+    def get_flat_field_names(self, analysis_result: Dict[str, Any]) -> Set[str]:
+        all_fields = set(analysis_result['scalar_fields'])
+        all_fields.update(analysis_result['relationship_fields'].keys())
+        return all_fields
+
+    def get_aliased_field_mapping(self, analysis_result: Dict[str, Any]) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        aliases = analysis_result['aliases']
+        for field in analysis_result['scalar_fields']:
+            actual = aliases.get(field, field)
+            mapping[field] = actual
+        for field in analysis_result['relationship_fields'].keys():
+            actual = aliases.get(field, field)
+            mapping[field] = actual
+        return mapping
     
     def _is_relationship_field_by_name(self, field_name: str, strawberry_type: Type) -> bool:
         """Check if a field is a relationship field by analyzing the Strawberry type."""
