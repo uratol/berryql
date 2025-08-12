@@ -2079,61 +2079,6 @@ class BerryQLFactory:
                         json_data = []
                 
                 parsed_relationships = self.relationship_processor.parse_json_relationship_data(json_data, rel_config)
-
-                # Post-process each related instance to convert dict-valued single-object relationship fields
-                try:
-                    from typing import get_type_hints, get_origin, get_args, Union as _Union
-                    import sys
-                    try:
-                        from typing import ForwardRef as _ForwardRefType
-                    except Exception:  # pragma: no cover
-                        class _ForwardRefType:  # type: ignore
-                            pass
-                    for _inst in parsed_relationships:
-                        if not _inst:
-                            continue
-                        try:
-                            _hints = get_type_hints(type(_inst))
-                        except Exception:
-                            _hints = getattr(type(_inst), '__annotations__', {}) or {}
-                        for _fname, _ftype in _hints.items():
-                            try:
-                                _val = getattr(_inst, _fname, None)
-                                if not isinstance(_val, dict):
-                                    continue
-                                if type(_inst).__name__ == 'CommentType' and _fname == 'post':
-                                    logger.debug('Relationship post-process: converting CommentType.post dict -> instance (value keys=%s)', list(_val.keys()))
-                                # Resolve forward refs and string annotations
-                                if isinstance(_ftype, str):
-                                    mod = sys.modules.get(type(_inst).__module__)
-                                    if mod and hasattr(mod, _ftype):
-                                        _ftype = getattr(mod, _ftype)
-                                elif isinstance(_ftype, _ForwardRefType):  # type: ignore
-                                    try:
-                                        _eval = _ftype.__forward_arg__  # type: ignore[attr-defined]
-                                        mod = sys.modules.get(type(_inst).__module__)
-                                        if mod and hasattr(mod, _eval):
-                                            _ftype = getattr(mod, _eval)
-                                    except Exception:
-                                        pass
-                                _origin = get_origin(_ftype)
-                                _args = get_args(_ftype) if _origin is _Union else ()
-                                if _origin is _Union and any(a is type(None) for a in _args):  # Optional unwrap
-                                    _nn = [a for a in _args if a is not type(None)]  # noqa: E721
-                                    _inner = _nn[0] if _nn else None
-                                else:
-                                    _inner = _ftype
-                                if _inner and hasattr(_inner, '__strawberry_definition__'):
-                                    from .resolved_data_helper import convert_json_to_strawberry_instances as _conv
-                                    _converted = _conv([_val], _inner)
-                                    if _converted:
-                                        setattr(_inst, _fname, _converted[0])
-                                        if type(_inst).__name__ == 'CommentType' and _fname == 'post':
-                                            logger.debug('Relationship post-process: conversion complete, set PostType instance id=%s', getattr(_converted[0], 'id', None))
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
                 
                 actual_field_name = rel_config.get('_resolved_field_name', display_name)
                 if '_resolved' not in relationship_data:
