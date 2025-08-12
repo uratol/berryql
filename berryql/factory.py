@@ -809,6 +809,16 @@ class RelationshipProcessor:
         
         for display_name, field_info in relationship_fields.items():
             actual_field_name = alias_mapping.get(display_name, display_name)
+
+            # Fallback: if actual field name not found on strawberry type, try snake_case conversion
+            try:
+                if not hasattr(strawberry_type, actual_field_name):
+                    from .naming import camel_to_snake as _cts  # local import to avoid cycles
+                    snake_variant = _cts(actual_field_name)
+                    if snake_variant != actual_field_name and hasattr(strawberry_type, snake_variant):
+                        actual_field_name = snake_variant
+            except Exception:
+                pass
             
             # Create a unique key based on display name + field name + parameters
             field_arguments = field_info.get('field_arguments', {}) if isinstance(field_info, dict) else {}
@@ -1426,6 +1436,13 @@ class BerryQLFactory:
     ):
         """Build relationship subquery as SQL for use in json_agg."""
         try:
+            # Normalize (process) nested relationship field configs if they are still in analyzer format
+            try:
+                if relationships and all(not isinstance(k, tuple) for k in relationships.keys()):
+                    # No alias mapping at nested level yet; pass empty mapping
+                    relationships = self.relationship_processor.process_relationship_fields(relationships, {}, strawberry_type)
+            except Exception:
+                pass
             # Create a specific alias for this subquery based on field name and nesting level
             if current_field_name:
                 current_alias = f"{current_field_name}_lvl{nesting_level}"

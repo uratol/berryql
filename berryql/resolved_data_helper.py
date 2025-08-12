@@ -403,20 +403,72 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                         is_method = True
                 except Exception:
                     pass
+            # Fallback: camelCase JSON key -> snake_case method name
+            method_name = fname
+            if not is_method:
+                try:
+                    from .naming import camel_to_snake as _cts
+                    snake_variant = _cts(fname)
+                    if snake_variant != fname and hasattr(strawberry_type, snake_variant):
+                        attr2 = getattr(strawberry_type, snake_variant)
+                        if callable(attr2):
+                            is_method = True
+                            method_name = snake_variant
+                except Exception:
+                    pass
             is_constructor_param = fname in type_hints
 
             if is_method:
-                target_type = _method_returns_strawberry(strawberry_type, fname)
+                target_type = _method_returns_strawberry(strawberry_type, method_name)
+                # Detect relationship list via method return annotation
+                try:
+                    method_obj = getattr(strawberry_type, method_name, None)
+                    rt = getattr(method_obj, '__annotations__', {}).get('return') if callable(method_obj) else None
+                    from typing import get_origin as _go, get_args as _ga, Union as _U
+                    is_list_rel = False
+                    inner_rel_type = None
+                    if rt is not None:
+                        origin = _go(rt)
+                        if origin is list:
+                            is_list_rel = True
+                            args = _ga(rt)
+                            inner_rel_type = args[0] if args else None
+                        elif origin is _U:
+                            rargs = _ga(rt)
+                            if len(rargs) == 2 and any(a is type(None) for a in rargs):  # Optional[...] pattern
+                                nn = [a for a in rargs if a is not type(None)]
+                                if nn:
+                                    nn0 = nn[0]
+                                    if getattr(getattr(nn0, '__origin__', None), '__name__', None) == 'list' or getattr(nn0, '__origin__', None) is list:
+                                        sub_origin = getattr(nn0, '__origin__', None)
+                                        if sub_origin is list:
+                                            is_list_rel = True
+                                            sub_args = getattr(nn0, '__args__', ())
+                                            inner_rel_type = sub_args[0] if sub_args else None
+                    if is_list_rel and isinstance(fval, list):
+                        if '_resolved' not in resolved_data:
+                            resolved_data['_resolved'] = {}
+                        if method_name not in resolved_data['_resolved']:
+                            resolved_data['_resolved'][method_name] = {}
+                        if inner_rel_type and hasattr(inner_rel_type, '__strawberry_definition__') and fval and isinstance(fval[0], dict):
+                            converted_children = convert_json_to_strawberry_instances(fval, inner_rel_type)
+                        else:
+                            converted_children = fval
+                        # Map display (JSON) key under the python method name for alias handling consistency
+                        resolved_data['_resolved'][method_name][fname] = converted_children
+                        continue  # handled relationship list
+                except Exception:
+                    pass
                 if target_type:  # scalar/object custom field
                     data_obj = _parse_json(fval)
                     if isinstance(data_obj, dict):
                         try:
                             conv = convert_json_to_strawberry_instances([data_obj], target_type)
-                            direct_attrs[fname] = conv[0] if conv else None
+                            direct_attrs[method_name] = conv[0] if conv else None
                         except Exception:
-                            direct_attrs[fname] = data_obj
+                            direct_attrs[method_name] = data_obj
                     else:
-                        direct_attrs[fname] = fval
+                        direct_attrs[method_name] = fval
                     continue
                 else:
                     data_obj = _parse_json(fval)
@@ -429,16 +481,16 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                                 processed[k] = v
                         try:
                             from types import SimpleNamespace as _NS
-                            direct_attrs[fname] = _NS(**processed)
+                            direct_attrs[method_name] = _NS(**processed)
                         except Exception:
-                            direct_attrs[fname] = processed
+                            direct_attrs[method_name] = processed
                         continue
                 if '_resolved' not in resolved_data:
                     resolved_data['_resolved'] = {}
                 if isinstance(fval, list) and fval and isinstance(fval[0], dict):
-                    _process_relationship_list(strawberry_type, fname, fval, resolved_data)
+                    _process_relationship_list(strawberry_type, method_name, fval, resolved_data)
                 else:
-                    resolved_data['_resolved'][fname] = fval
+                    resolved_data['_resolved'][method_name] = fval
             elif is_constructor_param:
                 constructor_data[fname] = _convert_constructor_value(fname, fval, type_hints, datetime_fields)
             # else ignore stray fields
@@ -618,7 +670,15 @@ def get_resolved_field_data(instance: Any, info: strawberry.Info, relationship_n
     resolved_data = getattr(instance, '_resolved', {})
     
     # Get the actual field name from the GraphQL selection (this handles aliases)
-    actual_field_name = info.field_name  # This is 'tasks' for both 'tasks' and 'a: tasks'
+    actual_field_name = info.field_name  # GraphQL field name (camelCase possible)
+    # Fallback: map camelCase GraphQL field name to snake_case storage key
+    if actual_field_name not in resolved_data:
+        try:
+            snake_variant = camel_to_snake(actual_field_name)
+            if snake_variant in resolved_data:
+                actual_field_name = snake_variant
+        except Exception:
+            pass
     
     # Check if this is an alias by looking at the GraphQL selection
     display_name = actual_field_name  # Default to the field name
@@ -639,7 +699,14 @@ def get_resolved_field_data(instance: Any, info: strawberry.Info, relationship_n
         result = field_data
     else:
         # Fallback: try to get data directly by relationship name
+        # Also attempt snake_case fallback for provided relationship_name
         result = resolved_data.get(relationship_name, [])
+        if not result:
+            try:
+                snake_rel = camel_to_snake(relationship_name)
+                result = resolved_data.get(snake_rel, [])
+            except Exception:
+                pass
     
     # Ensure we always return a list, never None
     return result if result is not None else []
