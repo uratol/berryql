@@ -14,6 +14,7 @@ import strawberry
 from functools import wraps
 from sqlalchemy.sql import ColumnElement
 from sqlalchemy import func
+from .naming import camel_to_snake
 
 T = TypeVar('T')
 
@@ -69,12 +70,6 @@ def _normalize_order_arg(other_params: Dict[str, Any]):
     return order
 
 
-def _camel_to_snake(name: str) -> str:
-    try:
-        import re
-        return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
-    except Exception:
-        return name
 
 
 def _apply_mapping(mapping: Any, value: Any, where_conditions: Dict[str, Any]):
@@ -138,7 +133,7 @@ def _process_graphql_arguments(graphql_kwargs: Dict[str, Any], parameter_mapping
             if param_name in parameter_mappings:
                 mapping = parameter_mappings[param_name]
             else:
-                snake = _camel_to_snake(param_name)
+                snake = camel_to_snake(param_name)
                 if snake in parameter_mappings:
                     mapping = parameter_mappings[snake]
         if mapping is not None:

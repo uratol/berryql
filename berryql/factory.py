@@ -27,6 +27,7 @@ try:
     from sqlalchemy.sql import Select
 except Exception:  # pragma: no cover
     Select = None  # Fallback if import path changes; we'll use duck-typing
+from .naming import camel_to_snake
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ def apply_explicit_parameter_mappings(
     for _arg, _val in field_arguments.items():
         if _val is None or _arg in ['where', 'order_by', 'orderBy', 'limit', 'offset']:
             continue
-        snake_arg = FieldMapper.camel_to_snake(_arg)
+        snake_arg = camel_to_snake(_arg)
         mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
         if not mapping:
             continue
@@ -210,13 +211,7 @@ class GraphQLQueryParams:
 
 class FieldMapper:
     """Handles field name mapping between GraphQL and database representations."""
-    
-    @staticmethod
-    def camel_to_snake(name: str) -> str:
-        """Convert camelCase GraphQL field names to snake_case database column names."""
-        s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-        return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-    
+
     @staticmethod
     def map_graphql_field_to_db_column(field_name: str, strawberry_type: Type = None) -> str:
         """Map GraphQL field name to database column name."""
@@ -225,11 +220,11 @@ class FieldMapper:
             if field_name in type_hints:
                 return field_name
             
-            snake_case_field = FieldMapper.camel_to_snake(field_name)
+            snake_case_field = camel_to_snake(field_name)
             if snake_case_field in type_hints:
                 return snake_case_field
         
-        return FieldMapper.camel_to_snake(field_name)
+        return camel_to_snake(field_name)
 
 
 class TypeAnalyzer:
@@ -341,7 +336,7 @@ class CustomFieldManager:
             return True
         
         # Check snake_case version
-        snake_case_field = FieldMapper.camel_to_snake(field_name)
+        snake_case_field = camel_to_snake(field_name)
         if snake_case_field in custom_fields:
             return True
         
@@ -406,9 +401,9 @@ class CustomFieldManager:
                     custom_fields[field_name] = CUSTOM_QUERY_REGISTRY[registry_key]
                 else:
                     # Try snake_case
-                    snake_key = (module, class_name, FieldMapper.camel_to_snake(field_name))
+                    snake_key = (module, class_name, camel_to_snake(field_name))
                     if snake_key in CUSTOM_QUERY_REGISTRY:
-                        custom_fields[FieldMapper.camel_to_snake(field_name)] = CUSTOM_QUERY_REGISTRY[snake_key]
+                        custom_fields[camel_to_snake(field_name)] = CUSTOM_QUERY_REGISTRY[snake_key]
         except Exception:
             pass
         
@@ -421,7 +416,7 @@ class CustomFieldManager:
                 query_builder = custom_fields[field_name]
                 custom_field_name = field_name
             else:
-                snake_case_field = FieldMapper.camel_to_snake(field_name)
+                snake_case_field = camel_to_snake(field_name)
                 if snake_case_field in custom_fields:
                     query_builder = custom_fields[snake_case_field]
                     custom_field_name = snake_case_field
@@ -489,7 +484,7 @@ class QueryConditionProcessor:
         
         for field_name, value in where_conditions.items():
             # Convert camelCase GraphQL field names to snake_case database column names
-            db_field_name = FieldMapper.camel_to_snake(field_name)
+            db_field_name = camel_to_snake(field_name)
             
             # Validate field exists on model
             if db_field_name in valid_columns:
@@ -637,7 +632,7 @@ class InstanceCreator:
                         attr = getattr(strawberry_type, field_name)
                         is_method = callable(attr)
                     if not is_method:
-                        snake_attr = FieldMapper.camel_to_snake(field_name)
+                        snake_attr = camel_to_snake(field_name)
                         if hasattr(strawberry_type, snake_attr):
                             attr2 = getattr(strawberry_type, snake_attr)
                             is_method = callable(attr2)
@@ -704,7 +699,7 @@ class InstanceCreator:
                 # Map to constructor field name if present
                 actual_field_name = field_name
                 if field_name not in type_hints:
-                    snake_case_field = FieldMapper.camel_to_snake(field_name)
+                    snake_case_field = camel_to_snake(field_name)
                     if snake_case_field in type_hints:
                         actual_field_name = snake_case_field
                     else:

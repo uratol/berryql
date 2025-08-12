@@ -8,6 +8,7 @@ proper handling of fragments, inline fragments, aliases, and multiple field node
 import logging
 from typing import Dict, Set, List, Any, Type, get_type_hints, Union, Optional
 from graphql import GraphQLResolveInfo
+from .naming import camel_to_snake, snake_to_camel
 
 logger = logging.getLogger(__name__)
  
@@ -400,23 +401,7 @@ class QueryFieldAnalyzer:
                 return s.replace('_', '').lower()
 
             def to_camel(s: str) -> str:
-                # user_posts -> userPosts
-                parts = s.split('_')
-                if not parts:
-                    return s
-                return parts[0] + ''.join(p.capitalize() or '_' for p in parts[1:])
-
-            def to_snake(s: str) -> str:
-                # userPosts -> user_posts
-                out = []
-                for ch in s:
-                    if ch.isupper():
-                        out.append('_')
-                        out.append(ch.lower())
-                    else:
-                        out.append(ch)
-                snake = ''.join(out).strip('_')
-                return snake
+                return snake_to_camel(camel_to_snake(s))  # normalize then convert
 
             candidates = set()
             for c in (python_name, gql_name):
@@ -426,7 +411,7 @@ class QueryFieldAnalyzer:
             more = set()
             for c in list(candidates):
                 more.add(to_camel(c))
-                more.add(to_snake(c))
+                more.add(camel_to_snake(c))
             candidates.update(more)
 
             norm_field = normalize(field_name)
