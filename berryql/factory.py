@@ -1602,6 +1602,9 @@ class BerryQLFactory:
                         obj_subq = obj_subq.where(cond2)
                     obj_subq = obj_subq.limit(1)
                     json_columns.extend([text(f"'{obj_display}'"), obj_subq.scalar_subquery()])
+                    # Ensure MSSQL FOR JSON PATH includes object relationship scalar JSON objects
+                    if isinstance(db_adapter_local, MSSQLAdapter):
+                        mssql_nested_columns.append((obj_display, obj_subq.scalar_subquery()))
             
             # Handle nested relationships recursively by adding them to the JSON object
             if relationships:
