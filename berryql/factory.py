@@ -577,6 +577,27 @@ class QueryConditionProcessor:
                 except ValueError:
                     logger.warning(f"Could not parse datetime value: {value}")
                     return value
+
+        # Normalize numeric strings for numeric DB columns (prevents PG int < varchar errors)
+        if isinstance(value, str):
+            # Integer-like
+            if any(num_type in column_type for num_type in ['int', 'smallint', 'bigint']):
+                v = value.strip()
+                if v.lstrip('-').isdigit():
+                    try:
+                        return int(v)
+                    except Exception:
+                        pass  # fall through to return original
+            # Float / numeric
+            if any(num_type in column_type for num_type in ['numeric', 'decimal', 'float', 'double']):
+                v = value.strip()
+                try:
+                    # Attempt int first for cleaner typing, then float
+                    if v.lstrip('-').isdigit():
+                        return int(v)
+                    return float(v)
+                except Exception:
+                    pass  # fall through
         
         return value
     
