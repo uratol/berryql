@@ -190,46 +190,13 @@ class QueryFieldAnalyzer:
         """Check if a field is a relationship field by analyzing the Strawberry type."""
         try:
             logger.debug(f"Checking if {field_name} is relationship field on {strawberry_type.__name__}")
-            
-            # Check type annotations first (for directly annotated fields)
-            type_hints = get_type_hints(strawberry_type)
-            logger.debug(f"Type hints for {strawberry_type.__name__}: {list(type_hints.keys())}")
-            
-            if field_name in type_hints:
-                field_type = type_hints[field_name]
-                is_rel = self._is_relationship_field_type(field_type)
-                logger.debug(f"Field {field_name} found in type hints, is_relationship: {is_rel}")
-                return is_rel
-            
-            # Check strawberry definition fields (for @strawberry.field methods)
-            if hasattr(strawberry_type, '__strawberry_definition__'):
-                definition = strawberry_type.__strawberry_definition__
-                if hasattr(definition, 'fields'):
-                    for strawberry_field in definition.fields:
-                        # Support matching GraphQL field names that may use camelCase while python uses snake_case
-                        if self._field_name_matches(strawberry_field, field_name):
-                            logger.debug(f"Field {field_name} found in strawberry definition")
-                            # Get the field's return type from the method annotations
-                            if hasattr(strawberry_type, field_name):
-                                method = getattr(strawberry_type, field_name)
-                                if hasattr(method, '__annotations__') and 'return' in method.__annotations__:
-                                    return_type = method.__annotations__['return']
-                                    is_rel = self._is_relationship_field_type(return_type)
-                                    logger.debug(f"Field {field_name} return type: {return_type}, is_relationship: {is_rel}")
-                                    return is_rel
-            
-            # Check strawberry field methods (legacy detection)
-            if hasattr(strawberry_type, field_name):
-                attr = getattr(strawberry_type, field_name)
-                logger.debug(f"Field {field_name} found as attribute: {type(attr)}")
-                
-                if hasattr(attr, '__strawberry_metadata__') and callable(attr):
-                    logger.debug(f"Field {field_name} has strawberry metadata and is callable")
-                    if hasattr(attr, '__annotations__') and 'return' in attr.__annotations__:
-                        return_type = attr.__annotations__['return']
-                        is_rel = self._is_relationship_field_type(return_type)
-                        logger.debug(f"Field {field_name} return type: {return_type}, is_relationship: {is_rel}")
-                        return is_rel
+            # Unified retrieval of return annotation (handles snake/camel, type hints, methods)
+            return_annotation = self._get_field_return_annotation(field_name, strawberry_type)
+            if return_annotation is not None:
+                is_rel = self._is_relationship_field_type(return_annotation)
+                logger.debug(f"Relationship check via unified helper: {field_name} -> {return_annotation} (is_rel={is_rel})")
+                if is_rel:
+                    return True
             
             # Check for special relationship patterns
             is_special = self._is_special_relationship_field(field_name)
@@ -286,36 +253,12 @@ class QueryFieldAnalyzer:
     def _get_relationship_inner_type(self, field_name: str, strawberry_type: Type) -> Optional[Type]:
         """Get the inner type of a relationship field."""
         try:
-            # Check type annotations first
-            type_hints = get_type_hints(strawberry_type)
-            if field_name in type_hints:
-                field_type = type_hints[field_name]
-                inner_type = self._extract_inner_type(field_type)
+            return_annotation = self._get_field_return_annotation(field_name, strawberry_type)
+            if return_annotation is not None:
+                inner_type = self._extract_inner_type(return_annotation)
                 if inner_type:
                     return inner_type
-            
-            # Check strawberry definition fields (for @strawberry.field methods)
-            if hasattr(strawberry_type, '__strawberry_definition__'):
-                definition = strawberry_type.__strawberry_definition__
-                if hasattr(definition, 'fields'):
-                    for strawberry_field in definition.fields:
-                        if self._field_name_matches(strawberry_field, field_name):
-                            # Get the field's return type from the method annotations
-                            if hasattr(strawberry_type, field_name):
-                                method = getattr(strawberry_type, field_name)
-                                if hasattr(method, '__annotations__') and 'return' in method.__annotations__:
-                                    return_type = method.__annotations__['return']
-                                    return self._extract_inner_type(return_type)
-            
-            # Check strawberry field methods (legacy)
-            if hasattr(strawberry_type, field_name):
-                attr = getattr(strawberry_type, field_name)
-                if hasattr(attr, '__strawberry_metadata__') and callable(attr):
-                    if hasattr(attr, '__annotations__') and 'return' in attr.__annotations__:
-                        return_type = attr.__annotations__['return']
-                        return self._extract_inner_type(return_type)
-            
-            # Try dynamic type resolution as fallback
+            # Dynamic fallback (singularize etc.)
             return self._resolve_type_dynamically(field_name)
             
         except Exception as e:
@@ -493,6 +436,52 @@ class QueryFieldAnalyzer:
             return False
         except Exception:
             return False
+
+    # ---------- Shared low-level retrieval helper (DRY) ----------
+    def _get_field_return_annotation(self, field_name: str, strawberry_type: Type) -> Optional[Any]:
+        """Return the annotated return type for a field if resolvable.
+
+        Handles:
+        - Direct dataclass-style attribute annotations (type hints)
+        - @strawberry.field methods (using strawberry definition for reliable python_name)
+        - Legacy callable fields with __strawberry_metadata__
+        - snake_case / camelCase matching via _field_name_matches
+        Returns None if not resolvable.
+        """
+        # 1. Direct type hints (attempt flexible matching across keys)
+        type_hints = get_type_hints(strawberry_type)
+        if field_name in type_hints:
+            return type_hints[field_name]
+        else:
+            # Try matching keys with normalization (snake/camel)
+            for hint_key in type_hints.keys():
+                class _Tmp:  # lightweight object for matching
+                    python_name = hint_key
+                    name = hint_key
+                if self._field_name_matches(_Tmp, field_name):
+                    return type_hints[hint_key]
+
+        # 2. Strawberry definition based methods
+        if hasattr(strawberry_type, '__strawberry_definition__'):
+            definition = strawberry_type.__strawberry_definition__
+            fields = getattr(definition, 'fields', [])
+            for strawberry_field in fields:
+                if self._field_name_matches(strawberry_field, field_name):
+                    python_name = getattr(strawberry_field, 'python_name', field_name)
+                    if hasattr(strawberry_type, python_name):
+                        method = getattr(strawberry_type, python_name)
+                        annotations = getattr(method, '__annotations__', {})
+                        if 'return' in annotations:
+                            return annotations['return']
+
+        # 3. Legacy direct attribute method (only if exact attribute exists)
+        if hasattr(strawberry_type, field_name):
+            attr = getattr(strawberry_type, field_name)
+            if callable(attr):
+                annotations = getattr(attr, '__annotations__', {})
+                if 'return' in annotations:
+                    return annotations['return']
+        return None
 
 
 # Global instance for easy importing

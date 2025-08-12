@@ -62,28 +62,6 @@ class DateTimeString(str):
         return str(self)
 
 
-# ------------------------------ DRY Helpers ----------------------------------
-def _get_db_session_from_info(info: Any):
-    """Extract a DB session from a Strawberry resolver info.context in a consistent way."""
-    db_value = None
-    try:
-        if hasattr(info, 'context') and info.context:
-            if hasattr(info.context, 'get'):
-                db_value = (info.context.get('db_session') or
-                            info.context.get('db') or
-                            info.context.get('database') or
-                            info.context.get('session'))
-            if db_value is None:  # attribute-style
-                for attr_name in ('db_session', 'db', 'database', 'session'):
-                    if hasattr(info.context, attr_name):
-                        db_value = getattr(info.context, attr_name)
-                        if db_value:
-                            break
-    except Exception:  # pragma: no cover - defensive
-        pass
-    return db_value
-
-
 def _normalize_order_arg(other_params: Dict[str, Any]):
     order = other_params.get('order_by')
     if order is None:
