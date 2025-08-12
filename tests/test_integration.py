@@ -151,6 +151,83 @@ class TestBerryQLIntegration:
             # Clean up event listener
             event.remove(engine, "before_cursor_execute", count_queries)
     
+    @pytest.mark.asyncio
+    async def test_posts_and_comments_author_relationships(self, graphql_schema, graphql_context, populated_db):
+        """Test that posts.author and comments.author nested relationships resolve correctly and efficiently."""
+        from sqlalchemy import event
+
+        engine = graphql_context['db_session'].get_bind()
+        query_count = {'count': 0}
+
+        def count_queries(conn, cursor, statement, parameters, context, executemany):
+            query_count['count'] += 1
+
+        event.listen(engine, "before_cursor_execute", count_queries)
+        try:
+            query = """
+            query {
+                users {
+                    id
+                    name
+                    posts {
+                        id
+                        title
+                        author { id name }
+                        comments {
+                            id
+                            content
+                            author { id name }
+                        }
+                    }
+                }
+            }
+            """
+            query_count['count'] = 0
+            result = await graphql_schema.execute(query, context_value=graphql_context)
+
+            assert result.errors is None, f"Errors: {result.errors}"
+            assert result.data is not None
+            users = result.data['users']
+            assert len(users) == 4
+
+            # Helper to get user by name
+            def get_user(name):
+                return next(u for u in users if u['name'] == name)
+
+            # Validate post.author matches owning user
+            alice = get_user('Alice Johnson')
+            for post in alice['posts']:
+                assert post['author']['id'] == alice['id']
+                assert post['author']['name'] == 'Alice Johnson'
+
+            bob = get_user('Bob Smith')
+            for post in bob['posts']:
+                assert post['author']['id'] == bob['id']
+                assert post['author']['name'] == 'Bob Smith'
+
+            # Spot-check comment authors on a few known comments from fixtures
+            first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
+            comment_authors = {c['content']: c['author']['name'] for c in first_post['comments']}
+            # From fixtures: "Great post!" by Bob Smith, "Thanks for sharing!" by Charlie Brown
+            assert comment_authors.get('Great post!') == 'Bob Smith'
+            assert comment_authors.get('Thanks for sharing!') == 'Charlie Brown'
+
+            graphql_post = next(p for p in alice['posts'] if p['title'] == 'GraphQL is Great')
+            if graphql_post['comments']:
+                # Only one comment: "I agree completely!" by Bob Smith
+                assert graphql_post['comments'][0]['author']['name'] == 'Bob Smith'
+
+            sqlalchemy_tips = next(p for p in bob['posts'] if p['title'] == 'SQLAlchemy Tips')
+            sql_comment_authors = {c['content']: c['author']['name'] for c in sqlalchemy_tips['comments']}
+            # From fixtures: "Very helpful tips" by Alice Johnson, "Nice work!" by Charlie Brown
+            assert sql_comment_authors.get('Very helpful tips') == 'Alice Johnson'
+            assert sql_comment_authors.get('Nice work!') == 'Charlie Brown'
+
+            # Ensure optimization (expect single composed SQL query)
+            assert query_count['count'] == 1, f"Expected 1 SQL query, got {query_count['count']}"
+        finally:
+            event.remove(engine, "before_cursor_execute", count_queries)
+
     
     @pytest.mark.asyncio
     async def test_users_query_with_filtering(self, graphql_schema, graphql_context, populated_db):

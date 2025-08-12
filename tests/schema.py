@@ -30,6 +30,8 @@ class CommentType:
     author_id: int
     created_at: datetime
     post: Optional['PostType'] = None
+    author: Optional['UserType'] = None
+
 
 
 @strawberry.type
@@ -39,6 +41,7 @@ class PostType:
     content: Optional[str] = None
     author_id: int
     created_at: datetime
+    author: Optional['UserType'] = None
     
     @strawberry.field
     @berryql.field(
