@@ -206,7 +206,8 @@ class QueryFieldAnalyzer:
                 definition = strawberry_type.__strawberry_definition__
                 if hasattr(definition, 'fields'):
                     for strawberry_field in definition.fields:
-                        if strawberry_field.python_name == field_name:
+                        # Support matching GraphQL field names that may use camelCase while python uses snake_case
+                        if self._field_name_matches(strawberry_field, field_name):
                             logger.debug(f"Field {field_name} found in strawberry definition")
                             # Get the field's return type from the method annotations
                             if hasattr(strawberry_type, field_name):
@@ -298,7 +299,7 @@ class QueryFieldAnalyzer:
                 definition = strawberry_type.__strawberry_definition__
                 if hasattr(definition, 'fields'):
                     for strawberry_field in definition.fields:
-                        if strawberry_field.python_name == field_name:
+                        if self._field_name_matches(strawberry_field, field_name):
                             # Get the field's return type from the method annotations
                             if hasattr(strawberry_type, field_name):
                                 method = getattr(strawberry_type, field_name)
@@ -434,6 +435,64 @@ class QueryFieldAnalyzer:
         except Exception:
             return None
         return None
+
+    # ---------- Internal helpers for flexible field name matching ----------
+    def _field_name_matches(self, strawberry_field, field_name: str) -> bool:
+        """Return True if the provided GraphQL field_name matches the Strawberry field.
+
+        Supports snake_case (python) vs camelCase (GraphQL) naming differences.
+        Matching rules:
+        - Direct match against python_name
+        - Direct match against field's GraphQL name (if present)
+        - Case-insensitive match with underscores removed
+        - snake_case <-> camelCase transformations
+        """
+        try:
+            python_name = getattr(strawberry_field, 'python_name', None)
+            gql_name = getattr(strawberry_field, 'name', python_name)
+            if not field_name:
+                return False
+
+            def normalize(s: str) -> str:
+                return s.replace('_', '').lower()
+
+            def to_camel(s: str) -> str:
+                # user_posts -> userPosts
+                parts = s.split('_')
+                if not parts:
+                    return s
+                return parts[0] + ''.join(p.capitalize() or '_' for p in parts[1:])
+
+            def to_snake(s: str) -> str:
+                # userPosts -> user_posts
+                out = []
+                for ch in s:
+                    if ch.isupper():
+                        out.append('_')
+                        out.append(ch.lower())
+                    else:
+                        out.append(ch)
+                snake = ''.join(out).strip('_')
+                return snake
+
+            candidates = set()
+            for c in (python_name, gql_name):
+                if c:
+                    candidates.add(c)
+            # Add transformed variants
+            more = set()
+            for c in list(candidates):
+                more.add(to_camel(c))
+                more.add(to_snake(c))
+            candidates.update(more)
+
+            norm_field = normalize(field_name)
+            for c in candidates:
+                if normalize(c) == norm_field:
+                    return True
+            return False
+        except Exception:
+            return False
 
 
 # Global instance for easy importing
