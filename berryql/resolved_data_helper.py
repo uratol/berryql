@@ -4,6 +4,7 @@ Helper utilities for working with resolved data in GraphQL types.
 
 from typing import List, TypeVar, Any, Optional, Callable, Union, Dict, Type, get_origin, get_args, get_type_hints, Tuple
 import sys
+import logging
 try:  # ForwardRef name changed across versions
     from typing import ForwardRef as _ForwardRefType
 except Exception:  # pragma: no cover
@@ -59,6 +60,154 @@ class DateTimeString(str):
     def isoformat(self):
         """Return the string as-is for GraphQL datetime serialization."""
         return str(self)
+
+
+# ------------------------------ DRY Helpers ----------------------------------
+def _get_db_session_from_info(info: Any):
+    """Extract a DB session from a Strawberry resolver info.context in a consistent way."""
+    db_value = None
+    try:
+        if hasattr(info, 'context') and info.context:
+            if hasattr(info.context, 'get'):
+                db_value = (info.context.get('db_session') or
+                            info.context.get('db') or
+                            info.context.get('database') or
+                            info.context.get('session'))
+            if db_value is None:  # attribute-style
+                for attr_name in ('db_session', 'db', 'database', 'session'):
+                    if hasattr(info.context, attr_name):
+                        db_value = getattr(info.context, attr_name)
+                        if db_value:
+                            break
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return db_value
+
+
+def _normalize_order_arg(other_params: Dict[str, Any]):
+    order = other_params.get('order_by')
+    if order is None:
+        order = other_params.get('orderBy')
+    return order
+
+
+def _camel_to_snake(name: str) -> str:
+    try:
+        import re
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
+    except Exception:
+        return name
+
+
+def _apply_mapping(mapping: Any, value: Any, where_conditions: Dict[str, Any]):
+    """Apply a single parameter mapping to mutate where_conditions."""
+    if mapping is None:
+        return
+    try:
+        if callable(mapping):
+            clause = mapping(value)
+            if isinstance(clause, dict):
+                where_conditions.update(clause)
+        elif isinstance(mapping, dict):
+            for field_name, condition in mapping.items():
+                if isinstance(condition, dict):
+                    # Evaluate any callables inside condition
+                    processed = {}
+                    has_callable = False
+                    for op, op_val in condition.items():
+                        if callable(op_val):
+                            has_callable = True
+                            processed[op] = op_val(value)
+                        else:
+                            processed[op] = op_val
+                    where_conditions[field_name] = processed if has_callable else condition
+                elif callable(condition):
+                    where_conditions[field_name] = condition(value)
+                else:
+                    where_conditions[field_name] = {'eq': condition}
+    except Exception:  # pragma: no cover
+        pass
+
+
+def _process_graphql_arguments(graphql_kwargs: Dict[str, Any], parameter_mappings: Optional[Dict[str, Any]], handle_where: bool):
+    """Return (where_conditions, other_params, raw_where_value) applying mappings.
+
+    handle_where: if True, treat 'where' specially (convert input types / allow raw string).
+    """
+    where_conditions: Dict[str, Any] = {}
+    other_params: Dict[str, Any] = {}
+    raw_where_value = None
+    for param_name, value in graphql_kwargs.items():
+        if value is None:
+            continue
+        if handle_where and param_name == 'where':
+            # Special handling of 'where'
+            try:
+                from .input_converter import convert_where_input
+                if hasattr(value, '__dict__'):
+                    converted_where = convert_where_input(value.__dict__)
+                    where_conditions.update(converted_where)
+                elif isinstance(value, dict):
+                    where_conditions.update(value)
+                elif isinstance(value, str):
+                    raw_where_value = value
+                continue
+            except Exception:  # pragma: no cover
+                raw_where_value = value if isinstance(value, str) else None
+                continue
+        mapping = None
+        if parameter_mappings:
+            if param_name in parameter_mappings:
+                mapping = parameter_mappings[param_name]
+            else:
+                snake = _camel_to_snake(param_name)
+                if snake in parameter_mappings:
+                    mapping = parameter_mappings[snake]
+        if mapping is not None:
+            _apply_mapping(mapping, value, where_conditions)
+        else:
+            # raw where string preserved when not handle_where, or any other args go to other_params
+            other_params[param_name] = value
+    return where_conditions, other_params, raw_where_value
+
+
+def _extract_strawberry_return_info(return_type):
+    """Given a function return annotation, extract (strawberry_type, return_single).
+    return_single indicates whether resolver returns a single object vs list.
+    Raises ValueError if invalid.
+    """
+    strawberry_type = None
+    return_single = False
+    if not return_type:
+        return None, False
+    origin = get_origin(return_type)
+    if origin is list:
+        args = get_args(return_type)
+        if args:
+            inner = args[0]
+            if hasattr(inner, '__strawberry_definition__') or hasattr(inner, '__strawberry_type__'):
+                strawberry_type = inner
+                return_single = False
+            else:
+                raise ValueError(f"Return type List[{inner}] is not a valid Strawberry type")
+    elif origin is Union:
+        args = get_args(return_type)
+        if args and len(args) == 2 and type(None) in args:
+            inner = args[0] if args[1] is type(None) else args[1]
+            if hasattr(inner, '__strawberry_definition__') or hasattr(inner, '__strawberry_type__'):
+                strawberry_type = inner
+                return_single = True
+            else:
+                raise ValueError(f"Return type Optional[{inner}] is not a valid Strawberry type")
+        else:
+            raise ValueError(f"Unsupported Union return type: {return_type}")
+    else:
+        if hasattr(return_type, '__strawberry_definition__') or hasattr(return_type, '__strawberry_type__'):
+            strawberry_type = return_type
+            return_single = True
+        else:
+            raise ValueError(f"Return type {return_type} is not a valid Strawberry type")
+    return strawberry_type, return_single
 
 
 def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type: Type) -> List[Any]:
@@ -607,57 +756,13 @@ def berryql_field(
                 # This is a resolver field - create and use BerryQL resolver
                 from .factory import BerryQLFactory
                 
-                # Extract strawberry type from return type annotation
-                strawberry_type = None
-                return_single = False  # Determine if we should return a single object vs list
-                if return_type:
-                    # Handle List[SomeType] - extract the inner type
-                    origin = get_origin(return_type)
-                    if origin is list:
-                        args = get_args(return_type)
-                        if args and len(args) > 0:
-                            inner_type = args[0]
-                            # Validate that the inner type is a proper Strawberry type
-                            if hasattr(inner_type, '__strawberry_definition__') or hasattr(inner_type, '__strawberry_type__'):
-                                strawberry_type = inner_type
-                                return_single = False  # List return type
-                            else:
-                                import logging
-                                logger = logging.getLogger(__name__)
-                                logger.error(f"Invalid inner type in List annotation for {func.__name__}: {inner_type}")
-                                logger.error(f"Return type was: {return_type}")
-                                raise ValueError(f"Return type List[{inner_type}] is not a valid Strawberry type for {func.__name__}")
-                    elif origin is Union:
-                        # Handle Optional[SomeType] which is Union[SomeType, type(None)]
-                        args = get_args(return_type)
-                        if args and len(args) == 2 and type(None) in args:
-                            # This is Optional[SomeType]
-                            inner_type = args[0] if args[1] is type(None) else args[1]
-                            if hasattr(inner_type, '__strawberry_definition__') or hasattr(inner_type, '__strawberry_type__'):
-                                strawberry_type = inner_type
-                                return_single = True  # Single object return type (can be None)
-                            else:
-                                import logging
-                                logger = logging.getLogger(__name__)
-                                logger.error(f"Invalid inner type in Optional annotation for {func.__name__}: {inner_type}")
-                                logger.error(f"Return type was: {return_type}")
-                                raise ValueError(f"Return type Optional[{inner_type}] is not a valid Strawberry type for {func.__name__}")
-                        else:
-                            import logging
-                            logger = logging.getLogger(__name__)
-                            logger.error(f"Unsupported Union type for {func.__name__}: {return_type}")
-                            raise ValueError(f"Union types other than Optional are not supported for {func.__name__}")
-                    else:
-                        # Check if it's a valid Strawberry type
-                        if hasattr(return_type, '__strawberry_definition__') or hasattr(return_type, '__strawberry_type__'):
-                            strawberry_type = return_type
-                            return_single = True  # Single object return type
-                        else:
-                            import logging
-                            logger = logging.getLogger(__name__)
-                            logger.error(f"Invalid return type annotation for {func.__name__}: {return_type}")
-                            logger.error(f"Expected a Strawberry type, List[StrawberryType], or Optional[StrawberryType]")
-                            raise ValueError(f"Return type {return_type} is not a valid Strawberry type for {func.__name__}")
+                # Extract strawberry type using helper
+                try:
+                    strawberry_type, return_single = _extract_strawberry_return_info(return_type)
+                except ValueError as e:
+                    logger = logging.getLogger(__name__)
+                    logger.error(f"{e} for {func.__name__}")
+                    raise
                 
                 if strawberry_type is None:
                     raise ValueError(f"Could not determine strawberry type from return annotation of {func.__name__}. "
@@ -751,56 +856,15 @@ def berryql_field(
                             # Build GraphQLQueryParams from the GraphQL arguments - same as for root fields
                             from .factory import GraphQLQueryParams
                             
-                            # Build where conditions using explicit parameter mappings (same logic as root fields)
-                            where_conditions = {}
-                            other_params = {}
-                            
-                            for param_name, value in graphql_kwargs.items():
-                                if value is not None:
-                                    mapping = None
-                                    if actual_parameter_mappings:
-                                        # Direct lookup first
-                                        if param_name in actual_parameter_mappings:
-                                            mapping = actual_parameter_mappings[param_name]
-                                        else:
-                                            # Attempt camelCase -> snake_case conversion
-                                            import re
-                                            snake_candidate = re.sub(r'(?<!^)(?=[A-Z])', '_', param_name).lower()
-                                            if snake_candidate in actual_parameter_mappings:
-                                                mapping = actual_parameter_mappings[snake_candidate]
-                                    if mapping is not None:
-                                        if callable(mapping):
-                                            where_clause = mapping(value)
-                                            if isinstance(where_clause, dict):
-                                                where_conditions.update(where_clause)
-                                        elif isinstance(mapping, dict):
-                                            for field_name, condition in mapping.items():
-                                                if isinstance(condition, dict):
-                                                    if any(callable(v) for v in condition.values()):
-                                                        processed_condition = {}
-                                                        for op, op_value in condition.items():
-                                                            processed_condition[op] = op_value(value) if callable(op_value) else op_value
-                                                        where_conditions[field_name] = processed_condition
-                                                    else:
-                                                        where_conditions[field_name] = condition
-                                                elif callable(condition):
-                                                    where_conditions[field_name] = condition(value)
-                                                else:
-                                                    where_conditions[field_name] = {'eq': condition}
-                                    else:
-                                        # Preserve raw where string for validation in GraphQLQueryParams
-                                        if param_name == 'where' and isinstance(value, str):
-                                            other_params[param_name] = value
-                                        else:
-                                            other_params[param_name] = value
+                            where_conditions, other_params, raw_where_value_unused = _process_graphql_arguments(
+                                graphql_kwargs, actual_parameter_mappings, handle_where=False
+                            )
                             
                             # Build GraphQLQueryParams with where conditions and other parameters
                             # Support both snake_case and camelCase argument names from GraphQL
-                            _order_by_arg = other_params.get('order_by')
-                            if _order_by_arg is None:
-                                _order_by_arg = other_params.get('orderBy')
+                            _order_by_arg = _normalize_order_arg(other_params)
                             query_params = GraphQLQueryParams(
-                                where=where_conditions if where_conditions else other_params.get('where'),
+                                where=where_conditions if where_conditions else other_params.get('where'),  # relationship variant
                                 limit=other_params.get('limit') or other_params.get('Limit') or other_params.get('LIMIT'),
                                 offset=other_params.get('offset') or other_params.get('Offset') or other_params.get('OFFSET'),
                                 order_by=_order_by_arg
@@ -1005,74 +1069,13 @@ def berryql_field(
                     where_conditions = {}
                     other_params = {}
                     
-                    for param_name, value in berryql_kwargs.items():
-                        if param_name not in ['info', 'db', 'database', 'session'] and value is not None:
-                            # Special handling for 'where' parameter
-                            if param_name == 'where':
-                                # Convert Strawberry input type to dictionary format
-                                from .input_converter import convert_where_input
-                                # Track raw where string to allow JSON parsing/validation later
-                                raw_where_value = None
-                                if hasattr(value, '__dict__'):
-                                    # This is a Strawberry input type - convert it
-                                    converted_where = convert_where_input(value.__dict__)
-                                    where_conditions.update(converted_where)
-                                elif isinstance(value, dict):
-                                    # Already a dictionary - use directly
-                                    where_conditions.update(value)
-                                elif isinstance(value, str):
-                                    # Defer JSON parsing/validation to GraphQLQueryParams by passing raw string
-                                    raw_where_value = value
-                                continue
-                            
-                            # Check if this parameter has an explicit mapping (support camelCase GraphQL arg names)
-                            mapping = None
-                            if actual_parameter_mappings:
-                                if param_name in actual_parameter_mappings:
-                                    mapping = actual_parameter_mappings[param_name]
-                                else:
-                                    import re
-                                    snake_candidate = re.sub(r'(?<!^)(?=[A-Z])', '_', param_name).lower()
-                                    if snake_candidate in actual_parameter_mappings:
-                                        mapping = actual_parameter_mappings[snake_candidate]
-                            if mapping is not None:
-                                
-                                if callable(mapping):
-                                    # If mapping is a callable, call it with the value
-                                    where_clause = mapping(value)
-                                    if isinstance(where_clause, dict):
-                                        where_conditions.update(where_clause)
-                                elif isinstance(mapping, dict):
-                                    # If mapping is a dict, process it
-                                    for field_name, condition in mapping.items():
-                                        if isinstance(condition, dict):
-                                            # Direct field condition like {'like': '%value%'}
-                                            if any(callable(v) for v in condition.values()):
-                                                # Contains callables - process them
-                                                processed_condition = {}
-                                                for op, op_value in condition.items():
-                                                    if callable(op_value):
-                                                        processed_condition[op] = op_value(value)
-                                                    else:
-                                                        processed_condition[op] = op_value
-                                                where_conditions[field_name] = processed_condition
-                                            else:
-                                                # Static condition
-                                                where_conditions[field_name] = condition
-                                        elif callable(condition):
-                                            # Field condition is a callable
-                                            where_conditions[field_name] = condition(value)
-                                        else:
-                                            # Simple field condition
-                                            where_conditions[field_name] = {'eq': condition}
-                            else:
-                                # No explicit mapping - treat as other parameter
-                                other_params[param_name] = value
+                    filtered_kwargs = {k: v for k, v in berryql_kwargs.items() if k not in ['info', 'db', 'database', 'session']}
+                    where_conditions, other_params, raw_where_value = _process_graphql_arguments(
+                        filtered_kwargs, actual_parameter_mappings, handle_where=True
+                    )
                     
                     # Build GraphQLQueryParams with where conditions and other parameters
-                    _order_by_arg = other_params.get('order_by')
-                    if _order_by_arg is None:
-                        _order_by_arg = other_params.get('orderBy')
+                    _order_by_arg = _normalize_order_arg(other_params)
                     query_params = GraphQLQueryParams(
                         where=where_conditions if where_conditions else (raw_where_value if 'raw_where_value' in locals() else None),
                         limit=other_params.get('limit') or other_params.get('Limit') or other_params.get('LIMIT'),
