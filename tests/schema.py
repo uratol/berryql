@@ -32,8 +32,6 @@ class CommentType:
     post: Optional['PostType'] = None
     author: Optional['UserType'] = None
 
-
-
 @strawberry.type
 class PostType:
     id: int

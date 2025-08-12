@@ -1442,6 +1442,27 @@ class BerryQLFactory:
             # Always include required fields even if not explicitly requested in GraphQL query
             required_fields = TypeAnalyzer.get_required_fields(strawberry_type)
             all_scalar_fields = scalar_fields | required_fields
+
+            # Include local foreign key columns needed for any requested object (single) relationships.
+            # E.g. selecting 'location { ... }' for a Scene requires selecting 'location_id' in Scene subquery
+            try:
+                if object_relationships:
+                    for obj_rel_name, obj_rel_cfg in (object_relationships.items() if isinstance(object_relationships, dict) else []):
+                        actual_obj_rel_name = obj_rel_cfg.get('_resolved_field_name', obj_rel_name) if isinstance(obj_rel_cfg, dict) else obj_rel_name
+                        if not hasattr(model_class, actual_obj_rel_name):
+                            continue
+                        rel_attr = getattr(model_class, actual_obj_rel_name)
+                        rel_prop = getattr(rel_attr, 'property', None)
+                        if not rel_prop:
+                            continue
+                        local_remote_pairs = getattr(rel_prop, 'local_remote_pairs', []) or []
+                        for local_col, _remote_col in local_remote_pairs:
+                            fk_name = getattr(local_col, 'key', None) or getattr(local_col, 'name', None)
+                            if fk_name and fk_name not in all_scalar_fields:
+                                all_scalar_fields.add(fk_name)
+            except Exception:
+                # Silent fail (non-critical); only affects presence of FK columns
+                pass
             
             # Build the base query for the related model, including custom fields
             # Separate regular vs custom fields for the related strawberry type
