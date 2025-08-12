@@ -345,9 +345,9 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 _val = getattr(instance, _fname, None)
                 if not isinstance(_val, dict):
                     continue
-                if st_type.__name__ == 'CommentType' and _fname == 'post':
+                if st_type.__name__ == 'PostCommentType' and _fname == 'post':
                     import logging as _lg
-                    _lg.getLogger(__name__).debug('Post-construction fixup converting CommentType.post dict -> instance (%s branch)' % ('datetime' if datetime_branch else 'no-datetime'))
+                    _lg.getLogger(__name__).debug('Post-construction fixup converting PostCommentType.post dict -> instance (%s branch)' % ('datetime' if datetime_branch else 'no-datetime'))
                 if isinstance(_ftype, str):
                     mod = sys.modules.get(st_type.__module__)
                     if mod and hasattr(mod, _ftype):

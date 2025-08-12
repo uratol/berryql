@@ -11,18 +11,18 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import berryql
-from .models import User, Post, Comment
+from .models import User, Post, PostComment
 from sqlalchemy import func, select
 
 
 @strawberry.type
-class CommentAggType:
+class PostCommentAggType:
     min_created_at: Optional[datetime] = None
     comments_count: int
 
 
 @strawberry.type
-class CommentType:
+class PostCommentType:
     id: int
     content: str
     rate: int
@@ -45,11 +45,11 @@ class PostType:
     @berryql.field(
         rate_less_than={'rate': {'lt': lambda value: value}}
     )
-    async def comments(self, 
+    async def post_comments(self, 
                        info: strawberry.Info,
                        order_by: Optional[str] = 'rate',
                        rate_less_than: Optional[int] = None,
-                       ) -> List[CommentType]:
+                       ) -> List[PostCommentType]:
         """Get post's comments using pre-resolved data."""
         pass
     
@@ -58,14 +58,14 @@ class PostType:
         select(
             berryql.json_object(
                 info,
-                'min_created_at', func.min(Comment.created_at),
-                'comments_count', func.count(Comment.id)
+                'min_created_at', func.min(PostComment.created_at),
+                'comments_count', func.count(PostComment.id)
             )
         )
-        .select_from(Comment)
-        .where(Comment.post_id == model_class.id)
+    .select_from(PostComment)
+    .where(PostComment.post_id == model_class.id)
     ))
-    async def comments_agg(self, info: strawberry.Info) -> Optional[CommentAggType]:
+    async def post_comments_agg(self, info: strawberry.Info) -> Optional[PostCommentAggType]:
         """Get post's comments aggregation using pre-resolved data."""
         pass
 
@@ -74,19 +74,19 @@ class PostType:
         select(
             berryql.json_object(
                 info,
-                'id', Comment.id,
-                'content', Comment.content,
-                'post_id', Comment.post_id,
-                'author_id', Comment.author_id,
-                'created_at', Comment.created_at
+                'id', PostComment.id,
+                'content', PostComment.content,
+                'post_id', PostComment.post_id,
+                'author_id', PostComment.author_id,
+                'created_at', PostComment.created_at
             )
         )
-        .select_from(Comment)
-        .where(Comment.post_id == model_class.id)
-        .order_by(Comment.created_at.desc().nullslast(), Comment.id.desc())
+    .select_from(PostComment)
+    .where(PostComment.post_id == model_class.id)
+    .order_by(PostComment.created_at.desc().nullslast(), PostComment.id.desc())
         .limit(1)
     ))
-    async def last_comment(self, info: strawberry.Info) -> Optional[CommentType]:
+    async def last_post_comment(self, info: strawberry.Info) -> Optional[PostCommentType]:
         """Get post's last comment using pre-resolved data."""
         pass
 
@@ -118,7 +118,7 @@ class UserType:
     
     @strawberry.field
     @berryql.field
-    async def comments(self, info: strawberry.Info) -> List[CommentType]:
+    async def post_comments(self, info: strawberry.Info) -> List[PostCommentType]:
         """Get user's comments using pre-resolved data."""
         pass
     

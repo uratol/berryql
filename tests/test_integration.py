@@ -81,7 +81,7 @@ class TestBerryQLIntegration:
         assert any(post['title'] == 'GraphQL is Great' for post in alice['posts'])
     
     @pytest.mark.asyncio
-    async def test_users_with_posts_and_comments(self, graphql_schema, graphql_context, populated_db):
+    async def test_users_with_posts_and_post_comments(self, graphql_schema, graphql_context, populated_db):
         """Test users query with nested posts and comments."""
         from sqlalchemy import event
         
@@ -108,13 +108,13 @@ class TestBerryQLIntegration:
                         id
                         title
                         content
-                        comments {
+                        postComments {
                             id
                             content
                             authorId
                         }
                     }
-                    comments {
+                    postComments {
                         id
                         content
                         postId
@@ -138,11 +138,11 @@ class TestBerryQLIntegration:
             # Check that Alice's posts have comments
             alice = next(user for user in users if user['name'] == 'Alice Johnson')
             first_post = next(post for post in alice['posts'] if post['title'] == 'First Post')
-            assert len(first_post['comments']) == 2  # First post has 2 comments
+            assert len(first_post['postComments']) == 2  # First post has 2 comments
             
             # Check that users have their own comments
             bob = next(user for user in users if user['name'] == 'Bob Smith')
-            assert len(bob['comments']) >= 1  # Bob has made comments
+            assert len(bob['postComments']) >= 1  # Bob has made comments
             
             # Assert that the SQL query was executed only once (N+1 prevention)
             assert query_count['count'] == 1, f"Expected 1 SQL query, but {query_count['count']} were executed"
@@ -152,7 +152,7 @@ class TestBerryQLIntegration:
             event.remove(engine, "before_cursor_execute", count_queries)
     
     @pytest.mark.asyncio
-    async def test_posts_and_comments_author_relationships(self, graphql_schema, graphql_context, populated_db):
+    async def test_posts_and_post_comments_author_relationships(self, graphql_schema, graphql_context, populated_db):
         """Test that posts.author and comments.author nested relationships resolve correctly and efficiently."""
         from sqlalchemy import event
 
@@ -173,7 +173,7 @@ class TestBerryQLIntegration:
                         id
                         title
                         author { id name }
-                        comments {
+                        postComments {
                             id
                             content
                             author { id name }
@@ -207,18 +207,18 @@ class TestBerryQLIntegration:
 
             # Spot-check comment authors on a few known comments from fixtures
             first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
-            comment_authors = {c['content']: c['author']['name'] for c in first_post['comments']}
+            comment_authors = {c['content']: c['author']['name'] for c in first_post['postComments']}
             # From fixtures: "Great post!" by Bob Smith, "Thanks for sharing!" by Charlie Brown
             assert comment_authors.get('Great post!') == 'Bob Smith'
             assert comment_authors.get('Thanks for sharing!') == 'Charlie Brown'
 
             graphql_post = next(p for p in alice['posts'] if p['title'] == 'GraphQL is Great')
-            if graphql_post['comments']:
+            if graphql_post['postComments']:
                 # Only one comment: "I agree completely!" by Bob Smith
-                assert graphql_post['comments'][0]['author']['name'] == 'Bob Smith'
+                assert graphql_post['postComments'][0]['author']['name'] == 'Bob Smith'
 
             sqlalchemy_tips = next(p for p in bob['posts'] if p['title'] == 'SQLAlchemy Tips')
-            sql_comment_authors = {c['content']: c['author']['name'] for c in sqlalchemy_tips['comments']}
+            sql_comment_authors = {c['content']: c['author']['name'] for c in sqlalchemy_tips['postComments']}
             # From fixtures: "Very helpful tips" by Alice Johnson, "Nice work!" by Charlie Brown
             assert sql_comment_authors.get('Very helpful tips') == 'Alice Johnson'
             assert sql_comment_authors.get('Nice work!') == 'Charlie Brown'
@@ -318,7 +318,7 @@ class TestBerryQLIntegration:
         assert result_none.data['users'][0]['posts'] == []
 
     @pytest.mark.asyncio
-    async def test_post_comments_rate_less_than_filter(self, graphql_schema, graphql_context, populated_db):
+    async def test_post_post_comments_rate_less_than_filter(self, graphql_schema, graphql_context, populated_db):
         """Test nested comments(rateLessThan) argument filters comments by rate (< value)."""
         # Query Alice's posts and filter comments with rateLessThan: 3 (should exclude rate >=3)
         query_rate_lt = """
@@ -328,7 +328,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    comments(rateLessThan: 3) {
+                    postComments(rateLessThan: 3) {
                         id
                         rate
                         content
@@ -345,11 +345,11 @@ class TestBerryQLIntegration:
         for post in alice['posts']:
             if post['title'] == 'First Post':
                 # First Post has comment rates 2 and 1 in fixtures; both are <3
-                comment_rates = sorted(c['rate'] for c in post['comments'])
+                comment_rates = sorted(c['rate'] for c in post['postComments'])
                 assert comment_rates == [1, 2]
             elif post['title'] == 'GraphQL is Great':
                 # GraphQL is Great has one comment rate 3 (==3) so with <3 filter should exclude it
-                assert post['comments'] == []
+                assert post['postComments'] == []
 
         # Stricter filter (rateLessThan: 2) should remove the rate 2 comment as well
         query_rate_lt_2 = """
@@ -358,7 +358,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    comments(rateLessThan: 2) { id rate }
+                    postComments(rateLessThan: 2) { id rate }
                 }
             }
         }
@@ -368,10 +368,10 @@ class TestBerryQLIntegration:
         for post in result_rate_lt_2.data['users'][0]['posts']:
             if post['title'] == 'First Post':
                 # <2 should keep only rate 1
-                rates = sorted(c['rate'] for c in post['comments'])
+                rates = sorted(c['rate'] for c in post['postComments'])
                 assert rates == [1]
             else:
-                assert post['comments'] == []
+                assert post['postComments'] == []
     
     @pytest.mark.asyncio
     async def test_admin_users_can_see_all_users(self, graphql_schema, graphql_context, populated_db):
@@ -792,13 +792,13 @@ class TestBerryQLIntegration:
                     id
                     title
                     content
-                    comments {
+                    postComments {
                         id
                         content
                         authorId
                     }
                 }
-                comments {
+                postComments {
                     id
                     content
                     postId
@@ -818,19 +818,19 @@ class TestBerryQLIntegration:
         for user in users:
             assert 'posts' in user
             assert isinstance(user['posts'], list)
-            assert 'comments' in user
-            assert isinstance(user['comments'], list)
+            assert 'postComments' in user
+            assert isinstance(user['postComments'], list)
             
             # Check that posts have the expected fields and comments
             for post in user['posts']:
                 assert 'id' in post
                 assert 'title' in post
                 assert 'content' in post
-                assert 'comments' in post
-                assert isinstance(post['comments'], list)
+                assert 'postComments' in post
+                assert isinstance(post['postComments'], list)
                 
                 # Check that comments have the expected fields
-                for comment in post['comments']:
+                for comment in post['postComments']:
                     assert 'id' in comment
                     assert 'content' in comment
                     assert 'authorId' in comment
@@ -1112,8 +1112,8 @@ class TestBerryQLIntegration:
         assert "Custom logic executed: User 999 is forbidden!" in str(result_with_error.errors[0])
 
     @pytest.mark.asyncio
-    async def test_posts_comments_agg(self, graphql_schema, graphql_context, populated_db):
-        """Verify commentsAgg provides minCreatedAt and commentsCount per post."""
+    async def test_posts_post_comments_agg(self, graphql_schema, graphql_context, populated_db):
+        """Verify postCommentsAgg provides minCreatedAt and commentsCount per post."""
         query = """
         query {
             users {
@@ -1122,7 +1122,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    commentsAgg {
+                    postCommentsAgg {
                         minCreatedAt
                         commentsCount
                     }
@@ -1136,30 +1136,29 @@ class TestBerryQLIntegration:
         assert result.data is not None
 
         users = result.data['users']
-        # Build a map of user -> {post title -> (minCreatedAt, commentsCount)}
+        # Validate aggregation structure and values
         for user in users:
             for post in user['posts']:
-                agg = post.get('commentsAgg')
+                agg = post.get('postCommentsAgg')
                 assert agg is not None
-                # minCreatedAt should be present (stringified datetime) and commentsCount non-negative
                 assert agg['minCreatedAt'] is not None
                 assert isinstance(agg['commentsCount'], int)
                 assert agg['commentsCount'] >= 0
 
         # Spot-check known counts from fixtures
         alice = next(u for u in users if u['name'] == 'Alice Johnson')
-        alice_counts = {p['title']: p['commentsAgg']['commentsCount'] for p in alice['posts']}
+        alice_counts = {p['title']: p['postCommentsAgg']['commentsCount'] for p in alice['posts']}
         assert alice_counts.get('First Post') == 2
         assert alice_counts.get('GraphQL is Great') == 1
 
         bob = next(u for u in users if u['name'] == 'Bob Smith')
-        bob_counts = {p['title']: p['commentsAgg']['commentsCount'] for p in bob['posts']}
+        bob_counts = {p['title']: p['postCommentsAgg']['commentsCount'] for p in bob['posts']}
         assert bob_counts.get('SQLAlchemy Tips') == 2
         assert bob_counts.get('Python Best Practices') == 1
 
     @pytest.mark.asyncio
-    async def test_posts_last_comment(self, graphql_schema, graphql_context, populated_db):
-        """Verify lastComment returns the latest comment per post (by created_at then id)."""
+    async def test_posts_last_post_comment(self, graphql_schema, graphql_context, populated_db):
+        """Verify lastPostComment returns the latest comment per post (by created_at then id)."""
         query = """
         query {
             users {
@@ -1168,7 +1167,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    lastComment {
+                    lastPostComment {
                         id
                         content
                         authorId
@@ -1189,7 +1188,7 @@ class TestBerryQLIntegration:
         def last_content_of(user_name, post_title):
             u = next(u for u in users if u['name'] == user_name)
             p = next(p for p in u['posts'] if p['title'] == post_title)
-            lc = p.get('lastComment')
+            lc = p.get('lastPostComment')
             return lc['content'] if lc else None
 
         # From fixtures, each post with comments should have a last comment
@@ -1200,8 +1199,8 @@ class TestBerryQLIntegration:
         assert last_content_of('Charlie Brown', 'Getting Started') is not None
 
     @pytest.mark.asyncio
-    async def test_post_comments_order_by_content_desc(self, graphql_schema, graphql_context, populated_db):
-        """Ensure PostType.comments(orderBy: "content desc") sorts comments by content descending."""
+    async def test_post_post_comments_order_by_content_desc(self, graphql_schema, graphql_context, populated_db):
+        """Ensure PostType.postComments(orderBy: "content desc") sorts comments by content descending."""
         query = """
         query {
             users(nameFilter: "Alice Johnson") {
@@ -1210,7 +1209,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    comments(orderBy: "content desc") {
+                    postComments(orderBy: "content desc") {
                         id
                         content
                     }
@@ -1227,17 +1226,14 @@ class TestBerryQLIntegration:
         assert len(users) == 1
         alice = users[0]
         first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
-        contents = [c['content'] for c in first_post['comments']]
-        # From fixtures for Alice's "First Post":
-        # - "Great post!"
-        # - "Thanks for sharing!"
-        # Descending by content should put "Thanks for sharing!" first
+        contents = [c['content'] for c in first_post['postComments']]
+        # From fixtures for Alice's "First Post": "Great post!", "Thanks for sharing!"
         assert contents == sorted(contents, reverse=True)
         assert contents[0] == "Thanks for sharing!"
 
     @pytest.mark.asyncio
-    async def test_post_comments_order_by_content_asc(self, graphql_schema, graphql_context, populated_db):
-        """Ensure PostType.comments(orderBy: "content asc") sorts comments by content ascending."""
+    async def test_post_post_comments_order_by_content_asc(self, graphql_schema, graphql_context, populated_db):
+        """Ensure PostType.postComments(orderBy: "content asc") sorts comments by content ascending."""
         query = """
         query {
             users(nameFilter: "Alice Johnson") {
@@ -1246,7 +1242,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    comments(orderBy: "content asc") {
+                    postComments(orderBy: "content asc") {
                         id
                         content
                     }
@@ -1263,14 +1259,13 @@ class TestBerryQLIntegration:
         assert len(users) == 1
         alice = users[0]
         first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
-        contents = [c['content'] for c in first_post['comments']]
-        # Ascending by content should put "Great post!" first
+        contents = [c['content'] for c in first_post['postComments']]
         assert contents == sorted(contents)
         assert contents[0] == "Great post!"
 
     @pytest.mark.asyncio
-    async def test_post_comments_default_order_by_rate(self, graphql_schema, graphql_context, populated_db):
-        """Ensure PostType.comments (without orderBy) defaults to order by rate (ascending)."""
+    async def test_post_post_comments_default_order_by_rate(self, graphql_schema, graphql_context, populated_db):
+        """Ensure PostType.postComments (without orderBy) defaults to order by rate (ascending)."""
         query = """
         query {
             users(nameFilter: "Alice Johnson") {
@@ -1279,7 +1274,7 @@ class TestBerryQLIntegration:
                 posts {
                     id
                     title
-                    comments {
+                    postComments {
                         id
                         content
                         rate
@@ -1298,15 +1293,13 @@ class TestBerryQLIntegration:
         assert len(users) == 1
         alice = users[0]
         first_post = next(p for p in alice['posts'] if p['title'] == 'First Post')
-        rates = [c['rate'] for c in first_post['comments']]
-        # With rates [1,2] for Alice's first post, default asc ordering should keep [1,2]
+        rates = [c['rate'] for c in first_post['postComments']]
         assert rates == sorted(rates)
-        # Also check the first is the lower-rated "Great post!"
-        assert first_post['comments'][0]['content'] == "Thanks for sharing!"
+        assert first_post['postComments'][0]['content'] == "Thanks for sharing!"
 
     @pytest.mark.asyncio
-    async def test_comment_parent_post_reference(self, graphql_schema, graphql_context, populated_db):
-        """Verify that requesting comments { post { id title } } returns parent post without N+1."""
+    async def test_post_comment_parent_post_reference(self, graphql_schema, graphql_context, populated_db):
+        """Verify that requesting postComments { post { id title } } returns parent post without N+1."""
         from sqlalchemy import event
         engine = graphql_context['db_session'].get_bind()
         query_count = {'count': 0}
@@ -1320,7 +1313,7 @@ class TestBerryQLIntegration:
                     id
                     posts {
                         id
-                        comments {
+                        postComments {
                             id
                             content
                             post { id title }
@@ -1336,7 +1329,7 @@ class TestBerryQLIntegration:
             assert len(users) == 1
             posts = users[0]['posts']
             for p in posts:
-                for c in p['comments']:
+                for c in p['postComments']:
                     parent = c.get('post')
                     assert parent is not None
                     assert parent['id'] == p['id']
@@ -1347,14 +1340,14 @@ class TestBerryQLIntegration:
             event.remove(engine, 'before_cursor_execute', count_queries)
 
     @pytest.mark.asyncio
-    async def test_comment_parent_post_with_nested_fields(self, graphql_schema, graphql_context, populated_db):
+    async def test_post_comment_parent_post_with_nested_fields(self, graphql_schema, graphql_context, populated_db):
         """Request parent post plus its own comments aggregation to ensure nested selection works."""
         query = """
         query {
             users(nameFilter: "Alice Johnson") {
                 posts {
                     id
-                    comments {
+                    postComments {
                         id
                         post {
                             id
@@ -1370,7 +1363,7 @@ class TestBerryQLIntegration:
         users = result.data['users']
         post_ids = {p['id'] for p in users[0]['posts']}
         for post in users[0]['posts']:
-            for c in post['comments']:
+            for c in post['postComments']:
                 assert c['post']['id'] in post_ids
 
 

@@ -21,8 +21,8 @@ class User(Base):
     
     # Relationship to posts
     posts = relationship("Post", back_populates="author")
-    # Relationship to comments
-    comments = relationship("Comment", back_populates="author")
+    # Relationship to comments (original name kept for BerryQL); GraphQL field renamed separately
+    post_comments = relationship("PostComment", back_populates="author")
 
 
 class Post(Base):
@@ -36,12 +36,12 @@ class Post(Base):
     
     # Relationship to user
     author = relationship("User", back_populates="posts")
-    # Relationship to comments
-    comments = relationship("Comment", back_populates="post")
+    # Relationship to comments (original name kept for BerryQL); GraphQL field renamed separately
+    post_comments = relationship("PostComment", back_populates="post")
 
 
-class Comment(Base):
-    __tablename__ = 'comments'
+class PostComment(Base):
+    __tablename__ = 'post_comments'
     
     id = Column(Integer, primary_key=True)
     content = Column(String(1000), nullable=False)
@@ -52,5 +52,6 @@ class Comment(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     
     # Relationships
-    post = relationship("Post", back_populates="comments")
-    author = relationship("User", back_populates="comments")
+    post = relationship("Post", back_populates="post_comments")
+    author = relationship("User", back_populates="post_comments")
+

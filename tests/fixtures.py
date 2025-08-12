@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import User, Post, Comment
+from .models import User, Post, PostComment
 
 
 @pytest.fixture(scope="function")
@@ -74,24 +74,24 @@ async def sample_comments(db_session: AsyncSession, sample_users, sample_posts):
     user3 = sample_users[2]
     post1, post2, post3, post4, post5 = sample_posts
     
-    comments = [
+    post_comments = [
         # Assign rates so that default ordering by rate asc is deterministic
-        Comment(content="Great post!", post_id=post1.id, author_id=user2.id, rate=2),
-        Comment(content="Thanks for sharing!", post_id=post1.id, author_id=user3.id, rate=1),
-        Comment(content="I agree completely!", post_id=post2.id, author_id=user2.id, rate=3),
-        Comment(content="Very helpful tips", post_id=post3.id, author_id=user1.id, rate=1),
-        Comment(content="Nice work!", post_id=post3.id, author_id=user3.id, rate=2),
-        Comment(content="Looking forward to more", post_id=post4.id, author_id=user1.id, rate=1),
-        Comment(content="This helped me a lot", post_id=post5.id, author_id=user2.id, rate=5),
+    PostComment(content="Great post!", post_id=post1.id, author_id=user2.id, rate=2),
+    PostComment(content="Thanks for sharing!", post_id=post1.id, author_id=user3.id, rate=1),
+    PostComment(content="I agree completely!", post_id=post2.id, author_id=user2.id, rate=3),
+    PostComment(content="Very helpful tips", post_id=post3.id, author_id=user1.id, rate=1),
+    PostComment(content="Nice work!", post_id=post3.id, author_id=user3.id, rate=2),
+    PostComment(content="Looking forward to more", post_id=post4.id, author_id=user1.id, rate=1),
+    PostComment(content="This helped me a lot", post_id=post5.id, author_id=user2.id, rate=5),
     ]
     
-    db_session.add_all(comments)
+    db_session.add_all(post_comments)
     # Flush to persist and populate primary keys without issuing per-row refreshes
     await db_session.flush()
     # Commit once after IDs are populated
     await db_session.commit()
     
-    return comments
+    return post_comments
 
 
 @pytest.fixture(scope="function")
@@ -100,5 +100,5 @@ async def populated_db(sample_users, sample_posts, sample_comments):
     return {
         'users': sample_users,
         'posts': sample_posts,
-        'comments': sample_comments
+        'post_comments': sample_comments
     }
