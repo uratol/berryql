@@ -3,6 +3,12 @@ Helper utilities for working with resolved data in GraphQL types.
 """
 
 from typing import List, TypeVar, Any, Optional, Callable, Union, Dict, Type, get_origin, get_args, get_type_hints, Tuple
+import sys
+try:  # ForwardRef name changed across versions
+    from typing import ForwardRef as _ForwardRefType
+except Exception:  # pragma: no cover
+    class _ForwardRefType:  # type: ignore
+        pass
 import strawberry
 from functools import wraps
 from sqlalchemy.sql import ColumnElement
@@ -121,8 +127,11 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 resolved_data = {}
                 direct_attrs = {}
                 
-                # Get type hints to understand which fields are constructor parameters
-                type_hints = getattr(strawberry_type, '__annotations__', {})
+                # Get type hints (resolved) to understand which fields are constructor parameters
+                try:
+                    type_hints = get_type_hints(strawberry_type)
+                except Exception:
+                    type_hints = getattr(strawberry_type, '__annotations__', {})
                 
                 for field_name, field_value in item_data.items():
                     # Check if this field is a method (relationship field) or a registered custom field
@@ -241,6 +250,48 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                             if target_type and hasattr(target_type, '__strawberry_definition__'):
                                 # Recursively convert nested relationship data
                                 converted_instances = convert_json_to_strawberry_instances(field_value, target_type)
+                                # Additionally, convert any single-object (parent) relationship dicts inside each item
+                                try:
+                                    # Access annotations of target_type to locate potential object relationship fields
+                                    child_type_hints = get_type_hints(target_type)
+                                    for idx, child_instance in enumerate(converted_instances):
+                                        if not child_instance:
+                                            continue
+                                        # Original raw dict for this child (same index in field_value)
+                                        raw_child_dict = field_value[idx] if idx < len(field_value) else None
+                                        if not isinstance(raw_child_dict, dict):
+                                            continue
+                                        for rel_field, rel_type in child_type_hints.items():
+                                            # Skip if value already set to a Strawberry instance
+                                            existing_val = getattr(child_instance, rel_field, None)
+                                            if existing_val and hasattr(existing_val, '__strawberry_definition__'):
+                                                continue
+                                            # Determine if this annotation is Optional[Something]
+                                            _origin = get_origin(rel_type)
+                                            _args = get_args(rel_type) if _origin is Union else ()
+                                            if _origin is Union and any(a is type(None) for a in _args):
+                                                non_none = [a for a in _args if a is not type(None)]
+                                                rel_type_inner = non_none[0] if non_none else None
+                                            else:
+                                                rel_type_inner = rel_type
+                                            if not rel_type_inner or not hasattr(rel_type_inner, '__strawberry_definition__'):
+                                                continue
+                                            raw_parent_val = raw_child_dict.get(rel_field)
+                                            if isinstance(raw_parent_val, dict):
+                                                # Convert dict to Strawberry instance(s)
+                                                parent_list = convert_json_to_strawberry_instances([raw_parent_val], rel_type_inner)
+                                                setattr(child_instance, rel_field, parent_list[0] if parent_list else None)
+                                            elif isinstance(raw_parent_val, str):
+                                                import json as _json
+                                                try:
+                                                    parsed_parent = _json.loads(raw_parent_val)
+                                                except Exception:
+                                                    parsed_parent = None
+                                                if isinstance(parsed_parent, dict):
+                                                    parent_list = convert_json_to_strawberry_instances([parsed_parent], rel_type_inner)
+                                                    setattr(child_instance, rel_field, parent_list[0] if parent_list else None)
+                                except Exception:
+                                    pass
                                 resolved_data['_resolved'][field_name] = converted_instances
                             else:
                                 # Fallback - store the raw data
@@ -249,15 +300,64 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                             # Not a nested relationship or empty - store as-is
                             resolved_data['_resolved'][field_name] = field_value
                     elif is_constructor_param:
-                        # This is a constructor parameter
+                        # This is a constructor parameter; convert nested object relationship dicts
                         if field_name in datetime_fields and isinstance(field_value, str):
-                            constructor_data[field_name] = DateTimeString(field_value)
+                            constructor_value = DateTimeString(field_value)
                         else:
-                            constructor_data[field_name] = field_value
+                            constructor_value = field_value
+                        try:
+                            target_type = type_hints.get(field_name)
+                            # Unwrap Optional/Union
+                            origin = get_origin(target_type)
+                            if origin is Union:
+                                args = [a for a in get_args(target_type) if a is not type(None)]  # noqa: E721
+                                if args:
+                                    target_type = args[0]
+                            # If JSON string, attempt to parse
+                            if isinstance(constructor_value, str) and hasattr(target_type, '__strawberry_definition__'):
+                                import json as _json
+                                try:
+                                    parsed_obj = _json.loads(constructor_value)
+                                except Exception:
+                                    parsed_obj = None
+                                if isinstance(parsed_obj, dict):
+                                    converted_list = convert_json_to_strawberry_instances([parsed_obj], target_type)
+                                    constructor_value = converted_list[0] if converted_list else None
+                            # If dict value corresponds to Strawberry type, recursively convert
+                            elif isinstance(constructor_value, dict) and hasattr(target_type, '__strawberry_definition__'):
+                                converted_list = convert_json_to_strawberry_instances([constructor_value], target_type)
+                                constructor_value = converted_list[0] if converted_list else None
+                            # Fallback: if still dict, instantiate directly
+                            if isinstance(constructor_value, dict) and hasattr(target_type, '__strawberry_definition__'):
+                                try:
+                                    constructor_value = target_type(**constructor_value)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        constructor_data[field_name] = constructor_value
                     # If it's neither, skip it (shouldn't happen in well-formed data)
                 
-                # Create the instance with constructor data only
-                instance = strawberry_type(**constructor_data)
+                # Create the instance; allow partial construction when required fields missing
+                try:
+                    instance = strawberry_type(**constructor_data)
+                except Exception:
+                    # Fallback: create instance without calling __init__ (partial selection)
+                    try:
+                        instance = object.__new__(strawberry_type)
+                        # Populate provided fields
+                        for k, v in constructor_data.items():
+                            setattr(instance, k, v)
+                        # Fill any missing annotated fields with None/default if absent
+                        try:
+                            annotations = getattr(strawberry_type, '__annotations__', {})
+                            for fld, _ann in annotations.items():
+                                if not hasattr(instance, fld):
+                                    setattr(instance, fld, None)
+                        except Exception:
+                            pass
+                    except Exception:
+                        raise
                 
                 # Set resolved data if any
                 if resolved_data:
@@ -267,6 +367,47 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 if direct_attrs:
                     for attr_name, attr_value in direct_attrs.items():
                         setattr(instance, attr_name, attr_value)
+
+                # Final safety pass: convert any remaining dict-valued object relationship fields
+                # (e.g., optional single-object parents) that may not have been converted earlier
+                try:
+                    _type_hints_fix = get_type_hints(strawberry_type)
+                except Exception:
+                    _type_hints_fix = getattr(strawberry_type, '__annotations__', {}) or {}
+                for _fname, _ftype in _type_hints_fix.items():
+                    try:
+                        _val = getattr(instance, _fname, None)
+                        if not isinstance(_val, dict):
+                            continue
+                        if strawberry_type.__name__ == 'CommentType' and _fname == 'post':
+                            import logging as _lg; _lg.getLogger(__name__).debug('Post-construction fixup converting CommentType.post dict -> instance (datetime branch)')
+                        # Resolve forward refs (string or ForwardRef) early
+                        if isinstance(_ftype, str):
+                            mod = sys.modules.get(strawberry_type.__module__)
+                            if mod and hasattr(mod, _ftype):
+                                _ftype = getattr(mod, _ftype)
+                        elif isinstance(_ftype, _ForwardRefType):  # type: ignore
+                            try:
+                                _eval = _ftype.__forward_arg__  # type: ignore[attr-defined]
+                                mod = sys.modules.get(strawberry_type.__module__)
+                                if mod and hasattr(mod, _eval):
+                                    _ftype = getattr(mod, _eval)
+                            except Exception:
+                                pass
+                        _origin = get_origin(_ftype)
+                        _args = get_args(_ftype) if _origin is Union else ()
+                        if _origin is Union and any(a is type(None) for a in _args):  # Optional[...] unwrap
+                            _nn = [a for a in _args if a is not type(None)]  # noqa: E721
+                            _inner = _nn[0] if _nn else None
+                        else:
+                            _inner = _ftype
+                        if _inner and hasattr(_inner, '__strawberry_definition__'):
+                            _converted = convert_json_to_strawberry_instances([_val], _inner)
+                            if _converted:
+                                setattr(instance, _fname, _converted[0])
+                    except Exception:
+                        # Best-effort; ignore conversion errors here
+                        pass
                 
                 strawberry_instances.append(instance)
     else:
@@ -278,8 +419,11 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                 resolved_data = {}
                 direct_attrs = {}
 
-                # Get type hints to understand which fields are constructor parameters
-                type_hints = getattr(strawberry_type, '__annotations__', {})
+                # Get type hints (resolved) to understand which fields are constructor parameters
+                try:
+                    type_hints = get_type_hints(strawberry_type)
+                except Exception:
+                    type_hints = getattr(strawberry_type, '__annotations__', {})
 
                 for field_name, field_value in item_data.items():
                     # Check if this field is a method (relationship field)
@@ -397,6 +541,44 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                             if target_type and hasattr(target_type, '__strawberry_definition__'):
                                 # Recursively convert nested relationship data
                                 converted_instances = convert_json_to_strawberry_instances(field_value, target_type)
+                                # Additionally, convert any single-object (parent) relationship dicts inside each item
+                                try:
+                                    child_type_hints = get_type_hints(target_type)
+                                    for idx, child_instance in enumerate(converted_instances):
+                                        if not child_instance:
+                                            continue
+                                        raw_child_dict = field_value[idx] if idx < len(field_value) else None
+                                        if not isinstance(raw_child_dict, dict):
+                                            continue
+                                        for rel_field, rel_type in child_type_hints.items():
+                                            # Skip if already converted
+                                            existing_val = getattr(child_instance, rel_field, None)
+                                            if existing_val and hasattr(existing_val, '__strawberry_definition__'):
+                                                continue
+                                            _origin = get_origin(rel_type)
+                                            _args = get_args(rel_type) if _origin is Union else ()
+                                            if _origin is Union and any(a is type(None) for a in _args):
+                                                non_none = [a for a in _args if a is not type(None)]
+                                                rel_type_inner = non_none[0] if non_none else None
+                                            else:
+                                                rel_type_inner = rel_type
+                                            if not rel_type_inner or not hasattr(rel_type_inner, '__strawberry_definition__'):
+                                                continue
+                                            raw_parent_val = raw_child_dict.get(rel_field)
+                                            if isinstance(raw_parent_val, dict):
+                                                parent_list = convert_json_to_strawberry_instances([raw_parent_val], rel_type_inner)
+                                                setattr(child_instance, rel_field, parent_list[0] if parent_list else None)
+                                            elif isinstance(raw_parent_val, str):
+                                                import json as _json
+                                                try:
+                                                    parsed_parent = _json.loads(raw_parent_val)
+                                                except Exception:
+                                                    parsed_parent = None
+                                                if isinstance(parsed_parent, dict):
+                                                    parent_list = convert_json_to_strawberry_instances([parsed_parent], rel_type_inner)
+                                                    setattr(child_instance, rel_field, parent_list[0] if parent_list else None)
+                                except Exception:
+                                    pass
                                 resolved_data['_resolved'][field_name] = converted_instances
                             else:
                                 # Fallback - store the raw data
@@ -405,12 +587,54 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                             # Not a nested relationship or empty - store as-is
                             resolved_data['_resolved'][field_name] = field_value
                     elif is_constructor_param:
-                        # This is a constructor parameter
-                        constructor_data[field_name] = field_value
+                        # This is a constructor parameter; convert nested object relationship dicts
+                        constructor_value = field_value
+                        try:
+                            target_type = type_hints.get(field_name)
+                            origin = get_origin(target_type)
+                            if origin is Union:
+                                args = [a for a in get_args(target_type) if a is not type(None)]  # noqa: E721
+                                if args:
+                                    target_type = args[0]
+                            if isinstance(constructor_value, str) and hasattr(target_type, '__strawberry_definition__'):
+                                import json as _json
+                                try:
+                                    parsed_obj = _json.loads(constructor_value)
+                                except Exception:
+                                    parsed_obj = None
+                                if isinstance(parsed_obj, dict):
+                                    converted_list = convert_json_to_strawberry_instances([parsed_obj], target_type)
+                                    constructor_value = converted_list[0] if converted_list else None
+                            elif isinstance(constructor_value, dict) and hasattr(target_type, '__strawberry_definition__'):
+                                converted_list = convert_json_to_strawberry_instances([constructor_value], target_type)
+                                constructor_value = converted_list[0] if converted_list else None
+                            if isinstance(constructor_value, dict) and hasattr(target_type, '__strawberry_definition__'):
+                                try:
+                                    constructor_value = target_type(**constructor_value)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        constructor_data[field_name] = constructor_value
                     # If it's neither, skip it (shouldn't happen in well-formed data)
 
-                # Create the instance with constructor data only
-                instance = strawberry_type(**constructor_data)
+                # Create the instance; allow partial construction when required fields missing
+                try:
+                    instance = strawberry_type(**constructor_data)
+                except Exception:
+                    try:
+                        instance = object.__new__(strawberry_type)
+                        for k, v in constructor_data.items():
+                            setattr(instance, k, v)
+                        try:
+                            annotations = getattr(strawberry_type, '__annotations__', {})
+                            for fld, _ann in annotations.items():
+                                if not hasattr(instance, fld):
+                                    setattr(instance, fld, None)
+                        except Exception:
+                            pass
+                    except Exception:
+                        raise
 
                 # Set resolved data if any
                 if resolved_data:
@@ -421,9 +645,117 @@ def convert_json_to_strawberry_instances(json_data: List[Dict], strawberry_type:
                     for attr_name, attr_value in direct_attrs.items():
                         setattr(instance, attr_name, attr_value)
 
+                # Final safety pass (non-datetime branch) for leftover dict object relationship fields
+                try:
+                    _type_hints_fix = get_type_hints(strawberry_type)
+                except Exception:
+                    _type_hints_fix = getattr(strawberry_type, '__annotations__', {}) or {}
+                for _fname, _ftype in _type_hints_fix.items():
+                    try:
+                        _val = getattr(instance, _fname, None)
+                        if not isinstance(_val, dict):
+                            continue
+                        if strawberry_type.__name__ == 'CommentType' and _fname == 'post':
+                            import logging as _lg; _lg.getLogger(__name__).debug('Post-construction fixup converting CommentType.post dict -> instance (no-datetime branch)')
+                        # Resolve forward refs (string or ForwardRef) early
+                        if isinstance(_ftype, str):
+                            mod = sys.modules.get(strawberry_type.__module__)
+                            if mod and hasattr(mod, _ftype):
+                                _ftype = getattr(mod, _ftype)
+                        elif isinstance(_ftype, _ForwardRefType):  # type: ignore
+                            try:
+                                _eval = _ftype.__forward_arg__  # type: ignore[attr-defined]
+                                mod = sys.modules.get(strawberry_type.__module__)
+                                if mod and hasattr(mod, _eval):
+                                    _ftype = getattr(mod, _eval)
+                            except Exception:
+                                pass
+                        _origin = get_origin(_ftype)
+                        _args = get_args(_ftype) if _origin is Union else ()
+                        if _origin is Union and any(a is type(None) for a in _args):
+                            _nn = [a for a in _args if a is not type(None)]  # noqa: E721
+                            _inner = _nn[0] if _nn else None
+                        else:
+                            _inner = _ftype
+                        if _inner and hasattr(_inner, '__strawberry_definition__'):
+                            _converted = convert_json_to_strawberry_instances([_val], _inner)
+                            if _converted:
+                                setattr(instance, _fname, _converted[0])
+                    except Exception:
+                        pass
+
                 strawberry_instances.append(instance)
     
     return strawberry_instances
+
+
+def _finalize_object_relationships(instance):
+    """Recursively convert any dict-valued attributes whose annotations resolve to Strawberry types.
+    Also descends into lists in _resolved relationship containers.
+    """
+    from typing import get_type_hints
+    import sys
+    try:
+        from typing import ForwardRef as _ForwardRefType
+    except Exception:  # pragma: no cover
+        class _ForwardRefType:  # type: ignore
+            pass
+    try:
+        hints = get_type_hints(type(instance))
+    except Exception:
+        hints = getattr(type(instance), '__annotations__', {}) or {}
+    for fname, ftype in hints.items():
+        try:
+            val = getattr(instance, fname, None)
+        except Exception:
+            continue
+        if isinstance(val, dict):
+            # Resolve forward ref
+            if isinstance(ftype, str):
+                mod = sys.modules.get(type(instance).__module__)
+                if mod and hasattr(mod, ftype):
+                    ftype = getattr(mod, ftype)
+            elif isinstance(ftype, _ForwardRefType):  # type: ignore
+                try:
+                    mod = sys.modules.get(type(instance).__module__)
+                    name = ftype.__forward_arg__  # type: ignore[attr-defined]
+                    if mod and hasattr(mod, name):
+                        ftype = getattr(mod, name)
+                except Exception:
+                    pass
+            from typing import get_origin, get_args, Union as _Union
+            origin = get_origin(ftype)
+            args = get_args(ftype) if origin is _Union else ()
+            if origin is _Union and any(a is type(None) for a in args):
+                nn = [a for a in args if a is not type(None)]  # noqa: E721
+                ftype_inner = nn[0] if nn else None
+            else:
+                ftype_inner = ftype
+            if ftype_inner and hasattr(ftype_inner, '__strawberry_definition__'):
+                try:
+                    converted = convert_json_to_strawberry_instances([val], ftype_inner)
+                    if converted:
+                        setattr(instance, fname, converted[0])
+                except Exception:
+                    pass
+        # Already instance: recurse
+        elif hasattr(val, '__strawberry_definition__'):
+            _finalize_object_relationships(val)
+    # Traverse resolved relationship lists
+    resolved = getattr(instance, '_resolved', {})
+    if isinstance(resolved, dict):
+        for rel in resolved.values():
+            if isinstance(rel, dict):  # alias mapping
+                for lst in rel.values():
+                    if isinstance(lst, list):
+                        for child in lst:
+                            if hasattr(child, '__strawberry_definition__'):
+                                _finalize_object_relationships(child)
+            elif isinstance(rel, list):
+                for child in rel:
+                    if hasattr(child, '__strawberry_definition__'):
+                        _finalize_object_relationships(child)
+
 
 
 def find_relationship_name_by_type(parent_model_class: Type, target_strawberry_type: Type) -> Optional[str]:

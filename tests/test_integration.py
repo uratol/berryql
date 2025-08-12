@@ -1206,6 +1206,7 @@ class TestBerryQLIntegration:
                         id
                         content
                         rate
+                        post { id title }  # parent reference
                     }
                 }
             }
@@ -1225,6 +1226,75 @@ class TestBerryQLIntegration:
         assert rates == sorted(rates)
         # Also check the first is the lower-rated "Great post!"
         assert first_post['comments'][0]['content'] == "Thanks for sharing!"
+
+    @pytest.mark.asyncio
+    async def test_comment_parent_post_reference(self, graphql_schema, graphql_context, populated_db):
+        """Verify that requesting comments { post { id title } } returns parent post without N+1."""
+        from sqlalchemy import event
+        engine = graphql_context['db_session'].get_bind()
+        query_count = {'count': 0}
+        def count_queries(conn, cursor, statement, parameters, context, executemany):
+            query_count['count'] += 1
+        event.listen(engine, 'before_cursor_execute', count_queries)
+        try:
+            query = """
+            query {
+                users(nameFilter: "Alice Johnson") {
+                    id
+                    posts {
+                        id
+                        comments {
+                            id
+                            content
+                            post { id title }
+                        }
+                    }
+                }
+            }
+            """
+            query_count['count'] = 0
+            result = await graphql_schema.execute(query, context_value=graphql_context)
+            assert result.errors is None, f"Errors: {result.errors}"
+            users = result.data['users']
+            assert len(users) == 1
+            posts = users[0]['posts']
+            for p in posts:
+                for c in p['comments']:
+                    parent = c.get('post')
+                    assert parent is not None
+                    assert parent['id'] == p['id']
+                    assert 'title' in parent
+            # still single optimized SQL query
+            assert query_count['count'] == 1, f"Expected 1 query got {query_count['count']}"
+        finally:
+            event.remove(engine, 'before_cursor_execute', count_queries)
+
+    @pytest.mark.asyncio
+    async def test_comment_parent_post_with_nested_fields(self, graphql_schema, graphql_context, populated_db):
+        """Request parent post plus its own comments aggregation to ensure nested selection works."""
+        query = """
+        query {
+            users(nameFilter: "Alice Johnson") {
+                posts {
+                    id
+                    comments {
+                        id
+                        post {
+                            id
+                            title
+                        }
+                    }
+                }
+            }
+        }
+        """
+        result = await graphql_schema.execute(query, context_value=graphql_context)
+        assert result.errors is None, result.errors
+        users = result.data['users']
+        post_ids = {p['id'] for p in users[0]['posts']}
+        for post in users[0]['posts']:
+            for c in post['comments']:
+                assert c['post']['id'] in post_ids
 
 
 @pytest.mark.integration

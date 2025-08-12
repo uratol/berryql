@@ -24,6 +24,7 @@ class QueryFieldAnalyzer:
             return {
                 'scalar_fields': set(),
                 'relationship_fields': {},
+                'object_relationship_fields': {},
                 'aliases': {},
                 'fragments': []
             }
@@ -38,6 +39,7 @@ class QueryFieldAnalyzer:
                     return {
                         'scalar_fields': set(),
                         'relationship_fields': {},
+                        'object_relationship_fields': {},
                         'aliases': {},
                         'fragments': []
                     }
@@ -45,6 +47,7 @@ class QueryFieldAnalyzer:
                 return {
                     'scalar_fields': set(),
                     'relationship_fields': {},
+                    'object_relationship_fields': {},
                     'aliases': {},
                     'fragments': []
                 }
@@ -52,6 +55,7 @@ class QueryFieldAnalyzer:
             return {
                 'scalar_fields': set(),
                 'relationship_fields': {},
+                'object_relationship_fields': {},
                 'aliases': {},
                 'fragments': []
             }
@@ -73,16 +77,21 @@ class QueryFieldAnalyzer:
     ) -> Dict[str, Any]:
         scalar_fields: Set[str] = set()
         relationship_fields: Dict[str, Any] = {}
+        object_relationship_fields: Dict[str, Any] = {}
         aliases: Dict[str, str] = {}
         fragments: List[Any] = []
         for selected_field in selected_fields:
             field_result = self._analyze_selected_field(selected_field, strawberry_type, info, depth_limit)
             scalar_fields.update(field_result['scalar_fields'])
             relationship_fields.update(field_result['relationship_fields'])
+            # merge object (single) relationships
+            if field_result.get('object_relationship_fields'):
+                object_relationship_fields.update(field_result['object_relationship_fields'])
             aliases.update(field_result['aliases'])
         return {
             'scalar_fields': scalar_fields,
             'relationship_fields': relationship_fields,
+            'object_relationship_fields': object_relationship_fields,
             'aliases': aliases,
             'fragments': fragments,
         }
@@ -100,6 +109,7 @@ class QueryFieldAnalyzer:
 
         scalar_fields: Set[str] = set()
         relationship_fields: Dict[str, Any] = {}
+        object_relationship_fields: Dict[str, Any] = {}
         aliases: Dict[str, str] = {}
         display_name = alias or field_name
         if alias:
@@ -127,14 +137,40 @@ class QueryFieldAnalyzer:
                 if field_arguments:
                     self._validate_field_arguments(field_arguments, field_name)
         else:
-            if not field_name.startswith('__'):
-                scalar_fields.add(display_name)
-                if field_arguments:
-                    self._validate_field_arguments(field_arguments, field_name)
+            # Detect single-object (parent) relationship (non-list) returning a Strawberry type
+            obj_rel_type = self._get_object_relationship_type(field_name, strawberry_type)
+            if obj_rel_type is not None:
+                if selected_field.selections and depth_limit > 0:
+                    sub_analysis = self._analyze_selected_fields(
+                        selected_field.selections, obj_rel_type, info, depth_limit - 1
+                    )
+                    object_relationship_fields[display_name] = {
+                        'type': obj_rel_type,
+                        'nested_fields': sub_analysis,
+                        'field_arguments': field_arguments,
+                    }
+                else:
+                    object_relationship_fields[display_name] = {
+                        'type': obj_rel_type,
+                        'field_arguments': field_arguments,
+                        'nested_fields': {
+                            'scalar_fields': set(),
+                            'relationship_fields': {},
+                            'object_relationship_fields': {},
+                            'aliases': {},
+                            'fragments': []
+                        }
+                    }
+            else:
+                if not field_name.startswith('__'):
+                    scalar_fields.add(display_name)
+                    if field_arguments:
+                        self._validate_field_arguments(field_arguments, field_name)
 
         return {
             'scalar_fields': scalar_fields,
             'relationship_fields': relationship_fields,
+            'object_relationship_fields': object_relationship_fields,
             'aliases': aliases,
         }
 
@@ -247,6 +283,10 @@ class QueryFieldAnalyzer:
             actual = aliases.get(field, field)
             mapping[field] = actual
         for field in analysis_result['relationship_fields'].keys():
+            actual = aliases.get(field, field)
+            mapping[field] = actual
+        # include object (single) relationships
+        for field in analysis_result.get('object_relationship_fields', {}).keys():
             actual = aliases.get(field, field)
             mapping[field] = actual
         return mapping
@@ -468,7 +508,7 @@ class QueryFieldAnalyzer:
                     break
             mapping[field] = actual_field or field
         
-        # Add relationship fields
+        # Add list relationship fields
         for field in analysis_result['relationship_fields'].keys():
             # If this is an alias, map it to the real field name
             actual_field = None
@@ -477,8 +517,55 @@ class QueryFieldAnalyzer:
                     actual_field = real_field
                     break
             mapping[field] = actual_field or field
+        # Add object relationship fields
+        for field in analysis_result.get('object_relationship_fields', {}).keys():
+            actual_field = None
+            for alias, real_field in aliases.items():
+                if alias == field:
+                    actual_field = real_field
+                    break
+            mapping[field] = actual_field or field
         
         return mapping
+
+    # -------- New helper methods for object (parent) relationships --------
+    def _get_object_relationship_type(self, field_name: str, strawberry_type: Type) -> Optional[Type]:
+        """Return the Strawberry type for a single-object (non-list) relationship if present."""
+        try:
+            type_hints = get_type_hints(strawberry_type)
+            if field_name in type_hints:
+                field_type = type_hints[field_name]
+                # unwrap Optional
+                origin = getattr(field_type, '__origin__', None)
+                if origin is Union:
+                    args = getattr(field_type, '__args__', ())
+                    non_none = [a for a in args if a is not type(None)]  # noqa: E721
+                    field_type = non_none[0] if non_none else field_type
+                # If still a list, not object
+                if getattr(field_type, '__origin__', None) is list:
+                    return None
+                if hasattr(field_type, '__strawberry_definition__'):
+                    return field_type
+            # method-based
+            if hasattr(strawberry_type, field_name):
+                attr = getattr(strawberry_type, field_name)
+                if callable(attr) and hasattr(attr, '__annotations__') and 'return' in attr.__annotations__:
+                    rt = attr.__annotations__['return']
+                    origin = getattr(rt, '__origin__', None)
+                    if origin is list:
+                        return None
+                    if origin is Union:
+                        args = getattr(rt, '__args__', ())
+                        non_none = [a for a in args if a is not type(None)]  # noqa: E721
+                        if non_none:
+                            rt = non_none[0]
+                            if getattr(rt, '__origin__', None) is list:
+                                return None
+                    if hasattr(rt, '__strawberry_definition__'):
+                        return rt
+        except Exception:
+            return None
+        return None
 
 
 # Global instance for easy importing

@@ -29,6 +29,7 @@ class CommentType:
     post_id: int
     author_id: int
     created_at: datetime
+    post: Optional['PostType'] = None
 
 
 @strawberry.type

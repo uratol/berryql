@@ -21,7 +21,7 @@ from datetime import datetime
 from .query_analyzer import query_analyzer
 from .database_adapters import get_database_adapter, DatabaseAdapter
 from .database_adapters import MSSQLAdapter
-from .resolved_data_helper import convert_json_to_strawberry_instances, CUSTOM_QUERY_REGISTRY
+from .resolved_data_helper import convert_json_to_strawberry_instances, CUSTOM_QUERY_REGISTRY, _finalize_object_relationships
 try:
     # SQLAlchemy 1.4/2.0 Select type for isinstance checks
     from sqlalchemy.sql import Select
@@ -700,6 +700,19 @@ class InstanceCreator:
                 else:
                     filtered_data[actual_field_name] = value
             
+            # Supply None for any Optional[...] fields missing from filtered_data/private_data
+            try:
+                for opt_field, opt_type in type_hints.items():
+                    if opt_field in filtered_data or opt_field in private_data:
+                        continue
+                    origin = getattr(opt_type, '__origin__', None)
+                    if origin is Union:
+                        args = getattr(opt_type, '__args__', ())
+                        if any(a is type(None) for a in args):  # Optional
+                            filtered_data[opt_field] = None
+            except Exception:
+                pass
+
             # Create the instance
             instance = strawberry_type(**filtered_data)
             
@@ -1062,7 +1075,8 @@ class BerryQLFactory:
         # Analyze GraphQL query for field selection
         query_analysis = query_analyzer.analyze_query_fields(info, strawberry_type) if info else {
             'scalar_fields': set(),
-            'relationship_fields': {}
+            'relationship_fields': {},
+            'object_relationship_fields': {}
         }
 
         # Populate missing relationship field arguments using selected_fields (avoid deprecated field_nodes)
@@ -1089,7 +1103,7 @@ class BerryQLFactory:
         
         # Get alias mapping to resolve display names to actual field names
         alias_mapping = query_analyzer.get_aliased_field_mapping(query_analysis) if info else {}
-        
+
         # Resolve aliases to get actual field names for database queries
         display_fields = query_analysis['scalar_fields']
         requested_fields = set()
@@ -1098,16 +1112,25 @@ class BerryQLFactory:
                 continue
             actual_field_name = alias_mapping.get(display_name, display_name)
             requested_fields.add(actual_field_name)
-        
+
+        # Include object relationship fields (parent references) so we can build JSON subqueries
+        object_relationships = query_analysis.get('object_relationship_fields', {})
+        object_relationship_fields = {}
+        for display_name, cfg in object_relationships.items():
+            actual_field_name = alias_mapping.get(display_name, display_name)
+            object_relationship_fields[display_name] = cfg | {'_resolved_field_name': actual_field_name}
+            # ensure selected so base subquery has placeholder column produced
+            requested_fields.add(actual_field_name)
+
         # Always include required fields even if not requested in GraphQL query
         required_fields = TypeAnalyzer.get_required_fields(strawberry_type)
         requested_fields.update(required_fields)
-        
+
         # Process relationships
         resolved_relationships = self.relationship_processor.process_relationship_fields(
             query_analysis['relationship_fields'], alias_mapping, strawberry_type
         )
-        
+
         # Build the unified query using lateral joins
         query_result = await self._build_and_execute_lateral_query(
             strawberry_type=strawberry_type,
@@ -1115,12 +1138,13 @@ class BerryQLFactory:
             db=db,
             requested_fields=requested_fields,
             relationships=resolved_relationships,
+            object_relationships=object_relationship_fields,
             params=params,
             is_root=is_root,
             parent_id_column=parent_id_column,
             info=info
         )
-        
+
         return query_result
 
     async def _build_and_execute_lateral_query(
@@ -1129,7 +1153,8 @@ class BerryQLFactory:
         model_class: Type,
         db: AsyncSession,
         requested_fields: Set[str],
-        relationships: Dict[str, Any],
+    relationships: Dict[str, Any],
+    object_relationships: Dict[str, Any],
         params: GraphQLQueryParams,
         is_root: bool,
         parent_id_column = None,
@@ -1153,15 +1178,22 @@ class BerryQLFactory:
             relationship_aggregations = await self._build_relationship_aggregations(
                 strawberry_type, model_class, relationships, db, info
             )
+
+        # Build object (single) relationship columns (parent references) as scalar JSON objects
+        object_rel_columns = []
+        if object_relationships:
+            object_rel_columns = await self._build_object_relationship_columns(
+                strawberry_type, model_class, object_relationships, db, info
+            )
         
         # Combine entity data with relationship data using lateral joins
         if is_root:
             final_query = self._build_root_lateral_query(
-                entity_subquery, relationship_aggregations, custom_order, params
+                entity_subquery, relationship_aggregations + object_rel_columns, custom_order, params
             )
         else:
             final_query = self._build_nested_lateral_query(
-                entity_subquery, relationship_aggregations, custom_order, params, 
+                entity_subquery, relationship_aggregations + object_rel_columns, custom_order, params, 
                 self._get_db_adapter(db)
             )
         
@@ -1177,7 +1209,7 @@ class BerryQLFactory:
                 pass
             logger.info(f"Root query found {len(rows)} rows")
             active_relationships = relationships if relationship_aggregations else {}
-            return self._parse_root_results(rows, strawberry_type, requested_fields, active_relationships)
+            return self._parse_root_results(rows, strawberry_type, requested_fields, active_relationships, object_relationships)
         else:
             row = result.first()
             try:
@@ -1185,6 +1217,63 @@ class BerryQLFactory:
             except Exception:
                 pass
             return row[0] if row and row[0] else []
+
+    async def _build_object_relationship_columns(
+        self,
+        parent_strawberry_type: Type,
+        parent_model_class: Type,
+        object_relationships: Dict[str, Any],
+        db: AsyncSession,
+        info
+    ) -> List[ColumnElement]:
+        """Build scalar JSON object columns for single (parent) relationships (e.g., comment.post)."""
+        columns: List[ColumnElement] = []
+        db_adapter = self._get_db_adapter(db)
+        for rel_key, rel_config in object_relationships.items():
+            display_name = rel_key
+            actual_field_name = rel_config.get('_resolved_field_name', display_name)
+            # Find relationship on parent_model_class (e.g., Comment.post)
+            if not hasattr(parent_model_class, actual_field_name):
+                continue
+            try:
+                relationship_prop = getattr(parent_model_class, actual_field_name).property
+                related_model = relationship_prop.mapper.class_
+            except Exception:
+                continue
+            related_type = rel_config.get('type')
+            if not related_type:
+                continue
+            # Determine columns to project: only required + requested scalar fields from nested selection
+            nested_fields = rel_config.get('nested_fields', {})
+            nested_scalar = nested_fields.get('scalar_fields', set()) if isinstance(nested_fields, dict) else set()
+            required = TypeAnalyzer.get_required_fields(related_type)
+            proj_fields = nested_scalar | required
+            related_columns = self.query_builder.build_columns_for_fields(related_model, proj_fields, related_type)
+            if not related_columns:
+                continue
+            # Build JSON object
+            json_kv = []
+            for col in related_columns:
+                json_kv.extend([text(f"'{col.name}'"), getattr(related_model, col.name)])
+            json_obj = db_adapter.json_build_object(*json_kv)
+            # Build correlated subquery using foreign key mapping
+            # Use first FK pair local_remote_pairs to link child->parent
+            fk_pairs = getattr(getattr(parent_model_class, actual_field_name).property, 'local_remote_pairs', [])
+            condition = None
+            if fk_pairs:
+                local_col, remote_col = fk_pairs[0]
+                # Correlate using outer entity subquery alias (anon_1 assumption for root)
+                if local_col.table.name == parent_model_class.__tablename__:
+                    # local_col is child FK column; reference outer alias
+                    condition = remote_col == literal_column(f"anon_1.{local_col.name}")
+                else:
+                    condition = local_col == literal_column(f"anon_1.{remote_col.name}")
+            subq = select(json_obj).select_from(related_model)
+            if condition is not None:
+                subq = subq.where(condition)
+            subq = subq.limit(1)  # single parent
+            columns.append(subq.scalar_subquery().label(f"_objrel_{display_name}"))
+        return columns
 
     def _get_custom_config(self, strawberry_type: Type, config_dict: Dict[Type, Any], default=None):
         """Get custom configuration for a strawberry type."""
@@ -1289,6 +1378,7 @@ class BerryQLFactory:
             nested_fields = rel_config.get('nested_fields', {}) if isinstance(rel_config, dict) else {}
             nested_scalar_fields = nested_fields.get('scalar_fields', set())
             nested_relationships = nested_fields.get('relationship_fields', {})
+            nested_object_relationships = nested_fields.get('object_relationship_fields', {})
             
             # Build relationship subquery as SQL
             relationship_subquery = await self._build_relationship_sql_subquery(
@@ -1296,6 +1386,7 @@ class BerryQLFactory:
                 related_model,
                 nested_scalar_fields,
                 nested_relationships,
+                nested_object_relationships,
                 nested_params,
                 relationship_prop,
                 db,
@@ -1317,7 +1408,8 @@ class BerryQLFactory:
         strawberry_type: Type,
         model_class: Type,
         scalar_fields: Set[str],
-        relationships: Dict[str, Any],
+    relationships: Dict[str, Any],
+    object_relationships: Dict[str, Any],
         params: GraphQLQueryParams,
         parent_relationship_prop,
         db: AsyncSession,
@@ -1405,6 +1497,46 @@ class BerryQLFactory:
                 # Reference the column from the subquery, not the original table
                 subquery_col = getattr(filtered_subquery.c, col.name)
                 json_columns.extend([text(f"'{col.name}'"), subquery_col])
+
+            # Include single-object (parent) relationships for this entity if requested
+            if object_relationships:
+                db_adapter_local = self._get_db_adapter(db)
+                for obj_display, obj_cfg in object_relationships.items():
+                    actual_obj_field = obj_display  # alias mapping not yet implemented for nested
+                    if not hasattr(model_class, actual_obj_field):
+                        continue
+                    try:
+                        obj_rel_prop = getattr(model_class, actual_obj_field).property
+                        obj_model = obj_rel_prop.mapper.class_
+                    except Exception:
+                        continue
+                    obj_type = obj_cfg.get('type') if isinstance(obj_cfg, dict) else None
+                    if not obj_type:
+                        continue
+                    obj_nested_fields = obj_cfg.get('nested_fields', {}) if isinstance(obj_cfg, dict) else {}
+                    obj_scalar = obj_nested_fields.get('scalar_fields', set()) if isinstance(obj_nested_fields, dict) else set()
+                    obj_required = TypeAnalyzer.get_required_fields(obj_type)
+                    obj_proj = obj_scalar | obj_required
+                    obj_cols = self.query_builder.build_columns_for_fields(obj_model, obj_proj, obj_type)
+                    if not obj_cols:
+                        continue
+                    obj_kv = []
+                    for c in obj_cols:
+                        obj_kv.extend([text(f"'{c.name}'"), getattr(obj_model, c.name)])
+                    obj_json = db_adapter_local.json_build_object(*obj_kv)
+                    fk_pairs2 = getattr(getattr(model_class, actual_obj_field).property, 'local_remote_pairs', [])
+                    cond2 = None
+                    if fk_pairs2:
+                        lcol, rcol = fk_pairs2[0]
+                        if lcol.table.name == model_class.__tablename__:
+                            cond2 = rcol == literal_column(f"{current_alias}.{lcol.name}")
+                        else:
+                            cond2 = lcol == literal_column(f"{current_alias}.{rcol.name}")
+                    obj_subq = select(obj_json).select_from(obj_model)
+                    if cond2 is not None:
+                        obj_subq = obj_subq.where(cond2)
+                    obj_subq = obj_subq.limit(1)
+                    json_columns.extend([text(f"'{obj_display}'"), obj_subq.scalar_subquery()])
             
             # Handle nested relationships recursively by adding them to the JSON object
             if relationships:
@@ -1500,6 +1632,7 @@ class BerryQLFactory:
                     nested_fields = rel_config.get('nested_fields', {}) if isinstance(rel_config, dict) else {}
                     nested_scalar_fields = nested_fields.get('scalar_fields', set())
                     nested_nested_relationships = nested_fields.get('relationship_fields', {})
+                    nested_obj_relationships = nested_fields.get('object_relationship_fields', {})
                     
                     logger.info(f"Nested fields: scalar={nested_scalar_fields}, relationships={list(nested_nested_relationships.keys()) if nested_nested_relationships else []}")
                     
@@ -1510,6 +1643,7 @@ class BerryQLFactory:
                         nested_related_model,
                         nested_scalar_fields,
                         nested_nested_relationships,
+                        nested_obj_relationships,
                         nested_params,
                         relationship_prop,
                         db,
@@ -1529,7 +1663,7 @@ class BerryQLFactory:
                         logger.warning(f"Failed to build nested subquery for {display_name}")
             else:
                 logger.info(f"No nested relationships to process for {strawberry_type.__name__}")
-            
+
             # Get database adapter for cross-database compatibility
             db_adapter = self._get_db_adapter(db)
 
@@ -1734,7 +1868,7 @@ class BerryQLFactory:
     def _build_root_lateral_query(
         self,
         entity_subquery,
-        relationship_aggregations: List[ColumnElement],
+    relationship_aggregations: List[ColumnElement],
         custom_order: List[str],
         params: GraphQLQueryParams
     ):
@@ -1840,8 +1974,9 @@ class BerryQLFactory:
         self,
         rows,
         strawberry_type: Type,
-        requested_fields: Set[str],
-        relationships: Dict[str, Any]
+    requested_fields: Set[str],
+    relationships: Dict[str, Any],
+    object_relationships: Dict[str, Any] = None
     ) -> List[Any]:
         """Parse results from root lateral query into Strawberry instances."""
         instances = []
@@ -1850,11 +1985,20 @@ class BerryQLFactory:
             total_entity_fields = self._get_total_entity_field_count(strawberry_type, requested_fields)
             entity_data = self._extract_entity_data_from_row(row, requested_fields)
             
+            rel_count = len(relationships) if relationships else 0
             if relationships:
                 relationship_data = self._extract_relationship_data_from_row(row, relationships, total_entity_fields)
                 entity_data.update(relationship_data)
+            if object_relationships:
+                object_data, obj_count = self._extract_object_relationship_data_from_row(row, object_relationships, total_entity_fields, rel_count)
+                entity_data.update(object_data)
+                total_entity_fields += obj_count  # adjust for subsequent rows if needed
             
             instance = InstanceCreator.create_strawberry_instance(strawberry_type, entity_data)
+            try:
+                _finalize_object_relationships(instance)
+            except Exception:
+                pass
             instances.append(instance)
         
         return instances
@@ -1935,6 +2079,61 @@ class BerryQLFactory:
                         json_data = []
                 
                 parsed_relationships = self.relationship_processor.parse_json_relationship_data(json_data, rel_config)
+
+                # Post-process each related instance to convert dict-valued single-object relationship fields
+                try:
+                    from typing import get_type_hints, get_origin, get_args, Union as _Union
+                    import sys
+                    try:
+                        from typing import ForwardRef as _ForwardRefType
+                    except Exception:  # pragma: no cover
+                        class _ForwardRefType:  # type: ignore
+                            pass
+                    for _inst in parsed_relationships:
+                        if not _inst:
+                            continue
+                        try:
+                            _hints = get_type_hints(type(_inst))
+                        except Exception:
+                            _hints = getattr(type(_inst), '__annotations__', {}) or {}
+                        for _fname, _ftype in _hints.items():
+                            try:
+                                _val = getattr(_inst, _fname, None)
+                                if not isinstance(_val, dict):
+                                    continue
+                                if type(_inst).__name__ == 'CommentType' and _fname == 'post':
+                                    logger.debug('Relationship post-process: converting CommentType.post dict -> instance (value keys=%s)', list(_val.keys()))
+                                # Resolve forward refs and string annotations
+                                if isinstance(_ftype, str):
+                                    mod = sys.modules.get(type(_inst).__module__)
+                                    if mod and hasattr(mod, _ftype):
+                                        _ftype = getattr(mod, _ftype)
+                                elif isinstance(_ftype, _ForwardRefType):  # type: ignore
+                                    try:
+                                        _eval = _ftype.__forward_arg__  # type: ignore[attr-defined]
+                                        mod = sys.modules.get(type(_inst).__module__)
+                                        if mod and hasattr(mod, _eval):
+                                            _ftype = getattr(mod, _eval)
+                                    except Exception:
+                                        pass
+                                _origin = get_origin(_ftype)
+                                _args = get_args(_ftype) if _origin is _Union else ()
+                                if _origin is _Union and any(a is type(None) for a in _args):  # Optional unwrap
+                                    _nn = [a for a in _args if a is not type(None)]  # noqa: E721
+                                    _inner = _nn[0] if _nn else None
+                                else:
+                                    _inner = _ftype
+                                if _inner and hasattr(_inner, '__strawberry_definition__'):
+                                    from .resolved_data_helper import convert_json_to_strawberry_instances as _conv
+                                    _converted = _conv([_val], _inner)
+                                    if _converted:
+                                        setattr(_inst, _fname, _converted[0])
+                                        if type(_inst).__name__ == 'CommentType' and _fname == 'post':
+                                            logger.debug('Relationship post-process: conversion complete, set PostType instance id=%s', getattr(_converted[0], 'id', None))
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
                 
                 actual_field_name = rel_config.get('_resolved_field_name', display_name)
                 if '_resolved' not in relationship_data:
@@ -1945,3 +2144,28 @@ class BerryQLFactory:
                 relationship_data['_resolved'][actual_field_name][display_name] = parsed_relationships
         
         return relationship_data
+
+    def _extract_object_relationship_data_from_row(self, row, object_relationships: Dict[str, Any], entity_field_count: int, rel_count: int) -> tuple[Dict[str, Any], int]:
+        """Extract single object relationship JSON columns from row after relationship arrays."""
+        data = {}
+        if not object_relationships:
+            return data, 0
+        # object relationship columns come after entity + list relationship cols
+        start_idx = entity_field_count + rel_count
+        processed = 0
+        for i, (rel_key, rel_cfg) in enumerate(object_relationships.items()):
+            col_index = start_idx + i
+            val = row[col_index] if col_index < len(row) else None
+            if val:
+                if isinstance(val, str):
+                    try:
+                        import json as _json
+                        val_json = _json.loads(val)
+                    except Exception:
+                        val_json = None
+                else:
+                    val_json = val
+                actual_field_name = rel_cfg.get('_resolved_field_name', rel_key)
+                data[actual_field_name] = val_json
+        processed = len(object_relationships)
+        return data, processed
