@@ -34,6 +34,113 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T')
 
 
+# ----------------------------
+# Module-level helper utilities (DRY extractions)
+# ----------------------------
+
+def parse_simple_order_by_str(order_by_str: str) -> List[Dict[str, str]]:
+    """Parse simple order by string like 'name desc' or multiple comma-separated fields.
+
+    Centralized utility used by GraphQLQueryParams and BerryQLFactory to avoid duplication.
+    """
+    if not order_by_str:
+        return []
+    fields: List[Dict[str, str]] = []
+    # Support multi-field comma separated specs. Each part may be 'col' or 'col desc'
+    for field_spec in order_by_str.split(','):
+        fs = field_spec.strip()
+        if not fs:
+            continue
+        parts = fs.split()
+        if len(parts) == 1:
+            fields.append({'field': parts[0], 'direction': 'asc'})
+        else:
+            fields.append({'field': parts[0], 'direction': parts[1].lower()})
+    return fields
+
+
+def apply_explicit_parameter_mappings(
+    field_arguments: Dict[str, Any],
+    resolver_fn: Optional[Callable],
+    base_where: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Apply explicit runtime parameter mappings declared on a resolver to build merged where.
+
+    Previously duplicated for root and nested relationship handling. Consolidated here.
+    """
+    if not resolver_fn:
+        return base_where
+    explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
+    if not (explicit_mappings and isinstance(field_arguments, dict)):
+        return base_where
+    merged_where = base_where if isinstance(base_where, dict) else {} if base_where is None else {}
+    for _arg, _val in field_arguments.items():
+        if _val is None or _arg in ['where', 'order_by', 'orderBy', 'limit', 'offset']:
+            continue
+        snake_arg = FieldMapper.camel_to_snake(_arg)
+        mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
+        if not mapping:
+            continue
+        if callable(mapping):
+            produced = mapping(_val)
+            if isinstance(produced, dict):
+                for fld, cond in produced.items():
+                    if isinstance(cond, dict):
+                        existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
+                        for op, op_val in cond.items():
+                            existing[op] = op_val
+                        merged_where[fld] = existing
+                    else:
+                        merged_where[fld] = {'eq': cond}
+        elif isinstance(mapping, dict):
+            for fld, cond in mapping.items():
+                if callable(cond):
+                    cond = cond(_val)
+                if isinstance(cond, dict):
+                    existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
+                    for op, op_val in cond.items():
+                        if callable(op_val):
+                            op_val = op_val(_val)
+                        existing[op] = op_val
+                    merged_where[fld] = existing
+                else:
+                    merged_where[fld] = {'eq': cond}
+    return merged_where
+
+
+def _build_order_clauses_generic(
+    order_fields: List[Union[str, Dict[str, str]]],
+    get_column: Callable[[str], Optional[Any]]
+):
+    """Shared internal helper to produce SQLAlchemy order clauses given an accessor.
+
+    Used by QueryConditionProcessor.apply_ordering (against subquery.c) and
+    QueryConditionProcessor.build_order_clauses_for_model (against model class attributes).
+    """
+    clauses = []
+    for order_field in order_fields:
+        if isinstance(order_field, str):
+            if not order_field.strip():
+                continue
+            parts = order_field.strip().split()
+            if not parts:
+                continue
+            field_name = parts[0]
+            direction = 'desc' if len(parts) > 1 and parts[1].lower() == 'desc' else 'asc'
+        elif isinstance(order_field, dict):
+            field_name = order_field.get('field')
+            direction = order_field.get('direction', 'asc').lower() if field_name else 'asc'
+        else:
+            continue
+        if not field_name:
+            continue
+        column = get_column(field_name)
+        if column is None:
+            continue
+        clauses.append(desc(column) if direction == 'desc' else asc(column))
+    return clauses
+
+
 class InvalidFieldError(ValueError):
     """Raised when an invalid field is used in where conditions or ordering."""
     pass
@@ -92,31 +199,13 @@ class GraphQLQueryParams:
                     # User intended JSON (starts with { or [) – raise to surface real parsing error
                     raise ValueError(f"Invalid order_by JSON: {e}: {order_by}")
             # Treat as simple order-by expression(s) (e.g., "name desc", "name asc, id desc")
-            return self._parse_simple_order_by(s)
+            return parse_simple_order_by_str(s)
         
         return []
 
     def _parse_simple_order_by(self, order_by_str: str) -> List[Dict[str, str]]:
         """Parse simple order by string like 'name desc' or multiple comma-separated fields."""
-        if not order_by_str:
-            return []
-        parts = order_by_str.strip().split()
-        if len(parts) == 1:
-            return [{'field': parts[0], 'direction': 'asc'}]
-        elif len(parts) == 2:
-            return [{'field': parts[0], 'direction': parts[1].lower()}]
-        # Support multiple fields: "name asc, id desc"
-        fields = []
-        for field_spec in order_by_str.split(','):
-            field_spec = field_spec.strip()
-            if not field_spec:
-                continue
-            parts = field_spec.split()
-            if len(parts) == 1:
-                fields.append({'field': parts[0], 'direction': 'asc'})
-            elif len(parts) == 2:
-                fields.append({'field': parts[0], 'direction': parts[1].lower()})
-        return fields
+        return parse_simple_order_by_str(order_by_str)
 
 
 class FieldMapper:
@@ -502,30 +591,10 @@ class QueryConditionProcessor:
         if not order_fields:
             return query
         
-        order_clauses = []
-        for order_field in order_fields:
-            if isinstance(order_field, str):
-                # Skip empty strings to avoid index errors
-                if not order_field.strip():
-                    continue
-                parts = order_field.strip().split()
-                if not parts:  # Additional safety check
-                    continue
-                field_name = parts[0]
-                direction = 'desc' if len(parts) > 1 and parts[1].lower() == 'desc' else 'asc'
-                
-                if hasattr(subquery.c, field_name):
-                    column = getattr(subquery.c, field_name)
-                    order_clauses.append(desc(column) if direction == 'desc' else asc(column))
-                        
-            elif isinstance(order_field, dict):
-                field_name = order_field.get('field')
-                direction = order_field.get('direction', 'asc').lower()
-                
-                if field_name and hasattr(subquery.c, field_name):
-                    column = getattr(subquery.c, field_name)
-                    order_clauses.append(desc(column) if direction == 'desc' else asc(column))
-        
+        order_clauses = _build_order_clauses_generic(
+            order_fields,
+            lambda fname: getattr(subquery.c, fname) if hasattr(subquery.c, fname) else None
+        )
         if order_clauses:
             query = query.order_by(*order_clauses)
         
@@ -536,32 +605,10 @@ class QueryConditionProcessor:
         """Build order clauses using model columns directly."""
         if not order_fields:
             return []
-        
-        order_clauses = []
-        for order_field in order_fields:
-            if isinstance(order_field, str):
-                # Skip empty strings to avoid index errors
-                if not order_field.strip():
-                    continue
-                parts = order_field.strip().split()
-                if not parts:  # Additional safety check
-                    continue
-                field_name = parts[0]
-                direction = 'desc' if len(parts) > 1 and parts[1].lower() == 'desc' else 'asc'
-                
-                if hasattr(model_class, field_name):
-                    column = getattr(model_class, field_name)
-                    order_clauses.append(desc(column) if direction == 'desc' else asc(column))
-                        
-            elif isinstance(order_field, dict):
-                field_name = order_field.get('field')
-                direction = order_field.get('direction', 'asc').lower()
-                
-                if field_name and hasattr(model_class, field_name):
-                    column = getattr(model_class, field_name)
-                    order_clauses.append(desc(column) if direction == 'desc' else asc(column))
-        
-        return order_clauses
+        return _build_order_clauses_generic(
+            order_fields,
+            lambda fname: getattr(model_class, fname) if hasattr(model_class, fname) else None
+        )
 
 
 class InstanceCreator:
@@ -1328,44 +1375,8 @@ class BerryQLFactory:
             # Parameter mappings now applied at analysis stage (query_analyzer) and merged into 'where' JSON string.
             merged_where = base_where
             # 1. Apply explicit parameter mappings set on resolver (runtime lambdas supported)
-            consumed_args = set()
             resolver_fn = getattr(strawberry_type, actual_field_name, None)
-            explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
-            if explicit_mappings and isinstance(field_arguments, dict):
-                for _arg, _val in field_arguments.items():
-                    if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
-                        continue
-                    snake_arg = FieldMapper.camel_to_snake(_arg)
-                    mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
-                    if not mapping:
-                        continue
-                    if merged_where is None or not isinstance(merged_where, dict):
-                        merged_where = {}
-                    if callable(mapping):
-                        produced = mapping(_val)
-                        if isinstance(produced, dict):
-                            for fld, cond in produced.items():
-                                if isinstance(cond, dict):
-                                    existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
-                                    for op, op_val in cond.items():
-                                        existing[op] = op_val
-                                    merged_where[fld] = existing
-                                else:
-                                    merged_where[fld] = {'eq': cond}
-                    elif isinstance(mapping, dict):
-                        for fld, cond in mapping.items():
-                            if callable(cond):
-                                cond = cond(_val)
-                            if isinstance(cond, dict):
-                                existing = merged_where.get(fld, {}) if isinstance(merged_where.get(fld), dict) else {}
-                                for op, op_val in cond.items():
-                                    if callable(op_val):
-                                        op_val = op_val(_val)
-                                    existing[op] = op_val
-                                merged_where[fld] = existing
-                            else:
-                                merged_where[fld] = {'eq': cond}
-                    consumed_args.add(_arg)
+            merged_where = apply_explicit_parameter_mappings(field_arguments, resolver_fn, merged_where)
 
             nested_params = GraphQLQueryParams(
                 where=merged_where,
@@ -1581,44 +1592,8 @@ class BerryQLFactory:
                     nested_base_where = self._parse_where_from_string(field_arguments.get('where'))
                     nested_merged_where = nested_base_where
                     # Apply explicit parameter mappings (runtime lambdas) for nested relationship field
-                    consumed_args = set()
                     resolver_fn = getattr(strawberry_type, actual_field_name, None)
-                    explicit_mappings = getattr(resolver_fn, '_berryql_parameter_mappings', None)
-                    if explicit_mappings and isinstance(field_arguments, dict):
-                        for _arg, _val in field_arguments.items():
-                            if _val is None or _arg in ['where','order_by','orderBy','limit','offset']:
-                                continue
-                            snake_arg = FieldMapper.camel_to_snake(_arg)
-                            mapping = explicit_mappings.get(_arg) or explicit_mappings.get(snake_arg)
-                            if not mapping:
-                                continue
-                            if nested_merged_where is None or not isinstance(nested_merged_where, dict):
-                                nested_merged_where = {}
-                            if callable(mapping):
-                                produced = mapping(_val)
-                                if isinstance(produced, dict):
-                                    for fld, cond in produced.items():
-                                        if isinstance(cond, dict):
-                                            existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
-                                            for op, op_val in cond.items():
-                                                existing[op] = op_val
-                                            nested_merged_where[fld] = existing
-                                        else:
-                                            nested_merged_where[fld] = {'eq': cond}
-                            elif isinstance(mapping, dict):
-                                for fld, cond in mapping.items():
-                                    if callable(cond):
-                                        cond = cond(_val)
-                                    if isinstance(cond, dict):
-                                        existing = nested_merged_where.get(fld, {}) if isinstance(nested_merged_where.get(fld), dict) else {}
-                                        for op, op_val in cond.items():
-                                            if callable(op_val):
-                                                op_val = op_val(_val)
-                                            existing[op] = op_val
-                                        nested_merged_where[fld] = existing
-                                    else:
-                                        nested_merged_where[fld] = {'eq': cond}
-                            consumed_args.add(_arg)
+                    nested_merged_where = apply_explicit_parameter_mappings(field_arguments, resolver_fn, nested_merged_where)
                     nested_params = GraphQLQueryParams(
                         where=nested_merged_where,
                         order_by=self._parse_order_by_from_string(_nested_order_by),
@@ -1837,33 +1812,15 @@ class BerryQLFactory:
                 elif isinstance(parsed, dict):
                     return [parsed]
                 else:
-                    return self._parse_simple_order_by(order_by_str)
+                    return parse_simple_order_by_str(order_by_str)
             except json.JSONDecodeError:
-                return self._parse_simple_order_by(order_by_str)
+                return parse_simple_order_by_str(order_by_str)
         
         return None
 
     def _parse_simple_order_by(self, order_by_str: str) -> List[Dict[str, str]]:
         """Parse simple order by string like 'name desc' or 'id'."""
-        if not order_by_str:
-            return []
-        
-        parts = order_by_str.strip().split()
-        if len(parts) == 1:
-            return [{'field': parts[0], 'direction': 'asc'}]
-        elif len(parts) == 2:
-            return [{'field': parts[0], 'direction': parts[1].lower()}]
-        else:
-            # Multiple fields separated by commas
-            fields = []
-            for field_spec in order_by_str.split(','):
-                field_spec = field_spec.strip()
-                parts = field_spec.split()
-                if len(parts) == 1:
-                    fields.append({'field': parts[0], 'direction': 'asc'})
-                elif len(parts) == 2:
-                    fields.append({'field': parts[0], 'direction': parts[1].lower()})
-            return fields
+        return parse_simple_order_by_str(order_by_str)
 
     def _build_root_lateral_query(
         self,
