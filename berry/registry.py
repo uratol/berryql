@@ -112,6 +112,48 @@ class RelationSelectionExtractor:
                         if not sub_def or sub_def.kind == 'scalar':
                             if sub_name not in rel_cfg['fields']:
                                 rel_cfg['fields'].append(sub_name)
+                        elif sub_def and sub_def.kind == 'relation':
+                            # Capture nested relation config
+                            ncfg = rel_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
+                            # copy arguments for nested relation
+                            try:
+                                for narg in getattr(sub, 'arguments', []) or []:
+                                    nraw = getattr(narg, 'value', None)
+                                    try:
+                                        if hasattr(nraw, 'value') and nraw is not None and nraw.__class__.__name__ != 'datetime':
+                                            iv = getattr(nraw, 'value')
+                                            nraw = iv if isinstance(iv, (int, str, float, bool)) else str(iv)
+                                    except Exception:
+                                        pass
+                                    if narg.name == 'limit':
+                                        ncfg['limit'] = nraw
+                                    elif narg.name == 'offset':
+                                        ncfg['offset'] = nraw
+                                    elif narg.name == 'order_by':
+                                        ncfg['order_by'] = nraw
+                                    elif narg.name == 'order_dir':
+                                        ncfg['order_dir'] = nraw
+                                    elif narg.name == 'order_multi':
+                                        ncfg['order_multi'] = nraw or []
+                                    elif narg.name == 'where':
+                                        ncfg['where'] = nraw
+                                    else:
+                                        ncfg['filter_args'][narg.name] = nraw
+                            except Exception:
+                                pass
+                            # nested scalar fields
+                            try:
+                                if getattr(sub, 'selections', None):
+                                    tgt_b2 = self.registry.types.get(sub_def.meta.get('target')) if sub_def.meta.get('target') else None
+                                    for sub2 in sub.selections:
+                                        nname2 = getattr(sub2, 'name', None)
+                                        if nname2 and not nname2.startswith('__'):
+                                            sdef2 = getattr(tgt_b2, '__berry_fields__', {}).get(nname2) if tgt_b2 else None
+                                            if not sdef2 or sdef2.kind == 'scalar':
+                                                if nname2 not in ncfg['fields']:
+                                                    ncfg['fields'].append(nname2)
+                            except Exception:
+                                pass
             # recurse nested relations
             try:
                 self._walk_selected(child, self.registry.types.get(fdef.meta.get('target')), out)
@@ -186,6 +228,46 @@ class RelationSelectionExtractor:
                     sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
                     if not sub_def or sub_def.kind == 'scalar':
                         sub_scalars.append(sub_name)
+                    elif sub_def and sub_def.kind == 'relation':
+                        # Capture nested relation config via AST
+                        ncfg = rel_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
+                        try:
+                            for narg in getattr(sub, 'arguments', []) or []:
+                                nname_node = getattr(narg, 'name', None)
+                                nname = getattr(nname_node, 'value', None) if nname_node and not isinstance(nname_node, str) else nname_node
+                                if not nname:
+                                    continue
+                                if nname == 'limit':
+                                    ncfg['limit'] = self._value_from_ast(narg.value)
+                                elif nname == 'offset':
+                                    ncfg['offset'] = self._value_from_ast(narg.value)
+                                elif nname == 'order_by':
+                                    ncfg['order_by'] = self._value_from_ast(narg.value)
+                                elif nname == 'order_dir':
+                                    ncfg['order_dir'] = self._value_from_ast(narg.value)
+                                elif nname == 'order_multi':
+                                    ncfg['order_multi'] = self._value_from_ast(narg.value) or []
+                                elif nname == 'where':
+                                    ncfg['where'] = self._value_from_ast(narg.value)
+                                else:
+                                    ncfg['filter_args'][nname] = self._value_from_ast(narg.value)
+                        except Exception:
+                            pass
+                        # nested scalar fields under this nested relation
+                        try:
+                            if getattr(sub, 'selection_set', None):
+                                tgt_b2 = self.registry.types.get(sub_def.meta.get('target')) if sub_def.meta.get('target') else None
+                                for sub2 in getattr(sub.selection_set, 'selections', []) or []:
+                                    sub2_name_node = getattr(sub2, 'name', None)
+                                    sub2_name = getattr(sub2_name_node, 'value', None) if sub2_name_node and not isinstance(sub2_name_node, str) else sub2_name_node
+                                    if not sub2_name:
+                                        continue
+                                    sub2_def = getattr(tgt_b2, '__berry_fields__', {}).get(sub2_name) if tgt_b2 else None
+                                    if not sub2_def or sub2_def.kind == 'scalar':
+                                        if sub2_name not in ncfg['fields']:
+                                            ncfg['fields'].append(sub2_name)
+                        except Exception:
+                            pass
                 if sub_scalars:
                     for s in sub_scalars:
                         if s not in rel_cfg['fields']:
@@ -518,7 +600,7 @@ class BerrySchema:
                             else:
                                 out[spec.alias or key] = spec
                         return out
-                    def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single, fname_local=fname):
+                    def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single, fname_local=fname, parent_btype_local=bcls):
                         target_filters = _collect_declared_filters_for_target(meta_copy.get('target')) if meta_copy.get('target') else {}
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
@@ -530,7 +612,7 @@ class BerrySchema:
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
                             parent_model = getattr(self, '_model', None)
-                            if not target_cls_i or parent_model is None:
+                            if not target_cls_i:
                                 return None if is_single_value else []
                             session = getattr(info.context, 'get', lambda k, d=None: info.context[k])('db_session', None) if info and info.context else None
                             if session is None:
@@ -541,14 +623,22 @@ class BerrySchema:
                             child_model_cls = target_btype.model
                             if is_single_value:
                                 candidate_fk_val = None
-                                for col in parent_model.__table__.columns:
-                                    if col.name.endswith('_id') and col.foreign_keys:
-                                        for fk in col.foreign_keys:
-                                            if fk.column.table.name == child_model_cls.__table__.name:
-                                                candidate_fk_val = getattr(parent_model, col.name)
-                                                break
-                                    if candidate_fk_val is not None:
-                                        break
+                                if parent_model is not None:
+                                    # Normal path: derive FK from ORM model instance
+                                    for col in parent_model.__table__.columns:
+                                        if col.name.endswith('_id') and col.foreign_keys:
+                                            for fk in col.foreign_keys:
+                                                if fk.column.table.name == child_model_cls.__table__.name:
+                                                    candidate_fk_val = getattr(parent_model, col.name)
+                                                    break
+                                        if candidate_fk_val is not None:
+                                            break
+                                else:
+                                    # Fallback for pushdown-hydrated parent (no _model): use <relation>_id scalar, if present
+                                    try:
+                                        candidate_fk_val = getattr(self, f"{fname_local}_id", None)
+                                    except Exception:
+                                        candidate_fk_val = None
                                 if candidate_fk_val is None:
                                     return None
                                 # Apply filters via query if any filter args passed
@@ -649,9 +739,14 @@ class BerrySchema:
                                 return inst
                             # list relation
                             fk_col = None
+                            parent_model_cls = getattr(parent_btype_local, 'model', None)
                             for col in child_model_cls.__table__.columns:
                                 for fk in col.foreign_keys:
-                                    if fk.column.table.name == parent_model.__table__.name:
+                                    try:
+                                        parent_table_name = parent_model_cls.__table__.name if parent_model_cls is not None else (parent_model.__table__.name if parent_model is not None else None)
+                                    except Exception:
+                                        parent_table_name = None
+                                    if parent_table_name and fk.column.table.name == parent_table_name:
                                         fk_col = col
                                         break
                                 if fk_col is not None:
@@ -659,7 +754,11 @@ class BerrySchema:
                             if fk_col is None:
                                 return []
                             from sqlalchemy import select as _select
-                            stmt = _select(child_model_cls).where(fk_col == getattr(parent_model, 'id'))
+                            # Determine parent id value: use ORM model if available; else fallback to hydrated scalar 'id'
+                            parent_id_val = getattr(parent_model, 'id', None) if parent_model is not None else getattr(self, 'id', None)
+                            if parent_id_val is None:
+                                return []
+                            stmt = _select(child_model_cls).where(fk_col == parent_id_val)
                             # Apply where from args and/or schema default
                             if related_where is not None or meta_copy.get('where') is not None:
                                 try:
@@ -797,10 +896,23 @@ class BerrySchema:
                                             raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                     if expr is not None:
                                         stmt = stmt.where(expr)
-                            if offset:
-                                stmt = stmt.offset(offset)
+                            if offset is not None:
+                                try:
+                                    o = int(offset)
+                                except Exception:
+                                    raise ValueError("offset must be an integer")
+                                if o < 0:
+                                    raise ValueError("offset must be non-negative")
+                                if o:
+                                    stmt = stmt.offset(o)
                             if limit is not None:
-                                stmt = stmt.limit(limit)
+                                try:
+                                    l = int(limit)
+                                except Exception:
+                                    raise ValueError("limit must be an integer")
+                                if l < 0:
+                                    raise ValueError("limit must be non-negative")
+                                stmt = stmt.limit(l)
                             result = await session.execute(stmt)
                             rows = [r[0] for r in result.all()]
                             out = []
@@ -1210,6 +1322,15 @@ class BerrySchema:
                             for sf, sdef in target_b.__berry_fields__.items():
                                 if sdef.kind == 'scalar':
                                     requested_scalar.append(sf)
+                        # Ensure FK helper columns for child's single relations are present
+                        try:
+                            for rel_name2, rel_def2 in target_b.__berry_fields__.items():
+                                if rel_def2.kind == 'relation' and (rel_def2.meta.get('single') or rel_def2.meta.get('mode') == 'single'):
+                                    fk_name = f"{rel_name2}_id"
+                                    if fk_name in child_model_cls.__table__.columns and fk_name not in requested_scalar:
+                                        requested_scalar.append(fk_name)
+                        except Exception:
+                            pass
                         inner_cols = [getattr(child_model_cls, c) for c in requested_scalar] if requested_scalar else [getattr(child_model_cls, 'id')]
                         inner_sel = select(*inner_cols).select_from(child_model_cls).where(fk_col == parent_model_cls.id).correlate(parent_model_cls)
                         # Apply ordering from relation config (multi -> single -> fallback id)
@@ -1668,6 +1789,15 @@ class BerrySchema:
                                     for sf, sdef in target_b_i.__berry_fields__.items():
                                         if sdef.kind == 'scalar':
                                             requested_scalar_i.append(sf)
+                                # Ensure FK helper columns for child's single relations are present
+                                try:
+                                    for r2, d2 in target_b_i.__berry_fields__.items():
+                                        if d2.kind == 'relation' and (d2.meta.get('single') or d2.meta.get('mode') == 'single'):
+                                            fk2 = f"{r2}_id"
+                                            if fk2 in child_model_cls_i.__table__.columns and fk2 not in requested_scalar_i:
+                                                requested_scalar_i.append(fk2)
+                                except Exception:
+                                    pass
                                 inner_cols_i = [getattr(child_model_cls_i, c) for c in requested_scalar_i] if requested_scalar_i else [getattr(child_model_cls_i, 'id')]
                                 if mssql_mode:
                                     parent_table = parent_model_cls.__tablename__
@@ -1842,7 +1972,15 @@ class BerrySchema:
                                     return None
                                 agg_query_i = select(_json_array_coalesce(agg_inner_expr_i)).select_from(limited_subq_i).correlate(parent_model_cls).scalar_subquery()
                                 return agg_query_i
-                            nested_expr = _build_list_relation_json_adapter(model_cls, btype_cls, rel_cfg)
+                            # Prefer nested-capable builder when nested relations are selected
+                            nested_expr = None
+                            try:
+                                if (rel_cfg.get('nested') or {}) and not mssql_mode:
+                                    nested_expr = _build_list_relation_json(model_cls, btype_cls, rel_cfg)
+                            except Exception:
+                                nested_expr = None
+                            if nested_expr is None:
+                                nested_expr = _build_list_relation_json_adapter(model_cls, btype_cls, rel_cfg)
                             if nested_expr is not None:
                                 if mssql_mode:
                                     # Wrap TextClause into a labeled column using scalar_subquery style text
@@ -2005,10 +2143,23 @@ class BerrySchema:
                                     applied_default = True
                         except Exception:
                             pass
-                    if offset:
-                        stmt = stmt.offset(offset)
+                    if offset is not None:
+                        try:
+                            o = int(offset)
+                        except Exception:
+                            raise ValueError("offset must be an integer")
+                        if o < 0:
+                            raise ValueError("offset must be non-negative")
+                        if o:
+                            stmt = stmt.offset(o)
                     if limit is not None:
-                        stmt = stmt.limit(limit)
+                        try:
+                            l = int(limit)
+                        except Exception:
+                            raise ValueError("limit must be an integer")
+                        if l < 0:
+                            raise ValueError("limit must be non-negative")
+                        stmt = stmt.limit(l)
                     async with lock:
                         result = await session.execute(stmt)
                         sa_rows = result.fetchall()
@@ -2112,6 +2263,7 @@ class BerrySchema:
                                                     for item in parsed_value:
                                                         if isinstance(item, dict):
                                                             child_inst = target_st()
+                                                            # Scalars
                                                             for sf, sdef in target_b.__berry_fields__.items():
                                                                 if sdef.kind == 'scalar':
                                                                     val = item.get(sf)
@@ -2127,6 +2279,66 @@ class BerrySchema:
                                                                         pass
                                                                     setattr(child_inst, sf, val)
                                                             setattr(child_inst, '_model', None)
+                                                            # Nested relations on this child (prefetch to avoid N+1)
+                                                            try:
+                                                                for nname, ndef in target_b.__berry_fields__.items():
+                                                                    if ndef.kind != 'relation':
+                                                                        continue
+                                                                    raw_nested = item.get(nname, None)
+                                                                    if raw_nested is None:
+                                                                        continue
+                                                                    import json as _json
+                                                                    parsed_nested = None
+                                                                    try:
+                                                                        parsed_nested = _json.loads(raw_nested) if isinstance(raw_nested, (str, bytes)) else raw_nested
+                                                                    except Exception:
+                                                                        parsed_nested = None
+                                                                    n_target = self.types.get(ndef.meta.get('target')) if ndef.meta.get('target') else None
+                                                                    n_st = self._st_types.get(ndef.meta.get('target')) if ndef.meta.get('target') else None
+                                                                    if not n_target or not n_target.model or not n_st:
+                                                                        continue
+                                                                    if ndef.meta.get('single'):
+                                                                        if isinstance(parsed_nested, dict):
+                                                                            ni = n_st()
+                                                                            for nsf, nsdef in n_target.__berry_fields__.items():
+                                                                                if nsdef.kind == 'scalar':
+                                                                                    setattr(ni, nsf, parsed_nested.get(nsf))
+                                                                            setattr(ni, '_model', None)
+                                                                            setattr(child_inst, nname, ni)
+                                                                            setattr(child_inst, f"_{nname}_prefetched", ni)
+                                                                        else:
+                                                                            setattr(child_inst, nname, None)
+                                                                            setattr(child_inst, f"_{nname}_prefetched", None)
+                                                                    else:
+                                                                        nlist = []
+                                                                        if isinstance(parsed_nested, list):
+                                                                            for nv in parsed_nested:
+                                                                                if isinstance(nv, dict):
+                                                                                    ni = n_st()
+                                                                                    for nsf, nsdef in n_target.__berry_fields__.items():
+                                                                                        if nsdef.kind == 'scalar':
+                                                                                            setattr(ni, nsf, nv.get(nsf))
+                                                                                    setattr(ni, '_model', None)
+                                                                                    nlist.append(ni)
+                                                                        setattr(child_inst, nname, nlist)
+                                                                        setattr(child_inst, f"_{nname}_prefetched", nlist)
+                                                                    # record nested pushdown meta
+                                                                    try:
+                                                                        meta_map2 = getattr(child_inst, '_pushdown_meta', None)
+                                                                        if meta_map2 is None:
+                                                                            meta_map2 = {}
+                                                                            setattr(child_inst, '_pushdown_meta', meta_map2)
+                                                                        parent_rel_meta = requested_relations.get(rel_name, {})
+                                                                        nested_meta_src = (parent_rel_meta.get('nested') or {}).get(nname, {})
+                                                                        meta_map2[nname] = {
+                                                                            'limit': nested_meta_src.get('limit'),
+                                                                            'offset': nested_meta_src.get('offset'),
+                                                                            'from_pushdown': True
+                                                                        }
+                                                                    except Exception:
+                                                                        pass
+                                                            except Exception:
+                                                                pass
                                                             tmp_list.append(child_inst)
                                                 built_value = tmp_list
                                         else:
