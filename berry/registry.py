@@ -10,6 +10,7 @@ try:  # adapter abstraction
 except Exception:  # pragma: no cover
     get_adapter = None  # type: ignore
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import load_only
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from datetime import datetime
 from enum import Enum
@@ -232,6 +233,101 @@ class RelationSelectionExtractor:
                     break
         except Exception:
             pass
+        return out
+
+# --- Helper: Root selection extractor to prune scalars/customs by query ---
+class RootSelectionExtractor:
+    """Extract which root-level fields were requested (scalars, relations, custom).
+
+    Traverses GraphQL AST (field_nodes) including aliases and (inline) fragments.
+    Returns dict with sets of field names per kind according to __berry_fields__.
+    """
+
+    def _children(self, node: Any) -> list[Any]:
+        selset = getattr(node, 'selection_set', None)
+        if selset is not None and getattr(selset, 'selections', None) is not None:
+            return list(selset.selections) or []
+        sels = getattr(node, 'selections', None)
+        if sels is not None:
+            return list(sels) or []
+        return []
+
+    def _name_of(self, node: Any) -> Optional[str]:
+        n = getattr(node, 'name', None)
+        if hasattr(n, 'value'):
+            return getattr(n, 'value', None)
+        return n
+
+    def _walk(self, sel_node: Any, out: dict[str, set[str]], btype: Any, fragments: dict | None):
+        for child in self._children(sel_node):
+            kind = getattr(child, 'kind', None)
+            # InlineFragment
+            if kind and 'InlineFragment' in str(kind):
+                self._walk(child, out, btype, fragments)
+                continue
+            # FragmentSpread
+            if kind and 'FragmentSpread' in str(kind):
+                frag_name = self._name_of(child)
+                if frag_name and fragments and frag_name in fragments:
+                    frag_def = fragments[frag_name]
+                    self._walk(frag_def, out, btype, fragments)
+                continue
+            name = self._name_of(child)
+            if not name or name.startswith('__'):
+                continue
+            try:
+                fdef = getattr(btype, '__berry_fields__', {}).get(name)
+            except Exception:
+                fdef = None
+            if not fdef:
+                continue
+            k = fdef.kind
+            if k == 'scalar':
+                out['scalars'].add(name)
+            elif k == 'relation':
+                out['relations'].add(name)
+            elif k == 'custom':
+                out['custom'].add(name)
+            elif k == 'custom_object':
+                out['custom_object'].add(name)
+            elif k == 'aggregate':
+                out['aggregate'].add(name)
+
+    def extract(self, info: Any, root_field_name: str, btype: Any) -> dict[str, set[str]]:
+        out = {'scalars': set(), 'relations': set(), 'custom': set(), 'custom_object': set(), 'aggregate': set()}
+        if info is None:
+            return out
+        try:
+            nodes = list(getattr(info, 'field_nodes', []) or [])
+        except Exception:
+            nodes = []
+        root_node = None
+        for n in nodes:
+            nname = getattr(getattr(n, 'name', None), 'value', None) or getattr(n, 'name', None)
+            if nname == root_field_name:
+                root_node = n
+                break
+        if root_node is None and nodes:
+            root_node = nodes[0]
+        frags = None
+        try:
+            frags = getattr(info, 'fragments', None) or {}
+        except Exception:
+            frags = None
+        if root_node is not None:
+            self._walk(root_node, out, btype, frags)
+        else:
+            # Fallback to Strawberry selected_fields tree
+            try:
+                fields = getattr(info, 'selected_fields', None)
+                for f in (fields or []):
+                    if getattr(f, 'name', None) == root_field_name:
+                        fake = type('Sel', (), {})()
+                        setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
+                        self._walk(fake, out, btype, frags)
+                        break
+            except Exception:
+                pass
         return out
 # Global operator registry (extensible)
 OPERATOR_REGISTRY: Dict[str, Callable[[Any, Any], Any]] = {
@@ -1301,8 +1397,18 @@ class BerrySchema:
                     custom_fields: List[tuple[str, Any]] = []
                     custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
                     select_columns: List[Any] = [model_cls]
-                    # Use extracted helper class
+                    # Use extracted helper classes: relations and root field kinds
                     requested_relations = RelationSelectionExtractor(self).extract(info, root_field_name, btype_cls)
+                    root_selected = RootSelectionExtractor().extract(info, root_field_name, btype_cls)
+                    requested_scalar_root: set[str] = set(root_selected.get('scalars', set()))
+                    requested_custom_root: set[str] = set(root_selected.get('custom', set()))
+                    requested_custom_obj_root: set[str] = set(root_selected.get('custom_object', set()))
+                    requested_aggregates_root: set[str] = set(root_selected.get('aggregate', set()))
+                    # Determine if we successfully extracted any selection at all. If yes, include
+                    # only explicitly requested custom/aggregate fields; if not, keep legacy behavior.
+                    selection_extracted = bool(
+                        requested_scalar_root or requested_custom_root or requested_custom_obj_root or requested_relations
+                    )
                     # Coerce JSON where values to match column types (helps strict dialects like Postgres)
                     def _coerce_where_value(col, val):
                         try:
@@ -1717,6 +1823,9 @@ class BerrySchema:
                     count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_expr)
                     for cf_name, cf_def in btype_cls.__berry_fields__.items():
                         if cf_def.kind == 'custom':
+                            # When selection is known, include only if explicitly requested
+                            if (selection_extracted or requested_custom_root) and (cf_name not in requested_custom_root):
+                                continue
                             builder = cf_def.meta.get('builder')
                             if builder is None:
                                 continue
@@ -1756,6 +1865,9 @@ class BerrySchema:
                             custom_fields.append((cf_name, expr))
                             select_columns.append(expr)
                         elif cf_def.kind == 'custom_object':
+                            # When selection is known, include only if explicitly requested
+                            if (selection_extracted or requested_custom_obj_root) and (cf_name not in requested_custom_obj_root):
+                                continue
                             builder = cf_def.meta.get('builder')
                             if builder is None:
                                 continue
@@ -1848,6 +1960,9 @@ class BerrySchema:
                             ops = cf_def.meta.get('ops') or []
                             is_count = op == 'count' or 'count' in ops
                             if is_count:
+                                # When selection is known, include only if explicitly requested
+                                if (selection_extracted or requested_aggregates_root) and (cf_name not in requested_aggregates_root):
+                                    continue
                                 source_rel = cf_def.meta.get('source')
                                 rel_def = btype_cls.__berry_fields__.get(source_rel)
                                 if rel_def and rel_def.kind == 'relation':
@@ -1872,6 +1987,26 @@ class BerrySchema:
                     mssql_mode = hasattr(adapter, 'name') and adapter.name == 'mssql'
                     if not adapter.supports_relation_pushdown() and not mssql_mode:
                         requested_relations = {}
+                    # Determine helper FK columns on parent for single relations when resolver path will be used
+                    required_fk_parent_cols: set[str] = set()
+                    try:
+                        for rel_name, rel_cfg in list(requested_relations.items()):
+                            # mark skip_pushdown if default_where is callable
+                            try:
+                                dw = rel_cfg.get('default_where')
+                                if dw is not None and not isinstance(dw, (dict, str)):
+                                    rel_cfg['skip_pushdown'] = True
+                            except Exception:
+                                pass
+                            if rel_cfg.get('single') and (rel_cfg.get('skip_pushdown') or (not adapter.supports_relation_pushdown() and not mssql_mode)):
+                                fk_col_name = f"{rel_name}_id"
+                                try:
+                                    if hasattr(model_cls, fk_col_name):
+                                        required_fk_parent_cols.add(fk_col_name)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        required_fk_parent_cols = set()
                     # Push down relation JSON arrays/objects
                     for rel_name, rel_cfg in requested_relations.items():
                         # If default_where is a callable, skip pushdown so resolver can apply it
@@ -2021,9 +2156,15 @@ class BerrySchema:
                                         if sdef.kind == 'scalar':
                                             requested_scalar_i.append(sf)
                                 # Ensure FK helper columns for child's single relations are present
+                                # only when that nested relation is actually requested.
                                 try:
+                                    nested_requested = set((rel_cfg_local.get('nested') or {}).keys())
                                     for r2, d2 in target_b_i.__berry_fields__.items():
-                                        if d2.kind == 'relation' and (d2.meta.get('single') or d2.meta.get('mode') == 'single'):
+                                        if (
+                                            d2.kind == 'relation'
+                                            and (d2.meta.get('single') or d2.meta.get('mode') == 'single')
+                                            and r2 in nested_requested
+                                        ):
                                             fk2 = f"{r2}_id"
                                             if fk2 in child_model_cls_i.__table__.columns and fk2 not in requested_scalar_i:
                                                 requested_scalar_i.append(fk2)
@@ -2379,6 +2520,25 @@ class BerrySchema:
                                 else:
                                     select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                     stmt = select(*select_columns)
+                    # Restrict entity columns using load_only to requested scalars and required helpers
+                    try:
+                        cols: list[Any] = []
+                        # Effective root columns: requested scalars, required FK helpers, and id when relations are requested
+                        effective_root_cols: set[str] = set(requested_scalar_root or set())
+                        if requested_relations:
+                            effective_root_cols.add('id')
+                        for sf in effective_root_cols:
+                            if hasattr(model_cls, sf):
+                                cols.append(getattr(model_cls, sf))
+                        for fk in required_fk_parent_cols:
+                            if hasattr(model_cls, fk):
+                                col_attr = getattr(model_cls, fk)
+                                if col_attr not in cols:
+                                    cols.append(col_attr)
+                        if cols:
+                            stmt = stmt.options(load_only(*cols))
+                    except Exception:
+                        pass
                     # ----- Phase 2 filtering (argument-driven) -----
                     where_clauses = []
                     # Apply optional context-aware root custom where if provided on BerryType
@@ -2560,13 +2720,16 @@ class BerrySchema:
                         for row_index, row in enumerate(rows):
                             inst = st_cls()
                             setattr(inst, '_model', row)
-                            # hydrate scalar fields
-                            for sf, sdef in btype_cls.__berry_fields__.items():
-                                if sdef.kind == 'scalar':
-                                    try:
-                                        setattr(inst, sf, getattr(row, sf, None))
-                                    except Exception:
-                                        pass
+                            # hydrate only requested scalar fields
+                            try:
+                                if requested_scalar_root:
+                                    for sf in requested_scalar_root:
+                                        try:
+                                            setattr(inst, sf, getattr(row, sf, None))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
                             # attach custom scalar field values from select
                             if custom_fields:
                                 base_offset = 1  # model at position 0
