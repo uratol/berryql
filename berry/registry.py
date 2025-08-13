@@ -291,13 +291,41 @@ class RelationSelectionExtractor:
         try:
             raw_info = getattr(info, '_raw_info', None)
             if raw_info and hasattr(raw_info, 'field_nodes'):
-                need_ast = (not out) or any((cfg.get('limit') is None and cfg.get('offset') is None and not cfg.get('filter_args')) for cfg in out.values())
-                if need_ast:
-                    for fn in raw_info.field_nodes:
-                        name_node = getattr(fn, 'name', None)
-                        root_name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
-                        if root_name == root_field_name:
-                            self._walk_ast(getattr(fn, 'selection_set', None), btype_cls, out)
+                # Always also walk AST to capture nested arguments reliably; merge into out
+                ast_map: Dict[str, Dict[str, Any]] = {}
+                for fn in raw_info.field_nodes:
+                    name_node = getattr(fn, 'name', None)
+                    root_name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
+                    if root_name == root_field_name:
+                        self._walk_ast(getattr(fn, 'selection_set', None), btype_cls, ast_map)
+                if ast_map:
+                    for rname, rcfg in ast_map.items():
+                        if rname not in out:
+                            out[rname] = rcfg
+                            continue
+                        # merge top-level simple args; consider non-canonical types as missing
+                        for k in ('where','order_by','order_dir','order_multi','limit','offset'):
+                            curv = out[rname].get(k)
+                            missing = curv in (None, [], {})
+                            if k == 'where' and curv is not None and not isinstance(curv, (str, dict)):
+                                missing = True
+                            if missing:
+                                out[rname][k] = rcfg.get(k, out[rname].get(k))
+                        # merge nested selections
+                        nested_ast = rcfg.get('nested') or {}
+                        if nested_ast:
+                            out_nested = out[rname].setdefault('nested', {})
+                            for nname, ncfg in nested_ast.items():
+                                if nname not in out_nested:
+                                    out_nested[nname] = ncfg
+                                else:
+                                    for nk in ('where','order_by','order_dir','order_multi','limit','offset','fields'):
+                                        curvk = out_nested[nname].get(nk)
+                                        missingk = curvk in (None, [], {})
+                                        if nk == 'where' and curvk is not None and not isinstance(curvk, (str, dict)):
+                                            missingk = True
+                                        if missingk:
+                                            out_nested[nname][nk] = ncfg.get(nk, out_nested[nname].get(nk))
         except Exception:
             pass
         return out
@@ -351,6 +379,65 @@ OPERATOR_REGISTRY: Dict[str, Callable[[Any, Any], Any]] = {
     'starts_with': lambda col, v: col.like(f"{v}%"),
     'ends_with': lambda col, v: col.like(f"%{v}"),
 }
+
+# Coerce JSON where values (or filter arg values) to column python types
+def _coerce_where_value(col, val):  # pragma: no cover - simple coercion helper
+    try:
+        from sqlalchemy.sql.sqltypes import Integer as _I, Float as _F, Boolean as _B, DateTime as _DT, Numeric as _N
+    except Exception:  # fallback if not importable in env
+        _I = Integer; _F = None; _B = Boolean; _DT = DateTime; _N = None
+    # List-like values -> coerce each element
+    if isinstance(val, (list, tuple)):
+        return [ _coerce_where_value(col, v) for v in val ]
+    ctype = getattr(col, 'type', None)
+    if ctype is None:
+        return val
+    try:
+        # DateTime: parse ISO strings
+        if isinstance(ctype, _DT):
+            if isinstance(val, str):
+                s = val.replace('Z', '+00:00') if 'Z' in val else val
+                try:
+                    dv = datetime.fromisoformat(s)
+                    # drop tzinfo if DB column is naive
+                    try:
+                        if getattr(ctype, 'timezone', False) is False and getattr(dv, 'tzinfo', None) is not None:
+                            dv = dv.replace(tzinfo=None)
+                    except Exception:
+                        pass
+                    return dv
+                except Exception:
+                    return val
+            return val
+        # Integer
+        if isinstance(ctype, _I):
+            try:
+                return int(val) if isinstance(val, str) else val
+            except Exception:
+                return val
+        # Numeric/Float
+        if _N is not None and isinstance(ctype, _N):
+            try:
+                return float(val) if isinstance(val, str) else val
+            except Exception:
+                return val
+        if _F is not None and isinstance(ctype, _F):
+            try:
+                return float(val) if isinstance(val, str) else val
+            except Exception:
+                return val
+        # Boolean
+        if isinstance(ctype, _B):
+            if isinstance(val, str):
+                lv = val.strip().lower()
+                if lv in ('true','t','1','yes','y'):
+                    return True
+                if lv in ('false','f','0','no','n'):
+                    return False
+            return bool(val)
+    except Exception:
+        return val
+    return val
 
 # Ordering direction enum for GraphQL (so queries can use order_dir: desc)
 class _DirectionEnum(Enum):
@@ -660,6 +747,10 @@ class BerrySchema:
                                                     if col is None:
                                                         continue
                                                     for op_name, val in (op_map or {}).items():
+                                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                            val = [_coerce_where_value(col, v) for v in val]
+                                                        else:
+                                                            val = _coerce_where_value(col, val)
                                                         op_fn = OPERATOR_REGISTRY.get(op_name)
                                                         if not op_fn:
                                                             continue
@@ -678,7 +769,11 @@ class BerrySchema:
                                                     col = child_model_cls.__table__.c.get(col_name)
                                                     if col is None:
                                                         continue
-                                                    for op_name, val in (op_map or {}).items():
+                                                for op_name, val in (op_map or {}).items():
+                                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                        val = [_coerce_where_value(col, v) for v in val]
+                                                    else:
+                                                        val = _coerce_where_value(col, val)
                                                         op_fn = OPERATOR_REGISTRY.get(op_name)
                                                         if not op_fn:
                                                             continue
@@ -717,7 +812,9 @@ class BerrySchema:
                                             if not op_fn:
                                                 raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
                                             try:
-                                                expr = op_fn(col, val)
+                                                # Coerce simple filter arg value to column type when possible
+                                                val2 = _coerce_where_value(col, val)
+                                                expr = op_fn(col, val2)
                                             except Exception as e:
                                                 raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                         if expr is not None:
@@ -773,6 +870,10 @@ class BerrySchema:
                                             if col is None:
                                                 continue
                                             for op_name, val in (op_map or {}).items():
+                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                    val = [_coerce_where_value(col, v) for v in val]
+                                                else:
+                                                    val = _coerce_where_value(col, val)
                                                 op_fn = OPERATOR_REGISTRY.get(op_name)
                                                 if not op_fn:
                                                     continue
@@ -792,6 +893,10 @@ class BerrySchema:
                                                 if col is None:
                                                     continue
                                                 for op_name, val in (op_map or {}).items():
+                                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                        val = [_coerce_where_value(col, v) for v in val]
+                                                    else:
+                                                        val = _coerce_where_value(col, val)
                                                     op_fn = OPERATOR_REGISTRY.get(op_name)
                                                     if not op_fn:
                                                         continue
@@ -891,7 +996,8 @@ class BerrySchema:
                                         if not op_fn:
                                             raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
                                         try:
-                                            expr = op_fn(col, val)
+                                            val2 = _coerce_where_value(col, val)
+                                            expr = op_fn(col, val2)
                                         except Exception as e:
                                             raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                     if expr is not None:
@@ -1297,6 +1403,64 @@ class BerrySchema:
                     select_columns: List[Any] = [model_cls]
                     # Use extracted helper class
                     requested_relations = RelationSelectionExtractor(self).extract(info, root_field_name, btype_cls)
+                    # Coerce JSON where values to match column types (helps strict dialects like Postgres)
+                    def _coerce_where_value(col, val):
+                        try:
+                            from sqlalchemy.sql.sqltypes import Integer as _I, Float as _F, Boolean as _B, DateTime as _DT, Numeric as _N
+                        except Exception:
+                            _I = Integer; _F = None; _B = Boolean; _DT = DateTime; _N = None  # fallbacks
+                        # List-like (in/between) -> coerce elements
+                        if isinstance(val, (list, tuple)):
+                            return [ _coerce_where_value(col, v) for v in val ]
+                        ctype = getattr(col, 'type', None)
+                        if ctype is None:
+                            return val
+                        try:
+                            # DateTime
+                            if isinstance(ctype, _DT):
+                                if isinstance(val, str):
+                                    s = val.replace('Z', '+00:00') if 'Z' in val else val
+                                    try:
+                                        dv = datetime.fromisoformat(s)
+                                        # If DB stores naive datetimes, drop tzinfo
+                                        try:
+                                            if getattr(ctype, 'timezone', False) is False and getattr(dv, 'tzinfo', None) is not None:
+                                                dv = dv.replace(tzinfo=None)
+                                        except Exception:
+                                            pass
+                                        return dv
+                                    except Exception:
+                                        return val
+                                return val
+                            # Integer
+                            if isinstance(ctype, _I):
+                                try:
+                                    return int(val) if isinstance(val, str) else val
+                                except Exception:
+                                    return val
+                            # Numeric/Float
+                            if _N is not None and isinstance(ctype, _N):
+                                try:
+                                    return float(val) if isinstance(val, str) else val
+                                except Exception:
+                                    return val
+                            if _F is not None and isinstance(ctype, _F):
+                                try:
+                                    return float(val) if isinstance(val, str) else val
+                                except Exception:
+                                    return val
+                            # Boolean
+                            if isinstance(ctype, _B):
+                                if isinstance(val, str):
+                                    lv = val.strip().lower()
+                                    if lv in ('true','t','1','yes','y'):
+                                        return True
+                                    if lv in ('false','f','0','no','n'):
+                                        return False
+                                return bool(val)
+                        except Exception:
+                            return val
+                        return val
                     # Helper to recursively build relation JSON expressions
                     def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
                         if 'mssql' in dialect_name:
@@ -1407,12 +1571,16 @@ class BerrySchema:
                                         if col is None:
                                             continue
                                         for op_name, val in (op_map or {}).items():
+                                            # coerce JSON where value(s) to column type
+                                            if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                val = [_coerce_where_value(col, v) for v in val]
+                                            else:
+                                                val = _coerce_where_value(col, val)
                                             op_fn = OPERATOR_REGISTRY.get(op_name)
                                             if not op_fn:
                                                 continue
                                             exprs.append(op_fn(col, val))
                                     if exprs:
-                                        from sqlalchemy import and_ as _and
                                         expr_r = _and(*exprs)
                                 except Exception:
                                     expr_r = None
@@ -1431,12 +1599,15 @@ class BerrySchema:
                                         if col is None:
                                             continue
                                         for op_name, val in (op_map or {}).items():
+                                            if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                val = [_coerce_where_value(col, v) for v in val]
+                                            else:
+                                                val = _coerce_where_value(col, val)
                                             op_fn = OPERATOR_REGISTRY.get(op_name)
                                             if not op_fn:
                                                 continue
                                             exprs.append(op_fn(col, val))
                                     if exprs:
-                                        from sqlalchemy import and_ as _and
                                         expr_r = _and(*exprs)
                                 except Exception:
                                     expr_r = None
@@ -1466,6 +1637,13 @@ class BerrySchema:
                             nested_b = self.types.get(nested_target)
                             if not nested_b or not nested_b.model:
                                 continue
+                            # If nested default_where is callable, skip pushdown for that nested branch
+                            try:
+                                ndw = nested_cfg.get('default_where')
+                            except Exception:
+                                ndw = None
+                            if ndw is not None and not isinstance(ndw, (dict, str)):
+                                continue
                             grand_model_cls = nested_b.model
                             # Determine FK from grandchild -> child
                             g_fk = None
@@ -1484,10 +1662,127 @@ class BerrySchema:
                                     if sdef2.kind == 'scalar':
                                         nested_scalars.append(sf2)
                             g_inner_cols = [getattr(grand_model_cls, c) for c in nested_scalars] if nested_scalars else [getattr(grand_model_cls, 'id')]
-                            g_sel = select(*g_inner_cols).select_from(grand_model_cls).where(g_fk == getattr(child_model_cls, 'id')).correlate(child_model_cls, parent_model_cls)
+                            # Join to the child limited subquery alias to properly scope nested rows per child
                             try:
-                                if 'id' in grand_model_cls.__table__.columns:
+                                g_sel = (
+                                    select(*g_inner_cols)
+                                    .select_from(grand_model_cls)
+                                    .select_from(limited_subq)
+                                    .where(g_fk == getattr(limited_subq.c, 'id'))
+                                )
+                            except Exception:
+                                # Fallback to correlation on base child model (less precise but functional)
+                                g_sel = select(*g_inner_cols).select_from(grand_model_cls).where(g_fk == getattr(child_model_cls, 'id')).correlate(child_model_cls, parent_model_cls)
+                            # Apply ordering from nested relation config
+                            try:
+                                allowed_order_fields = [sf for sf, sd in nested_b.__berry_fields__.items() if sd.kind == 'scalar']
+                                n_ordered = False
+                                n_multi = nested_cfg.get('order_multi') or []
+                                for spec in n_multi:
+                                    try:
+                                        cn, _, dd = str(spec).partition(':')
+                                        dd = dd or 'asc'
+                                        if cn not in allowed_order_fields:
+                                            raise ValueError(f"Invalid order field '{cn}' for relation {nested_cfg.get('target')}")
+                                        if dd.lower() not in ('asc','desc'):
+                                            raise ValueError(f"Invalid order direction '{dd}' for relation {nested_cfg.get('target')}")
+                                        col = getattr(grand_model_cls, cn, None)
+                                        if col is None:
+                                            raise ValueError(f"Unknown order column '{cn}' for relation {nested_cfg.get('target')}")
+                                        g_sel = g_sel.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                        n_ordered = True
+                                    except Exception:
+                                        raise
+                                if not n_ordered and nested_cfg.get('order_by') in allowed_order_fields:
+                                    cn = nested_cfg.get('order_by')
+                                    dd = _dir_value(nested_cfg.get('order_dir'))
+                                    if dd not in ('asc','desc'):
+                                        raise ValueError(f"Invalid order direction '{nested_cfg.get('order_dir')}' for relation {nested_cfg.get('target')}")
+                                    col = getattr(grand_model_cls, cn, None)
+                                    if col is None:
+                                        raise ValueError(f"Unknown order column '{cn}' for relation {nested_cfg.get('target')}")
+                                    g_sel = g_sel.order_by(col.desc() if dd=='desc' else col.asc())
+                                    n_ordered = True
+                                # Default order by id as final fallback
+                                if not n_ordered and 'id' in grand_model_cls.__table__.columns:
                                     g_sel = g_sel.order_by(getattr(grand_model_cls, 'id'))
+                            except Exception:
+                                pass
+                            # Apply nested where (query where + default where) before pagination
+                            try:
+                                dbg_where = nested_cfg.get('where')
+                                dbg_def_where = nested_cfg.get('default_where')
+                                if info and getattr(info, 'context', None) is not None:
+                                    # minimal debug print; acceptable during targeted test run
+                                    print(f"[berry debug] nested '{nested_name}' where={dbg_where!r} default_where={dbg_def_where!r}")
+                            except Exception:
+                                pass
+                            try:
+                                nrwhere = nested_cfg.get('where')
+                                ndwhere = nested_cfg.get('default_where')
+                                if nrwhere is not None:
+                                    import json as _json
+                                    wdict = nrwhere
+                                    if isinstance(nrwhere, str):
+                                        wdict = _json.loads(nrwhere)
+                                    expr_r = None
+                                    try:
+                                        exprs = []
+                                        for col_name, op_map in (wdict or {}).items():
+                                            col = grand_model_cls.__table__.c.get(col_name)
+                                            if col is None:
+                                                continue
+                                            for op_name, val in (op_map or {}).items():
+                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                    val = [_coerce_where_value(col, v) for v in val]
+                                                else:
+                                                    val = _coerce_where_value(col, val)
+                                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                if not op_fn:
+                                                    continue
+                                                exprs.append(op_fn(col, val))
+                                        if exprs:
+                                            expr_r = _and(*exprs)
+                                        if info and getattr(info, 'context', None) is not None:
+                                            print(f"[berry debug] nested where exprs={len(exprs)} expr={expr_r}")
+                                    except Exception as e:
+                                        expr_r = None
+                                        try:
+                                            if info and getattr(info, 'context', None) is not None:
+                                                print(f"[berry debug] nested where build error: {e}")
+                                        except Exception:
+                                            pass
+                                    if expr_r is not None:
+                                        g_sel = g_sel.where(expr_r)
+                                        if info and getattr(info, 'context', None) is not None:
+                                            print(f"[berry debug] applied nested where")
+                                if ndwhere is not None:
+                                    import json as _json
+                                    wdict = ndwhere
+                                    if isinstance(ndwhere, str):
+                                        wdict = _json.loads(ndwhere)
+                                    expr_r = None
+                                    try:
+                                        exprs = []
+                                        for col_name, op_map in (wdict or {}).items():
+                                            col = grand_model_cls.__table__.c.get(col_name)
+                                            if col is None:
+                                                continue
+                                            for op_name, val in (op_map or {}).items():
+                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                    val = [_coerce_where_value(col, v) for v in val]
+                                                else:
+                                                    val = _coerce_where_value(col, val)
+                                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                if not op_fn:
+                                                    continue
+                                                exprs.append(op_fn(col, val))
+                                        if exprs:
+                                            expr_r = _and(*exprs)
+                                    except Exception:
+                                        expr_r = None
+                                    if expr_r is not None:
+                                        g_sel = g_sel.where(expr_r)
                             except Exception:
                                 pass
                             if nested_cfg.get('offset'):
@@ -1502,7 +1797,11 @@ class BerrySchema:
                             agg_inner_expr = _json_array_agg(g_row_json)
                             if agg_inner_expr is None:
                                 continue
-                            g_agg_inner = select(_json_array_coalesce(agg_inner_expr)).select_from(g_subq).correlate(child_model_cls, parent_model_cls)
+                            # Correlate to limited_subq so nested clause can reference it
+                            try:
+                                g_agg_inner = select(_json_array_coalesce(agg_inner_expr)).select_from(g_subq).correlate(limited_subq)
+                            except Exception:
+                                g_agg_inner = select(_json_array_coalesce(agg_inner_expr)).select_from(g_subq).correlate(child_model_cls, parent_model_cls)
                             try:
                                 g_agg = g_agg_inner.scalar_subquery()
                             except Exception:
@@ -1802,14 +2101,173 @@ class BerrySchema:
                                 if mssql_mode:
                                     parent_table = parent_model_cls.__tablename__
                                     child_table = child_model_cls_i.__tablename__
-                                    where_clause = f"[{child_table}].[{fk_col_i.name}] = [{parent_table}].[id]"
-                                    order_clause = f"[{child_table}].[id]" if 'id' in child_model_cls_i.__table__.columns else None
+                                    # Start with FK correlation; extend with relation-level JSON where/default_where
+                                    where_parts_rel: list[str] = [f"[{child_table}].[{fk_col_i.name}] = [{parent_table}].[id]"]
+                                    # Helpers to render simple WHERE from JSON where dicts for MSSQL
+                                    def _mssql_literal(col, v):
+                                        try:
+                                            v2 = _coerce_where_value(col, v)
+                                        except Exception:
+                                            v2 = v
+                                        from sqlalchemy.sql.sqltypes import Integer as _I, Float as _F, Boolean as _B, DateTime as _DT, Numeric as _N
+                                        ctype = getattr(col, 'type', None)
+                                        if isinstance(v2, (int, float)):
+                                            return str(v2)
+                                        if isinstance(ctype, _B) or isinstance(v2, bool):
+                                            return '1' if bool(v2) else '0'
+                                        if isinstance(ctype, _DT):
+                                            try:
+                                                from datetime import datetime as _dt
+                                                if isinstance(v2, _dt):
+                                                    # Use ISO 8601 and CONVERT with style 126 for robust MSSQL parsing
+                                                    iso = v2.replace(tzinfo=None).isoformat(sep='T', timespec='seconds')
+                                                    return f"CONVERT(datetime2, '{iso}', 126)"
+                                            except Exception:
+                                                pass
+                                        s = str(v2).replace("'", "''")
+                                        return f"'{s}'"
+                                    def _mssql_where_from_dict(model_cls_local, wdict) -> list[str]:
+                                        parts: list[str] = []
+                                        for col_name, op_map in (wdict or {}).items():
+                                            col = model_cls_local.__table__.c.get(col_name)
+                                            if col is None:
+                                                continue
+                                            for op_name, val in (op_map or {}).items():
+                                                t = f"[{model_cls_local.__tablename__}].[{col_name}]"
+                                                if op_name == 'eq':
+                                                    parts.append(f"{t} = {_mssql_literal(col, val)}")
+                                                elif op_name == 'ne':
+                                                    parts.append(f"{t} <> {_mssql_literal(col, val)}")
+                                                elif op_name == 'lt':
+                                                    parts.append(f"{t} < {_mssql_literal(col, val)}")
+                                                elif op_name == 'lte':
+                                                    parts.append(f"{t} <= {_mssql_literal(col, val)}")
+                                                elif op_name == 'gt':
+                                                    parts.append(f"{t} > {_mssql_literal(col, val)}")
+                                                elif op_name == 'gte':
+                                                    parts.append(f"{t} >= {_mssql_literal(col, val)}")
+                                                elif op_name == 'like':
+                                                    parts.append(f"{t} LIKE {_mssql_literal(col, val)}")
+                                                elif op_name == 'ilike':
+                                                    # emulate case-insensitive like
+                                                    parts.append(f"LOWER({t}) LIKE LOWER({_mssql_literal(col, val)})")
+                                                elif op_name == 'in' and isinstance(val, (list, tuple)):
+                                                    vals = ', '.join([_mssql_literal(col, v) for v in val])
+                                                    parts.append(f"{t} IN ({vals})")
+                                                elif op_name == 'between' and isinstance(val, (list, tuple)) and len(val) >= 2:
+                                                    a = _mssql_literal(col, val[0])
+                                                    b = _mssql_literal(col, val[1])
+                                                    parts.append(f"{t} BETWEEN {a} AND {b}")
+                                        return parts
+                                    # Apply relation-level where/default_where if provided
+                                    try:
+                                        import json as _json
+                                        r_where = rel_cfg_local.get('where')
+                                        if r_where is not None:
+                                            wdict_rel = r_where
+                                            if isinstance(r_where, str):
+                                                wdict_rel = _json.loads(r_where)
+                                            where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, wdict_rel))
+                                        d_where = rel_cfg_local.get('default_where')
+                                        if d_where is not None and isinstance(d_where, (dict, str)):
+                                            dwdict_rel = d_where
+                                            if isinstance(d_where, str):
+                                                dwdict_rel = _json.loads(d_where)
+                                            where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, dwdict_rel))
+                                    except Exception:
+                                        pass
+                                    where_clause = ' AND '.join(where_parts_rel)
+                                    # Build ORDER BY honoring order_multi -> order_by/order_dir -> fallback id asc
+                                    try:
+                                        allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
+                                    except Exception:
+                                        allowed_fields = []
+                                    order_parts: list[str] = []
+                                    multi = (rel_cfg_local.get('order_multi') or [])
+                                    for spec in multi:
+                                        try:
+                                            cn, _, dd = str(spec).partition(':')
+                                            dd = dd or _dir_value(rel_cfg_local.get('order_dir'))
+                                            if cn in allowed_fields:
+                                                order_parts.append(f"[{child_table}].[{cn}] {'DESC' if (str(dd).lower()=='desc') else 'ASC'}")
+                                        except Exception:
+                                            pass
+                                    if not order_parts and rel_cfg_local.get('order_by') in allowed_fields:
+                                        cn = rel_cfg_local.get('order_by')
+                                        dd = _dir_value(rel_cfg_local.get('order_dir'))
+                                        order_parts.append(f"[{child_table}].[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
+                                    if not order_parts and 'id' in child_model_cls_i.__table__.columns:
+                                        order_parts.append(f"[{child_table}].[id] ASC")
+                                    order_clause = ', '.join(order_parts) if order_parts else None
+                                    # Build nested subqueries for MSSQL if nested relations are requested
+                                    nested_subqueries: list[tuple[str, str]] = []
+                                    for nname, ncfg in (rel_cfg_local.get('nested') or {}).items():
+                                        n_target = ncfg.get('target')
+                                        nb = self.types.get(n_target)
+                                        if not nb or not nb.model:
+                                            continue
+                                        grand_model = nb.model
+                                        # use helper functions defined above for MSSQL where rendering
+                                        # FK from grandchild -> child
+                                        g_fk = None
+                                        for c in grand_model.__table__.columns:
+                                            for fk in c.foreign_keys:
+                                                if fk.column.table.name == child_model_cls_i.__table__.name:
+                                                    g_fk = c
+                                                    break
+                                            if g_fk is not None:
+                                                break
+                                        if g_fk is None:
+                                            continue
+                                        n_cols = ncfg.get('fields') or []
+                                        if not n_cols:
+                                            for sf2, sd2 in nb.__berry_fields__.items():
+                                                if sd2.kind == 'scalar':
+                                                    n_cols.append(sf2)
+                                        n_col_select = ', '.join([f"[{grand_model.__tablename__}].[{c}] AS [{c}]" for c in (n_cols or ['id'])])
+                                        # where: correlate to child row id in MSSQL path
+                                        n_where_parts = [f"[{grand_model.__tablename__}].[{g_fk.name}] = [{child_table}].[id]"]
+                                        # apply JSON where/default_where if provided
+                                        try:
+                                            import json as _json
+                                            if ncfg.get('where') is not None:
+                                                wdict = ncfg.get('where')
+                                                if isinstance(wdict, str):
+                                                    wdict = _json.loads(wdict)
+                                                n_where_parts.extend(_mssql_where_from_dict(grand_model, wdict))
+                                            if ncfg.get('default_where') is not None and isinstance(ncfg.get('default_where'), (dict, str)):
+                                                dwdict = ncfg.get('default_where')
+                                                if isinstance(dwdict, str):
+                                                    dwdict = _json.loads(dwdict)
+                                                n_where_parts.extend(_mssql_where_from_dict(grand_model, dwdict))
+                                        except Exception:
+                                            pass
+                                        n_where = ' AND '.join(n_where_parts)
+                                        # order
+                                        n_order_parts: list[str] = []
+                                        nmulti = (ncfg.get('order_multi') or [])
+                                        for spec in nmulti:
+                                            cn, _, dd = str(spec).partition(':')
+                                            dd = dd or _dir_value(ncfg.get('order_dir'))
+                                            n_order_parts.append(f"[{grand_model.__tablename__}].[{cn}] {'DESC' if (str(dd).lower()=='desc') else 'ASC'}")
+                                        if not n_order_parts and ncfg.get('order_by'):
+                                            cn = ncfg.get('order_by')
+                                            dd = _dir_value(ncfg.get('order_dir'))
+                                            n_order_parts.append(f"[{grand_model.__tablename__}].[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
+                                        n_order_clause = (" ORDER BY " + ', '.join(n_order_parts)) if n_order_parts else ''
+                                        n_top = f"TOP ({int(ncfg.get('limit'))}) " if ncfg.get('limit') is not None else ''
+                                        # where/default_where (JSON): not applied in MSSQL nested builder to keep simple; future enhancement can mirror PG/SQLite
+                                        nested_sql = (
+                                            f"SELECT {n_top}{n_col_select} FROM {grand_model.__tablename__} WHERE {n_where}{n_order_clause} FOR JSON PATH"
+                                        )
+                                        nested_subqueries.append((nname, nested_sql))
                                     return adapter.build_list_relation_json(
                                         child_table=child_table,
                                         projected_columns=requested_scalar_i,
                                         where_condition=where_clause,
                                         limit=rel_cfg_local.get('limit'),
                                         order_by=order_clause,
+                                        nested_subqueries=nested_subqueries or None,
                                     )
                                 inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == parent_model_cls.id).correlate(parent_model_cls)
                                 # Apply filter args for list relation
@@ -1912,12 +2370,15 @@ class BerrySchema:
                                                 if col2 is None:
                                                     continue
                                                 for op_name2, val2 in (op_map2 or {}).items():
+                                                    if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
+                                                        val2 = [_coerce_where_value(col2, v) for v in val2]
+                                                    else:
+                                                        val2 = _coerce_where_value(col2, val2)
                                                     op_fn2 = OPERATOR_REGISTRY.get(op_name2)
                                                     if not op_fn2:
                                                         continue
                                                     exprs2.append(op_fn2(col2, val2))
                                             if exprs2:
-                                                from sqlalchemy import and_ as _and
                                                 expr_rr = _and(*exprs2)
                                         except Exception:
                                             expr_rr = None
@@ -1936,12 +2397,15 @@ class BerrySchema:
                                                 if col2 is None:
                                                     continue
                                                 for op_name2, val2 in (op_map2 or {}).items():
+                                                    if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
+                                                        val2 = [_coerce_where_value(col2, v) for v in val2]
+                                                    else:
+                                                        val2 = _coerce_where_value(col2, val2)
                                                     op_fn2 = OPERATOR_REGISTRY.get(op_name2)
                                                     if not op_fn2:
                                                         continue
                                                     exprs2.append(op_fn2(col2, val2))
                                             if exprs2:
-                                                from sqlalchemy import and_ as _and
                                                 expr_rr = _and(*exprs2)
                                         except Exception:
                                             expr_rr = None
@@ -2014,6 +2478,11 @@ class BerrySchema:
                                     if not op_fn:
                                         continue
                                     try:
+                                        # Coerce where value(s) to column type
+                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                            val = [_coerce_where_value(col, v) for v in val]
+                                        else:
+                                            val = _coerce_where_value(col, val)
                                         exprs.append(op_fn(col, val))
                                     except Exception:
                                         continue

@@ -1,14 +1,14 @@
-import pytest
-from schema import schema as berry_schema
+from tests.common.fixtures import *  # noqa: F401,F403
+from tests.new.schema import schema
 
-q = """
-query { users(name_ilike: \"Alice\") { id posts(limit:1, offset:0) { id } } }
-"""
-
-import asyncio
-
-async def main():
-	res = await berry_schema.execute(q, context_value={'db_session': db_session})
-	print(res)
-
-asyncio.run(main())
+@pytest.mark.asyncio
+async def test_post_comment_text_len_custom_field(db_session, populated_db):
+    # Query first 2 posts including custom aggregated length field
+    query = """
+    query {
+      posts(limit: 2) { id title comment_text_len }
+    }
+    """
+    res = await schema.execute(query, context_value={"db_session": db_session})
+    print(res.data)
+    assert not res.errors

@@ -25,12 +25,13 @@ async def sample_users(db_session: AsyncSession):
 async def sample_posts(db_session: AsyncSession, sample_users):
     user1, user2, user3, _ = sample_users
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # Ensure deterministic, unique created_at values for ordering tests
     posts = [
-        Post(title="First Post", content="Hello world!", author_id=user1.id, created_at=now - timedelta(minutes=45)),
-        Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id, created_at=now - timedelta(minutes=15)),
-        Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id),
-        Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id),
-        Post(title="Getting Started", content="A beginner's guide", author_id=user3.id),
+        Post(title="First Post", content="Hello world!", author_id=user1.id, created_at=now - timedelta(minutes=60)),
+        Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id, created_at=now - timedelta(minutes=45)),
+        Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id, created_at=now - timedelta(minutes=30)),
+        Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id, created_at=now - timedelta(minutes=15)),
+        Post(title="Getting Started", content="A beginner's guide", author_id=user3.id, created_at=now - timedelta(minutes=5)),
     ]
     db_session.add_all(posts)
     await db_session.flush()
