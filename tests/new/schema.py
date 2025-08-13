@@ -25,6 +25,11 @@ class PostCommentQL(BerryType):
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
+    # Declare filters for autogeneration (Phase 2 tests)
+    __filters__ = {
+        'title_ilike': {'column': 'title', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
+    'created_at': {'column': 'created_at', 'ops': ['gt','lt']},  # expands to created_at_gt / created_at_lt
+    }
     id = field()
     title = field()
     content = field()
@@ -57,6 +62,11 @@ class PostQL(BerryType):
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
+    __filters__ = {
+        'name_ilike': {'column': 'name', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
+        'created_at_between': {'column': 'created_at', 'op': 'between'},
+        'is_admin_eq': {'column': 'is_admin', 'op': 'eq'},
+    }
     id = field()
     name = field()
     email = field()

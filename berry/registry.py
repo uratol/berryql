@@ -19,6 +19,87 @@ except Exception:  # pragma: no cover
 
 T = TypeVar('T')
 
+# --- Filtering DSL (Phase 1: foundational pieces) ---
+
+@dataclass
+class FilterSpec:
+    """Represents a declared filter argument.
+
+    Forms supported (early phase):
+      - Column + single op: FilterSpec(column='name', op='ilike')
+      - Column + multiple ops (suffix form): FilterSpec(column='created_at', ops=['gt','lt'])
+      - Callable builder (dynamic): FilterSpec(builder=lambda model_cls, info, value: ...)
+
+    In later phases this will also drive GraphQL argument autogeneration.
+    For Phase 1, values are supplied via context (see root resolver notes).
+    """
+    column: Optional[str] = None
+    op: Optional[str] = None
+    ops: Optional[List[str]] = None
+    transform: Optional[Callable[[Any], Any]] = None
+    builder: Optional[Callable[..., Any]] = None  # signature: (model_cls, info, value) -> SQLA expression
+    alias: Optional[str] = None  # future: override argument name
+    required: bool = False
+    description: Optional[str] = None
+
+    def clone_with(self, **updates) -> 'FilterSpec':  # pragma: no cover - trivial helper
+        d = self.__dict__.copy()
+        d.update(updates)
+        return FilterSpec(**d)
+
+
+def ColumnFilter(column: str, *, op: Optional[str] = None, ops: Optional[List[str]] = None, transform: Optional[Callable[[Any], Any]] = None, **extras) -> FilterSpec:
+    return FilterSpec(column=column, op=op, ops=ops, transform=transform, **extras)
+
+
+# Global operator registry (extensible)
+OPERATOR_REGISTRY: Dict[str, Callable[[Any, Any], Any]] = {
+    'eq': lambda col, v: col == v,
+    'ne': lambda col, v: col != v,
+    'lt': lambda col, v: col < v,
+    'lte': lambda col, v: col <= v,
+    'gt': lambda col, v: col > v,
+    'gte': lambda col, v: col >= v,
+    'like': lambda col, v: col.like(v),
+    'ilike': lambda col, v: getattr(col, 'ilike', lambda x: func.lower(col).like(func.lower(x)))(v),  # fallback if ilike unsupported
+    'in': lambda col, v: col.in_(v if isinstance(v, (list, tuple, set)) else [v]),
+    'between': lambda col, v: col.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None,
+    'contains': lambda col, v: col.contains(v),
+    'starts_with': lambda col, v: col.like(f"{v}%"),
+    'ends_with': lambda col, v: col.like(f"%{v}"),
+}
+
+
+def _normalize_filter_spec(raw: Any) -> FilterSpec:
+    """Coerce user-provided filter spec syntaxes into a FilterSpec instance.
+
+    Supported raw forms:
+      - FilterSpec instance
+      - Callable (treated as dynamic builder)
+      - Dict with keys (column, op, ops, transform, alias)
+    """
+    if isinstance(raw, FilterSpec):
+        return raw
+    if callable(raw):  # dynamic builder only
+        return FilterSpec(builder=raw)
+    if isinstance(raw, dict):
+        return FilterSpec(
+            column=raw.get('column'),
+            op=raw.get('op'),
+            ops=raw.get('ops'),
+            transform=raw.get('transform'),
+            alias=raw.get('alias'),
+            builder=raw.get('builder'),
+            required=raw.get('required', False),
+            description=raw.get('description')
+        )
+    raise TypeError(f"Unsupported filter spec form: {raw!r}")
+
+
+def register_operator(name: str, fn: Callable[[Any, Any], Any]):  # pragma: no cover - simple
+    OPERATOR_REGISTRY[name] = fn
+
+
 # --- Field descriptor primitives (restored) ---
 @dataclass
 class FieldDef:
@@ -41,6 +122,7 @@ class FieldDescriptor:
 
 
 def field(**meta) -> FieldDescriptor:
+    # Allow filters passed for this field (stored in meta for later collection)
     return FieldDescriptor(kind='scalar', **meta)
 
 
@@ -501,8 +583,70 @@ class BerrySchema:
             st_type = self._st_types[name]
             field_name = self._pluralize(name)
             _model_cls = bcls.model
+            def _collect_declared_filters(btype_cls_local):
+                """Collect and expand declared filter specs.
+
+                Expansion rules:
+                  - If spec has .op set -> single arg named exactly as mapping key (or alias if provided)
+                  - If spec has .ops list and no .op:
+                        If mapping key equals column name -> produce arg per op named f"{key}_{op}"
+                        Else treat mapping key as prefix -> same as above
+                  - Callable-only spec (builder) uses provided key
+                Returns mapping of argument_name -> FilterSpec (with resolved single op).
+                """
+                out: Dict[str, FilterSpec] = {}
+                class_filters = getattr(btype_cls_local, '__filters__', {}) or {}
+                for key, raw in class_filters.items():
+                    try:
+                        spec = _normalize_filter_spec(raw)
+                    except Exception:
+                        continue
+                    if spec.ops and not spec.op:
+                        for op_name in spec.ops:
+                            base = spec.alias or key
+                            # If base already ends with _{op} or exactly op appended, don't duplicate
+                            if base.endswith(f"_{op_name}"):
+                                arg_name = base
+                            else:
+                                arg_name = f"{base}_{op_name}"
+                            out[arg_name] = spec.clone_with(op=op_name, ops=None)
+                    else:
+                        arg_name = spec.alias or key
+                        out[arg_name] = spec
+                return out
+
             def _make_root_resolver(model_cls, st_cls, btype_cls, root_field_name):
-                async def _resolver(info: StrawberryInfo, limit: int | None = None, offset: int | None = None):  # noqa: D401
+                declared_filters = _collect_declared_filters(btype_cls)
+                # Precompute column -> python type mapping for argument type inference
+                col_py_types: Dict[str, Any] = {}
+                if model_cls is not None and hasattr(model_cls, '__table__'):
+                    for col in model_cls.__table__.columns:
+                        if isinstance(col.type, Integer):
+                            py_t = int
+                        elif isinstance(col.type, String):
+                            py_t = str
+                        elif isinstance(col.type, Boolean):
+                            py_t = bool
+                        elif isinstance(col.type, DateTime):
+                            py_t = datetime
+                        else:
+                            py_t = str
+                        col_py_types[col.name] = py_t
+
+                # Build argument annotations dynamically
+                filter_arg_types: Dict[str, Any] = {}
+                for arg_name, f_spec in declared_filters.items():
+                    base_type = str
+                    if f_spec.column and f_spec.column in col_py_types:
+                        base_type = col_py_types[f_spec.column]
+                    # list type for in/between
+                    if f_spec.op in ('in', 'between'):
+                        from typing import List as _List
+                        filter_arg_types[arg_name] = Optional[List[base_type]]  # type: ignore
+                    else:
+                        filter_arg_types[arg_name] = Optional[base_type]
+
+                async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, _passed_filter_args: Dict[str, Any]):
                     session = info.context.get('db_session') if info and info.context else None
                     if session is None:
                         return []
@@ -938,6 +1082,49 @@ class BerrySchema:
                                 else:
                                     select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                     stmt = select(*select_columns)
+                    # ----- Phase 2 filtering (argument-driven) -----
+                    where_clauses = []
+                    for arg_name, value in _passed_filter_args.items():
+                        if value is None:
+                            continue
+                        f_spec = declared_filters.get(arg_name)
+                        if not f_spec:
+                            continue
+                        # transform value
+                        if f_spec.transform:
+                            try:
+                                value = f_spec.transform(value)
+                            except Exception:
+                                continue
+                        expr = None
+                        if f_spec.builder:
+                            try:
+                                expr = f_spec.builder(model_cls, info, value)
+                            except Exception:
+                                expr = None
+                        elif f_spec.column:
+                            try:
+                                col = model_cls.__table__.c.get(f_spec.column)
+                            except Exception:
+                                col = None
+                            if col is None:
+                                continue
+                            op_name = f_spec.op or 'eq'
+                            op_fn = OPERATOR_REGISTRY.get(op_name)
+                            if not op_fn:
+                                continue
+                            try:
+                                expr = op_fn(col, value)
+                            except Exception:
+                                expr = None
+                        if expr is not None:
+                            where_clauses.append(expr)
+                    if where_clauses:
+                        for wc in where_clauses:
+                            try:
+                                stmt = stmt.where(wc)
+                            except Exception:
+                                pass
                     if offset:
                         stmt = stmt.offset(offset)
                     if limit is not None:
@@ -1062,7 +1249,39 @@ class BerrySchema:
                                     cache[cache_key] = val or 0
                             out.append(inst)
                     return out
-                return _resolver
+                # Dynamically build a resolver with explicit filter args so Strawberry generates them
+                # Build function source
+                arg_defs = []
+                for a, t in filter_arg_types.items():
+                    # Represent type name for function definition (use forward ref if needed)
+                    # We'll not embed complex generics; rely on annotations assignment after creation
+                    arg_defs.append(f"{a}=None")
+                args_str = (', '.join(arg_defs)) if arg_defs else ''
+                func_name = f"_auto_root_{root_field_name}"
+                # Build parameter list: info, limit, offset, filter args
+                if args_str:
+                    full_params = f"info, limit=None, offset=None, {args_str}"
+                else:
+                    full_params = "info, limit=None, offset=None"
+                src = f"async def {func_name}({full_params}):\n" \
+                      f"    _fa = {{}}\n"  # gather passed filter args
+                for a in declared_filters.keys():
+                    src += f"    _fa['{a}'] = {a} if '{a}' in locals() else None\n"
+                src += "    return await _base_impl(info, limit, offset, _fa)\n"
+                # Exec the function in a prepared namespace
+                ns: Dict[str, Any] = {'_base_impl': _base_impl}
+                # Provide required symbols for optional typing (Optional, List, datetime, etc.) though not used in parameter defaults
+                ns.update({'Optional': Optional, 'List': List, 'datetime': datetime})
+                exec(src, ns)
+                generated_fn = ns[func_name]
+                # Ensure module attribute for Strawberry namespace resolution
+                if not getattr(generated_fn, '__module__', None):  # pragma: no cover - environment dependent
+                    generated_fn.__module__ = __name__
+                # Attach type annotations for Strawberry to introspect
+                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int]}
+                ann.update(filter_arg_types)
+                generated_fn.__annotations__ = ann
+                return generated_fn
             root_resolver = _make_root_resolver(_model_cls, st_type, bcls, field_name)
             query_annotations[field_name] = List[self._st_types[name]]  # type: ignore
             query_namespace[field_name] = strawberry.field(root_resolver)
