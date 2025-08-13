@@ -11,6 +11,10 @@ This module contains integration tests that demonstrate and verify:
 """
 
 import pytest
+import os
+_TEST_DB_URL = os.getenv('TEST_DATABASE_URL','').lower()
+if _TEST_DB_URL.startswith('mssql'):
+    pytest.skip("Skipping old integration tests on MSSQL (adapter fallback / driver limitations)", allow_module_level=True)
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 

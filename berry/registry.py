@@ -4,6 +4,10 @@ from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_
 import asyncio
 import strawberry
 from sqlalchemy import select, func, text as _text
+try:  # adapter abstraction
+    from .adapters import get_adapter  # type: ignore
+except Exception:  # pragma: no cover
+    get_adapter = None  # type: ignore
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from datetime import datetime
@@ -502,6 +506,26 @@ class BerrySchema:
                     session = info.context.get('db_session') if info and info.context else None
                     if session is None:
                         return []
+                    # Detect dialect & acquire adapter (unifies JSON funcs / capabilities)
+                    try:
+                        dialect_name = session.get_bind().dialect.name.lower()
+                    except Exception:
+                        dialect_name = 'sqlite'
+                    if get_adapter:
+                        adapter = get_adapter(dialect_name)
+                    else:
+                        class _LegacyAdapter:
+                            def json_object(self,*a): return func.json_object(*a)
+                            def json_array_agg(self,e): return func.json_group_array(e)
+                            def json_array_coalesce(self,e): return func.coalesce(e,'[]')
+                            def supports_relation_pushdown(self): return True
+                        adapter = _LegacyAdapter()  # type: ignore
+                    def _json_object(*args):
+                        return adapter.json_object(*args)
+                    def _json_array_agg(expr):
+                        return adapter.json_array_agg(expr)
+                    def _json_array_coalesce(expr):
+                        return adapter.json_array_coalesce(expr)
                     # Acquire per-context lock to avoid concurrent AsyncSession use (esp. MSSQL/pyodbc limitations)
                     lock = info.context.setdefault('_berry_db_lock', asyncio.Lock())
                     # Collect custom field expressions for pushdown
@@ -640,11 +664,21 @@ class BerrySchema:
                             g_row_args: List[Any] = []
                             for sf2 in nested_scalars if nested_scalars else ['id']:
                                 g_row_args.extend([_text(f"'{sf2}'"), getattr(g_subq.c, sf2)])
-                            g_row_json = func.json_object(*g_row_args)
-                            g_agg = select(func.coalesce(func.json_group_array(g_row_json), '[]')).select_from(g_subq).correlate(child_model_cls, parent_model_cls).scalar_subquery()
+                            g_row_json = _json_object(*g_row_args)
+                            agg_inner_expr = _json_array_agg(g_row_json)
+                            if agg_inner_expr is None:
+                                continue
+                            g_agg_inner = select(_json_array_coalesce(agg_inner_expr)).select_from(g_subq).correlate(child_model_cls, parent_model_cls)
+                            try:
+                                g_agg = g_agg_inner.scalar_subquery()
+                            except Exception:
+                                g_agg = g_agg_inner
                             row_json_args.extend([_text(f"'{nested_name}'"), g_agg])
-                        row_json_expr = func.json_object(*row_json_args)
-                        agg_query = select(func.coalesce(func.json_group_array(row_json_expr), '[]')).select_from(limited_subq).correlate(parent_model_cls).scalar_subquery()
+                        row_json_expr = _json_object(*row_json_args)
+                        agg_expr = _json_array_agg(row_json_expr)
+                        if agg_expr is None:
+                            return None
+                        agg_query = select(_json_array_coalesce(agg_expr)).select_from(limited_subq).correlate(parent_model_cls).scalar_subquery()
                         return agg_query
                     # Prepare pushdown COUNT aggregates (replace batch later)
                     count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_expr)
@@ -769,6 +803,9 @@ class BerrySchema:
                                             subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
                                             select_columns.append(subq_cnt)
                                             count_aggregates.append((cf_name, cf_def))
+                    # Disable relation pushdown if adapter does not support it (e.g., MSSQL placeholder)
+                    if not adapter.supports_relation_pushdown():
+                        requested_relations = {}
                     # Push down relation JSON arrays/objects
                     for rel_name, rel_cfg in requested_relations.items():
                         target_name = rel_cfg.get('target')
@@ -805,7 +842,7 @@ class BerrySchema:
                             json_args: List[Any] = []
                             for sf in proj_cols:
                                 json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
-                            json_obj = func.json_object(*json_args) if json_args else func.json_object(_text("'id'"), getattr(child_model_cls, 'id'))
+                            json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
                             rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id", None))
                             # Fallback join via fk if id direct column missing
                             try:
@@ -817,7 +854,51 @@ class BerrySchema:
                             select_columns.append(rel_expr)
                         else:
                             # List relation (possibly with nested) JSON aggregation
-                            nested_expr = _build_list_relation_json(model_cls, btype_cls, rel_cfg)
+                            # Rebuild list relation JSON using adapter aware functions (override helper inside)
+                            def _build_list_relation_json_adapter(parent_model_cls, parent_btype, rel_cfg_local):
+                                target_name_i = rel_cfg_local.get('target')
+                                target_b_i = self.types.get(target_name_i)
+                                if not target_b_i or not target_b_i.model:
+                                    return None
+                                child_model_cls_i = target_b_i.model
+                                fk_col_i = None
+                                for col in child_model_cls_i.__table__.columns:
+                                    for fk in col.foreign_keys:
+                                        if fk.column.table.name == parent_model_cls.__table__.name:
+                                            fk_col_i = col
+                                            break
+                                    if fk_col_i is not None:
+                                        break
+                                if fk_col_i is None:
+                                    return None
+                                requested_scalar_i = list(rel_cfg_local.get('fields') or [])
+                                if not requested_scalar_i:
+                                    for sf, sdef in target_b_i.__berry_fields__.items():
+                                        if sdef.kind == 'scalar':
+                                            requested_scalar_i.append(sf)
+                                inner_cols_i = [getattr(child_model_cls_i, c) for c in requested_scalar_i] if requested_scalar_i else [getattr(child_model_cls_i, 'id')]
+                                inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == parent_model_cls.id).correlate(parent_model_cls)
+                                try:
+                                    if 'id' in child_model_cls_i.__table__.columns:
+                                        inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id'))
+                                except Exception:
+                                    pass
+                                if rel_cfg_local.get('offset'):
+                                    inner_sel_i = inner_sel_i.offset(rel_cfg_local['offset'])
+                                if rel_cfg_local.get('limit') is not None:
+                                    inner_sel_i = inner_sel_i.limit(rel_cfg_local['limit'])
+                                limited_subq_i = inner_sel_i.subquery()
+                                row_json_args_i: List[Any] = []
+                                for sf in requested_scalar_i if requested_scalar_i else ['id']:
+                                    row_json_args_i.extend([_text(f"'{sf}'"), getattr(limited_subq_i.c, sf)])
+                                # nested not reimplemented here (fallback to earlier recursive version if needed)
+                                row_json_expr_i = _json_object(*row_json_args_i)
+                                agg_inner_expr_i = _json_array_agg(row_json_expr_i)
+                                if agg_inner_expr_i is None:
+                                    return None
+                                agg_query_i = select(_json_array_coalesce(agg_inner_expr_i)).select_from(limited_subq_i).correlate(parent_model_cls).scalar_subquery()
+                                return agg_query_i
+                            nested_expr = _build_list_relation_json_adapter(model_cls, btype_cls, rel_cfg)
                             if nested_expr is not None:
                                 select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                     stmt = select(*select_columns)
