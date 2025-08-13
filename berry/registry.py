@@ -11,6 +11,7 @@ except Exception:  # pragma: no cover
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from datetime import datetime
+from enum import Enum
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     class Registry: ...  # forward ref placeholder
@@ -45,6 +46,9 @@ class RelationSelectionExtractor:
             'fields': [],
             'limit': None,
             'offset': None,
+            'order_by': None,
+            'order_dir': None,
+            'order_multi': [],
             'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
             'target': fdef.meta.get('target'),
             'nested': {},
@@ -71,14 +75,23 @@ class RelationSelectionExtractor:
                     try:
                         if hasattr(raw_val, 'value') and raw_val is not None and raw_val.__class__.__name__ != 'datetime':
                             inner_v = getattr(raw_val, 'value')
+                            # Strawberry Enum or literal
                             if isinstance(inner_v, (int, str, float, bool)):
                                 raw_val = inner_v
+                            else:
+                                raw_val = str(inner_v)
                     except Exception:
                         pass
                     if arg.name == 'limit':
                         rel_cfg['limit'] = raw_val
                     elif arg.name == 'offset':
                         rel_cfg['offset'] = raw_val
+                    elif arg.name == 'order_by':
+                        rel_cfg['order_by'] = raw_val
+                    elif arg.name == 'order_dir':
+                        rel_cfg['order_dir'] = raw_val
+                    elif arg.name == 'order_multi':
+                        rel_cfg['order_multi'] = raw_val or []
                     else:
                         rel_cfg['filter_args'][arg.name] = raw_val
             except Exception:
@@ -109,6 +122,9 @@ class RelationSelectionExtractor:
                 return float(node.value)
             if isinstance(node, _gast.StringValueNode):
                 return node.value
+            # Enum for Direction
+            if hasattr(_gast, 'EnumValueNode') and isinstance(node, _gast.EnumValueNode):
+                return str(getattr(node, 'value', None))
             if isinstance(node, _gast.BooleanValueNode):
                 return bool(node.value)
             if isinstance(node, _gast.NullValueNode):
@@ -142,6 +158,12 @@ class RelationSelectionExtractor:
                     rel_cfg['limit'] = self._value_from_ast(arg.value)
                 elif arg_name == 'offset':
                     rel_cfg['offset'] = self._value_from_ast(arg.value)
+                elif arg_name == 'order_by':
+                    rel_cfg['order_by'] = self._value_from_ast(arg.value)
+                elif arg_name == 'order_dir':
+                    rel_cfg['order_dir'] = self._value_from_ast(arg.value)
+                elif arg_name == 'order_multi':
+                    rel_cfg['order_multi'] = self._value_from_ast(arg.value) or []
                 else:
                     rel_cfg['filter_args'][arg_name] = self._value_from_ast(arg.value)
             # scalar subfields
@@ -239,6 +261,24 @@ OPERATOR_REGISTRY: Dict[str, Callable[[Any, Any], Any]] = {
     'starts_with': lambda col, v: col.like(f"{v}%"),
     'ends_with': lambda col, v: col.like(f"%{v}"),
 }
+
+# Ordering direction enum for GraphQL (so queries can use order_dir: desc)
+class _DirectionEnum(Enum):
+    asc = 'asc'
+    desc = 'desc'
+
+Direction = strawberry.enum(_DirectionEnum, name="Direction")  # type: ignore
+
+def _dir_value(order_dir: Any) -> str:
+    """Normalize direction enum/string to lower-case string (defaults asc)."""
+    if order_dir is None:
+        return 'asc'
+    try:
+        # Strawberry Enum
+        val = getattr(order_dir, 'value', order_dir)
+        return str(val).lower()
+    except Exception:
+        return 'asc'
 
 
 def _normalize_filter_spec(raw: Any) -> FilterSpec:
@@ -476,7 +516,7 @@ class BerrySchema:
                         target_filters = _collect_declared_filters_for_target(meta_copy.get('target')) if meta_copy.get('target') else {}
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
-                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], _filter_args: Dict[str, Any]):
+                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], _filter_args: Dict[str, Any]):
                             prefetch_attr = f'_{fname_local}_prefetched'
                             if hasattr(self, prefetch_attr):
                                 # Reuse prefetched always (root pushdown included pagination already)
@@ -515,32 +555,32 @@ class BerrySchema:
                                             continue
                                         f_spec = target_filters.get(arg_name)
                                         if not f_spec:
-                                            continue
+                                            raise ValueError(f"Unknown filter argument: {arg_name}")
                                         expr = None
                                         if f_spec.transform:
                                             try:
                                                 val = f_spec.transform(val)
-                                            except Exception:
-                                                continue
+                                            except Exception as e:
+                                                raise ValueError(f"Filter transform failed for {arg_name}: {e}")
                                         if f_spec.builder:
                                             try:
                                                 expr = f_spec.builder(child_model_cls, info, val)
-                                            except Exception:
-                                                expr = None
+                                            except Exception as e:
+                                                raise ValueError(f"Filter builder failed for {arg_name}: {e}")
                                         elif f_spec.column:
                                             try:
                                                 col = child_model_cls.__table__.c.get(f_spec.column)
                                             except Exception:
                                                 col = None
                                             if col is None:
-                                                continue
+                                                raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
                                             op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
                                             if not op_fn:
-                                                continue
+                                                raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
                                             try:
                                                 expr = op_fn(col, val)
-                                            except Exception:
-                                                expr = None
+                                            except Exception as e:
+                                                raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                         if expr is not None:
                                             stmt = stmt.where(expr)
                                     result = await session.execute(stmt.limit(1))
@@ -571,6 +611,35 @@ class BerrySchema:
                                 return []
                             from sqlalchemy import select as _select
                             stmt = _select(child_model_cls).where(fk_col == getattr(parent_model, 'id'))
+                            # Ordering (multi then single) if column whitelist permits
+                            allowed_order = getattr(target_cls_i, '__ordering__', None)
+                            if allowed_order is None:
+                                # derive from scalar fields
+                                allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+                            applied_any = False
+                            if order_multi:
+                                for spec in order_multi:
+                                    try:
+                                        col_name, _, dir_part = spec.partition(':')
+                                        dir_part = dir_part or 'asc'
+                                        if col_name in allowed_order:
+                                            col_obj = child_model_cls.__table__.c.get(col_name)
+                                            if col_obj is not None:
+                                                stmt = stmt.order_by(col_obj.desc() if dir_part.lower()=='desc' else col_obj.asc())
+                                                applied_any = True
+                                    except Exception:
+                                        raise
+                            if not applied_any and order_by and order_by in allowed_order:
+                                try:
+                                    col_obj = child_model_cls.__table__.c.get(order_by)
+                                except Exception:
+                                    col_obj = None
+                                if col_obj is not None:
+                                    descending = _dir_value(order_dir) == 'desc'
+                                    try:
+                                        stmt = stmt.order_by(col_obj.desc() if descending else col_obj.asc())
+                                    except Exception:
+                                        raise
                             # Apply filters
                             if target_filters:
                                 for arg_name, val in _filter_args.items():
@@ -578,33 +647,33 @@ class BerrySchema:
                                         continue
                                     f_spec = target_filters.get(arg_name)
                                     if not f_spec:
-                                        continue
+                                        raise ValueError(f"Unknown filter argument: {arg_name}")
                                     orig_val = val
                                     if f_spec.transform:
                                         try:
                                             val = f_spec.transform(val)
-                                        except Exception:
-                                            continue
+                                        except Exception as e:
+                                            raise ValueError(f"Filter transform failed for {arg_name}: {e}")
                                     expr = None
                                     if f_spec.builder:
                                         try:
                                             expr = f_spec.builder(child_model_cls, info, val)
-                                        except Exception:
-                                            expr = None
+                                        except Exception as e:
+                                            raise ValueError(f"Filter builder failed for {arg_name}: {e}")
                                     elif f_spec.column:
                                         try:
                                             col = child_model_cls.__table__.c.get(f_spec.column)
                                         except Exception:
                                             col = None
                                         if col is None:
-                                            continue
+                                            raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
                                         op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
                                         if not op_fn:
-                                            continue
+                                            raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
                                         try:
                                             expr = op_fn(col, val)
-                                        except Exception:
-                                            expr = None
+                                        except Exception as e:
+                                            raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                     if expr is not None:
                                         stmt = stmt.where(expr)
                             if offset:
@@ -629,7 +698,7 @@ class BerrySchema:
                         arg_defs = []
                         for a in target_filters.keys():
                             arg_defs.append(f"{a}=None")
-                        params = 'self, info, limit=None, offset=None'
+                        params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None'
                         if arg_defs:
                             params += ', ' + ', '.join(arg_defs)
                         fname_inner = f"_rel_{fname_local}_resolver"
@@ -637,14 +706,14 @@ class BerrySchema:
                               f"    _fa={{}}\n"
                         for a in target_filters.keys():
                             src += f"    _fa['{a}']={a}\n"
-                        src += "    return await _impl(self, info, limit, offset, _fa)\n"
+                        src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, _fa)\n"
                         env: Dict[str, Any] = {'_impl': _impl}
                         exec(src, env)
                         fn = env[fname_inner]
                         if not getattr(fn, '__module__', None):  # ensure module for strawberry introspection
                             fn.__module__ = __name__
                         # annotations
-                        anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int]}
+                        anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]]}
                         # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
                         target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
                         col_type_map: Dict[str, Any] = {}
@@ -963,7 +1032,7 @@ class BerrySchema:
                     else:
                         filter_arg_types[arg_name] = Optional[base_type]
 
-                async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, _passed_filter_args: Dict[str, Any]):
+                async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], _passed_filter_args: Dict[str, Any]):
                     session = info.context.get('db_session') if info and info.context else None
                     if session is None:
                         return []
@@ -1022,8 +1091,37 @@ class BerrySchema:
                                     requested_scalar.append(sf)
                         inner_cols = [getattr(child_model_cls, c) for c in requested_scalar] if requested_scalar else [getattr(child_model_cls, 'id')]
                         inner_sel = select(*inner_cols).select_from(child_model_cls).where(fk_col == parent_model_cls.id).correlate(parent_model_cls)
+                        # Apply ordering from relation config (multi -> single -> fallback id)
+                        ordered = False
                         try:
-                            if 'id' in child_model_cls.__table__.columns:
+                            allowed_order_fields = [sf for sf, sd in target_b.__berry_fields__.items() if sd.kind == 'scalar']
+                            multi = rel_cfg.get('order_multi') or []
+                            for spec in multi:
+                                try:
+                                    cn, _, dd = str(spec).partition(':')
+                                    dd = dd or 'asc'
+                                    if cn not in allowed_order_fields:
+                                        raise ValueError(f"Invalid order field '{cn}' for relation {rel_cfg.get('target')}")
+                                    if dd.lower() not in ('asc','desc'):
+                                        raise ValueError(f"Invalid order direction '{dd}' for relation {rel_cfg.get('target')}")
+                                    col = getattr(child_model_cls, cn, None)
+                                    if col is None:
+                                        raise ValueError(f"Unknown order column '{cn}' for relation {rel_cfg.get('target')}")
+                                    inner_sel = inner_sel.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                    ordered = True
+                                except Exception:
+                                    raise
+                            if not ordered and rel_cfg.get('order_by') in allowed_order_fields:
+                                cn = rel_cfg.get('order_by')
+                                dd = _dir_value(rel_cfg.get('order_dir'))
+                                if dd not in ('asc','desc'):
+                                    raise ValueError(f"Invalid order direction '{rel_cfg.get('order_dir')}' for relation {rel_cfg.get('target')}")
+                                col = getattr(child_model_cls, cn, None)
+                                if col is None:
+                                    raise ValueError(f"Unknown order column '{cn}' for relation {rel_cfg.get('target')}")
+                                inner_sel = inner_sel.order_by(col.desc() if dd=='desc' else col.asc())
+                                ordered = True
+                            if not ordered and 'id' in child_model_cls.__table__.columns:
                                 inner_sel = inner_sel.order_by(getattr(child_model_cls, 'id'))
                         except Exception:
                             pass
@@ -1436,8 +1534,30 @@ class BerrySchema:
                                 except Exception:
                                     pass
                                 try:
-                                    if 'id' in child_model_cls_i.__table__.columns:
-                                        inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id'))
+                                    # Apply ordering (multi -> single -> fallback)
+                                    ordered_i = False
+                                    try:
+                                        allowed_order_fields_i = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
+                                        multi_i = rel_cfg_local.get('order_multi') or []
+                                        for spec in multi_i:
+                                            cn, _, dd = str(spec).partition(':')
+                                            dd = dd or 'asc'
+                                            if cn in allowed_order_fields_i:
+                                                col = getattr(child_model_cls_i, cn, None)
+                                                if col is not None:
+                                                    inner_sel_i = inner_sel_i.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                                    ordered_i = True
+                                        if not ordered_i and rel_cfg_local.get('order_by') in allowed_order_fields_i:
+                                            cn = rel_cfg_local.get('order_by')
+                                            dd = (rel_cfg_local.get('order_dir') or 'asc').lower()
+                                            col = getattr(child_model_cls_i, cn, None)
+                                            if col is not None:
+                                                inner_sel_i = inner_sel_i.order_by(col.desc() if dd=='desc' else col.asc())
+                                                ordered_i = True
+                                        if not ordered_i and 'id' in child_model_cls_i.__table__.columns:
+                                            inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id'))
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     pass
                                 if rel_cfg_local.get('offset') is not None:
@@ -1482,34 +1602,34 @@ class BerrySchema:
                             continue
                         f_spec = declared_filters.get(arg_name)
                         if not f_spec:
-                            continue
+                            raise ValueError(f"Unknown filter argument: {arg_name}")
                         # transform value
                         if f_spec.transform:
                             try:
                                 value = f_spec.transform(value)
-                            except Exception:
-                                continue
+                            except Exception as e:
+                                raise ValueError(f"Filter transform failed for {arg_name}: {e}")
                         expr = None
                         if f_spec.builder:
                             try:
                                 expr = f_spec.builder(model_cls, info, value)
-                            except Exception:
-                                expr = None
+                            except Exception as e:
+                                raise ValueError(f"Filter builder failed for {arg_name}: {e}")
                         elif f_spec.column:
                             try:
                                 col = model_cls.__table__.c.get(f_spec.column)
                             except Exception:
                                 col = None
                             if col is None:
-                                continue
+                                raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
                             op_name = f_spec.op or 'eq'
                             op_fn = OPERATOR_REGISTRY.get(op_name)
                             if not op_fn:
-                                continue
+                                raise ValueError(f"Unknown filter operator: {op_name} for argument {arg_name}")
                             try:
                                 expr = op_fn(col, value)
-                            except Exception:
-                                expr = None
+                            except Exception as e:
+                                raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                         if expr is not None:
                             where_clauses.append(expr)
                     if where_clauses:
@@ -1518,6 +1638,27 @@ class BerrySchema:
                                 stmt = stmt.where(wc)
                             except Exception:
                                 pass
+                    # Apply ordering (whitelist) before pagination
+                    if order_by:
+                        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
+                        if allowed_order_fields is None:
+                            # default allow scalar field names
+                            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
+                        if order_by not in allowed_order_fields:
+                            raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order_fields}")
+                        try:
+                            col = model_cls.__table__.c.get(order_by)
+                        except Exception:
+                            col = None
+                        if col is None:
+                            raise ValueError(f"Unknown order_by column: {order_by}")
+                        dir_v = _dir_value(order_dir)
+                        if dir_v not in ('asc','desc'):
+                            raise ValueError(f"Invalid order_dir '{order_dir}'. Use asc or desc")
+                        try:
+                            stmt = stmt.order_by(col.desc() if dir_v == 'desc' else col.asc())
+                        except Exception as e:
+                            raise
                     if offset:
                         stmt = stmt.offset(offset)
                     if limit is not None:
@@ -1602,7 +1743,19 @@ class BerrySchema:
                                                     child_inst = target_st()
                                                     for sf, sdef in target_b.__berry_fields__.items():
                                                         if sdef.kind == 'scalar':
-                                                            setattr(child_inst, sf, parsed_value.get(sf))
+                                                            val = parsed_value.get(sf)
+                                                            # Convert ISO datetime strings to datetime objects if field type is datetime
+                                                            try:
+                                                                target_model = target_b.model
+                                                                col = target_model.__table__.c.get(sf) if target_model is not None else None
+                                                                if col is not None and isinstance(getattr(col, 'type', None), DateTime) and isinstance(val, str):
+                                                                    try:
+                                                                        val = datetime.fromisoformat(val)
+                                                                    except Exception:
+                                                                        pass
+                                                            except Exception:
+                                                                pass
+                                                            setattr(child_inst, sf, val)
                                                     setattr(child_inst, '_model', None)
                                                     built_value = child_inst
                                                 else:
@@ -1615,7 +1768,18 @@ class BerrySchema:
                                                             child_inst = target_st()
                                                             for sf, sdef in target_b.__berry_fields__.items():
                                                                 if sdef.kind == 'scalar':
-                                                                    setattr(child_inst, sf, item.get(sf))
+                                                                    val = item.get(sf)
+                                                                    try:
+                                                                        target_model = target_b.model
+                                                                        col = target_model.__table__.c.get(sf) if target_model is not None else None
+                                                                        if col is not None and isinstance(getattr(col, 'type', None), DateTime) and isinstance(val, str):
+                                                                            try:
+                                                                                val = datetime.fromisoformat(val)
+                                                                            except Exception:
+                                                                                pass
+                                                                    except Exception:
+                                                                        pass
+                                                                    setattr(child_inst, sf, val)
                                                             setattr(child_inst, '_model', None)
                                                             tmp_list.append(child_inst)
                                                 built_value = tmp_list
@@ -1661,16 +1825,16 @@ class BerrySchema:
                     arg_defs.append(f"{a}=None")
                 args_str = (', '.join(arg_defs)) if arg_defs else ''
                 func_name = f"_auto_root_{root_field_name}"
-                # Build parameter list: info, limit, offset, filter args
+                # Build parameter list: info, limit, offset, ordering, filter args
                 if args_str:
-                    full_params = f"info, limit=None, offset=None, {args_str}"
+                    full_params = f"info, limit=None, offset=None, order_by=None, order_dir=None, {args_str}"
                 else:
-                    full_params = "info, limit=None, offset=None"
+                    full_params = "info, limit=None, offset=None, order_by=None, order_dir=None"
                 src = f"async def {func_name}({full_params}):\n" \
                       f"    _fa = {{}}\n"  # gather passed filter args
                 for a in declared_filters.keys():
                     src += f"    _fa['{a}'] = {a} if '{a}' in locals() else None\n"
-                src += "    return await _base_impl(info, limit, offset, _fa)\n"
+                src += "    return await _base_impl(info, limit, offset, order_by, order_dir, _fa)\n"
                 # Exec the function in a prepared namespace
                 ns: Dict[str, Any] = {'_base_impl': _base_impl}
                 # Provide required symbols for optional typing (Optional, List, datetime, etc.) though not used in parameter defaults
@@ -1681,7 +1845,7 @@ class BerrySchema:
                 if not getattr(generated_fn, '__module__', None):  # pragma: no cover - environment dependent
                     generated_fn.__module__ = __name__
                 # Attach type annotations for Strawberry to introspect
-                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int]}
+                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction]}
                 ann.update(filter_arg_types)
                 generated_fn.__annotations__ = ann
                 return generated_fn
