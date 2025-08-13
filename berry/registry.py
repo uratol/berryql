@@ -47,10 +47,13 @@ class RelationSelectionExtractor:
             'fields': [],
             'limit': None,
             'offset': None,
-            'order_by': None,
-            'order_dir': None,
-            'order_multi': [],
-            'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
+            # Default ordering from schema meta; can be overridden by query args
+            'order_by': fdef.meta.get('order_by'),
+            'order_dir': fdef.meta.get('order_dir'),
+            'order_multi': fdef.meta.get('order_multi') or [],
+            'where': None,
+            'default_where': fdef.meta.get('where'),
+            'single': bool(fdef.meta.get('single')),
             'target': fdef.meta.get('target'),
             'nested': {},
             'skip_pushdown': False,
@@ -93,6 +96,8 @@ class RelationSelectionExtractor:
                         rel_cfg['order_dir'] = raw_val
                     elif arg.name == 'order_multi':
                         rel_cfg['order_multi'] = raw_val or []
+                    elif arg.name == 'where':
+                        rel_cfg['where'] = raw_val
                     else:
                         rel_cfg['filter_args'][arg.name] = raw_val
             except Exception:
@@ -165,6 +170,8 @@ class RelationSelectionExtractor:
                     rel_cfg['order_dir'] = self._value_from_ast(arg.value)
                 elif arg_name == 'order_multi':
                     rel_cfg['order_multi'] = self._value_from_ast(arg.value) or []
+                elif arg_name == 'where':
+                    rel_cfg['where'] = self._value_from_ast(arg.value)
                 else:
                     rel_cfg['filter_args'][arg_name] = self._value_from_ast(arg.value)
             # scalar subfields
@@ -338,18 +345,16 @@ def field(**meta) -> FieldDescriptor:
     return FieldDescriptor(kind='scalar', **meta)
 
 
-def relation(target: Any = None, *, single: bool | None = None, mode: str | None = None, **meta) -> FieldDescriptor:
+def relation(target: Any = None, *, single: bool | None = None, **meta) -> FieldDescriptor:
     """Define a relation field.
 
-    target can be a BerryType subclass or its string name. single/mode selects cardinality.
+    target can be a BerryType subclass or its string name. 'single' selects cardinality.
     """
     m = dict(meta)
     if target is not None:
         m['target'] = target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target
     if single is not None:
         m['single'] = single
-    if mode is not None:
-        m['mode'] = mode
     return FieldDescriptor(kind='relation', **m)
             
 
@@ -481,7 +486,7 @@ class BerrySchema:
                     setattr(st_cls, fname, None)
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')
-                    is_single = fdef.meta.get('single') or fdef.meta.get('mode') == 'single'
+                    is_single = bool(fdef.meta.get('single'))
                     if target_name:
                         # Use string forward refs so we don't depend on decoration order
                         if is_single:
@@ -517,7 +522,7 @@ class BerrySchema:
                         target_filters = _collect_declared_filters_for_target(meta_copy.get('target')) if meta_copy.get('target') else {}
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
-                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], _filter_args: Dict[str, Any]):
+                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
                             prefetch_attr = f'_{fname_local}_prefetched'
                             if hasattr(self, prefetch_attr):
                                 # Reuse prefetched always (root pushdown included pagination already)
@@ -547,9 +552,52 @@ class BerrySchema:
                                 if candidate_fk_val is None:
                                     return None
                                 # Apply filters via query if any filter args passed
-                                if any(v is not None for v in _filter_args.values()):
+                                if any(v is not None for v in _filter_args.values()) or related_where is not None:
                                     from sqlalchemy import select as _select
                                     stmt = _select(child_model_cls).where(getattr(child_model_cls, 'id') == candidate_fk_val)
+                                    # Apply JSON where if provided (argument and schema default)
+                                    if related_where is not None or meta_copy.get('where') is not None:
+                                        try:
+                                            import json as _json
+                                            # apply arg where
+                                            if related_where is not None:
+                                                wdict = related_where
+                                                if isinstance(related_where, str):
+                                                    wdict = _json.loads(related_where)
+                                                exprs = []
+                                                for col_name, op_map in (wdict or {}).items():
+                                                    col = child_model_cls.__table__.c.get(col_name)
+                                                    if col is None:
+                                                        continue
+                                                    for op_name, val in (op_map or {}).items():
+                                                        op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                        if not op_fn:
+                                                            continue
+                                                        exprs.append(op_fn(col, val))
+                                                if exprs:
+                                                    from sqlalchemy import and_ as _and
+                                                    stmt = stmt.where(_and(*exprs))
+                                            # apply default where from schema
+                                            dwhere = meta_copy.get('where')
+                                            if dwhere is not None:
+                                                wdict = dwhere
+                                                if isinstance(dwhere, str):
+                                                    wdict = _json.loads(dwhere)
+                                                exprs = []
+                                                for col_name, op_map in (wdict or {}).items():
+                                                    col = child_model_cls.__table__.c.get(col_name)
+                                                    if col is None:
+                                                        continue
+                                                    for op_name, val in (op_map or {}).items():
+                                                        op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                        if not op_fn:
+                                                            continue
+                                                        exprs.append(op_fn(col, val))
+                                                if exprs:
+                                                    from sqlalchemy import and_ as _and
+                                                    stmt = stmt.where(_and(*exprs))
+                                        except Exception:
+                                            pass
                                     # Add filter where clauses
                                     for arg_name, val in _filter_args.items():
                                         if val is None:
@@ -612,6 +660,57 @@ class BerrySchema:
                                 return []
                             from sqlalchemy import select as _select
                             stmt = _select(child_model_cls).where(fk_col == getattr(parent_model, 'id'))
+                            # Apply where from args and/or schema default
+                            if related_where is not None or meta_copy.get('where') is not None:
+                                try:
+                                    import json as _json
+                                    if related_where is not None:
+                                        wdict = related_where
+                                        if isinstance(related_where, str):
+                                            wdict = _json.loads(related_where)
+                                        exprs = []
+                                        for col_name, op_map in (wdict or {}).items():
+                                            col = child_model_cls.__table__.c.get(col_name)
+                                            if col is None:
+                                                continue
+                                            for op_name, val in (op_map or {}).items():
+                                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                if not op_fn:
+                                                    continue
+                                                exprs.append(op_fn(col, val))
+                                        if exprs:
+                                            from sqlalchemy import and_ as _and
+                                            stmt = stmt.where(_and(*exprs))
+                                    dwhere = meta_copy.get('where')
+                                    if dwhere is not None:
+                                        if isinstance(dwhere, (dict, str)):
+                                            wdict = dwhere
+                                            if isinstance(dwhere, str):
+                                                wdict = _json.loads(dwhere)
+                                            exprs = []
+                                            for col_name, op_map in (wdict or {}).items():
+                                                col = child_model_cls.__table__.c.get(col_name)
+                                                if col is None:
+                                                    continue
+                                                for op_name, val in (op_map or {}).items():
+                                                    op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                    if not op_fn:
+                                                        continue
+                                                    exprs.append(op_fn(col, val))
+                                            if exprs:
+                                                from sqlalchemy import and_ as _and
+                                                stmt = stmt.where(_and(*exprs))
+                                        else:
+                                            try:
+                                                expr = dwhere(child_model_cls, info)
+                                                if expr is not None:
+                                                    stmt = stmt.where(expr)
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                            # Ad-hoc JSON where for relation list if present on selection
+                            rel_meta_map = getattr(self, '_pushdown_meta', None)  # not reliable; read from extractor cfg instead
                             # Ordering (multi then single) if column whitelist permits
                             allowed_order = getattr(target_cls_i, '__ordering__', None)
                             if allowed_order is None:
@@ -641,6 +740,27 @@ class BerrySchema:
                                         stmt = stmt.order_by(col_obj.desc() if descending else col_obj.asc())
                                     except Exception:
                                         raise
+                            # Apply default ordering from schema meta if still no order applied
+                            if not applied_any and (not order_by) and (meta_copy.get('order_by') or meta_copy.get('order_multi')):
+                                try:
+                                    def_dir = _dir_value(meta_copy.get('order_dir'))
+                                    if meta_copy.get('order_multi'):
+                                        for spec in meta_copy.get('order_multi') or []:
+                                            cn, _, dd = str(spec).partition(':')
+                                            dd = dd or def_dir
+                                            col = child_model_cls.__table__.c.get(cn)
+                                            if col is not None:
+                                                stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
+                                                applied_any = True
+                                    elif meta_copy.get('order_by'):
+                                        cn = meta_copy.get('order_by')
+                                        dd = def_dir
+                                        col = child_model_cls.__table__.c.get(cn)
+                                        if col is not None:
+                                            stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
+                                            applied_any = True
+                                except Exception:
+                                    pass
                             # Apply filters
                             if target_filters:
                                 for arg_name, val in _filter_args.items():
@@ -699,22 +819,22 @@ class BerrySchema:
                         arg_defs = []
                         for a in target_filters.keys():
                             arg_defs.append(f"{a}=None")
-                        params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None'
+                        params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None'
                         if arg_defs:
                             params += ', ' + ', '.join(arg_defs)
                         fname_inner = f"_rel_{fname_local}_resolver"
-                        src = f"async def {fname_inner}({params}):\n" \
-                              f"    _fa={{}}\n"
+                        src = f"async def {fname_inner}({params}):\n"
+                        src += "    _fa={}\n"
                         for a in target_filters.keys():
                             src += f"    _fa['{a}']={a}\n"
-                        src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, _fa)\n"
+                        src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, where, _fa)\n"
                         env: Dict[str, Any] = {'_impl': _impl}
                         exec(src, env)
                         fn = env[fname_inner]
                         if not getattr(fn, '__module__', None):  # ensure module for strawberry introspection
                             fn.__module__ = __name__
                         # annotations
-                        anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]]}
+                        anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
                         # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
                         target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
                         col_type_map: Dict[str, Any] = {}
@@ -1033,7 +1153,7 @@ class BerrySchema:
                     else:
                         filter_arg_types[arg_name] = Optional[base_type]
 
-                async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], _passed_filter_args: Dict[str, Any]):
+                async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], _passed_filter_args: Dict[str, Any], raw_where: Optional[Any] = None):
                     session = info.context.get('db_session') if info and info.context else None
                     if session is None:
                         return []
@@ -1122,8 +1242,85 @@ class BerrySchema:
                                     raise ValueError(f"Unknown order column '{cn}' for relation {rel_cfg.get('target')}")
                                 inner_sel = inner_sel.order_by(col.desc() if dd=='desc' else col.asc())
                                 ordered = True
+                            # Default order from schema meta if none applied yet
+                            if not ordered and (rel_cfg.get('order_by') or rel_cfg.get('order_multi')):
+                                try:
+                                    def_dir = _dir_value(rel_cfg.get('order_dir'))
+                                    multi = rel_cfg.get('order_multi') or []
+                                    if multi:
+                                        for spec in multi:
+                                            cn, _, dd = str(spec).partition(':')
+                                            dd = dd or def_dir
+                                            col = getattr(child_model_cls, cn, None)
+                                            if col is not None:
+                                                inner_sel = inner_sel.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                                ordered = True
+                                    elif rel_cfg.get('order_by'):
+                                        cn = rel_cfg.get('order_by')
+                                        dd = def_dir
+                                        col = getattr(child_model_cls, cn, None)
+                                        if col is not None:
+                                            inner_sel = inner_sel.order_by(col.desc() if dd=='desc' else col.asc())
+                                            ordered = True
+                                except Exception:
+                                    pass
                             if not ordered and 'id' in child_model_cls.__table__.columns:
                                 inner_sel = inner_sel.order_by(getattr(child_model_cls, 'id'))
+                        except Exception:
+                            pass
+                        # Apply schema-declared default_where AND query where before pagination
+                        try:
+                            rwhere = rel_cfg.get('where')
+                            dwhere = rel_cfg.get('default_where')
+                            # Merge dicts with AND semantics; if both exist, we AND their expressions
+                            if rwhere is not None:
+                                import json as _json
+                                wdict = rwhere
+                                if isinstance(rwhere, str):
+                                    wdict = _json.loads(rwhere)
+                                expr_r = None
+                                try:
+                                    exprs = []
+                                    for col_name, op_map in (wdict or {}).items():
+                                        col = child_model_cls.__table__.c.get(col_name)
+                                        if col is None:
+                                            continue
+                                        for op_name, val in (op_map or {}).items():
+                                            op_fn = OPERATOR_REGISTRY.get(op_name)
+                                            if not op_fn:
+                                                continue
+                                            exprs.append(op_fn(col, val))
+                                    if exprs:
+                                        from sqlalchemy import and_ as _and
+                                        expr_r = _and(*exprs)
+                                except Exception:
+                                    expr_r = None
+                                if expr_r is not None:
+                                    inner_sel = inner_sel.where(expr_r)
+                            if dwhere is not None:
+                                import json as _json
+                                wdict = dwhere
+                                if isinstance(dwhere, str):
+                                    wdict = _json.loads(dwhere)
+                                expr_r = None
+                                try:
+                                    exprs = []
+                                    for col_name, op_map in (wdict or {}).items():
+                                        col = child_model_cls.__table__.c.get(col_name)
+                                        if col is None:
+                                            continue
+                                        for op_name, val in (op_map or {}).items():
+                                            op_fn = OPERATOR_REGISTRY.get(op_name)
+                                            if not op_fn:
+                                                continue
+                                            exprs.append(op_fn(col, val))
+                                    if exprs:
+                                        from sqlalchemy import and_ as _and
+                                        expr_r = _and(*exprs)
+                                except Exception:
+                                    expr_r = None
+                                if expr_r is not None:
+                                    inner_sel = inner_sel.where(expr_r)
                         except Exception:
                             pass
                         if rel_cfg.get('offset') is not None:
@@ -1325,6 +1522,13 @@ class BerrySchema:
                         requested_relations = {}
                     # Push down relation JSON arrays/objects
                     for rel_name, rel_cfg in requested_relations.items():
+                        # If default_where is a callable, skip pushdown so resolver can apply it
+                        try:
+                            dw = rel_cfg.get('default_where')
+                            if dw is not None and not isinstance(dw, (dict, str)):
+                                rel_cfg['skip_pushdown'] = True
+                        except Exception:
+                            pass
                         if rel_cfg.get('skip_pushdown'):
                             continue
                         target_name = rel_cfg.get('target')
@@ -1561,6 +1765,60 @@ class BerrySchema:
                                         pass
                                 except Exception:
                                     pass
+                                # Apply ad-hoc JSON where for nested relation as well
+                                try:
+                                    rr = rel_cfg_local.get('where')
+                                    dr = rel_cfg_local.get('default_where')
+                                    if rr is not None:
+                                        import json as _json
+                                        wdict2 = rr
+                                        if isinstance(rr, str):
+                                            wdict2 = _json.loads(rr)
+                                        expr_rr = None
+                                        try:
+                                            exprs2 = []
+                                            for col_name2, op_map2 in (wdict2 or {}).items():
+                                                col2 = child_model_cls_i.__table__.c.get(col_name2)
+                                                if col2 is None:
+                                                    continue
+                                                for op_name2, val2 in (op_map2 or {}).items():
+                                                    op_fn2 = OPERATOR_REGISTRY.get(op_name2)
+                                                    if not op_fn2:
+                                                        continue
+                                                    exprs2.append(op_fn2(col2, val2))
+                                            if exprs2:
+                                                from sqlalchemy import and_ as _and
+                                                expr_rr = _and(*exprs2)
+                                        except Exception:
+                                            expr_rr = None
+                                        if expr_rr is not None:
+                                            inner_sel_i = inner_sel_i.where(expr_rr)
+                                    if dr is not None:
+                                        import json as _json
+                                        wdict2 = dr
+                                        if isinstance(dr, str):
+                                            wdict2 = _json.loads(dr)
+                                        expr_rr = None
+                                        try:
+                                            exprs2 = []
+                                            for col_name2, op_map2 in (wdict2 or {}).items():
+                                                col2 = child_model_cls_i.__table__.c.get(col_name2)
+                                                if col2 is None:
+                                                    continue
+                                                for op_name2, val2 in (op_map2 or {}).items():
+                                                    op_fn2 = OPERATOR_REGISTRY.get(op_name2)
+                                                    if not op_fn2:
+                                                        continue
+                                                    exprs2.append(op_fn2(col2, val2))
+                                            if exprs2:
+                                                from sqlalchemy import and_ as _and
+                                                expr_rr = _and(*exprs2)
+                                        except Exception:
+                                            expr_rr = None
+                                        if expr_rr is not None:
+                                            inner_sel_i = inner_sel_i.where(expr_rr)
+                                except Exception:
+                                    pass
                                 if rel_cfg_local.get('offset') is not None:
                                     try:
                                         inner_sel_i = inner_sel_i.offset(int(rel_cfg_local['offset']))
@@ -1647,6 +1905,18 @@ class BerrySchema:
                                     where_clauses.append(expr_obj)
                             except Exception:
                                 pass
+                    # Apply ad-hoc raw JSON where string if provided by user
+                    if raw_where is not None:
+                        try:
+                            import json as _json
+                            wdict = raw_where
+                            if isinstance(raw_where, str):
+                                wdict = _json.loads(raw_where)
+                            expr2 = _expr_from_where_dict(model_cls, wdict) if isinstance(wdict, dict) else None
+                            if expr2 is not None:
+                                where_clauses.append(expr2)
+                        except Exception:
+                            pass
                     for arg_name, value in _passed_filter_args.items():
                         if value is None:
                             continue
@@ -1875,16 +2145,16 @@ class BerrySchema:
                     arg_defs.append(f"{a}=None")
                 args_str = (', '.join(arg_defs)) if arg_defs else ''
                 func_name = f"_auto_root_{root_field_name}"
-                # Build parameter list: info, limit, offset, ordering, filter args
+                # Build parameter list: info, limit, offset, ordering, optional where, filter args
                 if args_str:
-                    full_params = f"info, limit=None, offset=None, order_by=None, order_dir=None, {args_str}"
+                    full_params = f"info, limit=None, offset=None, order_by=None, order_dir=None, where=None, {args_str}"
                 else:
-                    full_params = "info, limit=None, offset=None, order_by=None, order_dir=None"
+                    full_params = "info, limit=None, offset=None, order_by=None, order_dir=None, where=None"
                 src = f"async def {func_name}({full_params}):\n" \
                       f"    _fa = {{}}\n"  # gather passed filter args
                 for a in declared_filters.keys():
                     src += f"    _fa['{a}'] = {a} if '{a}' in locals() else None\n"
-                src += "    return await _base_impl(info, limit, offset, order_by, order_dir, _fa)\n"
+                src += "    return await _base_impl(info, limit, offset, order_by, order_dir, _fa, where)\n"
                 # Exec the function in a prepared namespace
                 ns: Dict[str, Any] = {'_base_impl': _base_impl}
                 # Provide required symbols for optional typing (Optional, List, datetime, etc.) though not used in parameter defaults
@@ -1895,7 +2165,7 @@ class BerrySchema:
                 if not getattr(generated_fn, '__module__', None):  # pragma: no cover - environment dependent
                     generated_fn.__module__ = __name__
                 # Attach type annotations for Strawberry to introspect
-                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction]}
+                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'where': Optional[str]}
                 ann.update(filter_arg_types)
                 generated_fn.__annotations__ = ann
                 return generated_fn
