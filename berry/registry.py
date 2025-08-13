@@ -1781,6 +1781,7 @@ class BerrySchema:
                                 except Exception:
                                     sel_cols = []
                                 key_exprs: list[tuple[str, Any]] = []
+                                agg_pairs: list[tuple[str, Any]] = []  # (key, aggregate/labeled expr)
                                 for col in sel_cols:
                                     try:
                                         labeled = col
@@ -1788,6 +1789,8 @@ class BerrySchema:
                                         if not col_name:
                                             col_name = f"{cf_name}_{len(key_exprs)}"
                                             labeled = col.label(col_name)
+                                        # Keep the aggregate/labeled expression for single-select JSON
+                                        agg_pairs.append((col_name, labeled))
                                         subq = select(labeled)
                                         try:
                                             for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
@@ -1817,11 +1820,22 @@ class BerrySchema:
                                         labels.append(lbl)
                                     custom_object_fields.append((cf_name, labels, cf_def.meta.get('returns')))
                                 else:
-                                    # Compose JSON object using adapter.json_object
+                                    # Compose JSON object via a single SELECT using aggregated expressions
                                     json_args: list[Any] = []
-                                    for k, v in key_exprs:
-                                        json_args.extend([_text(f"'{k}'"), v])
-                                    json_obj_expr = _json_object(*json_args)
+                                    for k, agg_expr in agg_pairs:
+                                        json_args.extend([_text(f"'{k}'"), agg_expr])
+                                    inner = select(_json_object(*json_args))
+                                    try:
+                                        for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
+                                            inner = inner.select_from(_from)
+                                    except Exception:
+                                        pass
+                                    for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
+                                        inner = inner.where(_w)
+                                    try:
+                                        json_obj_expr = inner.scalar_subquery()
+                                    except Exception:
+                                        json_obj_expr = inner
                                     # No null semantics: always return object, even when counts are zero
                                     json_label = f"_pushcf_{cf_name}"
                                     select_columns.append(json_obj_expr.label(json_label))
