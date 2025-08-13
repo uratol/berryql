@@ -13,7 +13,7 @@ async def test_single_object_relations_and_count(db_session, populated_db):
         post_comments(limit: 2) { id }
         post_comments_agg
       }
-      users(limit: 1) { id name posts(limit: 2) { id title } post_agg }
+      users(limit: 1) { id name posts(limit: 2) { id title } post_agg post_agg_obj { count } }
     }
     """
     res = await schema.execute(query, context_value={"db_session": db_session})
@@ -27,3 +27,8 @@ async def test_single_object_relations_and_count(db_session, populated_db):
     assert "users" in data
     assert len(data["users"]) == 1
     assert "post_agg" in data["users"][0]
+    assert "post_agg_obj" in data["users"][0]
+    # post_agg_obj should be either None or have count key
+    agg_obj = data["users"][0]["post_agg_obj"]
+    if agg_obj is not None:
+        assert set(agg_obj.keys()) == {"count"}

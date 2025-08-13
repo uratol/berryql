@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints
+import asyncio
 import strawberry
 from sqlalchemy import select
 from sqlalchemy.orm import DeclarativeBase
@@ -490,6 +491,8 @@ class BerrySchema:
                     session = info.context.get('db_session') if info and info.context else None
                     if session is None:
                         return []
+                    # Acquire per-context lock to avoid concurrent AsyncSession use (esp. MSSQL/pyodbc limitations)
+                    lock = info.context.setdefault('_berry_db_lock', asyncio.Lock())
                     # Collect custom field expressions for pushdown
                     custom_fields: List[tuple[str, Any]] = []
                     custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
@@ -594,98 +597,94 @@ class BerrySchema:
                         stmt = stmt.offset(offset)
                     if limit is not None:
                         stmt = stmt.limit(limit)
-                    result = await session.execute(stmt)
-                    sa_rows = result.fetchall()
-                    rows = [r[0] for r in sa_rows]
-                    out = []
-                    for row_index, row in enumerate(rows):
-                        inst = st_cls()
-                        setattr(inst, '_model', row)
-                        # hydrate scalar fields
-                        for sf, sdef in btype_cls.__berry_fields__.items():
-                            if sdef.kind == 'scalar':
-                                try:
-                                    setattr(inst, sf, getattr(row, sf, None))
-                                except Exception:
-                                    pass
-                        # attach custom scalar field values from select
-                        if custom_fields:
-                            base_offset = 1  # model at position 0
-                            for idx, (cf_name, _) in enumerate(custom_fields, start=base_offset):
-                                try:
-                                    val = sa_rows[row_index][idx]
-                                    setattr(inst, cf_name, val)
-                                except Exception:
-                                    pass
-                        # reconstruct custom object fields (all scalar subqueries executed in SELECT)
-                        if custom_object_fields:
-                            # Build mapping of column name -> value for this row
-                            row_mapping = {}
-                            full_row = sa_rows[row_index]
-                            # Aggregate columns with names
-                            try:
-                                # SQLAlchemy Row supports _mapping
-                                for k in getattr(full_row, '_mapping').keys():
-                                    row_mapping[k] = full_row._mapping[k]
-                            except Exception:
-                                for i, v in enumerate(full_row):
-                                    row_mapping[f'_col_{i}'] = v
-                            for cf_name, col_labels, returns_spec in custom_object_fields:
-                                data_dict = {}
-                                if isinstance(returns_spec, dict):
-                                    for k2 in returns_spec.keys():
-                                        if k2 in row_mapping:
-                                            data_dict[k2] = row_mapping[k2]
-                                nested_type_name = f"{btype_cls.__name__}_{cf_name}_Type"
-                                nested_type = self._st_types.get(nested_type_name)
-                                if nested_type and data_dict:
+                    async with lock:
+                        result = await session.execute(stmt)
+                        sa_rows = result.fetchall()
+                        rows = [r[0] for r in sa_rows]
+                        out = []
+                        for row_index, row in enumerate(rows):
+                            inst = st_cls()
+                            setattr(inst, '_model', row)
+                            # hydrate scalar fields
+                            for sf, sdef in btype_cls.__berry_fields__.items():
+                                if sdef.kind == 'scalar':
                                     try:
-                                        obj = nested_type(**data_dict)
+                                        setattr(inst, sf, getattr(row, sf, None))
                                     except Exception:
-                                        obj = None
-                                else:
-                                    obj = data_dict or None
-                                setattr(inst, f"_{cf_name}_data", obj)
-                        out.append(inst)
-                    # Batch aggregate counts if any count aggregate fields defined
-                    agg_fields = [ (fname, fdef) for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'aggregate' and (fdef.meta.get('op') == 'count' or 'count' in fdef.meta.get('ops', [])) ]
-                    if agg_fields and rows:
-                        parent_ids = [getattr(r, 'id') for r in rows]
-                        from sqlalchemy import select as _select, func as _func
-                        for agg_name, agg_def in agg_fields:
-                            source_rel = agg_def.meta.get('source')
-                            rel_def = btype_cls.__berry_fields__.get(source_rel)
-                            if not rel_def or rel_def.kind != 'relation':
-                                continue
-                            target_name = rel_def.meta.get('target')
-                            target_btype = self.types.get(target_name)
-                            if not target_btype or not target_btype.model:
-                                continue
-                            child_model_cls = target_btype.model
-                            # find fk col referencing parent
-                            fk_col = None
-                            for col in child_model_cls.__table__.columns:
-                                for fk in col.foreign_keys:
-                                    if fk.column.table.name == model_cls.__table__.name:
-                                        fk_col = col
+                                        pass
+                            # attach custom scalar field values from select
+                            if custom_fields:
+                                base_offset = 1  # model at position 0
+                                for idx, (cf_name, _) in enumerate(custom_fields, start=base_offset):
+                                    try:
+                                        val = sa_rows[row_index][idx]
+                                        setattr(inst, cf_name, val)
+                                    except Exception:
+                                        pass
+                            # reconstruct custom object fields (all scalar subqueries executed in SELECT)
+                            if custom_object_fields:
+                                row_mapping = {}
+                                full_row = sa_rows[row_index]
+                                try:
+                                    for k in getattr(full_row, '_mapping').keys():
+                                        row_mapping[k] = full_row._mapping[k]
+                                except Exception:
+                                    for i, v in enumerate(full_row):
+                                        row_mapping[f'_col_{i}'] = v
+                                for cf_name, col_labels, returns_spec in custom_object_fields:
+                                    data_dict = {}
+                                    if isinstance(returns_spec, dict):
+                                        for k2 in returns_spec.keys():
+                                            if k2 in row_mapping:
+                                                data_dict[k2] = row_mapping[k2]
+                                    nested_type_name = f"{btype_cls.__name__}_{cf_name}_Type"
+                                    nested_type = self._st_types.get(nested_type_name)
+                                    if nested_type and data_dict:
+                                        try:
+                                            obj = nested_type(**data_dict)
+                                        except Exception:
+                                            obj = None
+                                    else:
+                                        obj = data_dict or None
+                                    setattr(inst, f"_{cf_name}_data", obj)
+                            out.append(inst)
+                        # Batch aggregate counts if any count aggregate fields defined
+                        agg_fields = [ (fname, fdef) for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'aggregate' and (fdef.meta.get('op') == 'count' or 'count' in fdef.meta.get('ops', [])) ]
+                        if agg_fields and rows:
+                            parent_ids = [getattr(r, 'id') for r in rows]
+                            from sqlalchemy import select as _select, func as _func
+                            for agg_name, agg_def in agg_fields:
+                                source_rel = agg_def.meta.get('source')
+                                rel_def = btype_cls.__berry_fields__.get(source_rel)
+                                if not rel_def or rel_def.kind != 'relation':
+                                    continue
+                                target_name = rel_def.meta.get('target')
+                                target_btype = self.types.get(target_name)
+                                if not target_btype or not target_btype.model:
+                                    continue
+                                child_model_cls = target_btype.model
+                                # find fk col referencing parent
+                                fk_col = None
+                                for col in child_model_cls.__table__.columns:
+                                    for fk in col.foreign_keys:
+                                        if fk.column.table.name == model_cls.__table__.name:
+                                            fk_col = col
+                                            break
+                                    if fk_col is not None:
                                         break
-                                if fk_col is not None:
-                                    break
-                            if fk_col is None:
-                                continue
-                            stmt_cnt = _select(fk_col, _func.count().label('c')).select_from(child_model_cls).where(fk_col.in_(parent_ids)).group_by(fk_col)
-                            res_cnt = await session.execute(stmt_cnt)
-                            map_counts = {pid: cnt for pid, cnt in res_cnt.all()}
-                            print(f"DEBUG batch aggregate for field {agg_name} counts map: {map_counts}")
-                            cache_key = agg_def.meta.get('cache_key') or source_rel + ':count'
-                            for inst in out:
-                                pid = getattr(inst._model, 'id')
-                                cache = getattr(inst, '_agg_cache', None)
-                                if cache is None:
-                                    cache = {}
-                                    setattr(inst, '_agg_cache', cache)
-                                cache[cache_key] = map_counts.get(pid, 0)
-                                print(f"DEBUG batch cache set {cache_key} for parent {pid} = {cache[cache_key]}")
+                                if fk_col is None:
+                                    continue
+                                stmt_cnt = _select(fk_col, _func.count().label('c')).select_from(child_model_cls).where(fk_col.in_(parent_ids)).group_by(fk_col)
+                                res_cnt = await session.execute(stmt_cnt)
+                                map_counts = {pid: cnt for pid, cnt in res_cnt.all()}
+                                cache_key = agg_def.meta.get('cache_key') or source_rel + ':count'
+                                for inst in out:
+                                    pid = getattr(inst._model, 'id')
+                                    cache = getattr(inst, '_agg_cache', None)
+                                    if cache is None:
+                                        cache = {}
+                                        setattr(inst, '_agg_cache', cache)
+                                    cache[cache_key] = map_counts.get(pid, 0)
                     return out
                 return _resolver
             root_resolver = _make_root_resolver(_model_cls, st_type, bcls)

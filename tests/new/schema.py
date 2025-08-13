@@ -65,6 +65,15 @@ class UserQL(BerryType):
     posts = relation('PostQL')
     post_comments = relation('PostCommentQL')
     post_agg = count('posts')
+    # Object form of post aggregation (mirrors legacy PostAggType { count })
+    post_agg_obj = custom_object(
+        lambda model_cls: (
+            select(
+                func.count(Post.id).label('count')
+            ).select_from(Post).where(Post.author_id == model_cls.id)
+        ),
+        returns={'count': int}
+    )
     new_posts = relation('PostQL', window='recent')
     other_users = relation('UserQL', mode='exclude_self')
     bloggers = relation('UserQL', mode='has_posts')
