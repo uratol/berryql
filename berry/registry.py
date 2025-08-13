@@ -3,7 +3,7 @@ from dataclasses import dataclass, field as dc_field
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints
 import asyncio
 import strawberry
-from sqlalchemy import select
+from sqlalchemy import select, func, text as _text
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from datetime import datetime
@@ -15,38 +15,45 @@ except Exception:  # pragma: no cover
 
 T = TypeVar('T')
 
+# --- Field descriptor primitives (restored) ---
 @dataclass
 class FieldDef:
     name: str
-    resolver: Optional[Callable] = None
-    kind: str = 'scalar'  # scalar | relation | aggregate | custom | custom_object
-    target: Optional[str] = None  # relation target type name
-    meta: Dict[str, Any] = dc_field(default_factory=dict)
+    kind: str
+    meta: Dict[str, Any]
+
 
 class FieldDescriptor:
-    def __init__(self, *, kind: str = 'scalar', **meta):
+    def __init__(self, *, kind: str, **meta):
         self.kind = kind
-        self.meta = meta
-        self.name: Optional[str] = None
+        self.meta = dict(meta)
+        self.name: str | None = None
 
-    def __set_name__(self, owner, name):  # noqa: D401
+    def __set_name__(self, owner, name):  # pragma: no cover - simple
         self.name = name
 
-    def build(self, owner_name: str) -> FieldDef:
-        return FieldDef(name=self.name, kind=self.kind, meta=self.meta)
+    def build(self, parent_name: str) -> FieldDef:
+        return FieldDef(name=self.name or '', kind=self.kind, meta=self.meta)
+
 
 def field(**meta) -> FieldDescriptor:
     return FieldDescriptor(kind='scalar', **meta)
 
-def relation(target: str | Type | None = None, **meta) -> FieldDescriptor:
+
+def relation(target: Any = None, *, single: bool | None = None, mode: str | None = None, **meta) -> FieldDescriptor:
+    """Define a relation field.
+
+    target can be a BerryType subclass or its string name. single/mode selects cardinality.
+    """
     m = dict(meta)
     if target is not None:
-        if isinstance(target, str):
-            m['target'] = target
-        else:
-            m['target'] = target.__name__
-    # allow caller to specify single=True for belongs-to
+        m['target'] = target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target
+    if single is not None:
+        m['single'] = single
+    if mode is not None:
+        m['mode'] = mode
     return FieldDescriptor(kind='relation', **m)
+            
 
 def aggregate(source: str, **meta) -> FieldDescriptor:
     return FieldDescriptor(kind='aggregate', source=source, **meta)
@@ -186,8 +193,12 @@ class BerrySchema:
                     else:  # fallback placeholder
                         annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     meta_copy = dict(fdef.meta)
-                    def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single):
+                    def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single, fname_local=fname):
                         async def relation_resolver(self, info: StrawberryInfo, limit: Optional[int] = None, offset: Optional[int] = None):  # noqa: D401
+                            # Fast path: prefetched via root pushdown
+                            prefetch_attr = f'_{fname_local}_prefetched'
+                            if hasattr(self, prefetch_attr):
+                                return getattr(self, prefetch_attr)
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
                             parent_model = getattr(self, '_model', None)
@@ -486,7 +497,7 @@ class BerrySchema:
             st_type = self._st_types[name]
             field_name = self._pluralize(name)
             _model_cls = bcls.model
-            def _make_root_resolver(model_cls, st_cls, btype_cls):
+            def _make_root_resolver(model_cls, st_cls, btype_cls, root_field_name):
                 async def _resolver(info: StrawberryInfo, limit: int | None = None, offset: int | None = None):  # noqa: D401
                     session = info.context.get('db_session') if info and info.context else None
                     if session is None:
@@ -497,6 +508,146 @@ class BerrySchema:
                     custom_fields: List[tuple[str, Any]] = []
                     custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
                     select_columns: List[Any] = [model_cls]
+                    # Discover requested relation fields & their sub-selections/args via strawberry info
+                    requested_relations: Dict[str, Dict[str, Any]] = {}
+                    def _extract_relations(sel, btype):
+                        rels: Dict[str, Dict[str, Any]] = {}
+                        if not getattr(sel, 'selections', None) or not btype:
+                            return rels
+                        for child in sel.selections:
+                            name = getattr(child, 'name', None)
+                            if not name:
+                                continue
+                            fdef = getattr(btype, '__berry_fields__', {}).get(name)
+                            if not fdef or fdef.kind != 'relation':
+                                continue
+                            rel_limit = None
+                            rel_offset = None
+                            try:
+                                for arg in getattr(child, 'arguments', []) or []:
+                                    if arg.name == 'limit':
+                                        rel_limit = arg.value
+                                    elif arg.name == 'offset':
+                                        rel_offset = arg.value
+                            except Exception:
+                                pass
+                            sub_scalars = []
+                            if getattr(child, 'selections', None):
+                                for sub in child.selections:
+                                    sub_name = getattr(sub, 'name', None)
+                                    # Scalars for this relation level
+                                    if sub_name and not sub_name.startswith('__'):
+                                        sub_def = getattr(self.types.get(fdef.meta.get('target')), '__berry_fields__', {}).get(sub_name) if fdef.meta.get('target') else None
+                                        if not sub_def or sub_def.kind == 'scalar':
+                                            sub_scalars.append(sub_name)
+                            nested = {}
+                            # Recurse for nested relations
+                            try:
+                                nested = _extract_relations(child, self.types.get(fdef.meta.get('target')))
+                            except Exception:
+                                nested = {}
+                            rels[name] = {
+                                'fields': sub_scalars,
+                                'limit': rel_limit,
+                                'offset': rel_offset,
+                                'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
+                                'target': fdef.meta.get('target'),
+                                'nested': nested
+                            }
+                        return rels
+                    try:
+                        if info and getattr(info, 'selected_fields', None):
+                            matching_roots = [sf for sf in info.selected_fields if getattr(sf, 'name', None) == root_field_name]
+                            for root_sel in matching_roots:
+                                requested_relations.update(_extract_relations(root_sel, btype_cls))
+                    except Exception:
+                        pass
+                    # Helper to recursively build relation JSON expressions
+                    def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
+                        target_name = rel_cfg.get('target')
+                        target_b = self.types.get(target_name)
+                        if not target_b or not target_b.model:
+                            return None
+                        child_model_cls = target_b.model
+                        # FK
+                        fk_col = None
+                        for col in child_model_cls.__table__.columns:
+                            for fk in col.foreign_keys:
+                                if fk.column.table.name == parent_model_cls.__table__.name:
+                                    fk_col = col
+                                    break
+                            if fk_col is not None:
+                                break
+                        if fk_col is None:
+                            return None
+                        requested_scalar = list(rel_cfg.get('fields') or [])
+                        if not requested_scalar:
+                            for sf, sdef in target_b.__berry_fields__.items():
+                                if sdef.kind == 'scalar':
+                                    requested_scalar.append(sf)
+                        inner_cols = [getattr(child_model_cls, c) for c in requested_scalar] if requested_scalar else [getattr(child_model_cls, 'id')]
+                        inner_sel = select(*inner_cols).select_from(child_model_cls).where(fk_col == parent_model_cls.id).correlate(parent_model_cls)
+                        try:
+                            if 'id' in child_model_cls.__table__.columns:
+                                inner_sel = inner_sel.order_by(getattr(child_model_cls, 'id'))
+                        except Exception:
+                            pass
+                        if rel_cfg.get('offset'):
+                            inner_sel = inner_sel.offset(rel_cfg['offset'])
+                        if rel_cfg.get('limit') is not None:
+                            inner_sel = inner_sel.limit(rel_cfg['limit'])
+                        limited_subq = inner_sel.subquery()
+                        row_json_args: List[Any] = []
+                        # Scalars
+                        for sf in requested_scalar if requested_scalar else ['id']:
+                            row_json_args.extend([_text(f"'{sf}'"), getattr(limited_subq.c, sf)])
+                        # Nested relations within each child row
+                        for nested_name, nested_cfg in (rel_cfg.get('nested') or {}).items():
+                            # Build nested JSON (list or single)
+                            nested_target = nested_cfg.get('target')
+                            nested_b = self.types.get(nested_target)
+                            if not nested_b or not nested_b.model:
+                                continue
+                            grand_model_cls = nested_b.model
+                            # Determine FK from grandchild -> child
+                            g_fk = None
+                            for col in grand_model_cls.__table__.columns:
+                                for fk in col.foreign_keys:
+                                    if fk.column.table.name == child_model_cls.__table__.name:
+                                        g_fk = col
+                                        break
+                                if g_fk is not None:
+                                    break
+                            if g_fk is None:
+                                continue
+                            nested_scalars = nested_cfg.get('fields') or []
+                            if not nested_scalars:
+                                for sf2, sdef2 in nested_b.__berry_fields__.items():
+                                    if sdef2.kind == 'scalar':
+                                        nested_scalars.append(sf2)
+                            g_inner_cols = [getattr(grand_model_cls, c) for c in nested_scalars] if nested_scalars else [getattr(grand_model_cls, 'id')]
+                            g_sel = select(*g_inner_cols).select_from(grand_model_cls).where(g_fk == getattr(child_model_cls, 'id')).correlate(child_model_cls, parent_model_cls)
+                            try:
+                                if 'id' in grand_model_cls.__table__.columns:
+                                    g_sel = g_sel.order_by(getattr(grand_model_cls, 'id'))
+                            except Exception:
+                                pass
+                            if nested_cfg.get('offset'):
+                                g_sel = g_sel.offset(nested_cfg['offset'])
+                            if nested_cfg.get('limit') is not None:
+                                g_sel = g_sel.limit(nested_cfg['limit'])
+                            g_subq = g_sel.subquery()
+                            g_row_args: List[Any] = []
+                            for sf2 in nested_scalars if nested_scalars else ['id']:
+                                g_row_args.extend([_text(f"'{sf2}'"), getattr(g_subq.c, sf2)])
+                            g_row_json = func.json_object(*g_row_args)
+                            g_agg = select(func.coalesce(func.json_group_array(g_row_json), '[]')).select_from(g_subq).correlate(child_model_cls, parent_model_cls).scalar_subquery()
+                            row_json_args.extend([_text(f"'{nested_name}'"), g_agg])
+                        row_json_expr = func.json_object(*row_json_args)
+                        agg_query = select(func.coalesce(func.json_group_array(row_json_expr), '[]')).select_from(limited_subq).correlate(parent_model_cls).scalar_subquery()
+                        return agg_query
+                    # Prepare pushdown COUNT aggregates (replace batch later)
+                    count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_expr)
                     for cf_name, cf_def in btype_cls.__berry_fields__.items():
                         if cf_def.kind == 'custom':
                             builder = cf_def.meta.get('builder')
@@ -592,6 +743,83 @@ class BerrySchema:
                                     custom_object_fields.append((cf_name, col_labels, cf_def.meta.get('returns')))
                             else:
                                 continue
+                        elif cf_def.kind == 'aggregate':
+                            # Only handle count aggregates for pushdown
+                            op = cf_def.meta.get('op')
+                            ops = cf_def.meta.get('ops') or []
+                            is_count = op == 'count' or 'count' in ops
+                            if is_count:
+                                source_rel = cf_def.meta.get('source')
+                                rel_def = btype_cls.__berry_fields__.get(source_rel)
+                                if rel_def and rel_def.kind == 'relation':
+                                    target_name = rel_def.meta.get('target')
+                                    target_b = self.types.get(target_name)
+                                    if target_b and target_b.model:
+                                        child_model_cls = target_b.model
+                                        # find FK from child to parent
+                                        fk_col = None
+                                        for col in child_model_cls.__table__.columns:
+                                            for fk in col.foreign_keys:
+                                                if fk.column.table.name == model_cls.__table__.name:
+                                                    fk_col = col
+                                                    break
+                                            if fk_col is not None:
+                                                break
+                                        if fk_col is not None:
+                                            subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
+                                            select_columns.append(subq_cnt)
+                                            count_aggregates.append((cf_name, cf_def))
+                    # Push down relation JSON arrays/objects
+                    for rel_name, rel_cfg in requested_relations.items():
+                        target_name = rel_cfg.get('target')
+                        if not target_name:
+                            continue
+                        target_b = self.types.get(target_name)
+                        if not target_b or not target_b.model:
+                            continue
+                        child_model_cls = target_b.model
+                        # Determine FK
+                        fk_col = None
+                        for col in child_model_cls.__table__.columns:
+                            for fk in col.foreign_keys:
+                                if fk.column.table.name == model_cls.__table__.name:
+                                    fk_col = col
+                                    break
+                            if fk_col is not None:
+                                break
+                        if fk_col is None:
+                            continue
+                        # Determine projected scalar fields
+                        requested_scalar = rel_cfg.get('fields') or []
+                        if rel_cfg.get('single'):
+                            # Single relation: build json_object
+                            proj_cols = []
+                            if not requested_scalar:
+                                # default to all scalar fields of target
+                                for sf, sdef in target_b.__berry_fields__.items():
+                                    if sdef.kind == 'scalar':
+                                        requested_scalar.append(sf)
+                            for sf in requested_scalar:
+                                if sf in child_model_cls.__table__.columns:
+                                    proj_cols.append(sf)
+                            json_args: List[Any] = []
+                            for sf in proj_cols:
+                                json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
+                            json_obj = func.json_object(*json_args) if json_args else func.json_object(_text("'id'"), getattr(child_model_cls, 'id'))
+                            rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id", None))
+                            # Fallback join via fk if id direct column missing
+                            try:
+                                if not any(c.name == f"{rel_name}_id" for c in model_cls.__table__.columns):
+                                    rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == fk_col)
+                            except Exception:
+                                pass
+                            rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
+                            select_columns.append(rel_expr)
+                        else:
+                            # List relation (possibly with nested) JSON aggregation
+                            nested_expr = _build_list_relation_json(model_cls, btype_cls, rel_cfg)
+                            if nested_expr is not None:
+                                select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                     stmt = select(*select_columns)
                     if offset:
                         stmt = stmt.offset(offset)
@@ -647,47 +875,78 @@ class BerrySchema:
                                     else:
                                         obj = data_dict or None
                                     setattr(inst, f"_{cf_name}_data", obj)
+                            # hydrate pushed-down relation JSON
+                            try:
+                                mapping = getattr(sa_rows[row_index], '_mapping')
+                            except Exception:
+                                mapping = {}
+                            if requested_relations:
+                                for rel_name in requested_relations.keys():
+                                    key = f"_pushrel_{rel_name}"
+                                    if key in mapping:
+                                        raw_json = mapping[key]
+                                        rel_meta = requested_relations[rel_name]
+                                        is_single = rel_meta.get('single')
+                                        import json as _json
+                                        if raw_json is None:
+                                            parsed_value = None if is_single else []
+                                        else:
+                                            try:
+                                                parsed_value = _json.loads(raw_json) if isinstance(raw_json, (str, bytes)) else raw_json
+                                            except Exception:
+                                                parsed_value = None if is_single else []
+                                        target_name = rel_meta.get('target')
+                                        target_b = self.types.get(target_name) if target_name else None
+                                        target_st = self._st_types.get(target_name) if target_name else None
+                                        built_value = None if is_single else []
+                                        if target_b and target_b.model and target_st and parsed_value is not None:
+                                            if is_single:
+                                                if isinstance(parsed_value, dict):
+                                                    child_inst = target_st()
+                                                    for sf, sdef in target_b.__berry_fields__.items():
+                                                        if sdef.kind == 'scalar':
+                                                            setattr(child_inst, sf, parsed_value.get(sf))
+                                                    setattr(child_inst, '_model', None)
+                                                    built_value = child_inst
+                                                else:
+                                                    built_value = None
+                                            else:
+                                                tmp_list = []
+                                                if isinstance(parsed_value, list):
+                                                    for item in parsed_value:
+                                                        if isinstance(item, dict):
+                                                            child_inst = target_st()
+                                                            for sf, sdef in target_b.__berry_fields__.items():
+                                                                if sdef.kind == 'scalar':
+                                                                    setattr(child_inst, sf, item.get(sf))
+                                                            setattr(child_inst, '_model', None)
+                                                            tmp_list.append(child_inst)
+                                                built_value = tmp_list
+                                        else:
+                                            built_value = parsed_value
+                                        setattr(inst, f"_{rel_name}_prefetched", built_value)
+                                        # Also assign to public attribute to avoid resolver DB path
+                                        try:
+                                            setattr(inst, rel_name, built_value)
+                                        except Exception:
+                                            pass
+                            # populate aggregate count cache from pushdown columns
+                            if count_aggregates:
+                                cache = getattr(inst, '_agg_cache', None)
+                                if cache is None:
+                                    cache = {}
+                                    setattr(inst, '_agg_cache', cache)
+                                for agg_name, agg_def in count_aggregates:
+                                    try:
+                                        val = mapping.get(agg_name)
+                                    except Exception:
+                                        val = None
+                                    cache_key = agg_def.meta.get('cache_key') or (agg_def.meta.get('source') + ':count')
+                                    cache[cache_key] = val or 0
                             out.append(inst)
-                        # Batch aggregate counts if any count aggregate fields defined
-                        agg_fields = [ (fname, fdef) for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'aggregate' and (fdef.meta.get('op') == 'count' or 'count' in fdef.meta.get('ops', [])) ]
-                        if agg_fields and rows:
-                            parent_ids = [getattr(r, 'id') for r in rows]
-                            from sqlalchemy import select as _select, func as _func
-                            for agg_name, agg_def in agg_fields:
-                                source_rel = agg_def.meta.get('source')
-                                rel_def = btype_cls.__berry_fields__.get(source_rel)
-                                if not rel_def or rel_def.kind != 'relation':
-                                    continue
-                                target_name = rel_def.meta.get('target')
-                                target_btype = self.types.get(target_name)
-                                if not target_btype or not target_btype.model:
-                                    continue
-                                child_model_cls = target_btype.model
-                                # find fk col referencing parent
-                                fk_col = None
-                                for col in child_model_cls.__table__.columns:
-                                    for fk in col.foreign_keys:
-                                        if fk.column.table.name == model_cls.__table__.name:
-                                            fk_col = col
-                                            break
-                                    if fk_col is not None:
-                                        break
-                                if fk_col is None:
-                                    continue
-                                stmt_cnt = _select(fk_col, _func.count().label('c')).select_from(child_model_cls).where(fk_col.in_(parent_ids)).group_by(fk_col)
-                                res_cnt = await session.execute(stmt_cnt)
-                                map_counts = {pid: cnt for pid, cnt in res_cnt.all()}
-                                cache_key = agg_def.meta.get('cache_key') or source_rel + ':count'
-                                for inst in out:
-                                    pid = getattr(inst._model, 'id')
-                                    cache = getattr(inst, '_agg_cache', None)
-                                    if cache is None:
-                                        cache = {}
-                                        setattr(inst, '_agg_cache', cache)
-                                    cache[cache_key] = map_counts.get(pid, 0)
                     return out
                 return _resolver
-            root_resolver = _make_root_resolver(_model_cls, st_type, bcls)
+            root_resolver = _make_root_resolver(_model_cls, st_type, bcls, field_name)
             query_annotations[field_name] = List[self._st_types[name]]  # type: ignore
             query_namespace[field_name] = strawberry.field(root_resolver)
         # Add ping field
