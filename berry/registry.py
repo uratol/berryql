@@ -11,6 +11,9 @@ except Exception:  # pragma: no cover
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from datetime import datetime
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    class Registry: ...  # forward ref placeholder
 try:  # Provide StrawberryInfo for type annotations
     from strawberry.types import Info as StrawberryInfo  # type: ignore
 except Exception:  # pragma: no cover
@@ -18,6 +21,174 @@ except Exception:  # pragma: no cover
         ...
 
 T = TypeVar('T')
+
+# --- Helper: Relation selection extraction (moved out of resolver closure) ---
+class RelationSelectionExtractor:
+    """Extract relation selection metadata (fields, pagination, filters) from Strawberry
+    selected_fields data and/or raw GraphQL AST. Returns mapping:
+        relation_name -> {
+           fields: [scalar field names],
+           limit: int|None,
+           offset: int|None,
+           single: bool,
+           target: str | None,
+           nested: { ... future nested relation data ... },
+           skip_pushdown: bool,
+           filter_args: { arg_name: value }
+        }
+    """
+    def __init__(self, registry: 'Registry'):
+        self.registry = registry
+
+    def _init_rel_cfg(self, fdef) -> Dict[str, Any]:
+        return {
+            'fields': [],
+            'limit': None,
+            'offset': None,
+            'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
+            'target': fdef.meta.get('target'),
+            'nested': {},
+            'skip_pushdown': False,
+            'filter_args': {}
+        }
+
+    # Selected fields path (Strawberry's resolved selection tree)
+    def _walk_selected(self, sel, btype, out: Dict[str, Dict[str, Any]]):
+        if not getattr(sel, 'selections', None) or not btype:
+            return
+        for child in sel.selections:
+            name = getattr(child, 'name', None)
+            if not name:
+                continue
+            fdef = getattr(btype, '__berry_fields__', {}).get(name)
+            if not fdef or fdef.kind != 'relation':
+                continue
+            rel_cfg = out.setdefault(name, self._init_rel_cfg(fdef))
+            # arguments
+            try:
+                for arg in getattr(child, 'arguments', []) or []:
+                    raw_val = getattr(arg, 'value', None)
+                    try:
+                        if hasattr(raw_val, 'value') and raw_val is not None and raw_val.__class__.__name__ != 'datetime':
+                            inner_v = getattr(raw_val, 'value')
+                            if isinstance(inner_v, (int, str, float, bool)):
+                                raw_val = inner_v
+                    except Exception:
+                        pass
+                    if arg.name == 'limit':
+                        rel_cfg['limit'] = raw_val
+                    elif arg.name == 'offset':
+                        rel_cfg['offset'] = raw_val
+                    else:
+                        rel_cfg['filter_args'][arg.name] = raw_val
+            except Exception:
+                pass
+            # scalar subfields
+            if getattr(child, 'selections', None):
+                tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
+                for sub in child.selections:
+                    sub_name = getattr(sub, 'name', None)
+                    if sub_name and not sub_name.startswith('__'):
+                        sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
+                        if not sub_def or sub_def.kind == 'scalar':
+                            if sub_name not in rel_cfg['fields']:
+                                rel_cfg['fields'].append(sub_name)
+            # recurse nested relations
+            try:
+                self._walk_selected(child, self.registry.types.get(fdef.meta.get('target')), out)
+            except Exception:
+                pass
+
+    # Raw GraphQL AST path
+    def _value_from_ast(self, node):
+        try:
+            from graphql.language import ast as _gast
+            if isinstance(node, _gast.IntValueNode):
+                return int(node.value)
+            if isinstance(node, _gast.FloatValueNode):
+                return float(node.value)
+            if isinstance(node, _gast.StringValueNode):
+                return node.value
+            if isinstance(node, _gast.BooleanValueNode):
+                return bool(node.value)
+            if isinstance(node, _gast.NullValueNode):
+                return None
+            if isinstance(node, _gast.ListValueNode):
+                return [self._value_from_ast(v) for v in node.values]
+            if hasattr(node, 'value'):
+                return getattr(node, 'value')
+        except Exception:
+            return None
+        return None
+
+    def _walk_ast(self, selection_set, btype, out: Dict[str, Dict[str, Any]]):
+        if not selection_set or not btype:
+            return
+        for child in getattr(selection_set, 'selections', []) or []:
+            name_node = getattr(child, 'name', None)
+            name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
+            if not name:
+                continue
+            fdef = getattr(btype, '__berry_fields__', {}).get(name)
+            if not fdef or fdef.kind != 'relation':
+                continue
+            rel_cfg = out.setdefault(name, self._init_rel_cfg(fdef))
+            for arg in getattr(child, 'arguments', []) or []:
+                arg_name_node = getattr(arg, 'name', None)
+                arg_name = getattr(arg_name_node, 'value', None) if arg_name_node and not isinstance(arg_name_node, str) else arg_name_node
+                if not arg_name:
+                    continue
+                if arg_name == 'limit':
+                    rel_cfg['limit'] = self._value_from_ast(arg.value)
+                elif arg_name == 'offset':
+                    rel_cfg['offset'] = self._value_from_ast(arg.value)
+                else:
+                    rel_cfg['filter_args'][arg_name] = self._value_from_ast(arg.value)
+            # scalar subfields
+            if getattr(child, 'selection_set', None):
+                tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
+                sub_scalars = []
+                for sub in getattr(child.selection_set, 'selections', []) or []:
+                    sub_name_node = getattr(sub, 'name', None)
+                    sub_name = getattr(sub_name_node, 'value', None) if sub_name_node and not isinstance(sub_name_node, str) else sub_name_node
+                    if not sub_name:
+                        continue
+                    sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
+                    if not sub_def or sub_def.kind == 'scalar':
+                        sub_scalars.append(sub_name)
+                if sub_scalars:
+                    for s in sub_scalars:
+                        if s not in rel_cfg['fields']:
+                            rel_cfg['fields'].append(s)
+                # recurse deeper
+                try:
+                    self._walk_ast(getattr(child, 'selection_set', None), self.registry.types.get(fdef.meta.get('target')), out)
+                except Exception:
+                    pass
+
+    def extract(self, info: 'StrawberryInfo', root_field_name: str, btype_cls) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        # strawberry selected_fields
+        try:
+            if info and getattr(info, 'selected_fields', None):
+                for root_sel in [sf for sf in info.selected_fields if getattr(sf, 'name', None) == root_field_name]:
+                    self._walk_selected(root_sel, btype_cls, out)
+        except Exception:
+            pass
+        # AST fallback
+        try:
+            raw_info = getattr(info, '_raw_info', None)
+            if raw_info and hasattr(raw_info, 'field_nodes'):
+                need_ast = (not out) or any((cfg.get('limit') is None and cfg.get('offset') is None and not cfg.get('filter_args')) for cfg in out.values())
+                if need_ast:
+                    for fn in raw_info.field_nodes:
+                        name_node = getattr(fn, 'name', None)
+                        root_name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
+                        if root_name == root_field_name:
+                            self._walk_ast(getattr(fn, 'selection_set', None), btype_cls, out)
+        except Exception:
+            pass
+        return out
 
 # --- Filtering DSL (Phase 1: foundational pieces) ---
 
@@ -822,150 +993,8 @@ class BerrySchema:
                     custom_fields: List[tuple[str, Any]] = []
                     custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
                     select_columns: List[Any] = [model_cls]
-                    # Unified relation extraction (strawberry selected_fields + GraphQL AST) with recursion
-                    requested_relations: Dict[str, Dict[str, Any]] = {}
-                    def _init_rel_cfg(name: str, fdef) -> Dict[str, Any]:
-                        return {
-                            'fields': [],
-                            'limit': None,
-                            'offset': None,
-                            'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
-                            'target': fdef.meta.get('target'),
-                            'nested': {},
-                            'skip_pushdown': False,
-                            'filter_args': {}
-                        }
-                    # --- Strawberry selected_fields path ---
-                    def _walk_selected(sel, btype):
-                        if not getattr(sel, 'selections', None) or not btype:
-                            return
-                        for child in sel.selections:
-                            name = getattr(child, 'name', None)
-                            if not name:
-                                continue
-                            fdef = getattr(btype, '__berry_fields__', {}).get(name)
-                            if not fdef or fdef.kind != 'relation':
-                                continue
-                            rel_cfg = requested_relations.setdefault(name, _init_rel_cfg(name, fdef))
-                            try:
-                                for arg in getattr(child, 'arguments', []) or []:
-                                    raw_val = getattr(arg, 'value', None)
-                                    try:
-                                        if hasattr(raw_val, 'value') and raw_val is not None and raw_val.__class__.__name__ != 'datetime':
-                                            inner_v = getattr(raw_val, 'value')
-                                            if isinstance(inner_v, (int, str, float, bool)):
-                                                raw_val = inner_v
-                                    except Exception:
-                                        pass
-                                    if arg.name == 'limit':
-                                        rel_cfg['limit'] = raw_val
-                                    elif arg.name == 'offset':
-                                        rel_cfg['offset'] = raw_val
-                                    else:
-                                        rel_cfg['filter_args'][arg.name] = raw_val
-                            except Exception:
-                                pass
-                            # Scalars requested
-                            if getattr(child, 'selections', None):
-                                for sub in child.selections:
-                                    sub_name = getattr(sub, 'name', None)
-                                    if sub_name and not sub_name.startswith('__'):
-                                        tgt_b = self.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
-                                        sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
-                                        if not sub_def or sub_def.kind == 'scalar':
-                                            if sub_name not in rel_cfg['fields']:
-                                                rel_cfg['fields'].append(sub_name)
-                            # Recurse nested
-                            try:
-                                _walk_selected(child, self.types.get(fdef.meta.get('target')))
-                            except Exception:
-                                pass
-                    try:
-                        if info and getattr(info, 'selected_fields', None):
-                            for root_sel in [sf for sf in info.selected_fields if getattr(sf, 'name', None) == root_field_name]:
-                                _walk_selected(root_sel, btype_cls)
-                    except Exception:
-                        pass
-                    # --- GraphQL AST fallback path (full recursion) ---
-                    def _value_from_ast(node):  # minimal scalar + list support
-                        try:
-                            from graphql.language import ast as _gast
-                            if isinstance(node, _gast.IntValueNode):
-                                return int(node.value)
-                            if isinstance(node, _gast.FloatValueNode):
-                                return float(node.value)
-                            if isinstance(node, _gast.StringValueNode):
-                                return node.value
-                            if isinstance(node, _gast.BooleanValueNode):
-                                return bool(node.value)
-                            if isinstance(node, _gast.NullValueNode):
-                                return None
-                            if isinstance(node, _gast.ListValueNode):
-                                return [_value_from_ast(v) for v in node.values]
-                            if hasattr(node, 'value'):
-                                return getattr(node, 'value')
-                        except Exception:
-                            return None
-                        return None
-                    def _walk_ast(selection_set, btype):
-                        if not selection_set or not btype:
-                            return
-                        for child in getattr(selection_set, 'selections', []) or []:
-                            name_node = getattr(child, 'name', None)
-                            name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
-                            if not name:
-                                continue
-                            fdef = getattr(btype, '__berry_fields__', {}).get(name)
-                            if not fdef or fdef.kind != 'relation':
-                                # still descend for other fields to catch deeper relations under objects? skip for scalars
-                                continue
-                            rel_cfg = requested_relations.setdefault(name, _init_rel_cfg(name, fdef))
-                            for arg in getattr(child, 'arguments', []) or []:
-                                arg_name_node = getattr(arg, 'name', None)
-                                arg_name = getattr(arg_name_node, 'value', None) if arg_name_node and not isinstance(arg_name_node, str) else arg_name_node
-                                if not arg_name:
-                                    continue
-                                if arg_name == 'limit':
-                                    rel_cfg['limit'] = _value_from_ast(arg.value)
-                                elif arg_name == 'offset':
-                                    rel_cfg['offset'] = _value_from_ast(arg.value)
-                                else:
-                                    rel_cfg['filter_args'][arg_name] = _value_from_ast(arg.value)
-                            # scalar subfields
-                            sub_scalars = []
-                            if getattr(child, 'selection_set', None):
-                                tgt_b = self.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
-                                for sub in getattr(child.selection_set, 'selections', []) or []:
-                                    sub_name_node = getattr(sub, 'name', None)
-                                    sub_name = getattr(sub_name_node, 'value', None) if sub_name_node and not isinstance(sub_name_node, str) else sub_name_node
-                                    if not sub_name:
-                                        continue
-                                    sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
-                                    if not sub_def or sub_def.kind == 'scalar':
-                                        sub_scalars.append(sub_name)
-                                if sub_scalars:
-                                    for s in sub_scalars:
-                                        if s not in rel_cfg['fields']:
-                                            rel_cfg['fields'].append(s)
-                                # recurse deeper
-                                try:
-                                    _walk_ast(getattr(child, 'selection_set', None), self.types.get(fdef.meta.get('target')))
-                                except Exception:
-                                    pass
-                    try:
-                        # Run AST walk only if any relation lacks args OR no relations captured yet
-                        raw_info = getattr(info, '_raw_info', None)
-                        if raw_info and hasattr(raw_info, 'field_nodes'):
-                            need_ast = (not requested_relations) or any((cfg.get('limit') is None and cfg.get('offset') is None and not cfg.get('filter_args')) for cfg in requested_relations.values())
-                            if need_ast:
-                                for fn in raw_info.field_nodes:
-                                    # find the root fieldNode matching root_field_name
-                                    name_node = getattr(fn, 'name', None)
-                                    root_name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
-                                    if root_name == root_field_name:
-                                        _walk_ast(getattr(fn, 'selection_set', None), btype_cls)
-                    except Exception:
-                        pass
+                    # Use extracted helper class
+                    requested_relations = RelationSelectionExtractor(self).extract(info, root_field_name, btype_cls)
                     # Helper to recursively build relation JSON expressions
                     def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
                         if 'mssql' in dialect_name:
