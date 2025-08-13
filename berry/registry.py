@@ -1979,6 +1979,32 @@ class BerrySchema:
                             stmt = stmt.order_by(col.desc() if dir_v == 'desc' else col.asc())
                         except Exception as e:
                             raise
+                    else:
+                        # Apply default ordering from type meta if present
+                        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
+                        if allowed_order_fields is None:
+                            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
+                        def_dir = _dir_value(getattr(btype_cls, '__default_order_dir__', None))
+                        default_multi = getattr(btype_cls, '__default_order_multi__', None) or []
+                        default_by = getattr(btype_cls, '__default_order_by__', None)
+                        try:
+                            applied_default = False
+                            if default_multi:
+                                for spec in default_multi:
+                                    cn, _, dd = str(spec).partition(':')
+                                    dd = dd or def_dir
+                                    if cn in allowed_order_fields:
+                                        col = model_cls.__table__.c.get(cn)
+                                        if col is not None:
+                                            stmt = stmt.order_by(col.desc() if (dd=='desc') else col.asc())
+                                            applied_default = True
+                            elif default_by and default_by in allowed_order_fields:
+                                col = model_cls.__table__.c.get(default_by)
+                                if col is not None:
+                                    stmt = stmt.order_by(col.desc() if def_dir=='desc' else col.asc())
+                                    applied_default = True
+                        except Exception:
+                            pass
                     if offset:
                         stmt = stmt.offset(offset)
                     if limit is not None:

@@ -36,7 +36,7 @@ class PostQL(BerryType):
     author_id = field()
     created_at = field()
     author = relation('UserQL', single=True)
-    post_comments = relation('PostCommentQL')
+    post_comments = relation('PostCommentQL', order_by='id')
     post_comments_agg = count('post_comments')
     last_post_comment = aggregate('post_comments', ops=['last'])
     # Demonstration custom field: total length of all comment contents for the post
@@ -62,6 +62,9 @@ class PostQL(BerryType):
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
+    # Default root ordering: users by id asc
+    __default_order_by__ = 'id'
+    __default_order_dir__ = 'asc'
     # Root-level gating (admin -> all, user -> self, none -> none)
     @staticmethod
     def __root_custom_where__(model_cls, info):
