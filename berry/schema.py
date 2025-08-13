@@ -5,8 +5,9 @@ Not functionally equivalent yet: purely structural placeholder to evolve tests a
 from __future__ import annotations
 from typing import Optional, List, Any
 from datetime import datetime
+from sqlalchemy import select, func
 import strawberry
-from .registry import BerrySchema, BerryType, field, relation, aggregate, count
+from .registry import BerrySchema, BerryType, field, relation, aggregate, count, custom, custom_object
 from tests.models import User, Post, PostComment  # type: ignore
 
 berry_schema = BerrySchema()
@@ -33,6 +34,26 @@ class PostQL(BerryType):
     post_comments = relation('PostCommentQL')
     post_comments_agg = count('post_comments')
     last_post_comment = aggregate('post_comments', ops=['last'])
+    # Demonstration custom field: total length of all comment contents for the post
+    def _comment_text_len_builder(model_cls):
+        return (
+            select(
+                func.coalesce(func.sum(func.length(PostComment.content)), 0).label('comment_text_len')
+            )
+            .select_from(PostComment)
+            .where(PostComment.post_id == model_cls.id)
+        )
+    comment_text_len = custom(_comment_text_len_builder, returns=int)
+    # Multi-column aggregate object (min_created_at, comments_count)
+    post_comments_agg_obj = custom_object(
+        lambda model_cls: (
+            select(
+                func.min(PostComment.created_at).label('min_created_at'),
+                func.count(PostComment.id).label('comments_count')
+            ).select_from(PostComment).where(PostComment.post_id == model_cls.id)
+        ),
+        returns={'min_created_at': datetime, 'comments_count': int}
+    )
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
