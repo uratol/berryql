@@ -6,17 +6,20 @@ Environment variables:
   TEST_DATABASE_URL  optional SQLAlchemy async URL, e.g. postgresql+asyncpg://user:pass@localhost/db
                      defaults to sqlite+aiosqlite:///./berryql_demo.db
   DEMO_SEED          set to '0' to skip demo data seeding (default '1')
+    SQL_ECHO           set to '1' (default) to log SQL, '0' to disable; uses 'debug' to include params
 """
 from __future__ import annotations
 
 import os
 import sys
 import asyncio
+import logging
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from sqlalchemy import event
 
 from strawberry.fastapi import GraphQLRouter
 
@@ -32,19 +35,42 @@ app = FastAPI(title="BerryQL GraphQL Playground")
 async def _init_db(app: FastAPI) -> None:
     # Use in-memory SQLite by default; allow override via TEST_DATABASE_URL
     env_db_url = os.getenv("TEST_DATABASE_URL")
+    # Toggle SQL echo via env var (1=on, 0=off). When on, use 'debug' for params.
+    echo_enabled = os.getenv("SQL_ECHO", "1") != "0"
+    echo_value = "debug" if echo_enabled else False
     if env_db_url:
-        engine: AsyncEngine = create_async_engine(env_db_url, echo=False, future=True)
+        engine: AsyncEngine = create_async_engine(env_db_url, echo=echo_value, future=True)
     else:
         # Shared in-memory DB across connections using StaticPool
         engine: AsyncEngine = create_async_engine(
             "sqlite+aiosqlite:///:memory:",
-            echo=False,
+            echo=echo_value,
             future=True,
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
     app.state.engine = engine
     app.state.async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    # Ensure logger level so SQL shows up under Uvicorn
+    if echo_enabled:
+        logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
+        logging.getLogger("sqlalchemy.pool").setLevel(logging.INFO)
+
+        # Optional: add cursor-level hooks for timing/visibility
+        try:
+            @event.listens_for(engine.sync_engine, "before_cursor_execute")
+            def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+                logging.getLogger("sqlalchemy.engine").info("SQL: %s | params=%s", statement, parameters)
+
+            @event.listens_for(engine.sync_engine, "after_cursor_execute")
+            def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+                if context and getattr(context, "_query_start_time", None):
+                    dur_ms = (context._execution_endtime - context._query_start_time) * 1000  # type: ignore[attr-defined]
+                    logging.getLogger("sqlalchemy.engine").info("Done in %.2f ms", dur_ms)
+        except Exception:
+            # If event wiring fails (shouldn't), continue with echo logging
+            pass
 
     # Create schema (tables)
     async with engine.begin() as conn:
