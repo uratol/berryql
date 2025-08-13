@@ -1,6 +1,6 @@
 import pytest
-from tests.common.fixtures import *  # noqa: F401,F403
-from tests.new.schema import schema
+from tests.fixtures import *  # noqa: F401,F403
+from tests.schema import schema
 
 @pytest.mark.asyncio
 async def test_post_comment_text_len_custom_field(db_session, populated_db):

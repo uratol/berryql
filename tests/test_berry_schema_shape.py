@@ -1,4 +1,4 @@
-from tests.new.schema import UserQL, PostQL, PostCommentQL, schema as berry_strawberry_schema
+from tests.schema import UserQL, PostQL, PostCommentQL, schema as berry_strawberry_schema
 
 # Basic shape tests mapping to original tests/schema.py GraphQL types
 

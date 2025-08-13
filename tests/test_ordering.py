@@ -1,5 +1,5 @@
 import pytest
-from tests.new.schema import schema as berry_schema
+from tests.schema import schema as berry_schema
 
 @pytest.mark.asyncio
 async def test_root_ordering_single(db_session, populated_db):

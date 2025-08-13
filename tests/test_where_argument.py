@@ -1,6 +1,6 @@
 import pytest
-from tests.common.fixtures import *  # noqa: F401,F403
-from tests.new.schema import schema as berry_schema
+from tests.fixtures import *  # noqa: F401,F403
+from tests.schema import schema as berry_schema
 
 
 @pytest.mark.asyncio

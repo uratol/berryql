@@ -1,5 +1,5 @@
 import pytest
-from tests.new.schema import schema as berry_strawberry_schema
+from tests.schema import schema as berry_strawberry_schema
 
 
 @pytest.mark.asyncio
