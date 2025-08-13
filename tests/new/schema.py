@@ -62,6 +62,20 @@ class PostQL(BerryType):
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
+    # Root-level gating (admin -> all, user -> self, none -> none)
+    @staticmethod
+    def __root_custom_where__(model_cls, info):
+        try:
+            ctx = info.context if info else {}
+            current_user = ctx.get('current_user') if ctx else None
+            user_id = ctx.get('user_id') if ctx else None
+            if current_user and getattr(current_user, 'is_admin', False):
+                return {}
+            if user_id:
+                return {'id': {'eq': user_id}}
+            return {'id': {'eq': -1}}
+        except Exception:
+            return {'id': {'eq': -1}}
     __filters__ = {
         'name_ilike': {'column': 'name', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
         'created_at_between': {'column': 'created_at', 'op': 'between'},

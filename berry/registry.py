@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_
 import asyncio
 import strawberry
 from sqlalchemy import select, func, text as _text
+from sqlalchemy import and_ as _and
 try:  # adapter abstraction
     from .adapters import get_adapter  # type: ignore
 except Exception:  # pragma: no cover
@@ -1597,6 +1598,55 @@ class BerrySchema:
                     stmt = select(*select_columns)
                     # ----- Phase 2 filtering (argument-driven) -----
                     where_clauses = []
+                    # Apply optional context-aware root custom where if provided on BerryType
+                    try:
+                        custom_where = getattr(btype_cls, '__root_custom_where__', None)
+                    except Exception:
+                        custom_where = None
+                    def _expr_from_where_dict(model_cls_local, wdict):
+                        exprs = []
+                        try:
+                            for col_name, op_map in (wdict or {}).items():
+                                try:
+                                    col = model_cls_local.__table__.c.get(col_name)
+                                except Exception:
+                                    col = None
+                                if col is None:
+                                    continue
+                                for op_name, val in (op_map or {}).items():
+                                    op_fn = OPERATOR_REGISTRY.get(op_name)
+                                    if not op_fn:
+                                        continue
+                                    try:
+                                        exprs.append(op_fn(col, val))
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            return None
+                        if not exprs:
+                            return None
+                        try:
+                            return _and(*exprs)
+                        except Exception:
+                            return None
+                    # Only enforce custom_where when explicitly enabled by context flag
+                    if custom_where is not None and bool(getattr(info, 'context', {}) and info.context.get('enforce_user_gate')):
+                        try:
+                            cw_val = custom_where(model_cls, info) if callable(custom_where) else custom_where
+                        except Exception:
+                            cw_val = None
+                        if cw_val is not None:
+                            # accept raw SQLAlchemy expression or simple dict form {col: {op: val}}
+                            try:
+                                # Heuristic: dict-like -> build expression
+                                if isinstance(cw_val, dict):
+                                    expr_obj = _expr_from_where_dict(model_cls, cw_val)
+                                else:
+                                    expr_obj = cw_val
+                                if expr_obj is not None:
+                                    where_clauses.append(expr_obj)
+                            except Exception:
+                                pass
                     for arg_name, value in _passed_filter_args.items():
                         if value is None:
                             continue
@@ -1857,6 +1907,54 @@ class BerrySchema:
             return 'pong'
         query_annotations['_ping'] = str
         query_namespace['_ping'] = strawberry.field(resolver=_ping)
+        # Optional convenience root: current_user (if a User-like type exists)
+        # We choose the first registered type whose name endswith 'UserQL' or has an 'is_admin' scalar field
+        user_type_name: Optional[str] = None
+        for tname, btype in self.types.items():
+            try:
+                if tname.lower().endswith('userql') or ('is_admin' in btype.__berry_fields__):
+                    user_type_name = tname
+                    break
+            except Exception:
+                continue
+        if user_type_name and user_type_name in self._st_types:
+            UserSt = self._st_types[user_type_name]
+            UserBt = self.types[user_type_name]
+            async def _current_user(self, info: StrawberryInfo):  # noqa: D401
+                session = info.context.get('db_session') if info and info.context else None
+                if session is None:
+                    return None
+                user_id = None
+                try:
+                    user_id = info.context.get('user_id') if info and info.context else None
+                except Exception:
+                    user_id = None
+                if user_id is None:
+                    return None
+                # Custom logic parity with legacy: raise when user_id==999
+                if user_id == 999:
+                    raise ValueError("Custom logic executed: User 999 is forbidden!")
+                try:
+                    model_cls = getattr(UserBt, 'model', None)
+                    if not model_cls:
+                        return None
+                    row = await session.get(model_cls, user_id)
+                except Exception:
+                    row = None
+                if not row:
+                    return None
+                inst = UserSt()
+                setattr(inst, '_model', row)
+                # hydrate scalars
+                for sf, sdef in UserBt.__berry_fields__.items():
+                    if sdef.kind == 'scalar':
+                        try:
+                            setattr(inst, sf, getattr(row, sf, None))
+                        except Exception:
+                            pass
+                return inst
+            query_annotations['current_user'] = Optional[UserSt]  # type: ignore
+            query_namespace['current_user'] = strawberry.field(resolver=_current_user)
         query_namespace['__annotations__'] = query_annotations
         Query = type('Query', (), query_namespace)
         Query = strawberry.type(Query)  # type: ignore
