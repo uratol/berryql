@@ -54,3 +54,39 @@ async def test_single_object_relations_and_count(db_session, populated_db):
     assert query_counter['count'] == 2, f"Expected 2 SQL queries (one per root field), got {query_counter['count']}"
   finally:
     event.remove(engine, "before_cursor_execute", before_cursor_execute)
+
+
+@pytest.mark.asyncio
+async def test_users_post_agg_obj_nullable(db_session, populated_db):
+  """post_agg_obj should be null for users with no posts.
+
+  Query mirrors the reported case:
+  {
+    users(limit: 5, order_by: "id", order_dir: asc) {
+      id
+      post_agg_obj { count }
+    }
+  }
+  """
+  query = """
+  query {
+    users(limit: 5, order_by: "id", order_dir: asc) {
+      id
+      post_agg_obj { count }
+    }
+  }
+  """
+  res = await schema.execute(query, context_value={"db_session": db_session})
+  assert res.errors is None, res.errors
+  users = res.data["users"]
+  # With our fixtures there are 4 users (IDs start at 1), last user has no posts
+  assert len(users) == 4
+  # Expected counts per user in fixtures: [2, 2, 1, 0]
+  expected_counts = [2, 2, 1, 0]
+  # For all users, post_agg_obj should be non-null and expose only { count } with correct values
+  for idx, u in enumerate(users):
+    agg = u.get("post_agg_obj")
+    assert agg is not None
+    assert set(agg.keys()) == {"count"}
+    assert isinstance(agg["count"], int)
+    assert agg["count"] == expected_counts[idx]

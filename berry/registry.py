@@ -1095,10 +1095,10 @@ class BerrySchema:
                     except Exception:
                         annotations[fname] = Optional[str]
                     meta_copy = dict(fdef.meta)
-                    def _make_custom_resolver(meta_copy=meta_copy):
+                    def _make_custom_resolver(meta_copy=meta_copy, fname_local=fname):
                         async def custom_resolver(self, info: StrawberryInfo):  # noqa: D401
                             # Fast-path: if root query already populated attribute (no N+1), return it
-                            pre_value = getattr(self, fname, None)
+                            pre_value = getattr(self, fname_local, None)
                             if pre_value is not None:
                                 return pre_value
                             parent_model = getattr(self, '_model', None)
@@ -1177,9 +1177,13 @@ class BerrySchema:
                     meta_copy = dict(fdef.meta)
                     # store nested type for resolver reconstruction
                     meta_copy['_nested_type'] = nested_type
-                    def _make_custom_obj_resolver(meta_copy=meta_copy):
+                    def _make_custom_obj_resolver(meta_copy=meta_copy, fname_local=fname):
                         async def _resolver(self, info: StrawberryInfo):  # noqa: D401
-                            pre_v = getattr(self, f"_{fname}_data", None)
+                            # Prefer pre-hydrated values; no N+1 fallback
+                            pre_json = getattr(self, f"_{fname_local}_prefetched", None)
+                            if pre_json is not None:
+                                return pre_json
+                            pre_v = getattr(self, f"_{fname_local}_data", None)
                             if pre_v is not None:
                                 return pre_v
                             return None
@@ -1761,32 +1765,30 @@ class BerrySchema:
                                 if len(inspect.signature(builder).parameters) == 1:
                                     expr_sel = builder(model_cls)
                                 else:
-                                    continue  # skip complex builders for pushdown
+                                    continue  # skip builders needing session/info to avoid N+1
                             except Exception:
                                 continue
                             if expr_sel is None:
                                 continue
-                            # Expect a Select with multiple labeled columns
                             try:
                                 from sqlalchemy.sql import Select as _Select  # type: ignore
                             except Exception:
                                 _Select = None  # type: ignore
                             if _Select is not None and isinstance(expr_sel, _Select):
+                                # Build per-field scalar subqueries and compose a JSON object
                                 try:
                                     sel_cols = list(getattr(expr_sel, 'selected_columns', []))  # type: ignore[attr-defined]
                                 except Exception:
                                     sel_cols = []
-                                col_labels: List[str] = []
+                                key_exprs: list[tuple[str, Any]] = []
                                 for col in sel_cols:
                                     try:
                                         labeled = col
                                         col_name = getattr(labeled, 'name', None) or getattr(labeled, 'key', None)
                                         if not col_name:
-                                            col_name = f"{cf_name}_{len(col_labels)}"
+                                            col_name = f"{cf_name}_{len(key_exprs)}"
                                             labeled = col.label(col_name)
-                                        # Build correlated scalar subquery
                                         subq = select(labeled)
-                                        # add FROM / WHERE of original
                                         try:
                                             for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
                                                 subq = subq.select_from(_from)
@@ -1794,16 +1796,36 @@ class BerrySchema:
                                             pass
                                         for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
                                             subq = subq.where(_w)
-                                        if hasattr(subq, 'scalar_subquery'):
-                                            subq_expr = subq.scalar_subquery().label(col_name)
-                                        else:
-                                            subq_expr = subq.label(col_name)
-                                        select_columns.append(subq_expr)
-                                        col_labels.append(col_name)
+                                        subq_expr = subq.scalar_subquery() if hasattr(subq, 'scalar_subquery') else subq
+                                        key_exprs.append((col_name, subq_expr))
                                     except Exception:
                                         continue
-                                if col_labels:
-                                    custom_object_fields.append((cf_name, col_labels, cf_def.meta.get('returns')))
+                                if not key_exprs:
+                                    continue
+                                # MSSQL path: adapter.json_object is not available; select per-key labeled columns
+                                is_mssql = getattr(adapter, 'name', '') == 'mssql'
+                                if is_mssql:
+                                    labels: list[str] = []
+                                    for k, v in key_exprs:
+                                        lbl = f"_pushcf_{cf_name}__{k}"
+                                        try:
+                                            select_columns.append(v.label(lbl))
+                                        except Exception:
+                                            # Best-effort: wrap via text if needed
+                                            from sqlalchemy import literal_column
+                                            select_columns.append(literal_column(str(v)).label(lbl))
+                                        labels.append(lbl)
+                                    custom_object_fields.append((cf_name, labels, cf_def.meta.get('returns')))
+                                else:
+                                    # Compose JSON object using adapter.json_object
+                                    json_args: list[Any] = []
+                                    for k, v in key_exprs:
+                                        json_args.extend([_text(f"'{k}'"), v])
+                                    json_obj_expr = _json_object(*json_args)
+                                    # No null semantics: always return object, even when counts are zero
+                                    json_label = f"_pushcf_{cf_name}"
+                                    select_columns.append(json_obj_expr.label(json_label))
+                                    custom_object_fields.append((cf_name, [json_label], cf_def.meta.get('returns')))
                             else:
                                 continue
                         elif cf_def.kind == 'aggregate':
@@ -2540,32 +2562,106 @@ class BerrySchema:
                                         setattr(inst, cf_name, val)
                                     except Exception:
                                         pass
-                            # reconstruct custom object fields (all scalar subqueries executed in SELECT)
+                            # reconstruct custom object fields (prefer single JSON column if present)
                             if custom_object_fields:
-                                row_mapping = {}
-                                full_row = sa_rows[row_index]
                                 try:
-                                    for k in getattr(full_row, '_mapping').keys():
-                                        row_mapping[k] = full_row._mapping[k]
+                                    mapping = getattr(sa_rows[row_index], '_mapping')
                                 except Exception:
-                                    for i, v in enumerate(full_row):
-                                        row_mapping[f'_col_{i}'] = v
+                                    mapping = {}
                                 for cf_name, col_labels, returns_spec in custom_object_fields:
-                                    data_dict = {}
-                                    if isinstance(returns_spec, dict):
-                                        for k2 in returns_spec.keys():
-                                            if k2 in row_mapping:
-                                                data_dict[k2] = row_mapping[k2]
-                                    nested_type_name = f"{btype_cls.__name__}_{cf_name}_Type"
-                                    nested_type = self._st_types.get(nested_type_name)
-                                    if nested_type and data_dict:
+                                    obj = None
+                                    # If we labeled a JSON column for this field, use it; else assemble from multiple scalar labels (MSSQL)
+                                    json_col = col_labels[0] if (col_labels and len(col_labels) == 1) else None
+                                    raw_json = mapping[json_col] if (json_col and (json_col in mapping)) else None
+                                    # Optional debug: print available keys and value when enabled
+                                    try:
+                                        import os as _os
+                                        if _os.environ.get('BERRY_DEBUG') == '1' and json_col:
+                                            try:
+                                                print(f"[berry debug] custom_object '{cf_name}' json_col='{json_col}' keys={list(mapping.keys())}")
+                                                print(f"[berry debug] custom_object raw_json={raw_json!r}")
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                    if raw_json is not None:
+                                        import json as _json
+                                        parsed = None
                                         try:
-                                            obj = nested_type(**data_dict)
+                                            parsed = _json.loads(raw_json) if isinstance(raw_json, (str, bytes)) else raw_json
                                         except Exception:
-                                            obj = None
+                                            parsed = None
+                                        data_dict = parsed if isinstance(parsed, dict) else None
+                                        # MSSQL single-key labeled scalar value: build dict using label suffix
+                                        if data_dict is None and json_col and '__' in json_col:
+                                            try:
+                                                key = json_col.split('__', 1)[1]
+                                            except Exception:
+                                                key = json_col
+                                            data_dict = {key: parsed if parsed is not None else raw_json}
                                     else:
-                                        obj = data_dict or None
+                                        # MSSQL path: multiple scalar labeled columns like _pushcf_<field>__<key>
+                                        data_dict = None
+                                        try:
+                                            if col_labels and len(col_labels) > 1:
+                                                tmp: dict[str, Any] = {}
+                                                for lbl in col_labels:
+                                                    if lbl in mapping:
+                                                        # key is suffix after "__"
+                                                        try:
+                                                            key = lbl.split('__', 1)[1]
+                                                        except Exception:
+                                                            key = lbl
+                                                        tmp[key] = mapping[lbl]
+                                                data_dict = tmp
+                                        except Exception:
+                                            data_dict = None
+                                    # Filter keys to declared returns
+                                    if data_dict and isinstance(returns_spec, dict):
+                                        data_dict = {k: data_dict.get(k) for k in returns_spec.keys() if k in data_dict}
+                                        # Coerce values to expected Python types when possible (e.g., datetime)
+                                        try:
+                                            for k2, t2 in returns_spec.items():
+                                                if k2 in data_dict:
+                                                    v = data_dict[k2]
+                                                    # datetime from ISO string
+                                                    if t2 is datetime and isinstance(v, str):
+                                                        try:
+                                                            data_dict[k2] = datetime.fromisoformat(v)
+                                                        except Exception:
+                                                            # try common variant with 'T'
+                                                            try:
+                                                                data_dict[k2] = datetime.fromisoformat(v.replace(' ', 'T'))
+                                                            except Exception:
+                                                                pass
+                                        except Exception:
+                                            pass
+                                    if data_dict:
+                                        nested_type_name = f"{btype_cls.__name__}_{cf_name}_Type"
+                                        nested_type = self._st_types.get(nested_type_name)
+                                        try:
+                                            if nested_type is not None:
+                                                # Prefer constructing via kwargs to satisfy dataclass/strawberry init
+                                                try:
+                                                    obj = nested_type(**data_dict)
+                                                except Exception:
+                                                    obj = nested_type()
+                                                    for k, v in data_dict.items():
+                                                        try:
+                                                            setattr(obj, k, v)
+                                                        except Exception:
+                                                            pass
+                                            else:
+                                                obj = data_dict
+                                        except Exception:
+                                            obj = data_dict
+                                    # cache on instance and set public attribute as well
                                     setattr(inst, f"_{cf_name}_data", obj)
+                                    setattr(inst, f"_{cf_name}_prefetched", obj)
+                                    try:
+                                        setattr(inst, cf_name, obj)
+                                    except Exception:
+                                        pass
                             # hydrate pushed-down relation JSON
                             try:
                                 mapping = getattr(sa_rows[row_index], '_mapping')
@@ -2748,6 +2844,15 @@ class BerrySchema:
                                     cache_key = agg_def.meta.get('cache_key') or (agg_def.meta.get('source') + ':count')
                                     cache[cache_key] = val or 0
                             out.append(inst)
+                        # Explicitly close result to release DBAPI cursor (important for MSSQL without MARS)
+                        try:
+                            try:
+                                await result.close()  # type: ignore[func-returns-value]
+                            except TypeError:
+                                # some SQLAlchemy versions expose close() as sync
+                                result.close()
+                        except Exception:
+                            pass
                     return out
                 # Dynamically build a resolver with explicit filter args so Strawberry generates them
                 # Build function source

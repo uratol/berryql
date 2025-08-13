@@ -7,6 +7,7 @@ import os
 import sys
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from urllib.parse import quote_plus, unquote_plus
 
 from tests.models import Base
 
@@ -32,6 +33,22 @@ async def engine():
     if test_db_url:
         # Try to use the provided database URL
         try:
+            # For MSSQL aioodbc DSNs, enable MARS to avoid 'Connection is busy' during concurrent operations
+            try:
+                if test_db_url.startswith("mssql+aioodbc:///") and "odbc_connect=" in test_db_url:
+                    prefix = "mssql+aioodbc:///"  # preserve triple slash
+                    # Extract existing encoded odbc_connect value
+                    idx = test_db_url.find("odbc_connect=")
+                    if idx != -1:
+                        enc_val = test_db_url[idx + len("odbc_connect="):]
+                        dsn = unquote_plus(enc_val)
+                        if 'MARS_Connection' not in dsn and 'MultipleActiveResultSets' not in dsn:
+                            if not dsn.endswith(';'):
+                                dsn += ';'
+                            dsn += 'MARS_Connection=Yes;MultipleActiveResultSets=True'
+                            test_db_url = prefix + "?odbc_connect=" + quote_plus(dsn)
+            except Exception:
+                pass
             if test_db_url.startswith("postgresql"):
                 # PostgreSQL with asyncpg - use minimal connection args to avoid event loop issues
                 engine = create_async_engine(
