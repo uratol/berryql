@@ -50,8 +50,7 @@ async def test_single_object_relations_and_count(db_session, populated_db):
       dialect_name = db_session.get_bind().dialect.name.lower()
     except Exception:
       dialect_name = 'sqlite'
-    if dialect_name.startswith('mssql'):
-      pytest.skip("Relation pushdown disabled for MSSQL adapter")
+  # MSSQL now supports relation pushdown; enforce same query count
     assert query_counter['count'] == 2, f"Expected 2 SQL queries (one per root field), got {query_counter['count']}"
   finally:
     event.remove(engine, "before_cursor_execute", before_cursor_execute)

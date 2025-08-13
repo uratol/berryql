@@ -46,12 +46,7 @@ async def test_nested_relations_query_count(db_session, populated_db):
                 assert "posts" in data
                 for p in data["posts"]:
                         assert "post_comments" in p
-                try:
-                        dialect_name = db_session.get_bind().dialect.name.lower()
-                except Exception:
-                        dialect_name = 'sqlite'
-                if dialect_name.startswith('mssql'):
-                        pytest.skip("Relation pushdown disabled for MSSQL adapter")
+
                 assert query_counter['count'] == 2, f"Expected 2 SQL queries, got {query_counter['count']}"
         finally:
                 event.remove(engine, "before_cursor_execute", before_cursor_execute)

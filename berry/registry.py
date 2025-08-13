@@ -588,6 +588,8 @@ class BerrySchema:
                         pass
                     # Helper to recursively build relation JSON expressions
                     def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
+                        if 'mssql' in dialect_name:
+                            return None  # skip legacy JSON aggregation path for MSSQL
                         target_name = rel_cfg.get('target')
                         target_b = self.types.get(target_name)
                         if not target_b or not target_b.model:
@@ -803,8 +805,9 @@ class BerrySchema:
                                             subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
                                             select_columns.append(subq_cnt)
                                             count_aggregates.append((cf_name, cf_def))
-                    # Disable relation pushdown if adapter does not support it (e.g., MSSQL placeholder)
-                    if not adapter.supports_relation_pushdown():
+                    # MSSQL special handling: we'll emulate JSON aggregation via FOR JSON PATH
+                    mssql_mode = hasattr(adapter, 'name') and adapter.name == 'mssql'
+                    if not adapter.supports_relation_pushdown() and not mssql_mode:
                         requested_relations = {}
                     # Push down relation JSON arrays/objects
                     for rel_name, rel_cfg in requested_relations.items():
@@ -829,7 +832,7 @@ class BerrySchema:
                         # Determine projected scalar fields
                         requested_scalar = rel_cfg.get('fields') or []
                         if rel_cfg.get('single'):
-                            # Single relation: build json_object
+                            # Single relation: build json object
                             proj_cols = []
                             if not requested_scalar:
                                 # default to all scalar fields of target
@@ -839,22 +842,33 @@ class BerrySchema:
                             for sf in requested_scalar:
                                 if sf in child_model_cls.__table__.columns:
                                     proj_cols.append(sf)
-                            json_args: List[Any] = []
-                            for sf in proj_cols:
-                                json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
-                            json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
-                            rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id", None))
-                            # Fallback join via fk if id direct column missing
-                            try:
-                                if not any(c.name == f"{rel_name}_id" for c in model_cls.__table__.columns):
-                                    rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == fk_col)
-                            except Exception:
-                                pass
-                            rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
-                            select_columns.append(rel_expr)
+                            if mssql_mode:
+                                if not proj_cols:
+                                    proj_cols = ['id']
+                                join_cond = f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{rel_name}_id]"
+                                rel_expr = adapter.build_single_relation_json(
+                                    child_table=child_model_cls.__tablename__,
+                                    projected_columns=proj_cols,
+                                    join_condition=join_cond,
+                                ).label(f"_pushrel_{rel_name}")
+                                select_columns.append(rel_expr)
+                            else:
+                                json_args: List[Any] = []
+                                for sf in proj_cols:
+                                    json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
+                                json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
+                                rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id", None))
+                                # Fallback join via fk if id direct column missing
+                                try:
+                                    if not any(c.name == f"{rel_name}_id" for c in model_cls.__table__.columns):
+                                        rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == fk_col)
+                                except Exception:
+                                    pass
+                                rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
+                                select_columns.append(rel_expr)
                         else:
                             # List relation (possibly with nested) JSON aggregation
-                            # Rebuild list relation JSON using adapter aware functions (override helper inside)
+                            # Rebuild list relation JSON: adapter-aware; MSSQL via FOR JSON PATH
                             def _build_list_relation_json_adapter(parent_model_cls, parent_btype, rel_cfg_local):
                                 target_name_i = rel_cfg_local.get('target')
                                 target_b_i = self.types.get(target_name_i)
@@ -877,6 +891,18 @@ class BerrySchema:
                                         if sdef.kind == 'scalar':
                                             requested_scalar_i.append(sf)
                                 inner_cols_i = [getattr(child_model_cls_i, c) for c in requested_scalar_i] if requested_scalar_i else [getattr(child_model_cls_i, 'id')]
+                                if mssql_mode:
+                                    parent_table = parent_model_cls.__tablename__
+                                    child_table = child_model_cls_i.__tablename__
+                                    where_clause = f"[{child_table}].[{fk_col_i.name}] = [{parent_table}].[id]"
+                                    order_clause = f"[{child_table}].[id]" if 'id' in child_model_cls_i.__table__.columns else None
+                                    return adapter.build_list_relation_json(
+                                        child_table=child_table,
+                                        projected_columns=requested_scalar_i,
+                                        where_condition=where_clause,
+                                        limit=rel_cfg_local.get('limit'),
+                                        order_by=order_clause,
+                                    )
                                 inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == parent_model_cls.id).correlate(parent_model_cls)
                                 try:
                                     if 'id' in child_model_cls_i.__table__.columns:
@@ -892,6 +918,8 @@ class BerrySchema:
                                 for sf in requested_scalar_i if requested_scalar_i else ['id']:
                                     row_json_args_i.extend([_text(f"'{sf}'"), getattr(limited_subq_i.c, sf)])
                                 # nested not reimplemented here (fallback to earlier recursive version if needed)
+                                if mssql_mode:
+                                    return None  # handled above
                                 row_json_expr_i = _json_object(*row_json_args_i)
                                 agg_inner_expr_i = _json_array_agg(row_json_expr_i)
                                 if agg_inner_expr_i is None:
@@ -900,7 +928,15 @@ class BerrySchema:
                                 return agg_query_i
                             nested_expr = _build_list_relation_json_adapter(model_cls, btype_cls, rel_cfg)
                             if nested_expr is not None:
-                                select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
+                                if mssql_mode:
+                                    # Wrap TextClause into a labeled column using scalar_subquery style text
+                                    try:
+                                        select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
+                                    except Exception:
+                                        from sqlalchemy import literal_column
+                                        select_columns.append(literal_column(str(nested_expr)).label(f"_pushrel_{rel_name}"))
+                                else:
+                                    select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                     stmt = select(*select_columns)
                     if offset:
                         stmt = stmt.offset(offset)

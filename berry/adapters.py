@@ -34,14 +34,44 @@ class PostgresAdapter(BaseAdapter):
 class MSSQLAdapter(BaseAdapter):
     name = 'mssql'
     def json_object(self, *args):
-        # Basic single pair fallback; full JSON support TBD
-        return func.concat('{', args[0], ':', args[1], '}') if len(args) >= 2 else func.concat('{','}')
+        # Not used directly; registry composes JSON via FOR JSON PATH.
+        return None
     def json_array_agg(self, expr):
-        return None  # signal unsupported
+        # Force registry to use custom MSSQL aggregation path.
+        return None
     def json_array_coalesce(self, expr):
         return None
     def supports_relation_pushdown(self) -> bool:
-        return False
+        return True
+
+    # --- MSSQL specific helpers -------------------------------------------------
+    def build_single_relation_json(self, *, child_table: str, projected_columns: list[str], join_condition: str) -> Any:
+        """Build a FOR JSON PATH sub-select for a single related object.
+
+        Parameters:
+            child_table: table name of related entity
+            projected_columns: list of column names to include
+            join_condition: raw SQL condition joining related row(s) to parent
+        Returns a TextClause producing a JSON object string or 'null'.
+        """
+        cols = projected_columns or ['id']
+        col_list = ', '.join([f"[{child_table}].[{c}]" for c in cols])
+        raw = (
+            f"ISNULL((SELECT TOP 1 {col_list} FROM {child_table} WHERE {join_condition} "
+            f"FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
+        )
+        return _text(raw)
+
+    def build_list_relation_json(self, *, child_table: str, projected_columns: list[str], where_condition: str, limit: int | None, order_by: str | None) -> Any:
+        """Build a FOR JSON PATH list aggregation for a to-many relation."""
+        cols = projected_columns or ['id']
+        select_cols = ', '.join([f"[{child_table}].[{c}] AS [{c}]" for c in cols])
+        top_clause = f"TOP ({int(limit)}) " if limit is not None else ''
+        order_clause = f" ORDER BY {order_by}" if order_by else ''
+        raw = (
+            f"ISNULL((SELECT {top_clause}{select_cols} FROM {child_table} WHERE {where_condition}{order_clause} FOR JSON PATH),'[]')"
+        )
+        return _text(raw)
 
 def get_adapter(dialect_name: str) -> BaseAdapter:
     dn = (dialect_name or '').lower()
