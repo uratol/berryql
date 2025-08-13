@@ -23,6 +23,7 @@ from strawberry.fastapi import GraphQLRouter
 # Reuse test models and the already-built Strawberry schema from tests
 from tests.models import Base, User, Post, PostComment  # type: ignore
 from tests.schema import schema  # Strawberry schema built from Berry DSL
+from tests.fixtures import seed_populated_db  # reuse test seeding logic
 
 app = FastAPI(title="BerryQL GraphQL Playground")
 
@@ -57,49 +58,12 @@ async def _init_db(app: FastAPI) -> None:
 
             users_count = (await session.execute(select(User).limit(1))).first()
             if not users_count:
-                await _seed_demo(session)
+                await seed_populated_db(session)
 
 
 async def _seed_demo(session: AsyncSession) -> None:
-    """Seed data mirroring tests/fixtures.py for consistency."""
-    from datetime import datetime, timezone, timedelta
-
-    # Users
-    users = [
-        User(name="Alice Johnson", email="alice@example.com", is_admin=True),
-        User(name="Bob Smith", email="bob@example.com", is_admin=False),
-        User(name="Charlie Brown", email="charlie@example.com", is_admin=False),
-        User(name="Dave NoPosts", email="dave@example.com", is_admin=False),
-    ]
-    session.add_all(users)
-    await session.flush()
-    u1, u2, u3, _ = users
-
-    # Posts with deterministic created_at
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    posts = [
-        Post(title="First Post", content="Hello world!", author_id=u1.id, created_at=now - timedelta(minutes=60)),
-        Post(title="GraphQL is Great", content="I love GraphQL!", author_id=u1.id, created_at=now - timedelta(minutes=45)),
-        Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=u2.id, created_at=now - timedelta(minutes=30)),
-        Post(title="Python Best Practices", content="Here are some tips...", author_id=u2.id, created_at=now - timedelta(minutes=15)),
-        Post(title="Getting Started", content="A beginner's guide", author_id=u3.id, created_at=now - timedelta(minutes=5)),
-    ]
-    session.add_all(posts)
-    await session.flush()
-    p1, p2, p3, p4, p5 = posts
-
-    # Comments
-    post_comments = [
-        PostComment(content="Great post!", post_id=p1.id, author_id=u2.id, rate=2),
-        PostComment(content="Thanks for sharing!", post_id=p1.id, author_id=u3.id, rate=1),
-        PostComment(content="I agree completely!", post_id=p2.id, author_id=u2.id, rate=3),
-        PostComment(content="Very helpful tips", post_id=p3.id, author_id=u1.id, rate=1),
-        PostComment(content="Nice work!", post_id=p3.id, author_id=u3.id, rate=2),
-        PostComment(content="Looking forward to more", post_id=p4.id, author_id=u1.id, rate=1),
-        PostComment(content="This helped me a lot", post_id=p5.id, author_id=u2.id, rate=5),
-    ]
-    session.add_all(post_comments)
-    await session.commit()
+    # Kept for backward compatibility; now delegates to shared test seeding
+    await seed_populated_db(session)
 
 
 # Create/cleanup one DB session per request
