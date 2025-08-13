@@ -279,11 +279,36 @@ class BerrySchema:
                     else:  # fallback placeholder
                         annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     meta_copy = dict(fdef.meta)
+                    def _collect_declared_filters_for_target(target_type_name: str):
+                        out: Dict[str, FilterSpec] = {}
+                        target_b = self.types.get(target_type_name)
+                        if not target_b:
+                            return out
+                        class_filters = getattr(target_b, '__filters__', {}) or {}
+                        for key, raw in class_filters.items():
+                            try:
+                                spec = _normalize_filter_spec(raw)
+                            except Exception:
+                                continue
+                            if spec.ops and not spec.op:
+                                for op_name in spec.ops:
+                                    base = spec.alias or key
+                                    if base.endswith(f"_{op_name}"):
+                                        arg_name = base
+                                    else:
+                                        arg_name = f"{base}_{op_name}"
+                                    out[arg_name] = spec.clone_with(op=op_name, ops=None)
+                            else:
+                                out[spec.alias or key] = spec
+                        return out
                     def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single, fname_local=fname):
-                        async def relation_resolver(self, info: StrawberryInfo, limit: Optional[int] = None, offset: Optional[int] = None):  # noqa: D401
-                            # Fast path: prefetched via root pushdown
+                        target_filters = _collect_declared_filters_for_target(meta_copy.get('target')) if meta_copy.get('target') else {}
+                        # Build dynamic resolver with filter args + limit/offset
+                        # Determine python types for target columns (if available) for future use (not required for arg defs now)
+                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], _filter_args: Dict[str, Any]):
                             prefetch_attr = f'_{fname_local}_prefetched'
                             if hasattr(self, prefetch_attr):
+                                # Reuse prefetched always (root pushdown included pagination already)
                                 return getattr(self, prefetch_attr)
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
@@ -309,7 +334,48 @@ class BerrySchema:
                                         break
                                 if candidate_fk_val is None:
                                     return None
-                                row = await session.get(child_model_cls, candidate_fk_val)
+                                # Apply filters via query if any filter args passed
+                                if any(v is not None for v in _filter_args.values()):
+                                    from sqlalchemy import select as _select
+                                    stmt = _select(child_model_cls).where(getattr(child_model_cls, 'id') == candidate_fk_val)
+                                    # Add filter where clauses
+                                    for arg_name, val in _filter_args.items():
+                                        if val is None:
+                                            continue
+                                        f_spec = target_filters.get(arg_name)
+                                        if not f_spec:
+                                            continue
+                                        expr = None
+                                        if f_spec.transform:
+                                            try:
+                                                val = f_spec.transform(val)
+                                            except Exception:
+                                                continue
+                                        if f_spec.builder:
+                                            try:
+                                                expr = f_spec.builder(child_model_cls, info, val)
+                                            except Exception:
+                                                expr = None
+                                        elif f_spec.column:
+                                            try:
+                                                col = child_model_cls.__table__.c.get(f_spec.column)
+                                            except Exception:
+                                                col = None
+                                            if col is None:
+                                                continue
+                                            op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                            if not op_fn:
+                                                continue
+                                            try:
+                                                expr = op_fn(col, val)
+                                            except Exception:
+                                                expr = None
+                                        if expr is not None:
+                                            stmt = stmt.where(expr)
+                                    result = await session.execute(stmt.limit(1))
+                                    row = result.scalar_one_or_none()
+                                else:
+                                    row = await session.get(child_model_cls, candidate_fk_val)
                                 if not row:
                                     return None
                                 inst = target_cls_i()
@@ -334,6 +400,42 @@ class BerrySchema:
                                 return []
                             from sqlalchemy import select as _select
                             stmt = _select(child_model_cls).where(fk_col == getattr(parent_model, 'id'))
+                            # Apply filters
+                            if target_filters:
+                                for arg_name, val in _filter_args.items():
+                                    if val is None:
+                                        continue
+                                    f_spec = target_filters.get(arg_name)
+                                    if not f_spec:
+                                        continue
+                                    orig_val = val
+                                    if f_spec.transform:
+                                        try:
+                                            val = f_spec.transform(val)
+                                        except Exception:
+                                            continue
+                                    expr = None
+                                    if f_spec.builder:
+                                        try:
+                                            expr = f_spec.builder(child_model_cls, info, val)
+                                        except Exception:
+                                            expr = None
+                                    elif f_spec.column:
+                                        try:
+                                            col = child_model_cls.__table__.c.get(f_spec.column)
+                                        except Exception:
+                                            col = None
+                                        if col is None:
+                                            continue
+                                        op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                        if not op_fn:
+                                            continue
+                                        try:
+                                            expr = op_fn(col, val)
+                                        except Exception:
+                                            expr = None
+                                    if expr is not None:
+                                        stmt = stmt.where(expr)
                             if offset:
                                 stmt = stmt.offset(offset)
                             if limit is not None:
@@ -352,7 +454,51 @@ class BerrySchema:
                                             pass
                                 out.append(inst)
                             return out
-                        return relation_resolver
+                        # Build dynamic wrapper to expose filter args
+                        arg_defs = []
+                        for a in target_filters.keys():
+                            arg_defs.append(f"{a}=None")
+                        params = 'self, info, limit=None, offset=None'
+                        if arg_defs:
+                            params += ', ' + ', '.join(arg_defs)
+                        fname_inner = f"_rel_{fname_local}_resolver"
+                        src = f"async def {fname_inner}({params}):\n" \
+                              f"    _fa={{}}\n"
+                        for a in target_filters.keys():
+                            src += f"    _fa['{a}']={a}\n"
+                        src += "    return await _impl(self, info, limit, offset, _fa)\n"
+                        env: Dict[str, Any] = {'_impl': _impl}
+                        exec(src, env)
+                        fn = env[fname_inner]
+                        if not getattr(fn, '__module__', None):  # ensure module for strawberry introspection
+                            fn.__module__ = __name__
+                        # annotations
+                        anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int]}
+                        # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
+                        target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
+                        col_type_map: Dict[str, Any] = {}
+                        if target_b and target_b.model and hasattr(target_b.model, '__table__'):
+                            for col in target_b.model.__table__.columns:
+                                if isinstance(col.type, Integer):
+                                    col_type_map[col.name] = int
+                                elif isinstance(col.type, String):
+                                    col_type_map[col.name] = str
+                                elif isinstance(col.type, Boolean):
+                                    col_type_map[col.name] = bool
+                                elif isinstance(col.type, DateTime):
+                                    col_type_map[col.name] = datetime
+                                else:
+                                    col_type_map[col.name] = str
+                        for a, spec in target_filters.items():
+                            base_t = str
+                            if spec.column and spec.column in col_type_map:
+                                base_t = col_type_map[spec.column]
+                            if spec.op in ('in','between'):
+                                anns[a] = Optional[List[base_t]]  # type: ignore
+                            else:
+                                anns[a] = Optional[base_t]
+                        fn.__annotations__ = anns
+                        return fn
                     setattr(st_cls, fname, strawberry.field(_make_relation_resolver()))
                 elif fdef.kind == 'aggregate':
                     # Normalize meta: if ops contains 'count' without explicit op, set op='count'
@@ -676,12 +822,23 @@ class BerrySchema:
                     custom_fields: List[tuple[str, Any]] = []
                     custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
                     select_columns: List[Any] = [model_cls]
-                    # Discover requested relation fields & their sub-selections/args via strawberry info
+                    # Unified relation extraction (strawberry selected_fields + GraphQL AST) with recursion
                     requested_relations: Dict[str, Dict[str, Any]] = {}
-                    def _extract_relations(sel, btype):
-                        rels: Dict[str, Dict[str, Any]] = {}
+                    def _init_rel_cfg(name: str, fdef) -> Dict[str, Any]:
+                        return {
+                            'fields': [],
+                            'limit': None,
+                            'offset': None,
+                            'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
+                            'target': fdef.meta.get('target'),
+                            'nested': {},
+                            'skip_pushdown': False,
+                            'filter_args': {}
+                        }
+                    # --- Strawberry selected_fields path ---
+                    def _walk_selected(sel, btype):
                         if not getattr(sel, 'selections', None) or not btype:
-                            return rels
+                            return
                         for child in sel.selections:
                             name = getattr(child, 'name', None)
                             if not name:
@@ -689,45 +846,124 @@ class BerrySchema:
                             fdef = getattr(btype, '__berry_fields__', {}).get(name)
                             if not fdef or fdef.kind != 'relation':
                                 continue
-                            rel_limit = None
-                            rel_offset = None
+                            rel_cfg = requested_relations.setdefault(name, _init_rel_cfg(name, fdef))
                             try:
                                 for arg in getattr(child, 'arguments', []) or []:
+                                    raw_val = getattr(arg, 'value', None)
+                                    try:
+                                        if hasattr(raw_val, 'value') and raw_val is not None and raw_val.__class__.__name__ != 'datetime':
+                                            inner_v = getattr(raw_val, 'value')
+                                            if isinstance(inner_v, (int, str, float, bool)):
+                                                raw_val = inner_v
+                                    except Exception:
+                                        pass
                                     if arg.name == 'limit':
-                                        rel_limit = arg.value
+                                        rel_cfg['limit'] = raw_val
                                     elif arg.name == 'offset':
-                                        rel_offset = arg.value
+                                        rel_cfg['offset'] = raw_val
+                                    else:
+                                        rel_cfg['filter_args'][arg.name] = raw_val
                             except Exception:
                                 pass
-                            sub_scalars = []
+                            # Scalars requested
                             if getattr(child, 'selections', None):
                                 for sub in child.selections:
                                     sub_name = getattr(sub, 'name', None)
-                                    # Scalars for this relation level
                                     if sub_name and not sub_name.startswith('__'):
-                                        sub_def = getattr(self.types.get(fdef.meta.get('target')), '__berry_fields__', {}).get(sub_name) if fdef.meta.get('target') else None
+                                        tgt_b = self.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
+                                        sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
                                         if not sub_def or sub_def.kind == 'scalar':
-                                            sub_scalars.append(sub_name)
-                            nested = {}
-                            # Recurse for nested relations
+                                            if sub_name not in rel_cfg['fields']:
+                                                rel_cfg['fields'].append(sub_name)
+                            # Recurse nested
                             try:
-                                nested = _extract_relations(child, self.types.get(fdef.meta.get('target')))
+                                _walk_selected(child, self.types.get(fdef.meta.get('target')))
                             except Exception:
-                                nested = {}
-                            rels[name] = {
-                                'fields': sub_scalars,
-                                'limit': rel_limit,
-                                'offset': rel_offset,
-                                'single': fdef.meta.get('single') or fdef.meta.get('mode') == 'single',
-                                'target': fdef.meta.get('target'),
-                                'nested': nested
-                            }
-                        return rels
+                                pass
                     try:
                         if info and getattr(info, 'selected_fields', None):
-                            matching_roots = [sf for sf in info.selected_fields if getattr(sf, 'name', None) == root_field_name]
-                            for root_sel in matching_roots:
-                                requested_relations.update(_extract_relations(root_sel, btype_cls))
+                            for root_sel in [sf for sf in info.selected_fields if getattr(sf, 'name', None) == root_field_name]:
+                                _walk_selected(root_sel, btype_cls)
+                    except Exception:
+                        pass
+                    # --- GraphQL AST fallback path (full recursion) ---
+                    def _value_from_ast(node):  # minimal scalar + list support
+                        try:
+                            from graphql.language import ast as _gast
+                            if isinstance(node, _gast.IntValueNode):
+                                return int(node.value)
+                            if isinstance(node, _gast.FloatValueNode):
+                                return float(node.value)
+                            if isinstance(node, _gast.StringValueNode):
+                                return node.value
+                            if isinstance(node, _gast.BooleanValueNode):
+                                return bool(node.value)
+                            if isinstance(node, _gast.NullValueNode):
+                                return None
+                            if isinstance(node, _gast.ListValueNode):
+                                return [_value_from_ast(v) for v in node.values]
+                            if hasattr(node, 'value'):
+                                return getattr(node, 'value')
+                        except Exception:
+                            return None
+                        return None
+                    def _walk_ast(selection_set, btype):
+                        if not selection_set or not btype:
+                            return
+                        for child in getattr(selection_set, 'selections', []) or []:
+                            name_node = getattr(child, 'name', None)
+                            name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
+                            if not name:
+                                continue
+                            fdef = getattr(btype, '__berry_fields__', {}).get(name)
+                            if not fdef or fdef.kind != 'relation':
+                                # still descend for other fields to catch deeper relations under objects? skip for scalars
+                                continue
+                            rel_cfg = requested_relations.setdefault(name, _init_rel_cfg(name, fdef))
+                            for arg in getattr(child, 'arguments', []) or []:
+                                arg_name_node = getattr(arg, 'name', None)
+                                arg_name = getattr(arg_name_node, 'value', None) if arg_name_node and not isinstance(arg_name_node, str) else arg_name_node
+                                if not arg_name:
+                                    continue
+                                if arg_name == 'limit':
+                                    rel_cfg['limit'] = _value_from_ast(arg.value)
+                                elif arg_name == 'offset':
+                                    rel_cfg['offset'] = _value_from_ast(arg.value)
+                                else:
+                                    rel_cfg['filter_args'][arg_name] = _value_from_ast(arg.value)
+                            # scalar subfields
+                            sub_scalars = []
+                            if getattr(child, 'selection_set', None):
+                                tgt_b = self.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
+                                for sub in getattr(child.selection_set, 'selections', []) or []:
+                                    sub_name_node = getattr(sub, 'name', None)
+                                    sub_name = getattr(sub_name_node, 'value', None) if sub_name_node and not isinstance(sub_name_node, str) else sub_name_node
+                                    if not sub_name:
+                                        continue
+                                    sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
+                                    if not sub_def or sub_def.kind == 'scalar':
+                                        sub_scalars.append(sub_name)
+                                if sub_scalars:
+                                    for s in sub_scalars:
+                                        if s not in rel_cfg['fields']:
+                                            rel_cfg['fields'].append(s)
+                                # recurse deeper
+                                try:
+                                    _walk_ast(getattr(child, 'selection_set', None), self.types.get(fdef.meta.get('target')))
+                                except Exception:
+                                    pass
+                    try:
+                        # Run AST walk only if any relation lacks args OR no relations captured yet
+                        raw_info = getattr(info, '_raw_info', None)
+                        if raw_info and hasattr(raw_info, 'field_nodes'):
+                            need_ast = (not requested_relations) or any((cfg.get('limit') is None and cfg.get('offset') is None and not cfg.get('filter_args')) for cfg in requested_relations.values())
+                            if need_ast:
+                                for fn in raw_info.field_nodes:
+                                    # find the root fieldNode matching root_field_name
+                                    name_node = getattr(fn, 'name', None)
+                                    root_name = getattr(name_node, 'value', None) if name_node and not isinstance(name_node, str) else name_node
+                                    if root_name == root_field_name:
+                                        _walk_ast(getattr(fn, 'selection_set', None), btype_cls)
                     except Exception:
                         pass
                     # Helper to recursively build relation JSON expressions
@@ -762,10 +998,16 @@ class BerrySchema:
                                 inner_sel = inner_sel.order_by(getattr(child_model_cls, 'id'))
                         except Exception:
                             pass
-                        if rel_cfg.get('offset'):
-                            inner_sel = inner_sel.offset(rel_cfg['offset'])
+                        if rel_cfg.get('offset') is not None:
+                            try:
+                                inner_sel = inner_sel.offset(int(rel_cfg['offset']))
+                            except Exception:
+                                inner_sel = inner_sel.offset(rel_cfg['offset'])
                         if rel_cfg.get('limit') is not None:
-                            inner_sel = inner_sel.limit(rel_cfg['limit'])
+                            try:
+                                inner_sel = inner_sel.limit(int(rel_cfg['limit']))
+                            except Exception:
+                                inner_sel = inner_sel.limit(rel_cfg['limit'])
                         limited_subq = inner_sel.subquery()
                         row_json_args: List[Any] = []
                         # Scalars
@@ -955,6 +1197,8 @@ class BerrySchema:
                         requested_relations = {}
                     # Push down relation JSON arrays/objects
                     for rel_name, rel_cfg in requested_relations.items():
+                        if rel_cfg.get('skip_pushdown'):
+                            continue
                         target_name = rel_cfg.get('target')
                         if not target_name:
                             continue
@@ -1008,6 +1252,64 @@ class BerrySchema:
                                         rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == fk_col)
                                 except Exception:
                                     pass
+                                # Apply filter args if any
+                                try:
+                                    filter_args = rel_cfg.get('filter_args') or {}
+                                    if filter_args:
+                                        # collect declared filters for target
+                                        target_btype = self.types.get(target_name)
+                                        if target_btype:
+                                            # replicate root filter expansion logic
+                                            class_filters = getattr(target_btype, '__filters__', {}) or {}
+                                            expanded: Dict[str, FilterSpec] = {}
+                                            for key, raw in class_filters.items():
+                                                try:
+                                                    spec = _normalize_filter_spec(raw)
+                                                except Exception:
+                                                    continue
+                                                if spec.ops and not spec.op:
+                                                    for op_name in spec.ops:
+                                                        base = spec.alias or key
+                                                        if base.endswith(f"_{op_name}"):
+                                                            an = base
+                                                        else:
+                                                            an = f"{base}_{op_name}"
+                                                        expanded[an] = spec.clone_with(op=op_name, ops=None)
+                                                else:
+                                                    expanded[spec.alias or key] = spec
+                                            for arg_name, val in filter_args.items():
+                                                f_spec = expanded.get(arg_name)
+                                                if not f_spec:
+                                                    continue
+                                                if f_spec.transform:
+                                                    try:
+                                                        val = f_spec.transform(val)
+                                                    except Exception:
+                                                        continue
+                                                expr = None
+                                                if f_spec.builder:
+                                                    try:
+                                                        expr = f_spec.builder(child_model_cls, info, val)
+                                                    except Exception:
+                                                        expr = None
+                                                elif f_spec.column:
+                                                    try:
+                                                        col = child_model_cls.__table__.c.get(f_spec.column)
+                                                    except Exception:
+                                                        col = None
+                                                    if col is None:
+                                                        continue
+                                                    op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                                    if not op_fn:
+                                                        continue
+                                                    try:
+                                                        expr = op_fn(col, val)
+                                                    except Exception:
+                                                        expr = None
+                                                if expr is not None:
+                                                    rel_subq = rel_subq.where(expr)
+                                except Exception:
+                                    pass
                                 rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
                                 select_columns.append(rel_expr)
                         else:
@@ -1048,15 +1350,77 @@ class BerrySchema:
                                         order_by=order_clause,
                                     )
                                 inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == parent_model_cls.id).correlate(parent_model_cls)
+                                # Apply filter args for list relation
+                                try:
+                                    filter_args = rel_cfg.get('filter_args') or {}
+                                    if filter_args:
+                                        target_btype = self.types.get(rel_cfg.get('target'))
+                                        if target_btype:
+                                            class_filters = getattr(target_btype, '__filters__', {}) or {}
+                                            expanded: Dict[str, FilterSpec] = {}
+                                            for key, raw in class_filters.items():
+                                                try:
+                                                    spec = _normalize_filter_spec(raw)
+                                                except Exception:
+                                                    continue
+                                                if spec.ops and not spec.op:
+                                                    for op_name in spec.ops:
+                                                        base = spec.alias or key
+                                                        if base.endswith(f"_{op_name}"):
+                                                            an = base
+                                                        else:
+                                                            an = f"{base}_{op_name}"
+                                                        expanded[an] = spec.clone_with(op=op_name, ops=None)
+                                                else:
+                                                    expanded[spec.alias or key] = spec
+                                            for arg_name, val in filter_args.items():
+                                                f_spec = expanded.get(arg_name)
+                                                if not f_spec:
+                                                    continue
+                                                if f_spec.transform:
+                                                    try:
+                                                        val = f_spec.transform(val)
+                                                    except Exception:
+                                                        continue
+                                                expr = None
+                                                if f_spec.builder:
+                                                    try:
+                                                        expr = f_spec.builder(child_model_cls_i, info, val)
+                                                    except Exception:
+                                                        expr = None
+                                                elif f_spec.column:
+                                                    try:
+                                                        col = child_model_cls_i.__table__.c.get(f_spec.column)
+                                                    except Exception:
+                                                        col = None
+                                                    if col is None:
+                                                        continue
+                                                    op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                                    if not op_fn:
+                                                        continue
+                                                    try:
+                                                        expr = op_fn(col, val)
+                                                    except Exception:
+                                                        expr = None
+                                                if expr is not None:
+                                                    inner_sel_i = inner_sel_i.where(expr)
+                                except Exception:
+                                    pass
                                 try:
                                     if 'id' in child_model_cls_i.__table__.columns:
                                         inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id'))
                                 except Exception:
                                     pass
-                                if rel_cfg_local.get('offset'):
-                                    inner_sel_i = inner_sel_i.offset(rel_cfg_local['offset'])
+                                if rel_cfg_local.get('offset') is not None:
+                                    try:
+                                        inner_sel_i = inner_sel_i.offset(int(rel_cfg_local['offset']))
+                                    except Exception:
+                                        inner_sel_i = inner_sel_i.offset(rel_cfg_local['offset'])
                                 if rel_cfg_local.get('limit') is not None:
-                                    inner_sel_i = inner_sel_i.limit(rel_cfg_local['limit'])
+                                    try:
+                                        inner_sel_i = inner_sel_i.limit(int(rel_cfg_local['limit']))
+                                    except Exception:
+                                        inner_sel_i = inner_sel_i.limit(rel_cfg_local['limit'])
                                 limited_subq_i = inner_sel_i.subquery()
                                 row_json_args_i: List[Any] = []
                                 for sf in requested_scalar_i if requested_scalar_i else ['id']:
@@ -1229,6 +1593,16 @@ class BerrySchema:
                                         else:
                                             built_value = parsed_value
                                         setattr(inst, f"_{rel_name}_prefetched", built_value)
+                                        # record pushdown meta for pagination reuse
+                                        meta_map = getattr(inst, '_pushdown_meta', None)
+                                        if meta_map is None:
+                                            meta_map = {}
+                                            setattr(inst, '_pushdown_meta', meta_map)
+                                        meta_map[rel_name] = {
+                                            'limit': rel_cfg.get('limit'),
+                                            'offset': rel_cfg.get('offset'),
+                                            'from_pushdown': True
+                                        }
                                         # Also assign to public attribute to avoid resolver DB path
                                         try:
                                             setattr(inst, rel_name, built_value)
