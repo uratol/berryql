@@ -8,7 +8,7 @@ import sys
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-from .models import Base
+from tests.common.models import Base
 
 # Try to load environment variables from .env file
 load_dotenv()
@@ -105,4 +105,4 @@ async def db_session(engine) -> AsyncGenerator[AsyncSession, None]:
 
 
 # Import fixtures from fixtures module
-from .fixtures import sample_users, sample_posts, sample_comments, populated_db
+from tests.common.fixtures import sample_users, sample_posts, sample_comments, populated_db

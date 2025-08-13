@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from berryql import BerryQLFactory
 from .schema import schema
-from .models import User, Post
+from tests.common.models import User, Post
 @pytest.fixture
 async def berryql_factory():
     """Create BerryQL factory."""
