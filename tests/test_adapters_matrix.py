@@ -1,7 +1,7 @@
 import os
 import pytest
 
-from berry.adapters import get_adapter, SQLiteAdapter, PostgresAdapter, MSSQLAdapter
+from berryql.adapters import get_adapter, SQLiteAdapter, PostgresAdapter, MSSQLAdapter
 
 
 @pytest.mark.parametrize("dialect,cls", [

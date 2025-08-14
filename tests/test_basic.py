@@ -1,5 +1,5 @@
 import pytest
-from berry import BerrySchema, BerryType, field, relation, count
+from berryql import BerrySchema, BerryType, field, relation, count
 
 schema = BerrySchema()
 

@@ -25,7 +25,7 @@ from strawberry.fastapi import GraphQLRouter
 
 # Reuse test models and the already-built Strawberry schema from tests
 from tests.models import Base, User, Post, PostComment  # type: ignore
-from tests.schema import schema  # Strawberry schema built from Berry DSL
+from tests.schema import schema  # Strawberry schema built from berryql DSL
 from tests.fixtures import seed_populated_db  # reuse test seeding logic
 
 app = FastAPI(title="BerryQL GraphQL Playground")
