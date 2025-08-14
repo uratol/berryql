@@ -28,7 +28,9 @@ T = TypeVar('T')
 # --- Helper: Relation selection extraction (moved out of resolver closure) ---
 class RelationSelectionExtractor:
     """Extract relation selection metadata (fields, pagination, filters) from Strawberry
-    selected_fields data and/or raw GraphQL AST. Returns mapping:
+    selected_fields data and/or raw GraphQL AST.
+
+    Returns mapping like:
         relation_name -> {
            fields: [scalar field names],
            limit: int|None,
@@ -45,19 +47,18 @@ class RelationSelectionExtractor:
            filter_args: { arg_name: value }
         }
     """
-    def __init__(self, registry: 'Registry'):
-        self.registry = registry
-
-    def _children(self, node: Any) -> list[Any]:
-        selset = getattr(node, 'selection_set', None)
-        if selset is not None and getattr(selset, 'selections', None) is not None:
-            return list(selset.selections) or []
-        sels = getattr(node, 'selections', None)
-        if sels is not None:
-            return list(sels) or []
-        return []
+    def __init__(self, registry: 'Registry' | None = None):
+        # Support both explicit and legacy no-arg initialization
+        if registry is not None:
+            self.registry = registry
+        else:
+            # Will be assigned by caller if omitted
+            self.registry = getattr(self, 'registry', None)
 
     def _init_rel_cfg(self, fdef: Any) -> Dict[str, Any]:
+        # Build a default relation config dict based on field definition metadata
+        single = bool(fdef.meta.get('single') or (fdef.meta.get('mode') == 'single'))
+        target = fdef.meta.get('target')
         return {
             'fields': [],
             'limit': None,
@@ -66,43 +67,43 @@ class RelationSelectionExtractor:
             'order_dir': None,
             'order_multi': [],
             'where': None,
-            'default_where': fdef.meta.get('where'),
-            'single': bool(fdef.meta.get('single')),
-            'target': fdef.meta.get('target'),
+            'default_where': fdef.meta.get('where') if fdef.meta.get('where') is not None else None,
+            'single': single,
+            'target': target,
             'nested': {},
             'skip_pushdown': False,
-            'filter_args': {},
+            'filter_args': {}
         }
 
+    def _children(self, sel: Any) -> list[Any]:
+        # Strawberry selected_fields nodes expose `.selections` or `.children`
+        kids = getattr(sel, 'selections', None)
+        if kids is None:
+            kids = getattr(sel, 'children', None)
+        return list(kids or [])
+
     def _ast_value(self, node: Any, info: Any) -> Any:
-        # Best-effort conversion of GraphQL AST nodes to Python values
-        if node is None:
-            return None
-        # ListValueNode
+        # Best-effort GraphQL AST value normalization
         try:
-            if hasattr(node, 'values'):
-                vals = getattr(node, 'values', []) or []
+            if node is None:
+                return None
+            # ListValue
+            vals = getattr(node, 'values', None)
+            if vals is not None:
                 return [self._ast_value(v, info) for v in vals]
-        except Exception:
-            pass
-        # ObjectValueNode
-        try:
-            if hasattr(node, 'fields'):
-                out = {}
-                for f in getattr(node, 'fields', []) or []:
+            # ObjectValue
+            fields = getattr(node, 'fields', None)
+            if fields is not None:
+                out: dict[str, Any] = {}
+                for f in fields:
                     k = getattr(getattr(f, 'name', None), 'value', None) or getattr(f, 'name', None)
-                    v = self._ast_value(getattr(f, 'value', None), info)
-                    out[k] = v
+                    out[k] = self._ast_value(getattr(f, 'value', None), info)
                 return out
-        except Exception:
-            pass
-        # Scalar/Enum/Name nodes expose .value we can consume directly
-        try:
+            # Scalar
             if hasattr(node, 'value'):
                 return getattr(node, 'value')
         except Exception:
-            pass
-        # Fallback: return as-is
+            return node
         return node
 
     def _walk_selected(self, sel: Any, btype: Any, out: Dict[str, Dict[str, Any]]):
@@ -117,24 +118,43 @@ class RelationSelectionExtractor:
             rel_cfg = out.setdefault(name, self._init_rel_cfg(fdef))
             # arguments on the relation field
             try:
-                for arg in getattr(child, 'arguments', []) or []:
-                    arg_name = getattr(getattr(arg, 'name', None), 'value', None) or getattr(arg, 'name', None)
-                    raw_val = getattr(arg, 'value', None)
-                    val = self._ast_value(raw_val, getattr(sel, 'info', None))
-                    if arg_name == 'limit':
-                        rel_cfg['limit'] = val
-                    elif arg_name == 'offset':
-                        rel_cfg['offset'] = val
-                    elif arg_name == 'order_by':
-                        rel_cfg['order_by'] = val
-                    elif arg_name == 'order_dir':
-                        rel_cfg['order_dir'] = val
-                    elif arg_name == 'order_multi':
-                        rel_cfg['order_multi'] = val or []
-                    elif arg_name == 'where':
-                        rel_cfg['where'] = val
-                    else:
-                        rel_cfg['filter_args'][arg_name] = val
+                _args = getattr(child, 'arguments', None)
+                # Strawberry SelectedField.arguments is usually a dict
+                if isinstance(_args, dict):
+                    for arg_name, val in _args.items():
+                        if arg_name == 'limit':
+                            rel_cfg['limit'] = val
+                        elif arg_name == 'offset':
+                            rel_cfg['offset'] = val
+                        elif arg_name == 'order_by':
+                            rel_cfg['order_by'] = val
+                        elif arg_name == 'order_dir':
+                            rel_cfg['order_dir'] = val
+                        elif arg_name == 'order_multi':
+                            rel_cfg['order_multi'] = val or []
+                        elif arg_name == 'where':
+                            rel_cfg['where'] = val
+                        else:
+                            rel_cfg['filter_args'][arg_name] = val
+                else:
+                    for arg in (_args or []):
+                        arg_name = getattr(getattr(arg, 'name', None), 'value', None) or getattr(arg, 'name', None)
+                        raw_val = getattr(arg, 'value', None)
+                        val = self._ast_value(raw_val, getattr(sel, 'info', None))
+                        if arg_name == 'limit':
+                            rel_cfg['limit'] = val
+                        elif arg_name == 'offset':
+                            rel_cfg['offset'] = val
+                        elif arg_name == 'order_by':
+                            rel_cfg['order_by'] = val
+                        elif arg_name == 'order_dir':
+                            rel_cfg['order_dir'] = val
+                        elif arg_name == 'order_multi':
+                            rel_cfg['order_multi'] = val or []
+                        elif arg_name == 'where':
+                            rel_cfg['where'] = val
+                        else:
+                            rel_cfg['filter_args'][arg_name] = val
             except Exception:
                 pass
             # collect scalar subfields and nested relations
@@ -154,24 +174,42 @@ class RelationSelectionExtractor:
                         ncfg = rel_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
                         # copy arguments for nested relation
                         try:
-                            for narg in getattr(sub, 'arguments', []) or []:
-                                narg_name = getattr(getattr(narg, 'name', None), 'value', None) or getattr(narg, 'name', None)
-                                nraw = getattr(narg, 'value', None)
-                                nval = self._ast_value(nraw, getattr(sel, 'info', None))
-                                if narg_name == 'limit':
-                                    ncfg['limit'] = nval
-                                elif narg_name == 'offset':
-                                    ncfg['offset'] = nval
-                                elif narg_name == 'order_by':
-                                    ncfg['order_by'] = nval
-                                elif narg_name == 'order_dir':
-                                    ncfg['order_dir'] = nval
-                                elif narg_name == 'order_multi':
-                                    ncfg['order_multi'] = nval or []
-                                elif narg_name == 'where':
-                                    ncfg['where'] = nval
-                                else:
-                                    ncfg['filter_args'][narg_name] = nval
+                            _nargs = getattr(sub, 'arguments', None)
+                            if isinstance(_nargs, dict):
+                                for narg_name, nval in _nargs.items():
+                                    if narg_name == 'limit':
+                                        ncfg['limit'] = nval
+                                    elif narg_name == 'offset':
+                                        ncfg['offset'] = nval
+                                    elif narg_name == 'order_by':
+                                        ncfg['order_by'] = nval
+                                    elif narg_name == 'order_dir':
+                                        ncfg['order_dir'] = nval
+                                    elif narg_name == 'order_multi':
+                                        ncfg['order_multi'] = nval or []
+                                    elif narg_name == 'where':
+                                        ncfg['where'] = nval
+                                    else:
+                                        ncfg['filter_args'][narg_name] = nval
+                            else:
+                                for narg in (_nargs or []):
+                                    narg_name = getattr(getattr(narg, 'name', None), 'value', None) or getattr(narg, 'name', None)
+                                    nraw = getattr(narg, 'value', None)
+                                    nval = self._ast_value(nraw, getattr(sel, 'info', None))
+                                    if narg_name == 'limit':
+                                        ncfg['limit'] = nval
+                                    elif narg_name == 'offset':
+                                        ncfg['offset'] = nval
+                                    elif narg_name == 'order_by':
+                                        ncfg['order_by'] = nval
+                                    elif narg_name == 'order_dir':
+                                        ncfg['order_dir'] = nval
+                                    elif narg_name == 'order_multi':
+                                        ncfg['order_multi'] = nval or []
+                                    elif narg_name == 'where':
+                                        ncfg['where'] = nval
+                                    else:
+                                        ncfg['filter_args'][narg_name] = nval
                         except Exception:
                             pass
                         # nested scalar fields
@@ -197,28 +235,7 @@ class RelationSelectionExtractor:
 
     def extract(self, info: Any, root_field_name: str, btype: Any) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
-        # Prefer AST from field_nodes
-        try:
-            nodes = list(getattr(info, 'field_nodes', []) or [])
-        except Exception:
-            nodes = []
-        root_node = None
-        for n in nodes:
-            nname = getattr(getattr(n, 'name', None), 'value', None) or getattr(n, 'name', None)
-            if nname == root_field_name:
-                root_node = n
-                break
-        if root_node is None and nodes:
-            root_node = nodes[0]
-        if root_node is not None and getattr(getattr(root_node, 'selection_set', None), 'selections', None):
-            try:
-                fake = type('Sel', (), {})()
-                setattr(fake, 'selections', getattr(root_node.selection_set, 'selections', []))
-                self._walk_selected(fake, btype, out)
-                return out
-            except Exception:
-                pass
-        # Fallback: if Strawberry exposes selected_fields with children
+        # Use Strawberry selected_fields (no deprecated field_nodes access)
         try:
             fields = getattr(info, 'selected_fields', None)
             for f in (fields or []):
@@ -229,6 +246,102 @@ class RelationSelectionExtractor:
                     break
         except Exception:
             pass
+        # Fallback: also inspect GraphQL AST (field_nodes) to capture arguments when
+        # selected_fields doesn't expose them. Merge only argument keys to avoid
+        # changing already collected scalar field lists.
+        def _children_ast(node: Any) -> list[Any]:
+            try:
+                selset = getattr(node, 'selection_set', None)
+                if selset is not None and getattr(selset, 'selections', None) is not None:
+                    return list(selset.selections) or []
+            except Exception:
+                pass
+            return []
+        def _name_ast(node: Any) -> Optional[str]:
+            try:
+                n = getattr(node, 'name', None)
+                if hasattr(n, 'value'):
+                    return getattr(n, 'value', None)
+                return n
+            except Exception:
+                return None
+        def _merge_rel_args(cfg_dst: Dict[str, Any], args_dict: Dict[str, Any]):
+            if not isinstance(cfg_dst, dict):
+                return
+            # Normalize and set supported argument keys
+            for k in ('limit','offset','order_by','order_dir','order_multi','where'):
+                if k in args_dict and args_dict[k] is not None:
+                    cfg_dst[k] = args_dict[k]
+        try:
+            field_nodes = getattr(info, 'field_nodes', None) or getattr(getattr(info, '_raw_info', None), 'field_nodes', None)
+        except Exception:
+            field_nodes = None
+        if field_nodes:
+            try:
+                # Find the root field node matching root_field_name
+                root_nodes = [n for n in field_nodes if _name_ast(n) == root_field_name]
+                if root_nodes:
+                    root_node = root_nodes[0]
+                    for rel_node in _children_ast(root_node):
+                        rname = _name_ast(rel_node)
+                        if not rname or rname.startswith('__'):
+                            continue
+                        fdef = getattr(btype, '__berry_fields__', {}).get(rname)
+                        if not fdef or fdef.kind != 'relation':
+                            continue
+                        # Collect argument values from AST
+                        ast_args = {}
+                        try:
+                            for a in getattr(rel_node, 'arguments', []) or []:
+                                an = _name_ast(a)
+                                av = self._ast_value(getattr(a, 'value', None), info)
+                                if an == 'order_multi' and av is not None and not isinstance(av, list):
+                                    av = [av]
+                                ast_args[an] = av
+                        except Exception:
+                            pass
+                        rel_cfg = out.setdefault(rname, self._init_rel_cfg(fdef))
+                        _merge_rel_args(rel_cfg, ast_args)
+                        # Capture scalar subfields selected under this relation
+                        try:
+                            tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
+                        except Exception:
+                            tgt_b = None
+                        try:
+                            for sub in _children_ast(rel_node):
+                                sub_name = _name_ast(sub)
+                                if not sub_name or sub_name.startswith('__'):
+                                    continue
+                                sdef = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
+                                if not sdef or sdef.kind == 'scalar':
+                                    if sub_name not in rel_cfg['fields']:
+                                        rel_cfg['fields'].append(sub_name)
+                        except Exception:
+                            pass
+                        # Nested relations inside this relation
+                        tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
+                        for sub in _children_ast(rel_node):
+                            sub_name = _name_ast(sub)
+                            if not sub_name or sub_name.startswith('__'):
+                                continue
+                            sub_def = getattr(tgt_b, '__berry_fields__', {}).get(sub_name) if tgt_b else None
+                            if not sub_def or sub_def.kind != 'relation':
+                                continue
+                            # Arguments for nested relation
+                            n_args = {}
+                            try:
+                                for na in getattr(sub, 'arguments', []) or []:
+                                    an = _name_ast(na)
+                                    av = self._ast_value(getattr(na, 'value', None), info)
+                                    if an == 'order_multi' and av is not None and not isinstance(av, list):
+                                        av = [av]
+                                    n_args[an] = av
+                            except Exception:
+                                pass
+                            ncfg = rel_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
+                            _merge_rel_args(ncfg, n_args)
+            except Exception:
+                pass
         return out
 
 # --- Helper: Root selection extractor to prune scalars/customs by query ---
@@ -293,35 +406,67 @@ class RootSelectionExtractor:
         out = {'scalars': set(), 'relations': set(), 'custom': set(), 'custom_object': set(), 'aggregate': set()}
         if info is None:
             return out
+        # Use Strawberry selected_fields only (avoid deprecated field_nodes)
         try:
-            nodes = list(getattr(info, 'field_nodes', []) or [])
-        except Exception:
-            nodes = []
-        root_node = None
-        for n in nodes:
-            nname = getattr(getattr(n, 'name', None), 'value', None) or getattr(n, 'name', None)
-            if nname == root_field_name:
-                root_node = n
-                break
-        if root_node is None and nodes:
-            root_node = nodes[0]
-        frags = None
-        try:
-            frags = getattr(info, 'fragments', None) or {}
-        except Exception:
+            fields = getattr(info, 'selected_fields', None)
             frags = None
-        if root_node is not None:
-            self._walk(root_node, out, btype, frags)
-        else:
-            # Fallback to Strawberry selected_fields tree
             try:
-                fields = getattr(info, 'selected_fields', None)
-                for f in (fields or []):
-                    if getattr(f, 'name', None) == root_field_name:
-                        fake = type('Sel', (), {})()
-                        setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
-                        self._walk(fake, out, btype, frags)
-                        break
+                frags = getattr(info, 'fragments', None) or {}
+            except Exception:
+                frags = None
+            for f in (fields or []):
+                if getattr(f, 'name', None) == root_field_name:
+                    fake = type('Sel', (), {})()
+                    setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
+                    self._walk(fake, out, btype, frags)
+                    break
+        except Exception:
+            pass
+        # Fallback: also walk GraphQL AST if selected_fields didn't yield anything
+        if not any(out.values()):
+            try:
+                def _children_ast(node: Any) -> list[Any]:
+                    try:
+                        selset = getattr(node, 'selection_set', None)
+                        if selset is not None and getattr(selset, 'selections', None) is not None:
+                            return list(selset.selections) or []
+                    except Exception:
+                        pass
+                    return []
+                def _name_ast(node: Any) -> Optional[str]:
+                    try:
+                        n = getattr(node, 'name', None)
+                        if hasattr(n, 'value'):
+                            return getattr(n, 'value', None)
+                        return n
+                    except Exception:
+                        return None
+                field_nodes = getattr(info, 'field_nodes', None) or getattr(getattr(info, '_raw_info', None), 'field_nodes', None)
+                if field_nodes:
+                    root_nodes = [n for n in field_nodes if _name_ast(n) == root_field_name]
+                    if root_nodes:
+                        root_node = root_nodes[0]
+                        for child in _children_ast(root_node):
+                            name = _name_ast(child)
+                            if not name or name.startswith('__'):
+                                continue
+                            try:
+                                fdef = getattr(btype, '__berry_fields__', {}).get(name)
+                            except Exception:
+                                fdef = None
+                            if not fdef:
+                                continue
+                            k = fdef.kind
+                            if k == 'scalar':
+                                out['scalars'].add(name)
+                            elif k == 'relation':
+                                out['relations'].add(name)
+                            elif k == 'custom':
+                                out['custom'].add(name)
+                            elif k == 'custom_object':
+                                out['custom_object'].add(name)
+                            elif k == 'aggregate':
+                                out['aggregate'].add(name)
             except Exception:
                 pass
         return out
@@ -703,8 +848,164 @@ class BerrySchema:
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
                             prefetch_attr = f'_{fname_local}_prefetched'
                             if hasattr(self, prefetch_attr):
-                                # Reuse prefetched always (root pushdown included pagination already)
-                                return getattr(self, prefetch_attr)
+                                # If relation was prefetched (via root pushdown), still honor relation args
+                                # by applying in-memory filtering/ordering/pagination on the prefetched data.
+                                prefetched = getattr(self, prefetch_attr)
+                                # Helper: apply JSON where dict onto a single object; returns bool
+                                def _match_where_obj(o: Any, where_dict: Any) -> bool:
+                                    if not isinstance(where_dict, dict):
+                                        return True
+                                    for col_name, op_map in (where_dict or {}).items():
+                                        v = getattr(o, col_name, None)
+                                        for op_name, val in (op_map or {}).items():
+                                            try:
+                                                if op_name == 'eq' and not (v == val):
+                                                    return False
+                                                if op_name == 'ne' and not (v != val):
+                                                    return False
+                                                if op_name == 'lt' and not (v < val):
+                                                    return False
+                                                if op_name == 'lte' and not (v <= val):
+                                                    return False
+                                                if op_name == 'gt' and not (v > val):
+                                                    return False
+                                                if op_name == 'gte' and not (v >= val):
+                                                    return False
+                                                if op_name in ('like','ilike'):
+                                                    s = '' if v is None else str(v)
+                                                    pat = '' if val is None else str(val)
+                                                    if op_name == 'ilike':
+                                                        s = s.lower(); pat = pat.lower()
+                                                    # crude % wildcard support: treat % as contains
+                                                    core = pat.replace('%','')
+                                                    if core not in s:
+                                                        return False
+                                                if op_name == 'in' and isinstance(val, (list, tuple, set)):
+                                                    if v not in val:
+                                                        return False
+                                                if op_name == 'between' and isinstance(val, (list, tuple)) and len(val) >= 2:
+                                                    if not (val[0] <= v <= val[1]):
+                                                        return False
+                                            except Exception:
+                                                return False
+                                    return True
+                                # Helper: apply declared filter args in-memory using column names
+                                def _apply_filter_args_list(objs: list[Any]) -> list[Any]:
+                                    if not _filter_args:
+                                        return objs
+                                    # Resolve FilterSpecs from declared target filters
+                                    if not target_filters:
+                                        return objs
+                                    out = []
+                                    for o in objs:
+                                        ok = True
+                                        for arg_name, raw_val in _filter_args.items():
+                                            if raw_val is None:
+                                                continue
+                                            f_spec = target_filters.get(arg_name)
+                                            if not f_spec:
+                                                continue
+                                            # Apply transform
+                                            val = raw_val
+                                            try:
+                                                if f_spec.transform:
+                                                    val = f_spec.transform(val)
+                                            except Exception:
+                                                pass
+                                            # Only column-based filters can be applied in-memory
+                                            col_name = f_spec.column
+                                            if not col_name:
+                                                continue
+                                            v = getattr(o, col_name, None)
+                                            try:
+                                                if f_spec.op == 'eq' and not (v == val):
+                                                    ok = False; break
+                                                if f_spec.op == 'ne' and not (v != val):
+                                                    ok = False; break
+                                                if f_spec.op == 'lt' and not (v < val):
+                                                    ok = False; break
+                                                if f_spec.op == 'lte' and not (v <= val):
+                                                    ok = False; break
+                                                if f_spec.op == 'gt' and not (v > val):
+                                                    ok = False; break
+                                                if f_spec.op == 'gte' and not (v >= val):
+                                                    ok = False; break
+                                                if f_spec.op == 'like' or f_spec.op == 'ilike':
+                                                    s = '' if v is None else str(v)
+                                                    pat = '' if val is None else str(val)
+                                                    if f_spec.op == 'ilike':
+                                                        s = s.lower(); pat = pat.lower()
+                                                    core = pat.replace('%','')
+                                                    if core not in s:
+                                                        ok = False; break
+                                                if f_spec.op == 'in' and isinstance(val, (list, tuple, set)):
+                                                    if v not in val:
+                                                        ok = False; break
+                                                if f_spec.op == 'between' and isinstance(val, (list, tuple)) and len(val) >= 2:
+                                                    if not (val[0] <= v <= val[1]):
+                                                        ok = False; break
+                                            except Exception:
+                                                pass
+                                        if ok:
+                                            out.append(o)
+                                    return out
+                                # Parse where JSON if provided
+                                import json as _json
+                                where_dict = None
+                                try:
+                                    where_dict = related_where
+                                    if isinstance(related_where, str):
+                                        where_dict = _json.loads(related_where)
+                                except Exception:
+                                    where_dict = None
+                                if is_single_value:
+                                    o = prefetched
+                                    if o is None:
+                                        return None
+                                    # Apply where
+                                    if where_dict and not _match_where_obj(o, where_dict):
+                                        return None
+                                    # Apply filter args
+                                    if target_filters and any(v is not None for v in _filter_args.values()):
+                                        if not _apply_filter_args_list([o]):
+                                            return None
+                                    return o
+                                # List relation
+                                lst = list(prefetched or [])
+                                # Apply where
+                                if where_dict:
+                                    lst = [o for o in lst if _match_where_obj(o, where_dict)]
+                                # Apply filter args (column-based only)
+                                lst = _apply_filter_args_list(lst)
+                                # Apply ordering
+                                try:
+                                    specs = []
+                                    for spec in (order_multi or []) or []:
+                                        cn, _, dd = str(spec).partition(':')
+                                        dd = (dd or _dir_value(order_dir)).lower()
+                                        specs.append((cn, dd))
+                                    if specs:
+                                        for cn, dd in reversed(specs):
+                                            lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
+                                    elif order_by:
+                                        dd = _dir_value(order_dir)
+                                        lst.sort(key=lambda o: getattr(o, order_by, None), reverse=(dd=='desc'))
+                                except Exception:
+                                    pass
+                                # Apply pagination
+                                try:
+                                    o = int(offset) if offset is not None else None
+                                except Exception:
+                                    o = offset if offset is not None else None
+                                try:
+                                    l = int(limit) if limit is not None else None
+                                except Exception:
+                                    l = limit if limit is not None else None
+                                if isinstance(o, int) and o > 0:
+                                    lst = lst[o:]
+                                if isinstance(l, int):
+                                    lst = lst[:l]
+                                return lst
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
                             parent_model = getattr(self, '_model', None)
@@ -719,8 +1020,13 @@ class BerrySchema:
                             child_model_cls = target_btype.model
                             if is_single_value:
                                 candidate_fk_val = None
-                                if parent_model is not None:
-                                    # Normal path: derive FK from ORM model instance
+                                # First, if the instance has a helper '<relation>_id' attribute, use it
+                                try:
+                                    candidate_fk_val = getattr(self, f"{fname_local}_id", None)
+                                except Exception:
+                                    candidate_fk_val = None
+                                if candidate_fk_val is None and parent_model is not None:
+                                    # Derive FK from ORM model instance when available
                                     for col in parent_model.__table__.columns:
                                         if col.name.endswith('_id') and col.foreign_keys:
                                             for fk in col.foreign_keys:
@@ -729,12 +1035,6 @@ class BerrySchema:
                                                     break
                                         if candidate_fk_val is not None:
                                             break
-                                else:
-                                    # Fallback for pushdown-hydrated parent (no _model): use <relation>_id scalar, if present
-                                    try:
-                                        candidate_fk_val = getattr(self, f"{fname_local}_id", None)
-                                    except Exception:
-                                        candidate_fk_val = None
                                 if candidate_fk_val is None:
                                     return None
                                 # Apply filters via query if any filter args passed
@@ -778,11 +1078,11 @@ class BerrySchema:
                                                     col = child_model_cls.__table__.c.get(col_name)
                                                     if col is None:
                                                         continue
-                                                for op_name, val in (op_map or {}).items():
-                                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                        val = [_coerce_where_value(col, v) for v in val]
-                                                    else:
-                                                        val = _coerce_where_value(col, val)
+                                                    for op_name, val in (op_map or {}).items():
+                                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                            val = [_coerce_where_value(col, v) for v in val]
+                                                        else:
+                                                            val = _coerce_where_value(col, val)
                                                         op_fn = OPERATOR_REGISTRY.get(op_name)
                                                         if not op_fn:
                                                             continue
@@ -1405,9 +1705,19 @@ class BerrySchema:
                 # Collect custom field expressions for pushdown
                 custom_fields: List[tuple[str, Any]] = []
                 custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
-                select_columns: List[Any] = [model_cls]
+                # Start with an empty selection; we'll add only the needed root columns
+                # (e.g., id and any explicitly requested scalars) plus pushdown expressions.
+                # Avoid selecting the full entity to keep SQL projections minimal.
+                select_columns: List[Any] = []
                 # Use extracted helper classes: relations and root field kinds
-                requested_relations = RelationSelectionExtractor(self).extract(info, root_field_name, btype_cls)
+                # Instantiate relation extractor in a backward-compatible way
+                _rel_extractor = RelationSelectionExtractor()  # type: ignore
+                try:
+                    # Ensure registry attribute is wired for extractor logic
+                    setattr(_rel_extractor, 'registry', self)
+                except Exception:
+                    pass
+                requested_relations = _rel_extractor.extract(info, root_field_name, btype_cls)
                 # Normalize any AST-node leftovers in relation configs to plain Python types
                 def _coerce_literal(v: Any) -> Any:
                     try:
@@ -1552,172 +1862,172 @@ class BerrySchema:
                 def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
                     return None
                 # Prepare pushdown COUNT aggregates (replace batch later)
-                count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_expr)
+                count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_def)
                 for cf_name, cf_def in btype_cls.__berry_fields__.items():
-                        if cf_def.kind == 'custom':
-                            # When selection is known, include only if explicitly requested
-                            if (selection_extracted or requested_custom_root) and (cf_name not in requested_custom_root):
+                    if cf_def.kind == 'custom':
+                        # Include only if explicitly requested
+                        if cf_name not in requested_custom_root:
+                            continue
+                        builder = cf_def.meta.get('builder')
+                        if builder is None:
+                            continue
+                        # Attempt to build expression using model class (no instance/session) to avoid N+1
+                        import inspect
+                        expr = None
+                        try:
+                            if len(inspect.signature(builder).parameters) == 1:
+                                expr = builder(model_cls)
+                            else:
+                                # Skip builders requiring session/info for pushdown
                                 continue
-                            builder = cf_def.meta.get('builder')
-                            if builder is None:
-                                continue
-                            # Attempt to build expression using model class (no instance/session) to avoid N+1
-                            import inspect
-                            expr = None
-                            try:
-                                if len(inspect.signature(builder).parameters) == 1:
-                                    expr = builder(model_cls)
-                                else:
-                                    # Skip builders requiring session/info for pushdown
-                                    continue
-                            except Exception:
-                                continue
-                            if expr is None:
-                                continue
-                            try:
-                                from sqlalchemy.sql import Select as _Select  # type: ignore
-                            except Exception:
-                                _Select = None  # type: ignore
-                            # Convert sub-selects to scalar
-                            try:
-                                if _Select is not None and isinstance(expr, _Select):
-                                    # If multiple columns, leave as is (handled after execution)
-                                    if hasattr(expr, 'subquery'):  # mark for scalar extraction
-                                        try:
-                                            # Use scalar_subquery if single column select
-                                            if len(expr.selected_columns) == 1:  # type: ignore[attr-defined]
-                                                expr = expr.scalar_subquery()
-                                        except Exception:
-                                            pass
-                                # Label unlabeled column expressions so result mapping works
-                                if hasattr(expr, 'label'):
-                                    expr = expr.label(cf_name)
-                            except Exception:
-                                continue
-                            custom_fields.append((cf_name, expr))
-                            select_columns.append(expr)
-                        elif cf_def.kind == 'custom_object':
-                            # When selection is known, include only if explicitly requested
-                            if (selection_extracted or requested_custom_obj_root) and (cf_name not in requested_custom_obj_root):
-                                continue
-                            builder = cf_def.meta.get('builder')
-                            if builder is None:
-                                continue
-                            import inspect
-                            expr_sel = None
-                            try:
-                                if len(inspect.signature(builder).parameters) == 1:
-                                    expr_sel = builder(model_cls)
-                                else:
-                                    continue  # skip builders needing session/info to avoid N+1
-                            except Exception:
-                                continue
-                            if expr_sel is None:
-                                continue
-                            try:
-                                from sqlalchemy.sql import Select as _Select  # type: ignore
-                            except Exception:
-                                _Select = None  # type: ignore
-                            if _Select is not None and isinstance(expr_sel, _Select):
-                                # Build per-field scalar subqueries and compose a JSON object
-                                try:
-                                    sel_cols = list(getattr(expr_sel, 'selected_columns', []))  # type: ignore[attr-defined]
-                                except Exception:
-                                    sel_cols = []
-                                key_exprs: list[tuple[str, Any]] = []
-                                agg_pairs: list[tuple[str, Any]] = []  # (key, aggregate/labeled expr)
-                                for col in sel_cols:
+                        except Exception:
+                            continue
+                        if expr is None:
+                            continue
+                        try:
+                            from sqlalchemy.sql import Select as _Select  # type: ignore
+                        except Exception:
+                            _Select = None  # type: ignore
+                        # Convert sub-selects to scalar
+                        try:
+                            if _Select is not None and isinstance(expr, _Select):
+                                # If multiple columns, leave as is (handled after execution)
+                                if hasattr(expr, 'subquery'):
                                     try:
-                                        labeled = col
-                                        col_name = getattr(labeled, 'name', None) or getattr(labeled, 'key', None)
-                                        if not col_name:
-                                            col_name = f"{cf_name}_{len(key_exprs)}"
-                                            labeled = col.label(col_name)
-                                        # Keep the aggregate/labeled expression for single-select JSON
-                                        agg_pairs.append((col_name, labeled))
-                                        subq = select(labeled)
-                                        try:
-                                            for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
-                                                subq = subq.select_from(_from)
-                                        except Exception:
-                                            pass
-                                        for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
-                                            subq = subq.where(_w)
-                                        subq_expr = subq.scalar_subquery() if hasattr(subq, 'scalar_subquery') else subq
-                                        key_exprs.append((col_name, subq_expr))
+                                        # Use scalar_subquery if single column select
+                                        if len(expr.selected_columns) == 1:  # type: ignore[attr-defined]
+                                            expr = expr.scalar_subquery()
                                     except Exception:
-                                        continue
-                                if not key_exprs:
-                                    continue
-                                # MSSQL path: adapter.json_object is not available; select per-key labeled columns
-                                is_mssql = getattr(adapter, 'name', '') == 'mssql'
-                                if is_mssql:
-                                    labels: list[str] = []
-                                    for k, v in key_exprs:
-                                        lbl = f"_pushcf_{cf_name}__{k}"
-                                        try:
-                                            select_columns.append(v.label(lbl))
-                                        except Exception:
-                                            # Best-effort: wrap via text if needed
-                                            from sqlalchemy import literal_column
-                                            select_columns.append(literal_column(str(v)).label(lbl))
-                                        labels.append(lbl)
-                                    custom_object_fields.append((cf_name, labels, cf_def.meta.get('returns')))
-                                else:
-                                    # Compose JSON object via a single SELECT using aggregated expressions
-                                    json_args: list[Any] = []
-                                    for k, agg_expr in agg_pairs:
-                                        json_args.extend([_text(f"'{k}'"), agg_expr])
-                                    inner = select(_json_object(*json_args))
+                                        pass
+                            # Label unlabeled column expressions so result mapping works
+                            if hasattr(expr, 'label'):
+                                expr = expr.label(cf_name)
+                        except Exception:
+                            continue
+                        custom_fields.append((cf_name, expr))
+                        select_columns.append(expr)
+                    elif cf_def.kind == 'custom_object':
+                        # Include only if explicitly requested
+                        if cf_name not in requested_custom_obj_root:
+                            continue
+                        builder = cf_def.meta.get('builder')
+                        if builder is None:
+                            continue
+                        import inspect
+                        expr_sel = None
+                        try:
+                            if len(inspect.signature(builder).parameters) == 1:
+                                expr_sel = builder(model_cls)
+                            else:
+                                continue  # skip builders needing session/info to avoid N+1
+                        except Exception:
+                            continue
+                        if expr_sel is None:
+                            continue
+                        try:
+                            from sqlalchemy.sql import Select as _Select  # type: ignore
+                        except Exception:
+                            _Select = None  # type: ignore
+                        if _Select is not None and isinstance(expr_sel, _Select):
+                            # Build per-field scalar subqueries and compose a JSON object
+                            try:
+                                sel_cols = list(getattr(expr_sel, 'selected_columns', []))  # type: ignore[attr-defined]
+                            except Exception:
+                                sel_cols = []
+                            key_exprs: list[tuple[str, Any]] = []
+                            agg_pairs: list[tuple[str, Any]] = []  # (key, aggregate/labeled expr)
+                            for col in sel_cols:
+                                try:
+                                    labeled = col
+                                    col_name = getattr(labeled, 'name', None) or getattr(labeled, 'key', None)
+                                    if not col_name:
+                                        col_name = f"{cf_name}_{len(key_exprs)}"
+                                        labeled = col.label(col_name)
+                                    # Keep the aggregate/labeled expression for single-select JSON
+                                    agg_pairs.append((col_name, labeled))
+                                    subq = select(labeled)
                                     try:
                                         for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
-                                            inner = inner.select_from(_from)
+                                            subq = subq.select_from(_from)
                                     except Exception:
                                         pass
                                     for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
-                                        inner = inner.where(_w)
-                                    try:
-                                        json_obj_expr = inner.scalar_subquery()
-                                    except Exception:
-                                        json_obj_expr = inner
-                                    # No null semantics: always return object, even when counts are zero
-                                    json_label = f"_pushcf_{cf_name}"
-                                    select_columns.append(json_obj_expr.label(json_label))
-                                    custom_object_fields.append((cf_name, [json_label], cf_def.meta.get('returns')))
-                            else:
-                                continue
-                        elif cf_def.kind == 'aggregate':
-                            # Only handle count aggregates for pushdown
-                            op = cf_def.meta.get('op')
-                            ops = cf_def.meta.get('ops') or []
-                            is_count = op == 'count' or 'count' in ops
-                            if is_count:
-                                # When selection is known, include only if explicitly requested
-                                if (selection_extracted or requested_aggregates_root) and (cf_name not in requested_aggregates_root):
+                                        subq = subq.where(_w)
+                                    subq_expr = subq.scalar_subquery() if hasattr(subq, 'scalar_subquery') else subq
+                                    key_exprs.append((col_name, subq_expr))
+                                except Exception:
                                     continue
-                                source_rel = cf_def.meta.get('source')
-                                rel_def = btype_cls.__berry_fields__.get(source_rel)
-                                if rel_def and rel_def.kind == 'relation':
-                                    target_name = rel_def.meta.get('target')
-                                    target_b = self.types.get(target_name)
-                                    if target_b and target_b.model:
-                                        child_model_cls = target_b.model
-                                        # find FK from child to parent
-                                        fk_col = None
-                                        for col in child_model_cls.__table__.columns:
-                                            for fk in col.foreign_keys:
-                                                if fk.column.table.name == model_cls.__table__.name:
-                                                    fk_col = col
-                                                    break
-                                            if fk_col is not None:
+                            if not key_exprs:
+                                continue
+                            # MSSQL path: adapter.json_object is not available; select per-key labeled columns
+                            is_mssql = getattr(adapter, 'name', '') == 'mssql'
+                            if is_mssql:
+                                labels: list[str] = []
+                                for k, v in key_exprs:
+                                    lbl = f"_pushcf_{cf_name}__{k}"
+                                    try:
+                                        select_columns.append(v.label(lbl))
+                                    except Exception:
+                                        from sqlalchemy import literal_column
+                                        select_columns.append(literal_column(str(v)).label(lbl))
+                                    labels.append(lbl)
+                                custom_object_fields.append((cf_name, labels, cf_def.meta.get('returns')))
+                            else:
+                                # Compose JSON object via a single SELECT using aggregated expressions
+                                json_args: list[Any] = []
+                                for k, agg_expr in agg_pairs:
+                                    json_args.extend([_text(f"'{k}'"), agg_expr])
+                                inner = select(_json_object(*json_args))
+                                try:
+                                    for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
+                                        inner = inner.select_from(_from)
+                                except Exception:
+                                    pass
+                                for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
+                                    inner = inner.where(_w)
+                                try:
+                                    json_obj_expr = inner.scalar_subquery()
+                                except Exception:
+                                    json_obj_expr = inner
+                                json_label = f"_pushcf_{cf_name}"
+                                select_columns.append(json_obj_expr.label(json_label))
+                                custom_object_fields.append((cf_name, [json_label], cf_def.meta.get('returns')))
+                        else:
+                            continue
+                    elif cf_def.kind == 'aggregate':
+                        # Only handle count aggregates for pushdown
+                        op = cf_def.meta.get('op')
+                        ops = cf_def.meta.get('ops') or []
+                        is_count = op == 'count' or 'count' in ops
+                        if is_count:
+                            # Include only if explicitly requested
+                            if cf_name not in requested_aggregates_root:
+                                continue
+                            source_rel = cf_def.meta.get('source')
+                            rel_def = btype_cls.__berry_fields__.get(source_rel)
+                            if rel_def and rel_def.kind == 'relation':
+                                target_name = rel_def.meta.get('target')
+                                target_b = self.types.get(target_name)
+                                if target_b and target_b.model:
+                                    child_model_cls = target_b.model
+                                    # find FK from child to parent
+                                    fk_col = None
+                                    for col in child_model_cls.__table__.columns:
+                                        for fk in col.foreign_keys:
+                                            if fk.column.table.name == model_cls.__table__.name:
+                                                fk_col = col
                                                 break
                                         if fk_col is not None:
-                                            subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
-                                            select_columns.append(subq_cnt)
-                                            count_aggregates.append((cf_name, cf_def))
+                                            break
+                                    if fk_col is not None:
+                                        subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
+                                        select_columns.append(subq_cnt)
+                                        count_aggregates.append((cf_name, cf_def))
                 # MSSQL special handling: we'll emulate JSON aggregation via FOR JSON PATH
                 mssql_mode = hasattr(adapter, 'name') and adapter.name == 'mssql'
-                # Determine helper FK columns on parent for single relations when resolver path will be used
+                # Determine helper FK columns on parent for single relations. Include them proactively
+                # whenever a single relation is requested so resolvers can operate even if pushdown
+                # isn't used (or additional filtering is applied at resolve time).
                 required_fk_parent_cols: set[str] = set()
                 try:
                     for rel_name, rel_cfg in list(requested_relations.items()):
@@ -1728,7 +2038,7 @@ class BerrySchema:
                                 rel_cfg['skip_pushdown'] = True
                         except Exception:
                             pass
-                        if rel_cfg.get('single') and (rel_cfg.get('skip_pushdown') or (not adapter.supports_relation_pushdown() and not mssql_mode)):
+                        if rel_cfg.get('single'):
                             fk_col_name = f"{rel_name}_id"
                             try:
                                 if hasattr(model_cls, fk_col_name):
@@ -1739,6 +2049,18 @@ class BerrySchema:
                     required_fk_parent_cols = set()
                 # Push down relation JSON arrays/objects
                 for rel_name, rel_cfg in requested_relations.items():
+                        # If a 'where' argument is provided, skip pushdown so resolver can apply it reliably.
+                        try:
+                            if rel_cfg.get('where') is not None:
+                                rel_cfg['skip_pushdown'] = True
+                        except Exception:
+                            pass
+                        # For single relations, also skip pushdown when filter args are present to avoid false negatives.
+                        try:
+                            if rel_cfg.get('single') and (rel_cfg.get('filter_args') or rel_cfg.get('where') is not None):
+                                rel_cfg['skip_pushdown'] = True
+                        except Exception:
+                            pass
                         # If default_where is a callable, skip pushdown so resolver can apply it
                         try:
                             dw = rel_cfg.get('default_where')
@@ -1782,7 +2104,21 @@ class BerrySchema:
                             if mssql_mode:
                                 if not proj_cols:
                                     proj_cols = ['id']
-                                join_cond = f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{rel_name}_id]"
+                                # Build join + optional where clauses for MSSQL
+                                join_parts = [f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{rel_name}_id]"]
+                                try:
+                                    import json as _json
+                                    r_where = rel_cfg.get('where')
+                                    if r_where is not None:
+                                        wdict_rel = r_where if not isinstance(r_where, str) else _json.loads(r_where)
+                                        join_parts.extend(adapter.where_from_dict(child_model_cls, wdict_rel))
+                                    d_where = rel_cfg.get('default_where')
+                                    if d_where is not None and isinstance(d_where, (dict, str)):
+                                        dwdict_rel = d_where if not isinstance(d_where, str) else _json.loads(d_where)
+                                        join_parts.extend(adapter.where_from_dict(child_model_cls, dwdict_rel))
+                                except Exception:
+                                    pass
+                                join_cond = ' AND '.join(join_parts)
                                 rel_expr = adapter.build_single_relation_json(
                                     child_table=child_model_cls.__tablename__,
                                     projected_columns=proj_cols,
@@ -1794,11 +2130,61 @@ class BerrySchema:
                                 for sf in proj_cols:
                                     json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
                                 json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
-                                rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id", None))
-                                # Fallback join via fk if id direct column missing
+                                # Require parent <rel>_id column to correlate; if absent, skip pushdown for this relation
                                 try:
-                                    if not any(c.name == f"{rel_name}_id" for c in model_cls.__table__.columns):
-                                        rel_subq = select(json_obj).select_from(child_model_cls).where(getattr(child_model_cls, 'id') == fk_col)
+                                    has_parent_fk = any(c.name == f"{rel_name}_id" for c in model_cls.__table__.columns)
+                                except Exception:
+                                    has_parent_fk = False
+                                if not has_parent_fk:
+                                    # Can't correlate reliably; skip pushdown
+                                    continue
+                                rel_subq = (
+                                    select(json_obj)
+                                    .select_from(child_model_cls)
+                                    .where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id"))
+                                    .correlate(model_cls)
+                                )
+                                # Apply relation-level JSON where/default_where if provided
+                                try:
+                                    import json as _json
+                                    r_where = rel_cfg.get('where')
+                                    if r_where is not None:
+                                        wdict_rel = r_where if not isinstance(r_where, str) else _json.loads(r_where)
+                                        exprs = []
+                                        for col_name, op_map in (wdict_rel or {}).items():
+                                            col = child_model_cls.__table__.c.get(col_name)
+                                            if col is None:
+                                                continue
+                                            for op_name, val in (op_map or {}).items():
+                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                    val = [_coerce_where_value(col, v) for v in val]
+                                                else:
+                                                    val = _coerce_where_value(col, val)
+                                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                if not op_fn:
+                                                    continue
+                                                exprs.append(op_fn(col, val))
+                                        if exprs:
+                                            rel_subq = rel_subq.where(_and(*exprs))
+                                    d_where = rel_cfg.get('default_where')
+                                    if d_where is not None and isinstance(d_where, (dict, str)):
+                                        dwdict_rel = d_where if not isinstance(d_where, str) else _json.loads(d_where)
+                                        exprs = []
+                                        for col_name, op_map in (dwdict_rel or {}).items():
+                                            col = child_model_cls.__table__.c.get(col_name)
+                                            if col is None:
+                                                continue
+                                            for op_name, val in (op_map or {}).items():
+                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                    val = [_coerce_where_value(col, v) for v in val]
+                                                else:
+                                                    val = _coerce_where_value(col, val)
+                                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                if not op_fn:
+                                                    continue
+                                                exprs.append(op_fn(col, val))
+                                        if exprs:
+                                            rel_subq = rel_subq.where(_and(*exprs))
                                 except Exception:
                                     pass
                                 # Apply filter args if any
@@ -2140,21 +2526,54 @@ class BerrySchema:
                                 except Exception:
                                     pass
                                 try:
-                                    # Apply ordering (multi -> single -> fallback)
+                                    # Apply ordering (multi -> single). Normalize AST artifacts to strings.
                                     ordered_i = False
                                     try:
                                         allowed_order_fields_i = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
-                                        multi_i = rel_cfg_local.get('order_multi') or []
+                                    except Exception:
+                                        allowed_order_fields_i = []
+                                    # 1) order_multi
+                                    try:
+                                        multi_i_raw = rel_cfg_local.get('order_multi') or []
+                                        # Normalize to list[str]
+                                        multi_i: list[str] = []
+                                        for spec in multi_i_raw:
+                                            try:
+                                                multi_i.append(str(getattr(spec, 'value', spec)))
+                                            except Exception:
+                                                multi_i.append(str(spec))
                                         for spec in multi_i:
-                                            cn, _, dd = str(spec).partition(':')
-                                            dd = dd or 'asc'
+                                            cn, _, dd = spec.partition(':')
+                                            dd = (dd or 'asc').lower()
                                             if cn in allowed_order_fields_i:
                                                 col = getattr(child_model_cls_i, cn, None)
                                                 if col is not None:
-                                                    inner_sel_i = inner_sel_i.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                                    inner_sel_i = inner_sel_i.order_by(col.desc() if dd=='desc' else col.asc())
                                                     ordered_i = True
                                     except Exception:
                                         pass
+                                    # 2) order_by/order_dir (only if no multi applied)
+                                    if not ordered_i:
+                                        try:
+                                            ob = rel_cfg_local.get('order_by')
+                                            if hasattr(ob, 'value'):
+                                                ob = getattr(ob, 'value')
+                                            if ob and ob in allowed_order_fields_i:
+                                                dir_v = _dir_value(rel_cfg_local.get('order_dir'))
+                                                col = getattr(child_model_cls_i, ob, None)
+                                                if col is not None:
+                                                    inner_sel_i = inner_sel_i.order_by(col.desc() if dir_v=='desc' else col.asc())
+                                                    ordered_i = True
+                                        except Exception:
+                                            pass
+                                    # 3) fallback: id asc if exists
+                                    if not ordered_i:
+                                        try:
+                                            if 'id' in child_model_cls_i.__table__.columns:
+                                                inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id').asc())
+                                                ordered_i = True
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     pass
                                 # Apply ad-hoc JSON where for nested relation as well
@@ -2260,25 +2679,33 @@ class BerrySchema:
                                 else:
                                     select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                 stmt = select(*select_columns)
-                # Restrict entity columns using load_only to requested scalars and required helpers
+                # Add minimal root columns directly into the SELECT to avoid pulling all entity columns
+                # Prefer selecting only requested scalars and id when relations are requested.
                 try:
-                    cols: list[Any] = []
-                    # Effective root columns: requested scalars, required FK helpers, and id when relations are requested
+                    base_root_cols: list[Any] = []
                     effective_root_cols: set[str] = set(requested_scalar_root or set())
+                    # Include id when any relation is requested (needed for correlation)
                     if requested_relations:
                         effective_root_cols.add('id')
+                    # Include any required FK helper columns for resolvers
+                    for fk in required_fk_parent_cols:
+                        effective_root_cols.add(fk)
+                    # Label columns explicitly so RowMapping uses plain keys (e.g., 'id', 'author_id')
                     for sf in effective_root_cols:
                         if hasattr(model_cls, sf):
-                            cols.append(getattr(model_cls, sf))
-                    for fk in required_fk_parent_cols:
-                        if hasattr(model_cls, fk):
-                            col_attr = getattr(model_cls, fk)
-                            if col_attr not in cols:
-                                cols.append(col_attr)
-                    if cols:
-                        stmt = stmt.options(load_only(*cols))
+                            try:
+                                col_obj = getattr(model_cls, sf)
+                                base_root_cols.append(col_obj.label(sf))
+                            except Exception:
+                                base_root_cols.append(getattr(model_cls, sf))
+                    if base_root_cols or select_columns:
+                        stmt = select(*base_root_cols, *select_columns)
+                    else:
+                        # Nothing explicit to project; fall back to entity
+                        stmt = select(model_cls)
                 except Exception:
-                    pass
+                    # Fallback if anything above fails
+                    stmt = select(model_cls)
                 else:
                 # ----- Phase 2 filtering (argument-driven) -----
                     where_clauses = []
@@ -2486,36 +2913,78 @@ class BerrySchema:
                     async with lock:
                         result = await session.execute(stmt)
                         sa_rows = result.fetchall()
-                        rows = [r[0] for r in sa_rows]
                         out = []
-                        for row_index, row in enumerate(rows):
+                        for row_index, sa_row in enumerate(sa_rows):
                             inst = st_cls()
-                            setattr(inst, '_model', row)
-                            # hydrate only requested scalar fields
+                            # Prefer mapping access for both minimal and legacy entity selects
+                            try:
+                                mapping = getattr(sa_row, '_mapping')
+                            except Exception:
+                                mapping = {}
+                            # Pre-hydrate any mapped root scalars onto the instance (id, helper FKs, requested scalars)
+                            try:
+                                # Mapping supports .items(); if not, try casting to dict
+                                it = None
+                                try:
+                                    it = mapping.items()
+                                except Exception:
+                                    try:
+                                        it = dict(mapping).items()
+                                    except Exception:
+                                        it = []
+                                for key, val in list(it):
+                                    try:
+                                        setattr(inst, key, val)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            # Attach _model only when an ORM entity is present in row 0
+                            try:
+                                row0 = sa_row[0]
+                                # Heuristic: ORM entity usually has __table__ attr on its class
+                                if hasattr(getattr(row0, '__class__', object), '__table__'):
+                                    setattr(inst, '_model', row0)
+                                else:
+                                    setattr(inst, '_model', None)
+                            except Exception:
+                                setattr(inst, '_model', None)
+                            # hydrate only requested scalar fields from mapping
                             try:
                                 if requested_scalar_root:
                                     for sf in requested_scalar_root:
                                         try:
-                                            setattr(inst, sf, getattr(row, sf, None))
+                                            setattr(inst, sf, mapping.get(sf, None))
                                         except Exception:
                                             pass
                             except Exception:
                                 pass
-                            # attach custom scalar field values from select
+                            # ensure helper root columns (id and FK helpers) are present on instance
+                            try:
+                                needed_cols: set[str] = set()
+                                # id often required for relation resolvers
+                                if requested_relations:
+                                    needed_cols.add('id')
+                                for fk in required_fk_parent_cols:
+                                    needed_cols.add(fk)
+                                for col_name in needed_cols:
+                                    if getattr(inst, col_name, None) is None and (col_name in mapping):
+                                        try:
+                                            setattr(inst, col_name, mapping.get(col_name))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            # attach custom scalar field values from labeled select columns
                             if custom_fields:
-                                base_offset = 1  # model at position 0
-                                for idx, (cf_name, _) in enumerate(custom_fields, start=base_offset):
+                                for (cf_name, _) in custom_fields:
                                     try:
-                                        val = sa_rows[row_index][idx]
-                                        setattr(inst, cf_name, val)
+                                        if cf_name in mapping:
+                                            setattr(inst, cf_name, mapping[cf_name])
                                     except Exception:
                                         pass
                             # reconstruct custom object fields (prefer single JSON column if present)
                             if custom_object_fields:
-                                try:
-                                    mapping = getattr(sa_rows[row_index], '_mapping')
-                                except Exception:
-                                    mapping = {}
                                 for cf_name, col_labels, returns_spec in custom_object_fields:
                                     obj = None
                                     # If we labeled a JSON column for this field, use it; else assemble from multiple scalar labels (MSSQL)
@@ -2611,10 +3080,7 @@ class BerrySchema:
                                     except Exception:
                                         pass
                             # hydrate pushed-down relation JSON
-                            try:
-                                mapping = getattr(sa_rows[row_index], '_mapping')
-                            except Exception:
-                                mapping = {}
+                                    # mapping already available above
                             if requested_relations:
                                 for rel_name in requested_relations.keys():
                                     key = f"_pushrel_{rel_name}"
@@ -2720,8 +3186,88 @@ class BerrySchema:
                                                                                             setattr(ni, nsf, nv.get(nsf))
                                                                                     setattr(ni, '_model', None)
                                                                                     nlist.append(ni)
-                                                                        setattr(child_inst, nname, nlist)
-                                                                        setattr(child_inst, f"_{nname}_prefetched", nlist)
+                                                                    # Apply Python-side ordering/filtering/pagination for nested if requested
+                                                                    try:
+                                                                        parent_rel_meta = requested_relations.get(rel_name, {})
+                                                                        nested_meta_src = (parent_rel_meta.get('nested') or {}).get(nname, {})
+                                                                        # ordering
+                                                                        nmulti = nested_meta_src.get('order_multi') or []
+                                                                        nby = nested_meta_src.get('order_by')
+                                                                        ndir = _dir_value(nested_meta_src.get('order_dir'))
+                                                                        if nmulti:
+                                                                            specs = []
+                                                                            for spec in nmulti:
+                                                                                cn, _, dd = str(spec).partition(':')
+                                                                                dd = (dd or 'asc').lower()
+                                                                                specs.append((cn, dd))
+                                                                            for cn, dd in reversed(specs):
+                                                                                nlist.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
+                                                                        elif nby:
+                                                                            nlist.sort(key=lambda o: getattr(o, nby, None), reverse=(ndir=='desc'))
+                                                                        # where
+                                                                        def _apply_where_py(objs, where_dict):
+                                                                            if not isinstance(where_dict, dict):
+                                                                                return objs
+                                                                            def _match(o):
+                                                                                for col_name2, op_map2 in (where_dict or {}).items():
+                                                                                    v = getattr(o, col_name2, None)
+                                                                                    for op_name2, val2 in (op_map2 or {}).items():
+                                                                                        if op_name2 == 'eq' and not (v == val2):
+                                                                                            return False
+                                                                                        if op_name2 == 'ne' and not (v != val2):
+                                                                                            return False
+                                                                                        if op_name2 == 'lt' and not (v < val2):
+                                                                                            return False
+                                                                                        if op_name2 == 'lte' and not (v <= val2):
+                                                                                            return False
+                                                                                        if op_name2 == 'gt' and not (v > val2):
+                                                                                            return False
+                                                                                        if op_name2 == 'gte' and not (v >= val2):
+                                                                                            return False
+                                                                                        if op_name2 == 'like' or op_name2 == 'ilike':
+                                                                                            try:
+                                                                                                s = (v or '')
+                                                                                                pat = str(val2 or '')
+                                                                                                if op_name2 == 'ilike':
+                                                                                                    s = str(s).lower(); pat = pat.lower()
+                                                                                                # naive % handling: contains
+                                                                                                pat2 = pat.replace('%','')
+                                                                                                if pat2 not in s:
+                                                                                                    return False
+                                                                                            except Exception:
+                                                                                                return False
+                                                                                return True
+                                                                            return [o for o in objs if _match(o)]
+                                                                        nwhere = nested_meta_src.get('where')
+                                                                        try:
+                                                                            import json as _json
+                                                                            if isinstance(nwhere, str):
+                                                                                nwhere = _json.loads(nwhere)
+                                                                        except Exception:
+                                                                            pass
+                                                                        if nwhere:
+                                                                            nlist = _apply_where_py(nlist, nwhere)
+                                                                        # pagination
+                                                                        noffset = nested_meta_src.get('offset')
+                                                                        nlimit = nested_meta_src.get('limit')
+                                                                        try:
+                                                                            if noffset is not None:
+                                                                                noffset = int(noffset)
+                                                                        except Exception:
+                                                                            pass
+                                                                        try:
+                                                                            if nlimit is not None:
+                                                                                nlimit = int(nlimit)
+                                                                        except Exception:
+                                                                            pass
+                                                                        if isinstance(noffset, int) and noffset > 0:
+                                                                            nlist = nlist[noffset:]
+                                                                        if isinstance(nlimit, int):
+                                                                            nlist = nlist[:nlimit]
+                                                                    except Exception:
+                                                                        pass
+                                                                    setattr(child_inst, nname, nlist)
+                                                                    setattr(child_inst, f"_{nname}_prefetched", nlist)
                                                                     # record nested pushdown meta
                                                                     try:
                                                                         meta_map2 = getattr(child_inst, '_pushdown_meta', None)
@@ -2759,10 +3305,79 @@ class BerrySchema:
                                                         tmp_list.sort(key=lambda o: getattr(o, single_by, None), reverse=(single_dir=='desc'))
                                                 except Exception:
                                                     pass
+                                                # Apply Python-side filtering/pagination for top-level relation if needed
+                                                try:
+                                                    rel_cfg_meta = requested_relations.get(rel_name, {})
+                                                    # where
+                                                    rwhere = rel_cfg_meta.get('where')
+                                                    try:
+                                                        import json as _json
+                                                        if isinstance(rwhere, str):
+                                                            rwhere = _json.loads(rwhere)
+                                                    except Exception:
+                                                        pass
+                                                    def _apply_where_py_top(objs, where_dict):
+                                                        if not isinstance(where_dict, dict):
+                                                            return objs
+                                                        def _match(o):
+                                                            for col_name2, op_map2 in (where_dict or {}).items():
+                                                                v = getattr(o, col_name2, None)
+                                                                for op_name2, val2 in (op_map2 or {}).items():
+                                                                    if op_name2 == 'eq' and not (v == val2):
+                                                                        return False
+                                                                    if op_name2 == 'ne' and not (v != val2):
+                                                                        return False
+                                                                    if op_name2 == 'lt' and not (v < val2):
+                                                                        return False
+                                                                    if op_name2 == 'lte' and not (v <= val2):
+                                                                        return False
+                                                                    if op_name2 == 'gt' and not (v > val2):
+                                                                        return False
+                                                                    if op_name2 == 'gte' and not (v >= val2):
+                                                                        return False
+                                                                    if op_name2 == 'like' or op_name2 == 'ilike':
+                                                                        try:
+                                                                            s = (v or '')
+                                                                            pat = str(val2 or '')
+                                                                            if op_name2 == 'ilike':
+                                                                                s = str(s).lower(); pat = pat.lower()
+                                                                            pat2 = pat.replace('%','')
+                                                                            if pat2 not in s:
+                                                                                return False
+                                                                        except Exception:
+                                                                            return False
+                                                            return True
+                                                        return [o for o in objs if _match(o)]
+                                                    if rwhere:
+                                                        tmp_list = _apply_where_py_top(tmp_list, rwhere)
+                                                    # offset/limit
+                                                    roffset = rel_cfg_meta.get('offset')
+                                                    rlimit = rel_cfg_meta.get('limit')
+                                                    try:
+                                                        if roffset is not None:
+                                                            roffset = int(roffset)
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        if rlimit is not None:
+                                                            rlimit = int(rlimit)
+                                                    except Exception:
+                                                        pass
+                                                    if isinstance(roffset, int) and roffset > 0:
+                                                        tmp_list = tmp_list[roffset:]
+                                                    if isinstance(rlimit, int):
+                                                        tmp_list = tmp_list[:rlimit]
+                                                except Exception:
+                                                    pass
                                                 built_value = tmp_list
                                         else:
                                             built_value = parsed_value
-                                        setattr(inst, f"_{rel_name}_prefetched", built_value)
+                                        # Only cache prefetched value for single relation if object is present;
+                                        # when None, allow the resolver to perform a targeted DB fetch.
+                                        if is_single and built_value is None:
+                                            pass
+                                        else:
+                                            setattr(inst, f"_{rel_name}_prefetched", built_value)
                                         # record pushdown meta for pagination reuse
                                         meta_map = getattr(inst, '_pushdown_meta', None)
                                         if meta_map is None:
@@ -2773,11 +3388,8 @@ class BerrySchema:
                                             'offset': rel_cfg.get('offset'),
                                             'from_pushdown': True
                                         }
-                                        # Also assign to public attribute to avoid resolver DB path
-                                        try:
-                                            setattr(inst, rel_name, built_value)
-                                        except Exception:
-                                            pass
+                                        # Don't assign to public attribute; resolver will read _prefetched and
+                                        # still apply per-call filters/order/pagination deterministically.
                             # populate aggregate count cache from pushdown columns
                             if count_aggregates:
                                 cache = getattr(inst, '_agg_cache', None)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any
-from sqlalchemy import func, text as _text
+from sqlalchemy import func, text as _text, literal
 
 class BaseAdapter:
     name = 'base'
@@ -20,7 +20,8 @@ class SQLiteAdapter(BaseAdapter):
     def json_array_agg(self, expr):
         return func.json_group_array(expr)
     def json_array_coalesce(self, expr):
-        return func.coalesce(expr, '[]')
+        # Use a bound literal to avoid deprecation warnings for implicit string coercion
+        return func.coalesce(expr, literal('[]'))
 
 class PostgresAdapter(BaseAdapter):
     name = 'postgres'
@@ -29,7 +30,13 @@ class PostgresAdapter(BaseAdapter):
     def json_array_agg(self, expr):
         return func.json_agg(expr)
     def json_array_coalesce(self, expr):
-        return func.coalesce(expr, _text("'[]'::json"))
+        # Prefer a typed literal over raw text for JSON to avoid deprecation warnings
+        try:
+            from sqlalchemy.dialects.postgresql import JSON as _PG_JSON
+            return func.coalesce(expr, literal('[]', type_=_PG_JSON()))
+        except Exception:
+            # Fallback keeps previous behavior if dialect types aren't available at import time
+            return func.coalesce(expr, _text("'[]'::json"))
 
 class MSSQLAdapter(BaseAdapter):
     name = 'mssql'
