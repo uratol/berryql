@@ -13,6 +13,29 @@ def _from_camel(name: str) -> str:
 class RelationSelectionExtractor:
     def __init__(self, registry: Any | None = None):
         self.registry = registry or getattr(self, 'registry', None)
+        # Extract a name normalizer function from registry.name_converter if present
+        self._name_converter = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
+        # Precompute a mapping function from GraphQL -> Python name
+        # If a name_converter is present, reverse apply_naming_config by comparing candidates; fallback to camel->snake.
+        def _to_python(name: str, fields_map: Dict[str, Any]) -> str:
+            # Fast path: direct match
+            if name in fields_map:
+                return name
+            # Try auto camel-case hint
+            if getattr(self.registry, '_auto_camel_case', False):
+                snake = _from_camel(str(name))
+                if snake in fields_map:
+                    return snake
+            # If we have a converter, try to reverse map by applying converter to known python names
+            if callable(self._name_converter):
+                for py_name in fields_map.keys():
+                    try:
+                        if self._name_converter(py_name) == name:
+                            return py_name
+                    except Exception:
+                        continue
+            return name
+        self._to_python = _to_python
 
     def _init_rel_cfg(self, fdef: Any) -> Dict[str, Any]:
         single = bool(fdef.meta.get('single') or (fdef.meta.get('mode') == 'single'))
@@ -56,12 +79,11 @@ class RelationSelectionExtractor:
                 continue
             # Support camelCase field names when schema is configured with auto_camel_case
             fields_map = getattr(btype, '__berry_fields__', {}) or {}
-            fdef = fields_map.get(name)
-            if not fdef and getattr(getattr(self, 'registry', None), '_auto_camel_case', False):
-                snake = _from_camel(str(name))
-                fdef = fields_map.get(snake)
-                if fdef:
-                    name = snake
+            # Normalize name using config-aware converter
+            py_name = self._to_python(str(name), fields_map)
+            fdef = fields_map.get(py_name)
+            if fdef:
+                name = py_name
             if not fdef or fdef.kind != 'relation':
                 continue
             rel_cfg = out.setdefault(name, self._init_rel_cfg(fdef))
@@ -93,12 +115,11 @@ class RelationSelectionExtractor:
                         continue
                     # target sub-field camelCase support
                     sub_fields = getattr(tgt_b, '__berry_fields__', {}) if tgt_b else {}
-                    sub_def = sub_fields.get(sub_name) if tgt_b else None
-                    if not sub_def and getattr(getattr(self, 'registry', None), '_auto_camel_case', False):
-                        snake_sub = _from_camel(str(sub_name))
-                        sub_def = sub_fields.get(snake_sub) if tgt_b else None
-                        if sub_def:
-                            sub_name = snake_sub
+                    # Normalize nested field name
+                    py_sub = self._to_python(str(sub_name), sub_fields) if tgt_b else sub_name
+                    sub_def = sub_fields.get(py_sub) if tgt_b else None
+                    if sub_def:
+                        sub_name = py_sub
                     if not sub_def or sub_def.kind == 'scalar':
                         if sub_name not in rel_cfg['fields']:
                             rel_cfg['fields'].append(sub_name)
@@ -131,12 +152,10 @@ class RelationSelectionExtractor:
                                     nname2 = getattr(getattr(sub2, 'name', None), 'value', None) or getattr(sub2, 'name', None)
                                     if nname2 and not nname2.startswith('__'):
                                         sfields2 = getattr(tgt_b2, '__berry_fields__', {}) if tgt_b2 else {}
-                                        sdef2 = sfields2.get(nname2) if tgt_b2 else None
-                                        if not sdef2 and getattr(getattr(self, 'registry', None), '_auto_camel_case', False):
-                                            snake2 = _from_camel(str(nname2))
-                                            sdef2 = sfields2.get(snake2) if tgt_b2 else None
-                                            if sdef2:
-                                                nname2 = snake2
+                                        py2 = self._to_python(str(nname2), sfields2) if tgt_b2 else nname2
+                                        sdef2 = sfields2.get(py2) if tgt_b2 else None
+                                        if sdef2:
+                                            nname2 = py2
                                         if not sdef2 or sdef2.kind == 'scalar':
                                             if nname2 not in ncfg['fields']:
                                                 ncfg['fields'].append(nname2)
@@ -198,12 +217,10 @@ class RelationSelectionExtractor:
                             continue
                         # root relation camelCase support
                         fields_map = getattr(btype, '__berry_fields__', {}) or {}
-                        fdef = fields_map.get(rname)
-                        if not fdef and getattr(getattr(self, 'registry', None), '_auto_camel_case', False):
-                            snake = _from_camel(str(rname))
-                            fdef = fields_map.get(snake)
-                            if fdef:
-                                rname = snake
+                        py_r = self._to_python(str(rname), fields_map)
+                        fdef = fields_map.get(py_r)
+                        if fdef:
+                            rname = py_r
                         if not fdef or fdef.kind != 'relation':
                             continue
                         ast_args = {}
@@ -228,12 +245,10 @@ class RelationSelectionExtractor:
                                 if not sub_name or sub_name.startswith('__'):
                                     continue
                                 sub_fields = getattr(tgt_b, '__berry_fields__', {}) if tgt_b else {}
-                                sdef = sub_fields.get(sub_name) if tgt_b else None
-                                if not sdef and getattr(getattr(self, 'registry', None), '_auto_camel_case', False):
-                                    snake_sub = _from_camel(str(sub_name))
-                                    sdef = sub_fields.get(snake_sub) if tgt_b else None
-                                    if sdef:
-                                        sub_name = snake_sub
+                                py_sub = self._to_python(str(sub_name), sub_fields) if tgt_b else sub_name
+                                sdef = sub_fields.get(py_sub) if tgt_b else None
+                                if sdef:
+                                    sub_name = py_sub
                                 if not sdef or sdef.kind == 'scalar':
                                     if sub_name not in rel_cfg['fields']:
                                         rel_cfg['fields'].append(sub_name)
@@ -245,12 +260,10 @@ class RelationSelectionExtractor:
                             if not sub_name or sub_name.startswith('__'):
                                 continue
                             sub_fields = getattr(tgt_b, '__berry_fields__', {}) if tgt_b else {}
-                            sub_def = sub_fields.get(sub_name) if tgt_b else None
-                            if not sub_def and getattr(getattr(self, 'registry', None), '_auto_camel_case', False):
-                                snake_sub = _from_camel(str(sub_name))
-                                sub_def = sub_fields.get(snake_sub) if tgt_b else None
-                                if sub_def:
-                                    sub_name = snake_sub
+                            py_sub = self._to_python(str(sub_name), sub_fields) if tgt_b else sub_name
+                            sub_def = sub_fields.get(py_sub) if tgt_b else None
+                            if sub_def:
+                                sub_name = py_sub
                             if not sub_def or sub_def.kind != 'relation':
                                 continue
                             n_args = {}
@@ -270,6 +283,9 @@ class RelationSelectionExtractor:
         return out
 
 class RootSelectionExtractor:
+    def __init__(self, registry: Any | None = None):
+        # Currently unused but kept for parity/signature consistency
+        self.registry = registry or getattr(self, 'registry', None)
     def _children(self, node: Any) -> list[Any]:
         selset = getattr(node, 'selection_set', None)
         if selset is not None and getattr(selset, 'selections', None) is not None:

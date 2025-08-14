@@ -117,14 +117,23 @@ class BerrySchema:
         return base.lower() + 's'
 
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
-        # Persist selected camelCase behavior for extractor logic
+        # Persist naming behavior for extractor logic
         try:
-            if strawberry_config is not None and hasattr(strawberry_config, 'auto_camel_case'):
-                self._auto_camel_case = bool(getattr(strawberry_config, 'auto_camel_case'))
+            # Prefer explicit name_converter when available
+            if strawberry_config is not None and hasattr(strawberry_config, 'name_converter'):
+                self._name_converter = getattr(strawberry_config, 'name_converter')
+                # Derive auto_camel_case hint from converter when present
+                self._auto_camel_case = bool(getattr(self._name_converter, 'auto_camel_case', False))
             else:
-                self._auto_camel_case = False
+                # Fallback to auto_camel_case on config if exposed (older Strawberry)
+                if strawberry_config is not None and hasattr(strawberry_config, 'auto_camel_case'):
+                    self._auto_camel_case = bool(getattr(strawberry_config, 'auto_camel_case'))
+                else:
+                    self._auto_camel_case = False
+                self._name_converter = None
         except Exception:
             self._auto_camel_case = False
+            self._name_converter = None
         # Two-pass: create plain classes first
         for name, bcls in self.types.items():
             if name not in self._st_types:
@@ -1141,6 +1150,7 @@ class BerrySchema:
                         _normalize_rel_cfg(n)
                 for rel_cfg in list(requested_relations.values()):
                     _normalize_rel_cfg(rel_cfg)
+                # Use no-arg RootSelectionExtractor to maintain broad compatibility
                 root_selected = RootSelectionExtractor().extract(info, root_field_name, btype_cls)
                 requested_scalar_root: set[str] = set(root_selected.get('scalars', set()))
                 requested_custom_root: set[str] = set(root_selected.get('custom', set()))
