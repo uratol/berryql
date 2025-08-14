@@ -1233,7 +1233,33 @@ class BerrySchema:
                 def _json_array_coalesce(expr):
                     return adapter.json_array_coalesce(expr)
                 # Acquire per-context lock to avoid concurrent AsyncSession use (esp. MSSQL/pyodbc limitations)
-                lock = info.context.setdefault('_berry_db_lock', asyncio.Lock())
+                # info.context may be a dict or an object; handle both safely.
+                try:
+                    ctx = getattr(info, 'context', None)
+                except Exception:
+                    ctx = None
+                lock = None
+                if isinstance(ctx, dict):
+                    lock = ctx.get('_berry_db_lock')
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        try:
+                            ctx['_berry_db_lock'] = lock
+                        except Exception:
+                            pass
+                elif ctx is not None:
+                    try:
+                        lock = getattr(ctx, '_berry_db_lock')
+                    except Exception:
+                        lock = None
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        try:
+                            setattr(ctx, '_berry_db_lock', lock)
+                        except Exception:
+                            pass
+                if lock is None:
+                    lock = asyncio.Lock()
                 # Collect custom field expressions for pushdown
                 custom_fields: List[tuple[str, Any]] = []
                 custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
@@ -2516,7 +2542,19 @@ class BerrySchema:
                         custom_where = None
                     # Use shared where-dict -> SQLA expression builder
                     # Only enforce custom_where when explicitly enabled by context flag
-                    if custom_where is not None and bool(getattr(info, 'context', {}) and info.context.get('enforce_user_gate')):
+                    try:
+                        _ctx = getattr(info, 'context', None)
+                    except Exception:
+                        _ctx = None
+                    enforce_gate = False
+                    if isinstance(_ctx, dict):
+                        enforce_gate = bool(_ctx.get('enforce_user_gate'))
+                    elif _ctx is not None:
+                        try:
+                            enforce_gate = bool(getattr(_ctx, 'enforce_user_gate', False))
+                        except Exception:
+                            enforce_gate = False
+                    if custom_where is not None and enforce_gate:
                         try:
                             cw_val = custom_where(model_cls, info) if callable(custom_where) else custom_where
                         except Exception:
