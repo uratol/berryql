@@ -876,28 +876,6 @@ class BerrySchema:
                                     setattr(self, '_agg_cache', cache)
                                 cache[key] = val
                                 return val
-                            if is_last_local:
-                                from sqlalchemy import select as _select
-                                # Prefer created_at desc if column exists, else id desc
-                                order_col = None
-                                if 'created_at' in child_model_cls.__table__.columns:
-                                    order_col = child_model_cls.__table__.columns['created_at']
-                                elif 'id' in child_model_cls.__table__.columns:
-                                    order_col = child_model_cls.__table__.columns['id']
-                                stmt = _select(child_model_cls).where(fk_col == getattr(parent_model, 'id'))
-                                if order_col is not None:
-                                    stmt = stmt.order_by(order_col.desc())
-                                stmt = stmt.limit(1)
-                                result = await session.execute(stmt)
-                                row = result.scalar_one_or_none()
-                                if row is None:
-                                    return None
-                                # return last related row id if present
-                                val = getattr(row, 'id', None)
-                                if cache is None:
-                                    cache = {}
-                                    setattr(self, '_agg_cache', cache)
-                                return val
                             return None
                         return aggregate_resolver
                     setattr(st_cls, fname, strawberry.field(_make_aggregate_resolver()))
