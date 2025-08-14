@@ -19,6 +19,12 @@ try:  # Provide StrawberryInfo for type annotations
 except Exception:  # pragma: no cover
     class StrawberryInfo:  # type: ignore
         ...
+try:  # Provide StrawberryConfig for type annotations (optional)
+    from strawberry.schema.config import StrawberryConfig  # type: ignore
+except Exception:  # pragma: no cover
+    class StrawberryConfig:  # type: ignore
+        def __init__(self, auto_camel_case: bool | None = None):
+            self.auto_camel_case = auto_camel_case
 
 T = TypeVar('T')
 
@@ -110,7 +116,15 @@ class BerrySchema:
             base = name
         return base.lower() + 's'
 
-    def to_strawberry(self):
+    def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
+        # Persist selected camelCase behavior for extractor logic
+        try:
+            if strawberry_config is not None and hasattr(strawberry_config, 'auto_camel_case'):
+                self._auto_camel_case = bool(getattr(strawberry_config, 'auto_camel_case'))
+            else:
+                self._auto_camel_case = False
+        except Exception:
+            self._auto_camel_case = False
         # Two-pass: create plain classes first
         for name, bcls in self.types.items():
             if name not in self._st_types:
@@ -118,8 +132,6 @@ class BerrySchema:
                 cls = type(name, (), base_namespace)
                 cls.__module__ = __name__
                 self._st_types[name] = cls
-                # register in module globals for forward ref resolution later
-                globals()[name] = cls
         # Second pass: add fields & annotations before decoration
         for name, bcls in self.types.items():
             st_cls = self._st_types[name]
@@ -151,11 +163,15 @@ class BerrySchema:
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
                     if target_name:
-                        # Use string forward refs so we don't depend on decoration order
-                        if is_single:
-                            annotations[fname] = f'Optional[{target_name}]'
+                        # Use actual class objects from registry to avoid global forward-ref collisions
+                        target_cls_ref = self._st_types.get(target_name)
+                        if target_cls_ref is not None:
+                            if is_single:
+                                annotations[fname] = Optional[target_cls_ref]  # type: ignore[index]
+                            else:
+                                annotations[fname] = List[target_cls_ref]  # type: ignore[index]
                         else:
-                            annotations[fname] = f'List[{target_name}]'
+                            annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     else:  # fallback placeholder
                         annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     meta_copy = dict(fdef.meta)
@@ -955,9 +971,9 @@ class BerrySchema:
                 mod_globals.update({'Optional': Optional, 'List': List})
                 self._st_types[name] = strawberry.type(cls)  # type: ignore
         # Hand off to builder that assembles the Query type and Schema
-        return self._build_query()
+        return self._build_query(strawberry_config=strawberry_config)
 
-    def _build_query(self):
+    def _build_query(self, *, strawberry_config: Optional[StrawberryConfig] = None):
         # Root query assembly: create class, then attach fields before decoration
         query_annotations: Dict[str, Any] = {}
         QueryPlain = type('Query', (), {'__doc__': 'Auto-generated Berry root query (prototype).'})
@@ -1219,6 +1235,17 @@ class BerrySchema:
                             return None
                         # Scalars to project for child rows
                         requested_scalar_i = list(rel_cfg.get('fields') or [])
+                        # Keep only valid scalar fields; drop unknowns or relations (e.g., camelCase names)
+                        try:
+                            if requested_scalar_i:
+                                tmp: list[str] = []
+                                for sf in requested_scalar_i:
+                                    sdef = target_b_i.__berry_fields__.get(sf)
+                                    if sdef and sdef.kind == 'scalar':
+                                        tmp.append(sf)
+                                requested_scalar_i = tmp
+                        except Exception:
+                            pass
                         if not requested_scalar_i:
                             for sf, sdef in target_b_i.__berry_fields__.items():
                                 if sdef.kind == 'scalar':
@@ -1949,6 +1976,17 @@ class BerrySchema:
                                 if fk_col_i is None:
                                     return None
                                 requested_scalar_i = list(rel_cfg_local.get('fields') or [])
+                                # Keep only valid scalar fields; ignore unknowns/relations
+                                try:
+                                    if requested_scalar_i:
+                                        tmp: list[str] = []
+                                        for sf in requested_scalar_i:
+                                            sdef = target_b_i.__berry_fields__.get(sf)
+                                            if sdef and sdef.kind == 'scalar':
+                                                tmp.append(sf)
+                                        requested_scalar_i = tmp
+                                except Exception:
+                                    pass
                                 if not requested_scalar_i:
                                     for sf, sdef in target_b_i.__berry_fields__.items():
                                         if sdef.kind == 'scalar':
@@ -3223,12 +3261,24 @@ class BerrySchema:
         setattr(QueryPlain, '__annotations__', query_annotations)
         Query = QueryPlain
         Query = strawberry.type(Query)  # type: ignore
+        # Build the Schema honoring provided strawberry_config; keep backward compatibility.
+        # Precedence: explicit strawberry_config -> default False (legacy behavior)
+        if strawberry_config is not None:
+            # Try new-style config argument first
+            try:
+                return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
+            except TypeError:  # fallback for older strawberry versions
+                # Try to extract auto_camel_case from the provided config and pass directly
+                ac = getattr(strawberry_config, 'auto_camel_case', None)
+                try:
+                    return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
+                except TypeError:
+                    return strawberry.Schema(Query)
+        # Default: preserve previous library behavior (auto_camel_case=False)
         try:
-            # Prefer direct flag (older versions). Fallback to config object.
             return strawberry.Schema(Query, auto_camel_case=False)  # type: ignore[arg-type]
         except TypeError:  # pragma: no cover
             try:
-                from strawberry.schema.config import StrawberryConfig  # type: ignore
-                return strawberry.Schema(Query, config=StrawberryConfig(auto_camel_case=False))
+                return strawberry.Schema(Query, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
             except Exception:
                 return strawberry.Schema(Query)
