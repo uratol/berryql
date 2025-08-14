@@ -320,12 +320,16 @@ class BerrySchema:
                                 # Parse where JSON if provided
                                 import json as _json
                                 where_dict = None
-                                try:
-                                    where_dict = related_where
-                                    if isinstance(related_where, str):
-                                        where_dict = _json.loads(related_where)
-                                except Exception:
-                                    where_dict = None
+                                # Parse/validate where JSON strictly if provided
+                                if related_where is not None:
+                                    try:
+                                        where_dict = related_where
+                                        if isinstance(related_where, str):
+                                            where_dict = _json.loads(related_where)
+                                    except Exception as e:
+                                        raise ValueError(f"Invalid where JSON: {e}")
+                                    if where_dict is not None and not isinstance(where_dict, dict):
+                                        raise ValueError("where must be a JSON object")
                                 if is_single_value:
                                     o = prefetched
                                     if o is None:
@@ -417,12 +421,15 @@ class BerrySchema:
                                             if related_where is not None:
                                                 wdict = related_where
                                                 if isinstance(related_where, str):
-                                                    wdict = _json.loads(related_where)
+                                                    try:
+                                                        wdict = _json.loads(related_where)
+                                                    except Exception as e:
+                                                        raise ValueError(f"Invalid where JSON: {e}")
                                                 exprs = []
                                                 for col_name, op_map in (wdict or {}).items():
                                                     col = child_model_cls.__table__.c.get(col_name)
                                                     if col is None:
-                                                        continue
+                                                        raise ValueError(f"Unknown where column: {col_name}")
                                                     for op_name, val in (op_map or {}).items():
                                                         if op_name in ('in','between') and isinstance(val, (list, tuple)):
                                                             val = [_coerce_where_value(col, v) for v in val]
@@ -430,7 +437,7 @@ class BerrySchema:
                                                             val = _coerce_where_value(col, val)
                                                         op_fn = OPERATOR_REGISTRY.get(op_name)
                                                         if not op_fn:
-                                                            continue
+                                                            raise ValueError(f"Unknown where operator: {op_name}")
                                                         exprs.append(op_fn(col, val))
                                                 if exprs:
                                                     from sqlalchemy import and_ as _and
@@ -535,12 +542,45 @@ class BerrySchema:
                             stmt = _select(child_model_cls).where(fk_col == parent_id_val)
                             # Apply where from args and/or schema default
                             if related_where is not None or meta_copy.get('where') is not None:
-                                try:
-                                    import json as _json
-                                    if related_where is not None:
-                                        wdict = related_where
-                                        if isinstance(related_where, str):
+                                import json as _json
+                                # Strictly validate and apply argument-provided where
+                                if related_where is not None:
+                                    wdict = related_where
+                                    if isinstance(related_where, str):
+                                        try:
                                             wdict = _json.loads(related_where)
+                                        except Exception as e:
+                                            raise ValueError(f"Invalid where JSON: {e}")
+                                    if wdict is not None and not isinstance(wdict, dict):
+                                        raise ValueError("where must be a JSON object")
+                                    if isinstance(wdict, dict):
+                                        exprs = []
+                                        for col_name, op_map in (wdict or {}).items():
+                                            col = child_model_cls.__table__.c.get(col_name)
+                                            if col is None:
+                                                raise ValueError(f"Unknown where column: {col_name}")
+                                            for op_name, val in (op_map or {}).items():
+                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                                    val = [_coerce_where_value(col, v) for v in val]
+                                                else:
+                                                    val = _coerce_where_value(col, val)
+                                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                                if not op_fn:
+                                                    raise ValueError(f"Unknown where operator: {op_name}")
+                                                exprs.append(op_fn(col, val))
+                                        if exprs:
+                                            from sqlalchemy import and_ as _and
+                                            stmt = stmt.where(_and(*exprs))
+                                # Default where from schema meta: keep permissive
+                                dwhere = meta_copy.get('where')
+                                if dwhere is not None:
+                                    if isinstance(dwhere, (dict, str)):
+                                        try:
+                                            wdict = dwhere
+                                            if isinstance(dwhere, str):
+                                                wdict = _json.loads(dwhere)
+                                        except Exception:
+                                            wdict = None
                                         exprs = []
                                         for col_name, op_map in (wdict or {}).items():
                                             col = child_model_cls.__table__.c.get(col_name)
@@ -555,41 +595,16 @@ class BerrySchema:
                                                 if not op_fn:
                                                     continue
                                                 exprs.append(op_fn(col, val))
-                                    if exprs:
-                                        from sqlalchemy import and_ as _and
-                                        stmt = stmt.where(_and(*exprs))
-                                    dwhere = meta_copy.get('where')
-                                    if dwhere is not None:
-                                        if isinstance(dwhere, (dict, str)):
-                                            wdict = dwhere
-                                            if isinstance(dwhere, str):
-                                                wdict = _json.loads(dwhere)
-                                            exprs = []
-                                            for col_name, op_map in (wdict or {}).items():
-                                                col = child_model_cls.__table__.c.get(col_name)
-                                                if col is None:
-                                                    continue
-                                                for op_name, val in (op_map or {}).items():
-                                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                        val = [_coerce_where_value(col, v) for v in val]
-                                                    else:
-                                                        val = _coerce_where_value(col, val)
-                                                        op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                        if not op_fn:
-                                                            continue
-                                                        exprs.append(op_fn(col, val))
-                                            if exprs:
-                                                from sqlalchemy import and_ as _and
-                                                stmt = stmt.where(_and(*exprs))
-                                        else:
-                                            try:
-                                                expr = dwhere(child_model_cls, info)
-                                                if expr is not None:
-                                                    stmt = stmt.where(expr)
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
+                                        if exprs:
+                                            from sqlalchemy import and_ as _and
+                                            stmt = stmt.where(_and(*exprs))
+                                    else:
+                                        try:
+                                            expr = dwhere(child_model_cls, info)
+                                            if expr is not None:
+                                                stmt = stmt.where(expr)
+                                        except Exception:
+                                            pass
                             # Ad-hoc JSON where for relation list if present on selection
                             rel_meta_map = getattr(self, '_pushdown_meta', None)  # not reliable; read from extractor cfg instead
                             # Ordering (multi then single) if column whitelist permits
@@ -598,6 +613,9 @@ class BerrySchema:
                                 # derive from scalar fields
                                 allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
                             applied_any = False
+                            # Validate invalid order_by up front
+                            if order_by and order_by not in allowed_order:
+                                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
                             if order_multi:
                                 for spec in order_multi:
                                     try:
@@ -1151,6 +1169,7 @@ class BerrySchema:
                 for rel_cfg in list(requested_relations.values()):
                     _normalize_rel_cfg(rel_cfg)
                 # Use no-arg RootSelectionExtractor to maintain broad compatibility
+                # Ensure we don't pass registry into RootSelectionExtractor constructor
                 root_selected = RootSelectionExtractor().extract(info, root_field_name, btype_cls)
                 requested_scalar_root: set[str] = set(root_selected.get('scalars', set()))
                 requested_custom_root: set[str] = set(root_selected.get('custom', set()))
@@ -1795,6 +1814,14 @@ class BerrySchema:
                         target_b = self.types.get(target_name)
                         if not target_b or not target_b.model:
                             continue
+                        # Early validation of relation order_by for pushdown path
+                        try:
+                            allowed_fields_rel = [sf for sf, sd in target_b.__berry_fields__.items() if sd.kind == 'scalar']
+                        except Exception:
+                            allowed_fields_rel = []
+                        ob_rel = rel_cfg.get('order_by')
+                        if ob_rel and ob_rel not in allowed_fields_rel:
+                            raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                         child_model_cls = target_b.model
                         # Determine FK
                         fk_col = None
@@ -1868,12 +1895,19 @@ class BerrySchema:
                                     import json as _json
                                     r_where = rel_cfg.get('where')
                                     if r_where is not None:
-                                        wdict_rel = r_where if not isinstance(r_where, str) else _json.loads(r_where)
+                                        wdict_rel = r_where
+                                        if isinstance(r_where, str):
+                                            try:
+                                                wdict_rel = _json.loads(r_where)
+                                            except Exception as e:
+                                                raise ValueError(f"Invalid where JSON: {e}")
+                                        if wdict_rel is not None and not isinstance(wdict_rel, dict):
+                                            raise ValueError("where must be a JSON object")
                                         exprs = []
                                         for col_name, op_map in (wdict_rel or {}).items():
                                             col = child_model_cls.__table__.c.get(col_name)
                                             if col is None:
-                                                continue
+                                                raise ValueError(f"Unknown where column: {col_name}")
                                             for op_name, val in (op_map or {}).items():
                                                 if op_name in ('in','between') and isinstance(val, (list, tuple)):
                                                     val = [_coerce_where_value(col, v) for v in val]
@@ -1881,13 +1915,16 @@ class BerrySchema:
                                                     val = _coerce_where_value(col, val)
                                                 op_fn = OPERATOR_REGISTRY.get(op_name)
                                                 if not op_fn:
-                                                    continue
+                                                    raise ValueError(f"Unknown where operator: {op_name}")
                                                 exprs.append(op_fn(col, val))
                                         if exprs:
                                             rel_subq = rel_subq.where(_and(*exprs))
                                     d_where = rel_cfg.get('default_where')
                                     if d_where is not None and isinstance(d_where, (dict, str)):
-                                        dwdict_rel = d_where if not isinstance(d_where, str) else _json.loads(d_where)
+                                        try:
+                                            dwdict_rel = d_where if not isinstance(d_where, str) else _json.loads(d_where)
+                                        except Exception:
+                                            dwdict_rel = None
                                         exprs = []
                                         for col_name, op_map in (dwdict_rel or {}).items():
                                             col = child_model_cls.__table__.c.get(col_name)
@@ -1905,7 +1942,7 @@ class BerrySchema:
                                         if exprs:
                                             rel_subq = rel_subq.where(_and(*exprs))
                                 except Exception:
-                                    pass
+                                    raise
                                 # Apply filter args if any
                                 try:
                                     filter_args = rel_cfg.get('filter_args') or {}
@@ -2085,16 +2122,25 @@ class BerrySchema:
                                         if r_where is not None:
                                             wdict_rel = r_where
                                             if isinstance(r_where, str):
-                                                wdict_rel = _json.loads(r_where)
+                                                try:
+                                                    wdict_rel = _json.loads(r_where)
+                                                except Exception as e:
+                                                    raise ValueError(f"Invalid where JSON: {e}")
+                                            if wdict_rel is not None and not isinstance(wdict_rel, dict):
+                                                raise ValueError("where must be a JSON object")
                                             where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, wdict_rel))
                                         d_where = rel_cfg_local.get('default_where')
                                         if d_where is not None and isinstance(d_where, (dict, str)):
                                             dwdict_rel = d_where
                                             if isinstance(d_where, str):
-                                                dwdict_rel = _json.loads(d_where)
-                                            where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, dwdict_rel))
+                                                try:
+                                                    dwdict_rel = _json.loads(d_where)
+                                                except Exception:
+                                                    dwdict_rel = None
+                                            if dwdict_rel is not None:
+                                                where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, dwdict_rel))
                                     except Exception:
-                                        pass
+                                        raise
                                     where_clause = ' AND '.join(where_parts_rel)
                                     # Build ORDER BY honoring order_multi -> order_by/order_dir -> fallback id asc
                                     try:
@@ -2446,35 +2492,26 @@ class BerrySchema:
                         custom_where = None
                     def _expr_from_where_dict(model_cls_local, wdict):
                         exprs = []
-                        try:
-                            for col_name, op_map in (wdict or {}).items():
-                                try:
-                                    col = model_cls_local.__table__.c.get(col_name)
-                                except Exception:
-                                    col = None
-                                if col is None:
-                                    continue
-                                for op_name, val in (op_map or {}).items():
-                                    op_fn = OPERATOR_REGISTRY.get(op_name)
-                                    if not op_fn:
-                                        continue
-                                    try:
-                                        # Coerce where value(s) to column type
-                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                            val = [_coerce_where_value(col, v) for v in val]
-                                        else:
-                                            val = _coerce_where_value(col, val)
-                                        exprs.append(op_fn(col, val))
-                                    except Exception:
-                                        continue
-                        except Exception:
-                            return None
+                        for col_name, op_map in (wdict or {}).items():
+                            try:
+                                col = model_cls_local.__table__.c.get(col_name)
+                            except Exception:
+                                col = None
+                            if col is None:
+                                raise ValueError(f"Unknown where column: {col_name}")
+                            for op_name, val in (op_map or {}).items():
+                                op_fn = OPERATOR_REGISTRY.get(op_name)
+                                if not op_fn:
+                                    raise ValueError(f"Unknown where operator: {op_name}")
+                                # Coerce where value(s) to column type
+                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                    val = [_coerce_where_value(col, v) for v in val]
+                                else:
+                                    val = _coerce_where_value(col, val)
+                                exprs.append(op_fn(col, val))
                         if not exprs:
                             return None
-                        try:
-                            return _and(*exprs)
-                        except Exception:
-                            return None
+                        return _and(*exprs)
                     # Only enforce custom_where when explicitly enabled by context flag
                     if custom_where is not None and bool(getattr(info, 'context', {}) and info.context.get('enforce_user_gate')):
                         try:
@@ -2495,30 +2532,26 @@ class BerrySchema:
                                 pass
                     # Apply ad-hoc raw where if provided by user/defaults
                     if raw_where is not None:
-                        try:
-                            import json as _json
-                            wdict = raw_where
-                            # Allow callable: (model_cls, info) -> dict or SA expr
-                            if callable(raw_where):
-                                try:
-                                    wdict = raw_where(model_cls, info)
-                                except Exception:
-                                    wdict = None
-                            if isinstance(wdict, str):
-                                try:
-                                    wdict = _json.loads(wdict)
-                                except Exception:
-                                    wdict = None
-                            expr2 = None
-                            if isinstance(wdict, dict):
-                                expr2 = _expr_from_where_dict(model_cls, wdict)
-                            else:
-                                # assume SQLAlchemy expression
-                                expr2 = wdict
-                            if expr2 is not None:
-                                where_clauses.append(expr2)
-                        except Exception:
-                            pass
+                        import json as _json
+                        wdict = raw_where
+                        # Allow callable: (model_cls, info) -> dict or SA expr
+                        if callable(raw_where):
+                            wdict = raw_where(model_cls, info)
+                        if isinstance(wdict, str):
+                            try:
+                                wdict = _json.loads(wdict)
+                            except Exception as e:
+                                raise ValueError(f"Invalid where JSON: {e}")
+                        expr2 = None
+                        if isinstance(wdict, dict):
+                            expr2 = _expr_from_where_dict(model_cls, wdict)
+                        else:
+                            # assume SQLAlchemy expression; if not dict/expr and not None, it's invalid
+                            expr2 = wdict
+                        if expr2 is None and wdict is not None and not isinstance(wdict, dict):
+                            raise ValueError("where must be a JSON object")
+                        if expr2 is not None:
+                            where_clauses.append(expr2)
                     for arg_name, value in _passed_filter_args.items():
                         if value is None:
                             continue
