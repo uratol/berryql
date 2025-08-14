@@ -7,6 +7,7 @@ from typing import Optional, List, Any
 from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
+from strawberry.types import Info
 from berry import BerrySchema, BerryType, field, relation, aggregate, count, custom, custom_object
 from tests.models import User, Post, PostComment  # type: ignore
 
@@ -72,6 +73,23 @@ class PostQL(BerryType):
         ),
         returns={'min_created_at': datetime, 'comments_count': int}
     )
+    # Private relation (won't be exposed as GraphQL field) to fetch first comment
+    _first_comment = relation('PostCommentQL', single=True)
+    # Public computed field built on top of the private relation
+    @strawberry.field
+    async def first_comment_preview(self, info: Info) -> str | None:
+        try:
+            # Use the private relation resolver directly
+            c = await self._first_comment(info)
+            if c is None:
+                return None
+            txt = getattr(c, 'content', None)
+            if txt is None:
+                return None
+            s = str(txt)
+            return s if len(s) <= 10 else s[:10] + '...'
+        except Exception:
+            return None
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
@@ -122,7 +140,7 @@ class UserQL(BerryType):
 class Query:
     # Plural collections
     # Move gating here: if enforce_user_gate and not admin, filter to current user; else no filter.
-    def _gate_users(model_cls, info):
+    def _gate_users(model_cls, info: Info):
         try:
             ctx = info.context or {}
             if not ctx.get('enforce_user_gate'):

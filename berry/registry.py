@@ -173,10 +173,14 @@ class BerrySchema:
                         py_t = str
                     column_type_map[col.name] = py_t
             for fname, fdef in bcls.__berry_fields__.items():
+                is_private = isinstance(fname, str) and fname.startswith('_')
                 if hasattr(st_cls, fname):
                     # don't overwrite existing custom attr
                     pass
                 if fdef.kind == 'scalar':
+                    if is_private:
+                        # Skip exposing private scalars
+                        continue
                     py_t = column_type_map.get(fname, str)
                     annotations[fname] = Optional[py_t]
                     setattr(st_cls, fname, None)
@@ -187,14 +191,17 @@ class BerrySchema:
                         # Use actual class objects from registry to avoid global forward-ref collisions
                         target_cls_ref = self._st_types.get(target_name)
                         if target_cls_ref is not None:
-                            if is_single:
-                                annotations[fname] = Optional[target_cls_ref]  # type: ignore[index]
-                            else:
-                                annotations[fname] = List[target_cls_ref]  # type: ignore[index]
+                            if not is_private:
+                                if is_single:
+                                    annotations[fname] = Optional[target_cls_ref]  # type: ignore[index]
+                                else:
+                                    annotations[fname] = List[target_cls_ref]  # type: ignore[index]
                         else:
-                            annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
+                            if not is_private:
+                                annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     else:  # fallback placeholder
-                        annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
+                        if not is_private:
+                            annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     meta_copy = dict(fdef.meta)
                     def _collect_declared_filters_for_target(target_type_name: str):
                         # Deprecated path: type-level __filters__ removed; keep stub for parity
@@ -785,9 +792,16 @@ class BerrySchema:
                                 anns[a] = Optional[base_t]
                         fn.__annotations__ = anns
                         return fn
-                    # Attach resolver with explicit argument annotations to make relation args visible in schema
-                    setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver()))
+                    # Attach resolver: if private, expose as plain method only; else as GraphQL field
+                    if is_private:
+                        setattr(st_cls, fname, _make_relation_resolver())
+                    else:
+                        # Attach resolver with explicit argument annotations to make relation args visible in schema
+                        setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver()))
                 elif fdef.kind == 'aggregate':
+                    if is_private:
+                        # Skip exposing private aggregates
+                        continue
                     # Normalize meta: if ops contains 'count' without explicit op, set op='count'
                     if 'op' not in fdef.meta and 'ops' in fdef.meta and fdef.meta.get('ops') == ['count']:
                         fdef.meta['op'] = 'count'
@@ -893,6 +907,9 @@ class BerrySchema:
                         return aggregate_resolver
                     setattr(st_cls, fname, strawberry.field(_make_aggregate_resolver()))
                 elif fdef.kind == 'custom':
+                    if is_private:
+                        # Skip exposing private custom fields
+                        continue
                     ann_type = fdef.meta.get('returns') or str
                     try:
                         # basic mapping for common primitives
@@ -962,6 +979,9 @@ class BerrySchema:
                         return custom_resolver
                     setattr(st_cls, fname, strawberry.field(_make_custom_resolver()))
                 elif fdef.kind == 'custom_object':
+                    if is_private:
+                        # Skip exposing private custom object fields
+                        continue
                     returns_spec = fdef.meta.get('returns')
                     nested_type = None
                     if isinstance(returns_spec, dict):
