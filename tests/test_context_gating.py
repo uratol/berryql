@@ -46,27 +46,3 @@ async def test_no_user_context_returns_empty(db_session, populated_db):
     assert res.data['users'] == []
 
 
-@pytest.mark.asyncio
-async def test_current_user_query_normal(db_session, sample_users, populated_db):
-    alice = sample_users[0]
-    ctx = {'db_session': db_session, 'user_id': alice.id, 'current_user': alice}
-    q = """
-    query { current_user { id name email created_at } }
-    """
-    res = await berry_schema.execute(q, context_value=ctx)
-    assert res.errors is None, res.errors
-    cu = res.data['current_user']
-    assert cu is not None
-    assert cu['id'] == alice.id
-
-
-@pytest.mark.asyncio
-async def test_current_user_query_error_case(db_session, populated_db):
-    # Match legacy behavior: raise error if user_id == 999
-    ctx = {'db_session': db_session, 'user_id': 999}
-    q = """
-    query { current_user { id name } }
-    """
-    res = await berry_schema.execute(q, context_value=ctx)
-    assert res.errors is not None
-    assert any('Custom logic executed: User 999 is forbidden!' in str(e) for e in res.errors)

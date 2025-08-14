@@ -184,3 +184,58 @@ def expr_from_where_dict(model_cls, wdict: Dict[str, Any]):
     if not exprs:
         return None
     return _and(*exprs)
+
+# --- Context helpers ---
+def get_db_session(info_or_ctx: Any) -> Any | None:
+    """Best-effort extraction of an AsyncSession-like object from context.
+
+    Accepts either a Strawberry ``Info`` or a plain context object/dict. Tries
+    common keys/attributes in order: ``db_session``, ``db``, ``session``,
+    ``async_session``.
+
+    Returns:
+        The session object if found; otherwise ``None``.
+    """
+    if info_or_ctx is None:
+        return None
+    # If a Strawberry Info is passed, use its .context
+    ctx = getattr(info_or_ctx, 'context', info_or_ctx)
+    if ctx is None:
+        return None
+    candidates = ('db_session', 'db', 'session', 'async_session')
+    # Mapping-like access with .get
+    try:
+        get = getattr(ctx, 'get', None)
+        if callable(get):
+            for k in candidates:
+                try:
+                    v = get(k, None)
+                except Exception:
+                    v = None
+                if v is not None:
+                    return v
+    except Exception:
+        pass
+    # Mapping access via __getitem__
+    try:
+        for k in candidates:
+            try:
+                v = ctx[k]  # type: ignore[index]
+            except Exception:
+                v = None
+            if v is not None:
+                return v
+    except Exception:
+        pass
+    # Attribute access
+    try:
+        for k in candidates:
+            try:
+                v = getattr(ctx, k)
+            except Exception:
+                v = None
+            if v is not None:
+                return v
+    except Exception:
+        pass
+    return None

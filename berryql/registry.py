@@ -13,6 +13,7 @@ from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING
+from .core.utils import get_db_session as _get_db
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     class Registry: ...  # forward ref placeholder
 
@@ -492,7 +493,7 @@ class BerrySchema:
                             parent_model = getattr(self, '_model', None)
                             if not target_cls_i:
                                 return None if is_single_value else []
-                            session = getattr(info.context, 'get', lambda k, d=None: info.context[k])('db_session', None) if info and info.context else None
+                            session = _get_db(info)
                             if session is None:
                                 return None if is_single_value else []
                             target_btype = self.__berry_registry__.types.get(target_name_i)
@@ -918,7 +919,7 @@ class BerrySchema:
                                 if is_count_local:
                                     return 0
                                 return None
-                            session = getattr(info.context, 'get', lambda k, d=None: info.context[k])('db_session', None) if info and info.context else None
+                            session = _get_db(info)
                             if session is None:
                                 if is_count_local:
                                     return 0
@@ -989,7 +990,7 @@ class BerrySchema:
                             parent_model = getattr(self, '_model', None)
                             if parent_model is None:
                                 return None
-                            session = getattr(info.context, 'get', lambda k, d=None: info.context[k])('db_session', None) if info and info.context else None
+                            session = _get_db(info)
                             if session is None:
                                 return None
                             builder = meta_copy.get('builder')
@@ -1216,7 +1217,7 @@ class BerrySchema:
 
             async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], _passed_filter_args: Dict[str, Any], raw_where: Optional[Any] = None):
                 out = []
-                session = info.context.get('db_session') if info and info.context else None
+                session = _get_db(info)
                 if session is None:
                     return out
                 # Detect dialect & acquire adapter (unifies JSON funcs / capabilities)
@@ -3415,54 +3416,6 @@ class BerrySchema:
             return 'pong'
         query_annotations['_ping'] = str
         setattr(QueryPlain, '_ping', strawberry.field(resolver=_ping))
-        # Optional convenience root: current_user (if a User-like type exists)
-        # We choose the first registered type whose name endswith 'UserQL' or has an 'is_admin' scalar field
-        user_type_name: Optional[str] = None
-        for tname, btype in self.types.items():
-            try:
-                if tname.lower().endswith('userql') or ('is_admin' in btype.__berry_fields__):
-                    user_type_name = tname
-                    break
-            except Exception:
-                continue
-        if user_type_name and user_type_name in self._st_types:
-            UserSt = self._st_types[user_type_name]
-            UserBt = self.types[user_type_name]
-            async def _current_user(self, info: StrawberryInfo):  # noqa: D401
-                session = info.context.get('db_session') if info and info.context else None
-                if session is None:
-                    return None
-                user_id = None
-                try:
-                    user_id = info.context.get('user_id') if info and info.context else None
-                except Exception:
-                    user_id = None
-                if user_id is None:
-                    return None
-                # Custom logic parity with legacy: raise when user_id==999
-                if user_id == 999:
-                    raise ValueError("Custom logic executed: User 999 is forbidden!")
-                try:
-                    model_cls = getattr(UserBt, 'model', None)
-                    if not model_cls:
-                        return None
-                    row = await session.get(model_cls, user_id)
-                except Exception:
-                    row = None
-                if not row:
-                    return None
-                inst = UserSt()
-                setattr(inst, '_model', row)
-                # hydrate scalars
-                for sf, sdef in UserBt.__berry_fields__.items():
-                    if sdef.kind == 'scalar':
-                        try:
-                            setattr(inst, sf, getattr(row, sf, None))
-                        except Exception:
-                            pass
-                return inst
-            query_annotations['current_user'] = Optional[UserSt]  # type: ignore
-            setattr(QueryPlain, 'current_user', strawberry.field(resolver=_current_user))
         # Set annotations last
         setattr(QueryPlain, '__annotations__', query_annotations)
         Query = QueryPlain

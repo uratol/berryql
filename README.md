@@ -39,7 +39,7 @@ Map models to GraphQL using Berry’s DSL: scalars, relations, aggregates, and c
 Example (excerpt adapted from tests):
 
 - File: `tests/schema.py` builds the runtime Strawberry schema from Berry’s registry.
-- You only need to provide an async SQLAlchemy session via GraphQL context as `db_session`.
+- You only need to provide an async SQLAlchemy session via GraphQL context as `db_session` or `db`.
 
 Highlights in the example below:
 
