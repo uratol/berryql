@@ -821,32 +821,15 @@ class BerrySchema:
                         annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
                     meta_copy = dict(fdef.meta)
                     def _collect_declared_filters_for_target(target_type_name: str):
-                        out: Dict[str, FilterSpec] = {}
-                        target_b = self.types.get(target_type_name)
-                        if not target_b:
-                            return out
-                        class_filters = getattr(target_b, '__filters__', {}) or {}
-                        for key, raw in class_filters.items():
-                            try:
-                                spec = _normalize_filter_spec(raw)
-                            except Exception:
-                                continue
-                            if spec.ops and not spec.op:
-                                for op_name in spec.ops:
-                                    base = spec.alias or key
-                                    if base.endswith(f"_{op_name}"):
-                                        arg_name = base
-                                    else:
-                                        arg_name = f"{base}_{op_name}"
-                                    out[arg_name] = spec.clone_with(op=op_name, ops=None)
-                            else:
-                                out[spec.alias or key] = spec
-                        return out
+                        # Deprecated path: type-level __filters__ removed; keep stub for parity
+                        return {}
                     def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single, fname_local=fname, parent_btype_local=bcls):
-                        # Prefer per-relation arguments over target type __filters__
+                        # Build filter specs exclusively from relation-specific arguments
                         target_filters: Dict[str, FilterSpec] = {}
+                        # overlay relation-specific arguments
                         rel_args_spec = meta_copy.get('arguments')
                         if isinstance(rel_args_spec, dict):
+                            tmp: Dict[str, FilterSpec] = {}
                             for key, raw in rel_args_spec.items():
                                 try:
                                     if callable(raw):
@@ -859,11 +842,11 @@ class BerrySchema:
                                     for op_name in spec.ops:
                                         base = spec.alias or key
                                         arg_name = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
-                                        target_filters[arg_name] = spec.clone_with(op=op_name, ops=None)
+                                        tmp[arg_name] = spec.clone_with(op=op_name, ops=None)
                                 else:
-                                    target_filters[spec.alias or key] = spec
-                        elif meta_copy.get('target'):
-                            target_filters = _collect_declared_filters_for_target(meta_copy.get('target'))
+                                    tmp[spec.alias or key] = spec
+                            # overlay
+                            target_filters.update(tmp)
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
@@ -1408,7 +1391,8 @@ class BerrySchema:
                                 anns[a] = Optional[base_t]
                         fn.__annotations__ = anns
                         return fn
-                    setattr(st_cls, fname, strawberry.field(_make_relation_resolver()))
+                    # Attach resolver with explicit argument annotations to make relation args visible in schema
+                    setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver()))
                 elif fdef.kind == 'aggregate':
                     # Normalize meta: if ops contains 'count' without explicit op, set op='count'
                     if 'op' not in fdef.meta and 'ops' in fdef.meta and fdef.meta.get('ops') == ['count']:
@@ -1650,8 +1634,8 @@ class BerrySchema:
             Returns: mapping of argument_name -> FilterSpec (with resolved single op).
             """
             out: Dict[str, FilterSpec] = {}
-            # Prefer explicit relation arguments spec when provided
-            class_filters = rel_args_spec if isinstance(rel_args_spec, dict) else (getattr(btype_cls_local, '__filters__', {}) or {})
+            # Only explicit arguments are used; type-level __filters__ is no longer supported
+            class_filters = rel_args_spec if isinstance(rel_args_spec, dict) else {}
             for key, raw in class_filters.items():
                 try:
                     if callable(raw):
@@ -1941,8 +1925,8 @@ class BerrySchema:
                             if filter_args:
                                 target_btype = self.types.get(rel_cfg.get('target'))
                                 if target_btype:
-                                    # Prefer relation-defined arguments spec when available
-                                    class_filters = rel_cfg.get('arg_specs') or getattr(target_btype, '__filters__', {}) or {}
+                                    # Use only relation-defined arguments spec
+                                    class_filters = rel_cfg.get('arg_specs') or {}
                                     expanded: Dict[str, FilterSpec] = {}
                                     for key, raw in class_filters.items():
                                         try:
@@ -2567,8 +2551,8 @@ class BerrySchema:
                                         # collect declared filters for target
                                         target_btype = self.types.get(target_name)
                                         if target_btype:
-                                            # replicate root filter expansion logic
-                                            class_filters = rel_cfg.get('arg_specs') or getattr(target_btype, '__filters__', {}) or {}
+                                            # replicate root filter expansion logic using only relation arg_specs
+                                            class_filters = rel_cfg.get('arg_specs') or {}
                                             expanded: Dict[str, FilterSpec] = {}
                                             for key, raw in class_filters.items():
                                                 try:
@@ -2848,7 +2832,7 @@ class BerrySchema:
                                     if filter_args:
                                         target_btype = self.types.get(rel_cfg.get('target'))
                                         if target_btype:
-                                            class_filters = rel_cfg_local.get('arg_specs') or getattr(target_btype, '__filters__', {}) or {}
+                                            class_filters = rel_cfg_local.get('arg_specs') or {}
                                             expanded: Dict[str, FilterSpec] = {}
                                             for key, raw in class_filters.items():
                                                 try:

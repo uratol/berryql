@@ -30,7 +30,11 @@ class PostQL(BerryType):
     content = field()
     author_id = field()
     created_at = field()
-    author = relation('UserQL', single=True)
+    author = relation('UserQL', single=True, arguments={
+        'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
+        'created_at_between': lambda M, info, v: (M.created_at.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None),
+        'is_admin_eq': lambda M, info, v: M.is_admin == (bool(v) if isinstance(v, str) else v),
+    })
     post_comments = relation('PostCommentQL', order_by='id')
     post_comments_agg = count('post_comments')
     last_post_comment = aggregate('post_comments', ops=['last'])
@@ -63,8 +67,9 @@ class UserQL(BerryType):
     is_admin = field()
     created_at = field()
     posts = relation('PostQL', arguments={
-        'title_ilike': {'column': 'title', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
-        'created_at': {'column': 'created_at', 'ops': ['gt','lt']},
+        'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
+        'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
+        'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
     post_comments = relation('PostCommentQL')
     post_agg = count('posts')
@@ -107,17 +112,35 @@ class Query:
         except Exception:
             return {'id': {'eq': -1}}
     users = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users, arguments={
-        'name_ilike': {'column': 'name', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
-        'created_at_between': {'column': 'created_at', 'op': 'between'},
-        'is_admin_eq': {'column': 'is_admin', 'op': 'eq'},
+        'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
+        # Use column-based spec to expose proper GraphQL types (List[DateTime])
+        'created_at_between': {
+            'column': 'created_at',
+            'op': 'between',
+            'transform': lambda v: (
+                [
+                    (datetime.fromisoformat(v[0]) if isinstance(v[0], str) else v[0]),
+                    (datetime.fromisoformat(v[1]) if isinstance(v[1], str) else v[1]),
+                ] if isinstance(v, (list, tuple)) and len(v) >= 2 else v
+            ),
+        },
+        # Boolean equality with proper GraphQL Boolean type
+        'is_admin_eq': {
+            'column': 'is_admin',
+            'op': 'eq',
+        },
     })
     posts = relation('PostQL', order_by='id', order_dir='asc', arguments={
-        'title_ilike': {'column': 'title', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
-        'created_at': {'column': 'created_at', 'ops': ['gt','lt']},
+        'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
+        'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
+        'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
     # Example: fetch a single user by id using arguments mapping
     userById = relation('UserQL', single=True, arguments={
-        'id': lambda model_cls, info, v: model_cls.__table__.c.get('id') == v
+        'id': {
+            'column': 'id',
+            'op': 'eq'
+        }
     })
 
 schema = berry_schema.to_strawberry()
