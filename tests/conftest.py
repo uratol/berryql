@@ -27,8 +27,8 @@ def event_loop_policy():
 @pytest.fixture(scope="function")
 async def engine():
     """Create a test database engine for each test function."""
-    # Check for TEST_DATABASE_URL environment variable
-    test_db_url = os.getenv('TEST_DATABASE_URL')
+    # Check for BERRYQL_TEST_DATABASE_URL environment variable
+    test_db_url = os.getenv('BERRYQL_TEST_DATABASE_URL')
     
     if test_db_url:
         # Try to use the provided database URL

@@ -1,228 +1,222 @@
 # BerryQL
+BerryQL
+========
 
-A powerful GraphQL query optimization library for Strawberry GraphQL and SQLAlchemy that eliminates N+1 problems and provides advanced query building capabilities.
+A tiny, declarative GraphQL mapper for Strawberry + SQLAlchemy that optimizes queries automatically.
 
-## Features
+BerryQL lets you define GraphQL types on top of SQLAlchemy models with a minimal DSL. At runtime it:
 
-- **Unified Query Building**: Single approach using lateral joins + json_agg for all query levels
-- **Automatic Field Mapping**: Maps Strawberry GraphQL types to SQLAlchemy models automatically
-- **Dynamic Field Filtering**: Only requested fields are queried from the database
-- **Recursive Configuration**: Support for custom configurations at any nesting level
-- **Advanced Query Parameters**: Support for where/order_by/offset/limit parameters at any level
-- **Complete N+1 Elimination**: Uses optimized lateral joins to prevent N+1 query problems
-- **Type Safety**: Full type hints and proper GraphQL input types
-- **Fragment Support**: Handles GraphQL fragments, inline fragments, and aliases
-- **Custom Fields**: Support for computed fields with custom query builders
+- Projects only the columns you ask for (column-level projection pushdown)
+- Pushes down relations into a single SQL per root field when possible (JSON aggregation; FOR JSON PATH on MSSQL)
+- Supports relation filters, ordering, and pagination without N+1
+- Adds simple aggregates (e.g., count) and custom SQL-backed fields/objects
 
-## Installation
+It’s designed for async SQLAlchemy 2.x and Strawberry GraphQL.
 
-```bash
-pip install berryql
-```
 
-## Quick Start
+Quick start
+-----------
 
-### Basic Usage
+Install
 
-```python
-import strawberry
-from sqlalchemy.ext.asyncio import AsyncSession
-from berryql import BerryQLFactory, GraphQLQueryParams
+- Core:
+    - pip install berryql
+- Optional DB drivers and helpers (choose what you need):
+    - pip install "berryql[adapters]"  # asyncpg, pyodbc, python-dotenv
 
-# Define your Strawberry GraphQL type
-@strawberry.type
-class UserType:
-    id: int
-    name: str
-    email: str
-    posts: List["PostType"]
+Requirements: Python 3.8+ (tested up to 3.13), Strawberry GraphQL, SQLAlchemy 2.x
 
-# Create a resolver factory
-factory = BerryQLFactory()
 
-# Create an optimized resolver
-user_resolver = factory.create_berryql_resolver(
-    strawberry_type=UserType,
-    model_class=User  # Your SQLAlchemy model
-)
+Define your models (SQLAlchemy)
 
-# Use in your GraphQL schema
-@strawberry.type
-class Query:
-    @strawberry.field
-    async def users(
-        self, 
-        info: strawberry.Info,
-        db: AsyncSession,
-        params: Optional[GraphQLQueryParams] = None
-    ) -> List[UserType]:
-        return await user_resolver(db=db, info=info, params=params)
-```
+This repo ships demo models in `tests/models.py` (User, Post, PostComment). Any SQLAlchemy ORM models work.
 
-### Advanced Features
 
-#### Custom Fields
+Define Berry types
 
-```python
-from berryql import custom_field
-from sqlalchemy import func
+Map models to GraphQL using Berry’s DSL: scalars, relations, aggregates, and custom fields.
 
-@strawberry.type
-class UserType:
-    id: int
-    name: str
-    
-    @strawberry.field
-    @custom_field
-    def post_count(self) -> int:
-        """Custom field with automatic query optimization"""
-        pass
+Example (excerpt adapted from tests):
 
-# Define the custom field query builder
-def build_post_count_query(model_class, requested_fields):
-    return func.count(model_class.posts).label('post_count')
+- File: `tests/schema.py` builds the runtime Strawberry schema from Berry’s registry.
+- You only need to provide an async SQLAlchemy session via GraphQL context as `db_session`.
 
-# Create resolver with custom field configuration
-user_resolver = factory.create_berryql_resolver(
-    strawberry_type=UserType,
-    model_class=User,
-    custom_fields={
-        UserType: {
-            'post_count': build_post_count_query
-        }
-    }
-)
-```
+Highlights in the example below:
 
-#### Input Types for Filtering
+- field(): map model columns
+- relation(): to-one or to-many; supports arguments, ordering, pagination
+- count(): quick aggregate of a relation (e.g., posts count)
+- custom()/custom_object(): inject SQL selects for computed values (pushed down when possible)
+- @berry_schema.query(): define root collections (users, posts, etc.)
 
-```python
-from berryql.input_types import StringComparisonInput, IntComparisonInput
 
-@strawberry.input
-class UserWhereInput:
-    name: Optional[StringComparisonInput] = None
-    age: Optional[IntComparisonInput] = None
+What queries look like (and what SQL runs)
 
-# Use in your resolver
-@strawberry.field
-async def users(
-    self,
-    info: strawberry.Info,
-    db: AsyncSession,
-    where: Optional[UserWhereInput] = None
-) -> List[UserType]:
-    # Convert input to berryql format
-    where_dict = convert_where_input(where.__dict__ if where else {})
-    params = GraphQLQueryParams(where=where_dict)
-    return await user_resolver(db=db, info=info, params=params)
-```
+- Only selected columns are fetched for each table.
+- When selecting users with posts, BerryQL will execute one SQL for users and one for posts (root fields), aggregating nested rows without joining unrelated tables.
+- For simple selections like `users { id }`, the SQL only selects the id column.
 
-#### Relationship Data Access
+See tests for concrete assertions:
 
-```python
-from berryql import get_resolved_field_data
+- `tests/test_sql_projection.py` ensures only requested columns are present and unrelated tables aren’t touched.
+- `tests/test_relations_pagination_aggregate.py` ensures “one SQL per root field” when pushdown is supported.
 
-@strawberry.type
-class UserType:
-    id: int
-    name: str
-    
-    @strawberry.field
-    async def posts(self, info: strawberry.Info) -> List[PostType]:
-        # Automatically retrieves pre-resolved relationship data
-        return get_resolved_field_data(self, info, 'posts')
-    
-    @strawberry.field
-    async def recent_posts(self, info: strawberry.Info) -> List[PostType]:
-        # Access aliased fields
-        return get_resolved_field_data(self, info, 'posts')
-```
 
-## Core Components
+Run the example API (GraphiQL)
+------------------------------
 
-### BerryQLFactory
+There’s a minimal FastAPI app that mounts the Berry-generated Strawberry schema.
 
-The main factory class that creates optimized GraphQL resolvers.
+- File: `examples/main.py`
+- Endpoint: http://127.0.0.1:8000/graphql (GraphiQL enabled)
 
-```python
-factory = BerryQLFactory()
+Quick steps (PowerShell):
 
-resolver = factory.create_berryql_resolver(
-    strawberry_type=YourType,
-    model_class=YourModel,
-    custom_fields=None,  # Optional custom field definitions
-    custom_where=None,   # Optional custom where conditions
-    custom_order=None    # Optional default ordering
-)
-```
+1) Create venv and install deps
+     - python -m venv .venv
+     - .venv\Scripts\Activate.ps1
+     - pip install -r requirements.txt
+2) Run the app
+     - python -m uvicorn examples.main:app --reload --host 127.0.0.1 --port 8000
 
-### GraphQLQueryParams
+Environment variables (optional):
 
-Parameter object for GraphQL queries supporting filtering, ordering, and pagination.
+- BERRYQL_TEST_DATABASE_URL: async SQLAlchemy URL (e.g., postgresql+asyncpg://… or mssql+aioodbc:///?odbc_connect=…)
+- SQL_ECHO: set 1 to log SQL (default 1)
+- DEMO_SEED: set 1 to seed demo data (default 1)
 
-```python
-params = GraphQLQueryParams(
-    where={'name': {'like': '%john%'}},
-    order_by=[{'field': 'created_at', 'direction': 'desc'}],
-    offset=0,
-    limit=10
-)
-```
+See `README_RUN_FASTAPI.md` for more.
 
-### Input Types
 
-Type-safe GraphQL input types for filtering:
+Core concepts
+-------------
 
-- `StringComparisonInput`: String field comparisons (eq, ne, like, ilike, in, etc.)
-- `IntComparisonInput`: Integer field comparisons
-- `FloatComparisonInput`: Float field comparisons  
-- `DateTimeComparisonInput`: DateTime field comparisons
-- `UUIDComparisonInput`: UUID field comparisons
-- `BoolComparisonInput`: Boolean field comparisons
+- BerrySchema: registry for types and root query.
+- BerryType: base for GraphQL types. Use Berry’s field descriptors on subclasses.
+- field(): scalar column mapping.
+- relation(target, single=False, …): relation to another Berry type. Supports:
+    - arguments: map GraphQL args to SQL filters (column+op or builder callable)
+    - where: default JSON-style where for the relation (dict or JSON string) or callable(model_cls, info)
+    - order_by/order_dir/order_multi, limit/offset
+    - single=True for to-one
+- count(source): count aggregate of a relation.
+- aggregate(source, ops=[…]): additional prebuilt aggregates (tests use ‘last’ to get last related id).
+- custom(builder, returns=…): computed scalar; builder returns an SQLAlchemy Select or expression (preferred), or a value.
+- custom_object(builder, returns={…}): computed object; returns-spec defines fields and their types.
 
-## Advanced Usage
 
-### Custom Query Decorators
+Filtering arguments (relation.arguments)
+---------------------------------------
 
-```python
-from berryql import berryql_field
+Attach GraphQL args to a relation and map them to SQL with a simple spec:
 
-@strawberry.type
-class UserType:
-    @strawberry.field
-    @berryql_field  # Automatically handles resolved data
-    async def posts(self, info: strawberry.Info) -> List[PostType]:
-        pass  # Implementation handled by decorator
-```
+- Column-based spec:
+    - { 'column': 'created_at', 'op': 'between' }
+- Expand to multiple ops automatically:
+    - { 'column': 'created_at', 'ops': ['gt', 'lt'] }
+- Builder (full control):
+    - lambda Model, info, value: Model.name.ilike(f"%{value}%")
+- Optional transform to coerce/parse the input.
 
-### Mixin Approach
+At runtime BerryQL validates columns, operators, and types and applies them in SQL. When relation pushdown is skipped (e.g., because of a ‘where’ argument), filters are still applied safely in resolvers.
 
-```python
-from berryql import ResolvedDataMixin
+Supported operators include: eq, ne, lt, lte, gt, gte, like, ilike, in, between, contains, starts_with, ends_with. You can register more.
 
-@strawberry.type
-class UserType(ResolvedDataMixin):
-    @strawberry.field
-    async def posts(self, info: strawberry.Info) -> List[PostType]:
-        return self.get_resolved_field_data(info, 'posts')
-```
 
-## Requirements
+Ordering and pagination
+-----------------------
 
-- Python 3.8+
-- strawberry-graphql >= 0.200.0
-- SQLAlchemy >= 2.0.0
-- graphql-core >= 3.2.0
+- order_by: a single column
+- order_dir: asc|desc
+- order_multi: ["created_at:desc", "id:asc"]
+- limit/offset: integers
 
-## License
+Invalid order_by values raise a GraphQL error with the allowed fields.
 
-MIT License. See [LICENSE](LICENSE) for details.
 
-## Contributing
+JSON where
+----------
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details.
+- Relation resolvers accept a where argument that’s either a dict or a JSON string with operators, for example:
+    - { "created_at": { "between": ["2000-01-01T00:00:00", "2100-01-01T00:00:00"] } }
+- Type-coercion is handled using the target column’s type.
 
-## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for version history and changes.
+Scalar aggregates
+----------
+
+- Count is pushed down as a correlated subquery and cached per parent row.
+
+
+Custom fields and objects/aggregation
+-------------------------
+
+- Prefer builders that accept the model class and return a Select/aggregates expression; these can be pushed into the root SQL.
+- For custom_object, specify returns as a dict, e.g., { 'min_created_at': datetime, 'comments_count': int }.
+- On Postgres/SQLite, JSON composition uses native json functions; on MSSQL it uses FOR JSON PATH.
+
+
+Root query
+----------
+
+Define explicit roots with @berry_schema.query(). Each root field is a relation() to a Berry type. The resulting Strawberry schema exposes these roots.
+
+Example patterns used in tests:
+
+- Root collections: users, posts
+- Single by ID: userById(single=True)
+- Root-level arguments for filtering/ordering/pagination
+- Context-aware gating with where=lambda model_cls, info: … (see `tests/schema.py`)
+
+Execution and context
+---------------------
+
+Execute queries with the Strawberry schema built from Berry:
+
+- schema = berry_schema.to_strawberry()
+- await schema.execute(query, context_value={ 'db_session': async_session, … })
+
+Context keys recognized by the test schema:
+
+- db_session (required): AsyncSession used for all SQL
+- enforce_user_gate / user_id / current_user: example gating knobs in tests
+
+
+Dialect support and adapters
+----------------------------
+
+BerryQL detects the SQLAlchemy dialect from the provided session and adapts JSON handling:
+
+- SQLite: json_object/json_group_array
+- Postgres: json_build_object/json_agg
+- MSSQL: FOR JSON PATH (single and list relations, nested arrays)
+
+Relation pushdown works on all three. When it’s not safe to push down (e.g., custom where/filters that require resolver logic), BerryQL falls back to per-relation queries and still avoids N+1 where practical.
+
+
+Type naming and camelCase
+-------------------------
+
+BerryQL respects Strawberry name conversion. If you use auto_camel_case/name_converter in Strawberry config, selection extraction recognizes camelCase field names and maps them to your Python field names.
+
+
+Testing and development
+-----------------------
+
+- Run tests with the bundled suite:
+    - pytest -q
+- Provide BERRYQL_TEST_DATABASE_URL to run against Postgres/MSSQL; else tests use in-memory SQLite (async) and echo SQL.
+
+
+FAQ
+---
+
+- Do I need to write resolvers? No for basic scalars/relations/aggregates; BerryQL generates resolvers. You can still add regular @strawberry.field resolvers to your BerryType classes alongside Berry fields.
+- How does N+1 get avoided? By pushing down relation arrays/objects into one SQL per root field where possible; otherwise resolvers batch and apply filters with minimal columns.
+- Is Sync SQLAlchemy supported? BerryQL targets async SQLAlchemy 2.x APIs; the demo and tests use AsyncSession.
+
+
+License
+-------
+
+MIT (see LICENSE).

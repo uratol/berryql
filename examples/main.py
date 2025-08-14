@@ -3,7 +3,7 @@
 Run this file to start a local server and open http://127.0.0.1:8000/graphql
 
 Environment variables:
-  TEST_DATABASE_URL  optional SQLAlchemy async URL, e.g. postgresql+asyncpg://user:pass@localhost/db
+  BERRYQL_TEST_DATABASE_URL  optional SQLAlchemy async URL, e.g. postgresql+asyncpg://user:pass@localhost/db
                      defaults to sqlite+aiosqlite:///./berryql_demo.db
   DEMO_SEED          set to '0' to skip demo data seeding (default '1')
     SQL_ECHO           set to '1' (default) to log SQL, '0' to disable; uses 'debug' to include params
@@ -33,8 +33,8 @@ app = FastAPI(title="BerryQL GraphQL Playground")
 
 # Engine + session factory stored on app.state
 async def _init_db(app: FastAPI) -> None:
-    # Use in-memory SQLite by default; allow override via TEST_DATABASE_URL
-    env_db_url = os.getenv("TEST_DATABASE_URL")
+    # Use in-memory SQLite by default; allow override via BERRYQL_TEST_DATABASE_URL
+    env_db_url = os.getenv("BERRYQL_TEST_DATABASE_URL")
     # Toggle SQL echo via env var (1=on, 0=off). When on, use 'debug' for params.
     echo_enabled = os.getenv("SQL_ECHO", "1") != "0"
     echo_value = "debug" if echo_enabled else False

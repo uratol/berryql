@@ -9,7 +9,7 @@ def test_userql_fields_shape():
 
 def test_postql_fields_shape():
     f = set(PostQL.__berry_fields__.keys())
-    assert {'id','title','content','author_id','created_at','author','post_comments','post_comments_agg','last_post_comment'} <= f
+    assert {'id','title','content','author_id','created_at','author','post_comments','post_comments_agg'} <= f
 
 
 def test_postcommentql_fields_shape():

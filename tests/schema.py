@@ -52,7 +52,6 @@ class PostQL(BerryType):
     })
     post_comments = relation('PostCommentQL', order_by='id')
     post_comments_agg = count('post_comments')
-    last_post_comment = aggregate('post_comments', ops=['last'])
     # Demonstration custom field: total length of all comment contents for the post
     def _comment_text_len_builder(model_cls):
         return (

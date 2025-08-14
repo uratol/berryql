@@ -814,10 +814,7 @@ class BerrySchema:
                         fdef.meta['op'] = 'count'
                     ops = fdef.meta.get('ops') or ([fdef.meta.get('op')] if fdef.meta.get('op') else [])
                     is_count = fdef.meta.get('op') == 'count' or 'count' in ops
-                    is_last = fdef.meta.get('op') == 'last' or 'last' in ops
                     if is_count:
-                        annotations[fname] = Optional[int]
-                    elif is_last:
                         annotations[fname] = Optional[int]
                     else:
                         annotations[fname] = Optional[str]
@@ -825,21 +822,14 @@ class BerrySchema:
                     # assign cache key for count aggregates
                     if is_count:
                         meta_copy['cache_key'] = meta_copy.get('cache_key') or fdef.meta.get('source') + ':count'
-                    if is_last:
-                        meta_copy['cache_key_last'] = meta_copy.get('cache_key_last') or fdef.meta.get('source') + ':last'
                     def _make_aggregate_resolver(meta_copy=meta_copy, bcls_local=bcls):
                         async def aggregate_resolver(self, info: StrawberryInfo):  # noqa: D401
                             cache = getattr(self, '_agg_cache', None)
                             is_count_local = meta_copy.get('op') == 'count' or 'count' in meta_copy.get('ops', [])
-                            is_last_local = meta_copy.get('op') == 'last' or 'last' in meta_copy.get('ops', [])
                             if is_count_local and cache is not None:
                                 key = meta_copy.get('cache_key') or (meta_copy.get('source') + ':count')
                                 if key in cache:
                                     return cache[key]
-                            if is_last_local and cache is not None:
-                                key_last = meta_copy.get('cache_key_last') or (meta_copy.get('source') + ':last')
-                                if key_last in cache:
-                                    return cache[key_last]
                             parent_model = getattr(self, '_model', None)
                             if parent_model is None:
                                 if is_count_local:
@@ -904,11 +894,9 @@ class BerrySchema:
                                     return None
                                 # return last related row id if present
                                 val = getattr(row, 'id', None)
-                                key_last = meta_copy.get('cache_key_last') or (source + ':last')
                                 if cache is None:
                                     cache = {}
                                     setattr(self, '_agg_cache', cache)
-                                cache[key_last] = val
                                 return val
                             return None
                         return aggregate_resolver

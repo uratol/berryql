@@ -14,7 +14,7 @@ def test_get_adapter_matrix(dialect, cls):
     assert isinstance(a, cls)
 
 
-@pytest.mark.skipif(os.getenv('TEST_DATABASE_URL', '').startswith('postgresql') is False, reason="requires Postgres URL")
+@pytest.mark.skipif(os.getenv('BERRYQL_TEST_DATABASE_URL', '').startswith('postgresql') is False, reason="requires Postgres URL")
 def test_postgres_adapter_funcs():
     a = get_adapter('postgresql')
     # Ensure functions exist and return a SQLAlchemy expression-like object

@@ -14,7 +14,7 @@ Setup
 
 Config
 - Edit .env to control DB and logging:
-  - TEST_DATABASE_URL: async SQLAlchemy URL; default is in-memory SQLite
+  - BERRYQL_TEST_DATABASE_URL: async SQLAlchemy URL; default is in-memory SQLite
   - SQL_ECHO=1: log SQL (set 0 to disable)
   - DEMO_SEED=1: seed demo data on startup
 
