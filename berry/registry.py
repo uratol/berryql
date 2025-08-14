@@ -1860,7 +1860,353 @@ class BerrySchema:
                         return val
                 # Helper to recursively build relation JSON expressions
                 def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
-                    return None
+                    """Build a JSON array aggregation for a list relation including nested relations.
+
+                    This version targets non-MSSQL dialects using adapter.json_object/json_array_agg.
+                    It correlates the child selection to the parent model and any nested selection to
+                    the child limited subquery via limited_subq.c.id.
+                    """
+                    try:
+                        target_name_i = rel_cfg.get('target')
+                        target_b_i = self.types.get(target_name_i)
+                        if not target_b_i or not target_b_i.model:
+                            return None
+                        child_model_cls_i = target_b_i.model
+                        # FK child -> parent
+                        fk_col_i = None
+                        for col in child_model_cls_i.__table__.columns:
+                            for fk in col.foreign_keys:
+                                if fk.column.table.name == parent_model_cls.__table__.name:
+                                    fk_col_i = col; break
+                            if fk_col_i is not None:
+                                break
+                        if fk_col_i is None:
+                            return None
+                        # Scalars to project for child rows
+                        requested_scalar_i = list(rel_cfg.get('fields') or [])
+                        if not requested_scalar_i:
+                            for sf, sdef in target_b_i.__berry_fields__.items():
+                                if sdef.kind == 'scalar':
+                                    requested_scalar_i.append(sf)
+                        # Ensure FK helper columns for child's single nested relations are present
+                        # so that resolvers can lazy-load them when not pushed down as objects.
+                        try:
+                            nested_requested = set((rel_cfg.get('nested') or {}).keys())
+                            for r2, d2 in target_b_i.__berry_fields__.items():
+                                if (
+                                    d2.kind == 'relation'
+                                    and (d2.meta.get('single') or d2.meta.get('mode') == 'single')
+                                    and r2 in nested_requested
+                                ):
+                                    fk2 = f"{r2}_id"
+                                    if fk2 in child_model_cls_i.__table__.columns and fk2 not in requested_scalar_i:
+                                        requested_scalar_i.append(fk2)
+                        except Exception:
+                            pass
+                        # Always include child's id for nested correlation if available
+                        if 'id' in child_model_cls_i.__table__.columns and 'id' not in requested_scalar_i:
+                            requested_scalar_i.append('id')
+                        # Base inner select for child rows (correlated to parent)
+                        inner_cols_i = [getattr(child_model_cls_i, c) for c in requested_scalar_i] if requested_scalar_i else [getattr(child_model_cls_i, 'id')]
+                        inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == parent_model_cls.id).correlate(parent_model_cls)
+                        # Filters from filter_args
+                        try:
+                            filter_args = rel_cfg.get('filter_args') or {}
+                            if filter_args:
+                                target_btype = self.types.get(rel_cfg.get('target'))
+                                if target_btype:
+                                    class_filters = getattr(target_btype, '__filters__', {}) or {}
+                                    expanded: Dict[str, FilterSpec] = {}
+                                    for key, raw in class_filters.items():
+                                        try:
+                                            spec = _normalize_filter_spec(raw)
+                                        except Exception:
+                                            continue
+                                        if spec.ops and not spec.op:
+                                            for op_name in spec.ops:
+                                                base = spec.alias or key
+                                                an = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
+                                                expanded[an] = spec.clone_with(op=op_name, ops=None)
+                                        else:
+                                            expanded[spec.alias or key] = spec
+                                    for arg_name, val in filter_args.items():
+                                        f_spec = expanded.get(arg_name)
+                                        if not f_spec:
+                                            continue
+                                        if f_spec.transform:
+                                            try:
+                                                val = f_spec.transform(val)
+                                            except Exception:
+                                                continue
+                                        expr = None
+                                        if f_spec.builder:
+                                            try:
+                                                expr = f_spec.builder(child_model_cls_i, info, val)
+                                            except Exception:
+                                                expr = None
+                                        elif f_spec.column:
+                                            try:
+                                                col = child_model_cls_i.__table__.c.get(f_spec.column)
+                                            except Exception:
+                                                col = None
+                                            if col is None:
+                                                continue
+                                            op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                            if not op_fn:
+                                                continue
+                                            try:
+                                                expr = op_fn(col, val)
+                                            except Exception:
+                                                expr = None
+                                        if expr is not None:
+                                            inner_sel_i = inner_sel_i.where(expr)
+                        except Exception:
+                            pass
+                        # Relation JSON where/default_where for child
+                        try:
+                            rr = rel_cfg.get('where')
+                            dr = rel_cfg.get('default_where')
+                            if rr is not None:
+                                import json as _json
+                                wdict = rr if not isinstance(rr, str) else _json.loads(rr)
+                                exprs = []
+                                for col_name, op_map in (wdict or {}).items():
+                                    col = child_model_cls_i.__table__.c.get(col_name)
+                                    if col is None:
+                                        continue
+                                    for op_name, val in (op_map or {}).items():
+                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                            val = [_coerce_where_value(col, v) for v in val]
+                                        else:
+                                            val = _coerce_where_value(col, val)
+                                        op_fn = OPERATOR_REGISTRY.get(op_name)
+                                        if not op_fn:
+                                            continue
+                                        exprs.append(op_fn(col, val))
+                                if exprs:
+                                    inner_sel_i = inner_sel_i.where(_and(*exprs))
+                            if dr is not None and isinstance(dr, (dict, str)):
+                                import json as _json
+                                wdict = dr if not isinstance(dr, str) else _json.loads(dr)
+                                exprs = []
+                                for col_name, op_map in (wdict or {}).items():
+                                    col = child_model_cls_i.__table__.c.get(col_name)
+                                    if col is None:
+                                        continue
+                                    for op_name, val in (op_map or {}).items():
+                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                            val = [_coerce_where_value(col, v) for v in val]
+                                        else:
+                                            val = _coerce_where_value(col, val)
+                                        op_fn = OPERATOR_REGISTRY.get(op_name)
+                                        if not op_fn:
+                                            continue
+                                        exprs.append(op_fn(col, val))
+                                if exprs:
+                                    inner_sel_i = inner_sel_i.where(_and(*exprs))
+                        except Exception:
+                            pass
+                        # Ordering for child (order_multi -> order_by -> id)
+                        try:
+                            ordered = False
+                            allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
+                            multi = rel_cfg.get('order_multi') or []
+                            # Normalize possible AST nodes to strings
+                            nmulti: List[str] = []
+                            for spec in multi:
+                                try:
+                                    nmulti.append(str(getattr(spec, 'value', spec)))
+                                except Exception:
+                                    nmulti.append(str(spec))
+                            for spec in nmulti:
+                                cn, _, dd = spec.partition(':')
+                                dd = (dd or _dir_value(rel_cfg.get('order_dir'))).lower()
+                                if cn in allowed_fields:
+                                    col = getattr(child_model_cls_i, cn, None)
+                                    if col is not None:
+                                        inner_sel_i = inner_sel_i.order_by(col.desc() if dd=='desc' else col.asc())
+                                        ordered = True
+                            if not ordered and rel_cfg.get('order_by') in allowed_fields:
+                                cn = rel_cfg.get('order_by')
+                                dd = _dir_value(rel_cfg.get('order_dir'))
+                                col = getattr(child_model_cls_i, cn, None)
+                                if col is not None:
+                                    inner_sel_i = inner_sel_i.order_by(col.desc() if dd=='desc' else col.asc())
+                                    ordered = True
+                            if not ordered and 'id' in child_model_cls_i.__table__.columns:
+                                inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id').asc())
+                        except Exception:
+                            pass
+                        # Pagination for child
+                        try:
+                            if rel_cfg.get('offset') is not None:
+                                inner_sel_i = inner_sel_i.offset(int(rel_cfg.get('offset')) if isinstance(rel_cfg.get('offset'), (int, str)) else rel_cfg.get('offset'))
+                            if rel_cfg.get('limit') is not None:
+                                inner_sel_i = inner_sel_i.limit(int(rel_cfg.get('limit')) if isinstance(rel_cfg.get('limit'), (int, str)) else rel_cfg.get('limit'))
+                        except Exception:
+                            pass
+                        limited_subq_i = inner_sel_i.subquery()
+                        # Build per-row JSON object including requested scalars and nested relation JSON
+                        row_json_args_i: List[Any] = []
+                        # Scalars
+                        for sf in requested_scalar_i if requested_scalar_i else ['id']:
+                            row_json_args_i.extend([_text(f"'{sf}'"), getattr(limited_subq_i.c, sf)])
+            # Nested relations under child
+                        for nname, ncfg in (rel_cfg.get('nested') or {}).items():
+                            try:
+                                n_target = ncfg.get('target')
+                                nb = self.types.get(n_target)
+                                if not nb or not nb.model:
+                                    continue
+                                grand_model = nb.model
+                                # FK grandchild -> child
+                                g_fk = None
+                                for c in grand_model.__table__.columns:
+                                    for fk in c.foreign_keys:
+                                        if fk.column.table.name == child_model_cls_i.__table__.name:
+                                            g_fk = c; break
+                                    if g_fk is not None:
+                                        break
+                                if g_fk is None:
+                                    continue
+                                # Projected scalar fields for nested
+                                n_cols = list(ncfg.get('fields') or [])
+                                if not n_cols:
+                                    for sf2, sd2 in nb.__berry_fields__.items():
+                                        if sd2.kind == 'scalar':
+                                            n_cols.append(sf2)
+                                is_single_nested = bool(ncfg.get('single') or False)
+                                # Base select for nested correlated to limited_subq_i.c.id
+                                n_sel = select(*[getattr(grand_model, c) for c in (n_cols or ['id'])])\
+                                    .select_from(grand_model)\
+                                    .where(g_fk == getattr(limited_subq_i.c, 'id'))\
+                                    .correlate(limited_subq_i)
+                                # Apply nested where/default_where
+                                try:
+                                    import json as _json
+                                    rr2 = ncfg.get('where')
+                                    if rr2 is not None:
+                                        wdict = rr2 if not isinstance(rr2, str) else _json.loads(rr2)
+                                        exprs = []
+                                        for col_name2, op_map2 in (wdict or {}).items():
+                                            col2 = grand_model.__table__.c.get(col_name2)
+                                            if col2 is None:
+                                                continue
+                                            for op_name2, val2 in (op_map2 or {}).items():
+                                                if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
+                                                    val2 = [_coerce_where_value(col2, v) for v in val2]
+                                                else:
+                                                    val2 = _coerce_where_value(col2, val2)
+                                                op_fn2 = OPERATOR_REGISTRY.get(op_name2)
+                                                if not op_fn2:
+                                                    continue
+                                                exprs.append(op_fn2(col2, val2))
+                                        if exprs:
+                                            n_sel = n_sel.where(_and(*exprs))
+                                    dr2 = ncfg.get('default_where')
+                                    if dr2 is not None and isinstance(dr2, (dict, str)):
+                                        wdict = dr2 if not isinstance(dr2, str) else _json.loads(dr2)
+                                        exprs = []
+                                        for col_name2, op_map2 in (wdict or {}).items():
+                                            col2 = grand_model.__table__.c.get(col_name2)
+                                            if col2 is None:
+                                                continue
+                                            for op_name2, val2 in (op_map2 or {}).items():
+                                                if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
+                                                    val2 = [_coerce_where_value(col2, v) for v in val2]
+                                                else:
+                                                    val2 = _coerce_where_value(col2, val2)
+                                                op_fn2 = OPERATOR_REGISTRY.get(op_name2)
+                                                if not op_fn2:
+                                                    continue
+                                                exprs.append(op_fn2(col2, val2))
+                                        if exprs:
+                                            n_sel = n_sel.where(_and(*exprs))
+                                except Exception:
+                                    pass
+                                # Ordering for nested
+                                try:
+                                    ordered2 = False
+                                    n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
+                                    nmulti_raw = ncfg.get('order_multi') or []
+                                    nmulti: List[str] = []
+                                    for spec in nmulti_raw:
+                                        try:
+                                            nmulti.append(str(getattr(spec, 'value', spec)))
+                                        except Exception:
+                                            nmulti.append(str(spec))
+                                    for spec in nmulti:
+                                        cn, _, dd = spec.partition(':')
+                                        dd = (dd or _dir_value(ncfg.get('order_dir'))).lower()
+                                        if cn in n_allowed:
+                                            col2 = getattr(grand_model, cn, None)
+                                            if col2 is not None:
+                                                n_sel = n_sel.order_by(col2.desc() if dd=='desc' else col2.asc())
+                                                ordered2 = True
+                                    if not ordered2 and ncfg.get('order_by') in n_allowed:
+                                        cn = ncfg.get('order_by')
+                                        dd = _dir_value(ncfg.get('order_dir'))
+                                        col2 = getattr(grand_model, cn, None)
+                                        if col2 is not None:
+                                            n_sel = n_sel.order_by(col2.desc() if dd=='desc' else col2.asc())
+                                            ordered2 = True
+                                    if not ordered2 and 'id' in grand_model.__table__.columns:
+                                        n_sel = n_sel.order_by(getattr(grand_model, 'id').asc())
+                                except Exception:
+                                    pass
+                                # Pagination for nested
+                                try:
+                                    if ncfg.get('offset') is not None:
+                                        n_sel = n_sel.offset(int(ncfg.get('offset')) if isinstance(ncfg.get('offset'), (int, str)) else ncfg.get('offset'))
+                                    if ncfg.get('limit') is not None:
+                                        n_sel = n_sel.limit(int(ncfg.get('limit')) if isinstance(ncfg.get('limit'), (int, str)) else ncfg.get('limit'))
+                                except Exception:
+                                    pass
+                                if is_single_nested:
+                                    # Build JSON object of the first matching nested row
+                                    n_sel_single = n_sel.limit(1)
+                                    n_subq = n_sel_single.subquery()
+                                    n_row_args: List[Any] = []
+                                    for sf2 in (n_cols or ['id']):
+                                        n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
+                                    n_row_json = _json_object(*n_row_args)
+                                    n_single_select = select(n_row_json).select_from(n_subq).correlate(limited_subq_i)
+                                    try:
+                                        n_json_scalar = n_single_select.scalar_subquery()
+                                    except Exception:
+                                        n_json_scalar = n_single_select
+                                    row_json_args_i.extend([_text(f"'{nname}'"), n_json_scalar])
+                                else:
+                                    # Build JSON array for nested rows
+                                    n_subq = n_sel.subquery()
+                                    n_row_args: List[Any] = []
+                                    for sf2 in (n_cols or ['id']):
+                                        n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
+                                    n_row_json = _json_object(*n_row_args)
+                                    n_agg = _json_array_agg(n_row_json)
+                                    if n_agg is None:
+                                        continue
+                                    n_json_array = select(_json_array_coalesce(n_agg)).select_from(n_subq).correlate(limited_subq_i)
+                                    try:
+                                        n_json_scalar = n_json_array.scalar_subquery()
+                                    except Exception:
+                                        n_json_scalar = n_json_array
+                                    row_json_args_i.extend([_text(f"'{nname}'"), n_json_scalar])
+                            except Exception:
+                                # If any nested building fails, just skip that nested branch
+                                continue
+                        # Aggregate rows to JSON array
+                        row_json_expr_i = _json_object(*row_json_args_i)
+                        agg_inner_expr_i = _json_array_agg(row_json_expr_i)
+                        if agg_inner_expr_i is None:
+                            return None
+                        agg_query_i = select(_json_array_coalesce(agg_inner_expr_i)).select_from(limited_subq_i).correlate(parent_model_cls)
+                        try:
+                            return agg_query_i.scalar_subquery()
+                        except Exception:
+                            return agg_query_i
+                    except Exception:
+                        return None
                 # Prepare pushdown COUNT aggregates (replace batch later)
                 count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_def)
                 for cf_name, cf_def in btype_cls.__berry_fields__.items():
