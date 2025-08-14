@@ -98,6 +98,9 @@ class BerrySchema:
         self._root_query_fields = None
         # Keep reference to user-declared Query class to copy @strawberry.field methods
         self._user_query_cls = None
+        # Keep references to user-declared Mutation and Subscription classes
+        self._user_mutation_cls = None
+        self._user_subscription_cls = None
         # Domain registry: name -> (domain class, options)
         self._domains = {}
 
@@ -109,6 +112,36 @@ class BerrySchema:
         def deco(cls: Type[BerryType]):
             cls.model = model
             return self.register(cls)
+        return deco
+
+    def mutation(self):
+        """Decorator to declare the root Mutation using Strawberry fields.
+
+        Example:
+            @berry_schema.mutation()
+            class Mutation:
+                @strawberry.mutation
+                async def do_something(...): ...
+        """
+        def deco(cls: Type[Any]):
+            # Simply store reference; fields are copied during schema build
+            self._user_mutation_cls = cls
+            return cls
+        return deco
+
+    def subscription(self):
+        """Decorator to declare the root Subscription using Strawberry subscription fields.
+
+        Example:
+            @berry_schema.subscription()
+            class Subscription:
+                @strawberry.subscription
+                async def tick(...): ...
+        """
+        def deco(cls: Type[Any]):
+            # Simply store reference; fields are copied during schema build
+            self._user_subscription_cls = cls
+            return cls
         return deco
 
     def query(self):
@@ -3434,6 +3467,78 @@ class BerrySchema:
         setattr(QueryPlain, '__annotations__', query_annotations)
         Query = QueryPlain
         Query = strawberry.type(Query)  # type: ignore
+        # Optionally build Mutation and Subscription roots if provided by user
+        Mutation = None
+        Subscription = None
+        try:
+            if self._user_mutation_cls is not None:
+                MPlain = type('Mutation', (), {'__doc__': 'Auto-generated Berry root mutation.'})
+                setattr(MPlain, '__module__', __name__)
+                # Copy annotated attributes and strawberry-decorated fields as-is
+                try:
+                    anns_m = dict(getattr(self._user_mutation_cls, '__annotations__', {}) or {})
+                except Exception:
+                    anns_m = {}
+                for uf, utype in (anns_m or {}).items():
+                    try:
+                        setattr(MPlain, uf, getattr(self._user_mutation_cls, uf))
+                    except Exception:
+                        pass
+                # Copy methods/attributes decorated by strawberry (mutation/field)
+                for uf, val in vars(self._user_mutation_cls).items():
+                    if uf.startswith('__'):
+                        continue
+                    if hasattr(MPlain, uf):
+                        continue
+                    try:
+                        looks_strawberry = (
+                            str(getattr(getattr(val, "__class__", object), "module", "") or "").startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                        if looks_strawberry:
+                            # Prefer copying the field object as-is to preserve mutation semantics
+                            setattr(MPlain, uf, val)
+                    except Exception:
+                        pass
+                setattr(MPlain, '__annotations__', anns_m)
+                Mutation = strawberry.type(MPlain)  # type: ignore
+        except Exception:
+            Mutation = None
+        try:
+            if self._user_subscription_cls is not None:
+                SPlain = type('Subscription', (), {'__doc__': 'Auto-generated Berry root subscription.'})
+                setattr(SPlain, '__module__', __name__)
+                # Copy annotated attributes and strawberry subscription fields
+                try:
+                    anns_s = dict(getattr(self._user_subscription_cls, '__annotations__', {}) or {})
+                except Exception:
+                    anns_s = {}
+                for uf, utype in (anns_s or {}).items():
+                    try:
+                        setattr(SPlain, uf, getattr(self._user_subscription_cls, uf))
+                    except Exception:
+                        pass
+                for uf, val in vars(self._user_subscription_cls).items():
+                    if uf.startswith('__'):
+                        continue
+                    if hasattr(SPlain, uf):
+                        continue
+                    try:
+                        looks_strawberry = (
+                            str(getattr(getattr(val, "__class__", object), "module", "") or "").startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                        if looks_strawberry:
+                            # Preserve subscription objects as-is
+                            setattr(SPlain, uf, val)
+                    except Exception:
+                        pass
+                setattr(SPlain, '__annotations__', anns_s)
+                Subscription = strawberry.type(SPlain)  # type: ignore
+        except Exception:
+            Subscription = None
         # Build the Schema honoring provided strawberry_config; keep backward compatibility.
         # Precedence: explicit strawberry_config -> default False (legacy behavior)
         if strawberry_config is not None:
@@ -3442,29 +3547,53 @@ class BerrySchema:
                 ac = getattr(strawberry_config, 'auto_camel_case', None)
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                    if Mutation is not None and Subscription is not None:
+                        return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, auto_camel_case=ac)  # type: ignore[arg-type]
+                    if Mutation is not None:
+                        return strawberry.Schema(Query, mutation=Mutation, auto_camel_case=ac)  # type: ignore[arg-type]
                     return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
             except TypeError:
                 # If unsupported, try newer signature with config kwarg
                 try:
                     with warnings.catch_warnings():
                         warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                        if Mutation is not None and Subscription is not None:
+                            return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, config=strawberry_config)  # type: ignore[arg-type]
+                        if Mutation is not None:
+                            return strawberry.Schema(Query, mutation=Mutation, config=strawberry_config)  # type: ignore[arg-type]
                         return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
                 except TypeError:
                     # Last resort: build without config
                     with warnings.catch_warnings():
                         warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                        if Mutation is not None and Subscription is not None:
+                            return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription)
+                        if Mutation is not None:
+                            return strawberry.Schema(Query, mutation=Mutation)
                         return strawberry.Schema(Query)
         # Default: preserve previous library behavior (auto_camel_case=False)
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                if Mutation is not None and Subscription is not None:
+                    return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, auto_camel_case=False)  # type: ignore[arg-type]
+                if Mutation is not None:
+                    return strawberry.Schema(Query, mutation=Mutation, auto_camel_case=False)  # type: ignore[arg-type]
                 return strawberry.Schema(Query, auto_camel_case=False)  # type: ignore[arg-type]
         except TypeError:  # pragma: no cover
             try:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                    if Mutation is not None and Subscription is not None:
+                        return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
+                    if Mutation is not None:
+                        return strawberry.Schema(Query, mutation=Mutation, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
                     return strawberry.Schema(Query, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
             except Exception:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                    if Mutation is not None and Subscription is not None:
+                        return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription)
+                    if Mutation is not None:
+                        return strawberry.Schema(Query, mutation=Mutation)
                     return strawberry.Schema(Query)

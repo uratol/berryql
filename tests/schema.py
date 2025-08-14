@@ -3,13 +3,15 @@
 Not functionally equivalent yet: purely structural placeholder to evolve tests against.
 """
 from __future__ import annotations
-from typing import Optional, List, Any
+from typing import Optional, List, Any, AsyncGenerator
 from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
 from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain
 from tests.models import User, Post, PostComment  # type: ignore
+from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
 
 berry_schema = BerrySchema()
 
@@ -253,4 +255,50 @@ class Query:
     blogDomain = domain(BlogDomain)
     groupDomain = domain(GroupDomain)
 
+schema = berry_schema.to_strawberry()
+
+# --- Mutations and Subscriptions for tests ---
+
+# Simple in-memory pubsub for created posts
+_post_created_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+
+@strawberry.type
+class PostCreatedEvent:
+    id: int
+    title: Optional[str]
+    content: Optional[str]
+    author_id: int
+
+@berry_schema.mutation()
+class Mutation:
+    @strawberry.mutation
+    async def create_post(self, info: Info, title: str, content: str, author_id: int) -> int:
+        session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
+        if session is None:
+            raise ValueError("No db_session in context")
+        p = Post(title=title, content=content, author_id=author_id)
+        session.add(p)
+        await session.flush()
+        await session.commit()
+        # Notify subscribers
+        try:
+            await _post_created_queue.put({
+                'id': p.id,
+                'title': p.title,
+                'content': p.content,
+                'author_id': p.author_id,
+            })
+        except Exception:
+            pass
+        return int(p.id)
+
+@berry_schema.subscription()
+class Subscription:
+    @strawberry.subscription
+    async def post_created(self) -> AsyncGenerator[PostCreatedEvent, None]:
+        while True:
+            data = await _post_created_queue.get()
+            yield PostCreatedEvent(**data)
+
+# Rebuild schema to include mutation and subscription
 schema = berry_schema.to_strawberry()
