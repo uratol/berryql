@@ -45,6 +45,54 @@ class MSSQLAdapter(BaseAdapter):
         return True
 
     # --- MSSQL specific helpers -------------------------------------------------
+    def _as_int(self, v) -> int | None:
+        if v is None:
+            return None
+        try:
+            if hasattr(v, 'value'):
+                return int(getattr(v, 'value'))
+            if isinstance(v, (int, float)):
+                return int(v)
+            s = str(v)
+            return int(s)
+        except Exception:
+            try:
+                # Last resort: stringified .value of possible AST node
+                return int(str(getattr(v, 'value', v)))
+            except Exception:
+                raise
+
+    def _as_str(self, v) -> str | None:
+        if v is None:
+            return None
+        try:
+            if hasattr(v, 'value'):
+                return str(getattr(v, 'value'))
+            return str(v)
+        except Exception:
+            return None
+
+    def _as_list_str(self, v) -> list[str]:
+        # Normalize potential GraphQL AST ListValueNode or scalar into list[str]
+        if v is None:
+            return []
+        try:
+            if isinstance(v, list):
+                return [self._as_str(x) or str(x) for x in v]
+            if hasattr(v, 'values'):
+                vals = getattr(v, 'values', []) or []
+                out = []
+                for x in vals:
+                    xv = getattr(x, 'value', x)
+                    out.append(str(xv))
+                return out
+            # single spec
+            return [self._as_str(v) or str(v)]
+        except Exception:
+            try:
+                return [str(v)]
+            except Exception:
+                return []
     def _render_literal(self, col, v) -> str:
         """Render a Python value as an MSSQL SQL literal with type awareness."""
         try:
@@ -129,37 +177,48 @@ class MSSQLAdapter(BaseAdapter):
 
     def _build_order_clause(self, model_cls, table_alias: str, order_by: str | None, order_dir: str | None, order_multi: list[str] | None) -> str | None:
         parts: list[str] = []
-        multi = order_multi or []
+        multi = self._as_list_str(order_multi)
+        ob_str = self._as_str(order_by)
+        od_str = (self._as_str(order_dir) or 'asc').lower()
         for spec in multi:
             try:
                 cn, _, dd = str(spec).partition(':')
-                dd = (dd or (order_dir or 'asc')).lower()
+                dd = (dd or od_str).lower()
                 if cn in model_cls.__table__.columns:
                     parts.append(f"[{table_alias}].[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
             except Exception:
                 continue
-        if not parts and order_by and order_by in model_cls.__table__.columns:
-            dd = (order_dir or 'asc').lower()
-            parts.append(f"[{table_alias}].[{order_by}] {'DESC' if dd=='desc' else 'ASC'}")
+        if not parts and ob_str and ob_str in model_cls.__table__.columns:
+            dd = od_str
+            parts.append(f"[{table_alias}].[{ob_str}] {'DESC' if dd=='desc' else 'ASC'}")
         if not parts and 'id' in model_cls.__table__.columns:
             parts.append(f"[{table_alias}].[id] ASC")
         return ', '.join(parts) if parts else None
 
-    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | None, default_where: dict | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None) -> str:
+    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None) -> str:
         n_cols = fields or []
         if not n_cols:
             for c in grand_model.__table__.columns:
                 n_cols.append(c.name)
         n_col_select = ', '.join([f"[{grand_model.__tablename__}].[{c}] AS [{c}]" for c in (n_cols or ['id'])])
         where_parts = [f"[{grand_model.__tablename__}].[{g_fk_col_name}] = [{child_table}].[id]"]
+        # accept both dict and JSON string
+        import json as _json
+        def _as_dict(maybe):
+            if isinstance(maybe, str):
+                try:
+                    return _json.loads(maybe)
+                except Exception:
+                    return None
+            return maybe
         if where_dict:
-            where_parts.extend(self.where_from_dict(grand_model, where_dict))
+            where_parts.extend(self.where_from_dict(grand_model, _as_dict(where_dict)))
         if default_where:
-            where_parts.extend(self.where_from_dict(grand_model, default_where))
+            where_parts.extend(self.where_from_dict(grand_model, _as_dict(default_where)))
         n_where = ' AND '.join(where_parts)
         n_order = self._build_order_clause(grand_model, grand_model.__tablename__, order_by, order_dir, order_multi)
         n_order_clause = f" ORDER BY {n_order}" if n_order else ''
-        n_top = f"TOP ({int(limit)}) " if limit is not None else ''
+        n_top = f"TOP ({self._as_int(limit)}) " if limit is not None else ''
         return f"SELECT {n_top}{n_col_select} FROM {grand_model.__tablename__} WHERE {n_where}{n_order_clause} FOR JSON PATH"
 
     def build_relation_list_json_full(self, *, parent_table: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
@@ -211,7 +270,7 @@ class MSSQLAdapter(BaseAdapter):
                 )
                 nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
             nested_cols = ', ' + ', '.join(nested_parts) if nested_parts else ''
-        top_clause = f"TOP ({int(limit)}) " if limit is not None else ''
+        top_clause = f"TOP ({self._as_int(limit)}) " if limit is not None else ''
         order_sql = (f" ORDER BY {order_clause}" if order_clause else '')
         raw = (
             f"ISNULL((SELECT {top_clause}{select_cols}{nested_cols} FROM {child_model.__tablename__} WHERE {where_clause}{order_sql} FOR JSON PATH),'[]')"
@@ -247,7 +306,7 @@ class MSSQLAdapter(BaseAdapter):
             # Ensure each nested is wrapped in ISNULL(...) to always return '[]'
             nested_parts = [f"ISNULL(({sql}), '[]') AS [{alias}]" for alias, sql in nested_subqueries]
             nested_cols = (', ' + ', '.join(nested_parts)) if nested_parts else ''
-        top_clause = f"TOP ({int(limit)}) " if limit is not None else ''
+        top_clause = f"TOP ({self._as_int(limit)}) " if limit is not None else ''
         order_clause = f" ORDER BY {order_by}" if order_by else ''
         raw = (
             f"ISNULL((SELECT {top_clause}{select_cols}{nested_cols} FROM {child_table} WHERE {where_condition}{order_clause} FOR JSON PATH),'[]')"

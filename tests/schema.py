@@ -62,23 +62,6 @@ class PostQL(BerryType):
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
-    # Default root ordering: users by id asc
-    __default_order_by__ = 'id'
-    __default_order_dir__ = 'asc'
-    # Root-level gating (admin -> all, user -> self, none -> none)
-    @staticmethod
-    def __root_custom_where__(model_cls, info):
-        try:
-            ctx = info.context if info else {}
-            current_user = ctx.get('current_user') if ctx else None
-            user_id = ctx.get('user_id') if ctx else None
-            if current_user and getattr(current_user, 'is_admin', False):
-                return {}
-            if user_id:
-                return {'id': {'eq': user_id}}
-            return {'id': {'eq': -1}}
-        except Exception:
-            return {'id': {'eq': -1}}
     __filters__ = {
         'name_ilike': {'column': 'name', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
         'created_at_between': {'column': 'created_at', 'op': 'between'},
@@ -111,5 +94,28 @@ class UserQL(BerryType):
     other_users = relation('UserQL', mode='exclude_self')
     bloggers = relation('UserQL', mode='has_posts')
 
-# Build the Strawberry schema (prototype)
+# Declare Query with explicit roots only (no auto-roots)
+@berry_schema.query()
+class Query:
+    # Plural collections
+    # Move gating here: if enforce_user_gate and not admin, filter to current user; else no filter.
+    def _gate_users(model_cls, info):
+        try:
+            ctx = info.context or {}
+            if not ctx.get('enforce_user_gate'):
+                return {}
+            cu = ctx.get('current_user')
+            uid = ctx.get('user_id')
+            if cu and getattr(cu, 'is_admin', False):
+                return {}
+            if uid:
+                return {'id': {'eq': uid}}
+            return {'id': {'eq': -1}}
+        except Exception:
+            return {'id': {'eq': -1}}
+    users = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users)
+    posts = relation('PostQL', order_by='id', order_dir='asc')
+    # Example: fetch a single user by id using where default; tests can still call users(name_ilike: ...)
+    userById = relation('UserQL', single=True, where='{"id": {"eq": 1}}')
+
 schema = berry_schema.to_strawberry()
