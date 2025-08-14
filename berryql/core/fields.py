@@ -42,3 +42,34 @@ def custom(builder: Callable[..., Any], *, returns: Any | None = None) -> FieldD
 
 def custom_object(builder: Callable[..., Any], *, returns: Any) -> FieldDescriptor:
     return FieldDescriptor(kind='custom_object', builder=builder, returns=returns)
+
+# --- Domains (namespacing) ---
+
+@dataclass
+class DomainDef:
+    name: str
+    meta: Dict[str, Any]
+
+class DomainDescriptor:
+    """Descriptor placed on Query class to expose a registered domain under a field name.
+
+    The registry will collect these and generate the nested Strawberry types and resolvers.
+    """
+    def __init__(self, domain_cls: Type[Any], *, name: Optional[str] = None, **meta: Any):
+        self.domain_cls = domain_cls
+        self.name = name
+        self.meta = dict(meta)
+        self.attr_name: str | None = None
+
+    def __set_name__(self, owner, name):  # pragma: no cover
+        self.attr_name = name
+
+def domain(domain_cls: Type[Any], *, name: Optional[str] = None, **meta: Any) -> DomainDescriptor:
+    """Helper to declare a domain field on Query.
+
+    Usage:
+        @berry_schema.query()
+        class Query:
+            userDomain = domain(UserDomain)
+    """
+    return DomainDescriptor(domain_cls, name=name, **meta)

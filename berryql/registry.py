@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
 T = TypeVar('T')
 
 # DRY split: import core building blocks
-from .core.fields import FieldDef, FieldDescriptor, field, relation, aggregate, count, custom, custom_object
+from .core.fields import FieldDef, FieldDescriptor, field, relation, aggregate, count, custom, custom_object, DomainDescriptor
 from .core.filters import FilterSpec, OPERATOR_REGISTRY, register_operator, normalize_filter_spec as _normalize_filter_spec
 from .core.selection import RelationSelectionExtractor, RootSelectionExtractor
 from .core.utils import (
@@ -41,7 +41,7 @@ from .core.utils import (
     expr_from_where_dict as _expr_from_where_dict,
 )
 
-__all__ = ['BerrySchema', 'BerryType']
+__all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
 
 # --- Helper: Relation selection extraction (moved out of resolver closure) ---
 ## RelationSelectionExtractor imported from core.selection
@@ -75,6 +75,15 @@ class BerryTypeMeta(type):
 class BerryType(metaclass=BerryTypeMeta):
     model: Optional[Type] = None  # user sets via subclass attribute
 
+class BerryDomain:
+        """Marker base for a domain group. Holds relation FieldDescriptors and optional strawberry fields.
+
+        Attributes (set by schema.domain decorator meta):
+            __domain_name__: the GraphQL field name in Query (string)
+            __domain_guard__: optional callable (model_cls, info) -> dict|SA expr applied to all relations as default where
+        """
+        pass
+
 class BerrySchema:
     """Registry + dynamic Strawberry schema builder.
     """
@@ -85,6 +94,8 @@ class BerrySchema:
         self._root_query_fields = None
         # Keep reference to user-declared Query class to copy @strawberry.field methods
         self._user_query_cls = None
+        # Domain registry: name -> (domain class, options)
+        self._domains = {}
 
     def register(self, cls: Type[BerryType]):
         self.types[cls.__name__] = cls
@@ -111,9 +122,36 @@ class BerrySchema:
                 if isinstance(v, FieldDescriptor):
                     v.__set_name__(None, k)
                     qfields[k] = v.build('Query')
+                # Capture DomainDescriptor markers for exposure later
+                if isinstance(v, DomainDescriptor):
+                    v.__set_name__(None, k)
+                    dom_cls = v.domain_cls
+                    dom_name = v.name or v.attr_name or getattr(dom_cls, '__domain_name__', None) or k
+                    # Persist the chosen field name and class for build time
+                    self._domains.setdefault(dom_name, {'class': dom_cls, 'expose': True, 'options': dict(v.meta)})
             self._root_query_fields = qfields
             # Save user-declared class for copying strawberry fields later
             self._user_query_cls = cls
+            return cls
+        return deco
+
+    def domain(self, *, name: Optional[str] = None, guard: Optional[Callable[..., Any]] = None, description: Optional[str] = None):
+        """Decorator to register a domain class.
+
+        Example:
+            @berry_schema.domain(name='userDomain', guard=...)
+            class UserDomain(BerryDomain):
+                users = relation('UserQL')
+        """
+        def deco(cls: Type[BerryDomain]):
+            dom_name = name or getattr(cls, '__name__', 'Domain')
+            setattr(cls, '__domain_name__', dom_name)
+            if guard is not None:
+                setattr(cls, '__domain_guard__', guard)
+            if description is not None:
+                setattr(cls, '__doc__', description)
+            # Register placeholder; exposure onto Query happens when Query decorator processes DomainDescriptors
+            self._domains.setdefault(dom_name, {'class': cls, 'expose': False, 'options': {}})
             return cls
         return deco
 
@@ -3160,6 +3198,97 @@ class BerrySchema:
         # Only add user-declared root fields
         if self._root_query_fields:
             _add_declared_root_fields_to_class(QueryPlain)
+        # Build and attach any declared domain fields
+        if self._domains:
+            for dom_name, cfg in list(self._domains.items()):
+                dom_cls = cfg.get('class')
+                if not dom_cls:
+                    continue
+                # Build Strawberry type for domain if not yet built
+                type_name = f"{getattr(dom_cls, '__name__', dom_name)}Type"
+                if type_name in self._st_types:
+                    DomSt = self._st_types[type_name]
+                else:
+                    # Create plain runtime class
+                    DomSt = type(type_name, (), {'__doc__': f'Domain container for {dom_name}'})
+                    DomSt.__module__ = __name__
+                    ann: Dict[str, Any] = {}
+                    # Attach relation fields from domain class using same machinery as user-declared Query relations
+                    for fname, fval in list(vars(dom_cls).items()):
+                        if isinstance(fval, FieldDescriptor):
+                            fval.__set_name__(None, fname)
+                            fdef = fval.build(type_name)
+                            if fdef.kind != 'relation':
+                                continue
+                            target_name = fdef.meta.get('target')
+                            target_b = self.types.get(target_name) if target_name else None
+                            target_st = self._st_types.get(target_name) if target_name else None
+                            if not target_b or not target_b.model or not target_st:
+                                continue
+                            # Merge domain-level guard as default where if provided
+                            defaults = {
+                                'order_by': fdef.meta.get('order_by'),
+                                'order_dir': fdef.meta.get('order_dir'),
+                                'order_multi': fdef.meta.get('order_multi') or [],
+                                'where': fdef.meta.get('where'),
+                                'arguments': fdef.meta.get('arguments')
+                            }
+                            try:
+                                guard = getattr(dom_cls, '__domain_guard__', None)
+                            except Exception:
+                                guard = None
+                            if guard is not None and defaults.get('where') is None:
+                                defaults['where'] = guard
+                            is_single = bool(fdef.meta.get('single'))
+                            resolver = _make_root_resolver(target_b.model, target_st, target_b, fname, relation_defaults=defaults, is_single=is_single)
+                            if is_single:
+                                ann[fname] = Optional[target_st]  # type: ignore
+                            else:
+                                ann[fname] = List[target_st]  # type: ignore
+                            setattr(DomSt, fname, strawberry.field(resolver=resolver))
+                    # Copy any strawberry fields defined on the domain class (e.g., @strawberry.field)
+                    for uf, val in list(vars(dom_cls).items()):
+                        if isinstance(val, FieldDescriptor):
+                            continue
+                        if uf.startswith('__') or uf.startswith('_'):
+                            continue
+                        if hasattr(DomSt, uf):
+                            continue
+                        try:
+                            mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
+                            looks_st = (
+                                mod.startswith("strawberry")
+                                or hasattr(val, "resolver")
+                                or hasattr(val, "base_resolver")
+                            )
+                            if looks_st:
+                                fn = getattr(val, 'resolver', None)
+                                if fn is None:
+                                    br = getattr(val, 'base_resolver', None)
+                                    fn = getattr(br, 'func', None)
+                                if fn is None:
+                                    fn = getattr(val, 'func', None)
+                                if callable(fn):
+                                    setattr(DomSt, uf, strawberry.field(resolver=fn))
+                                else:
+                                    setattr(DomSt, uf, val)
+                        except Exception:
+                            pass
+                    DomSt.__annotations__ = ann
+                    # Decorate as strawberry type
+                    self._st_types[type_name] = strawberry.type(DomSt)  # type: ignore
+                    DomSt = self._st_types[type_name]
+                # Expose on Query as a field that returns the domain container instance
+                def _make_domain_resolver(DomSt_local):
+                    async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+                        # Provide a trivial instance to serve as parent for nested domain resolvers
+                        inst = DomSt_local()
+                        # Pass through registry for relation resolvers on domain
+                        setattr(inst, '__berry_registry__', self)
+                        return inst
+                    return _resolver
+                query_annotations[dom_name] = self._st_types[type_name]  # type: ignore
+                setattr(QueryPlain, dom_name, strawberry.field(resolver=_make_domain_resolver(self._st_types[type_name])))
         # Merge any regular @strawberry.field resolvers defined on the user Query class
         try:
             if getattr(self, '_user_query_cls', None) is not None:

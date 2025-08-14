@@ -8,7 +8,7 @@ from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
-from berryql import BerrySchema, BerryType, field, relation, aggregate, count, custom, custom_object
+from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain
 from tests.models import User, Post, PostComment  # type: ignore
 
 berry_schema = BerrySchema()
@@ -134,7 +134,58 @@ class UserQL(BerryType):
     other_users = relation('UserQL', mode='exclude_self')
     bloggers = relation('UserQL', mode='has_posts')
 
-# Declare Query with explicit roots only (no auto-roots)
+# --- Domains: userDomain and blogDomain ---
+
+@berry_schema.domain(name='userDomain')
+class UserDomain(BerryDomain):
+    # Reuse same relations as flat roots
+    def _gate_users(model_cls, info: Info):
+        try:
+            ctx = info.context or {}
+            if not ctx.get('enforce_user_gate'):
+                return {}
+            cu = ctx.get('current_user')
+            uid = ctx.get('user_id')
+            if cu and getattr(cu, 'is_admin', False):
+                return {}
+            if uid:
+                return {'id': {'eq': uid}}
+            return {'id': {'eq': -1}}
+        except Exception:
+            return {'id': {'eq': -1}}
+    users = relation('UserQL', order_by='id', order_dir='asc', arguments={
+        'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
+        'created_at_between': {
+            'column': 'created_at',
+            'op': 'between',
+            'transform': lambda v: (
+                [
+                    (datetime.fromisoformat(v[0]) if isinstance(v[0], str) else v[0]),
+                    (datetime.fromisoformat(v[1]) if isinstance(v[1], str) else v[1]),
+                ] if isinstance(v, (list, tuple)) and len(v) >= 2 else v
+            ),
+        },
+        'is_admin_eq': {
+            'column': 'is_admin',
+            'op': 'eq',
+        },
+    }, where=_gate_users)
+    userById = relation('UserQL', single=True, arguments={
+        'id': {
+            'column': 'id',
+            'op': 'eq'
+        }
+    })
+
+@berry_schema.domain(name='blogDomain')
+class BlogDomain(BerryDomain):
+    posts = relation('PostQL', order_by='id', order_dir='asc', arguments={
+        'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
+        'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
+        'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
+    })
+
+# Declare Query with explicit roots and grouped domains
 @berry_schema.query()
 class Query:
     # Plural collections
@@ -189,5 +240,9 @@ class Query:
     @strawberry.field
     def hello(self) -> str:
         return "world"
+
+    # Expose domains under namespaces
+    userDomain = domain(UserDomain)
+    blogDomain = domain(BlogDomain)
 
 schema = berry_schema.to_strawberry()
