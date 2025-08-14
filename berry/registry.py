@@ -32,7 +32,14 @@ T = TypeVar('T')
 from .core.fields import FieldDef, FieldDescriptor, field, relation, aggregate, count, custom, custom_object
 from .core.filters import FilterSpec, OPERATOR_REGISTRY, register_operator, normalize_filter_spec as _normalize_filter_spec
 from .core.selection import RelationSelectionExtractor, RootSelectionExtractor
-from .core.utils import Direction, dir_value as _dir_value, coerce_where_value as _coerce_where_value
+from .core.utils import (
+    Direction,
+    dir_value as _dir_value,
+    coerce_where_value as _coerce_where_value,
+    coerce_literal as _coerce_literal,
+    normalize_relation_cfg as _normalize_rel_cfg,
+    expr_from_where_dict as _expr_from_where_dict,
+)
 
 __all__ = ['BerrySchema', 'BerryType']
 
@@ -1183,75 +1190,7 @@ class BerrySchema:
                 _rel_extractor = RelationSelectionExtractor(self)  # type: ignore
                 requested_relations = _rel_extractor.extract(info, root_field_name, btype_cls)
                 # Normalize any AST-node leftovers in relation configs to plain Python types
-                def _coerce_literal(v: Any) -> Any:
-                    try:
-                        # Handle list-like
-                        if isinstance(v, list):
-                            return [ _coerce_literal(x) for x in v ]
-                        # Object-like from extractor is already dict of coerced values, but double-check
-                        if isinstance(v, dict):
-                            return { k: _coerce_literal(x) for k, x in v.items() }
-                        # GraphQL AST nodes expose .value
-                        if hasattr(v, 'values'):
-                            try:
-                                return [ _coerce_literal(x) for x in getattr(v, 'values', []) or [] ]
-                            except Exception:
-                                return v
-                        if hasattr(v, 'fields'):
-                            try:
-                                out = {}
-                                for f in getattr(v, 'fields', []) or []:
-                                    k = getattr(getattr(f, 'name', None), 'value', None) or getattr(f, 'name', None)
-                                    out[k] = _coerce_literal(getattr(f, 'value', None))
-                                return out
-                            except Exception:
-                                return v
-                        if hasattr(v, 'value'):
-                            return getattr(v, 'value')
-                    except Exception:
-                        return v
-                    return v
-                def _normalize_rel_cfg(cfg: Dict[str, Any]):
-                    if not isinstance(cfg, dict):
-                        return
-                    for key in ('limit','offset','order_by','order_dir','where','default_where'):
-                        if key in cfg:
-                            cfg[key] = _coerce_literal(cfg.get(key))
-                    # order_multi and fields
-                    if 'order_multi' in cfg and cfg.get('order_multi') is not None:
-                        try:
-                            om = _coerce_literal(cfg.get('order_multi'))
-                            if hasattr(om, 'values'):
-                                try:
-                                    om = [ _coerce_literal(x) for x in getattr(om, 'values', []) or [] ]
-                                except Exception:
-                                    pass
-                            if not isinstance(om, list):
-                                om = [om]
-                            cfg['order_multi'] = [ str(_coerce_literal(x)) for x in (om or []) ]
-                        except Exception:
-                            cfg['order_multi'] = [ str(cfg.get('order_multi')) ] if cfg.get('order_multi') is not None else []
-                    if 'fields' in cfg and cfg.get('fields') is not None:
-                        try:
-                            fl = _coerce_literal(cfg.get('fields'))
-                            if hasattr(fl, 'values'):
-                                try:
-                                    fl = [ _coerce_literal(x) for x in getattr(fl, 'values', []) or [] ]
-                                except Exception:
-                                    pass
-                            if not isinstance(fl, list):
-                                fl = [fl]
-                            cfg['fields'] = [ str(_coerce_literal(x)) for x in (fl or []) ]
-                        except Exception:
-                            cfg['fields'] = [ str(cfg.get('fields')) ] if cfg.get('fields') is not None else []
-                    # filter args
-                    if 'filter_args' in cfg and isinstance(cfg.get('filter_args'), dict):
-                        fa = cfg.get('filter_args') or {}
-                        for k in list(fa.keys()):
-                            fa[k] = _coerce_literal(fa[k])
-                    # nested
-                    for n in list((cfg.get('nested') or {}).values()):
-                        _normalize_rel_cfg(n)
+                # Using shared helpers from core.utils
                 for rel_cfg in list(requested_relations.values()):
                     _normalize_rel_cfg(rel_cfg)
                 # Use no-arg RootSelectionExtractor to maintain broad compatibility
@@ -1266,64 +1205,7 @@ class BerrySchema:
                 selection_extracted = bool(
                     requested_scalar_root or requested_custom_root or requested_custom_obj_root or requested_relations
                 )
-                # Coerce JSON where values to match column types (helps strict dialects like Postgres)
-                def _coerce_where_value(col, val):
-                        try:
-                            from sqlalchemy.sql.sqltypes import Integer as _I, Float as _F, Boolean as _B, DateTime as _DT, Numeric as _N
-                        except Exception:
-                            _I = Integer; _F = None; _B = Boolean; _DT = DateTime; _N = None  # fallbacks
-                        # List-like (in/between) -> coerce elements
-                        if isinstance(val, (list, tuple)):
-                            return [ _coerce_where_value(col, v) for v in val ]
-                        ctype = getattr(col, 'type', None)
-                        if ctype is None:
-                            return val
-                        try:
-                            # DateTime
-                            if isinstance(ctype, _DT):
-                                if isinstance(val, str):
-                                    s = val.replace('Z', '+00:00') if 'Z' in val else val
-                                    try:
-                                        dv = datetime.fromisoformat(s)
-                                        # If DB stores naive datetimes, drop tzinfo
-                                        try:
-                                            if getattr(ctype, 'timezone', False) is False and getattr(dv, 'tzinfo', None) is not None:
-                                                dv = dv.replace(tzinfo=None)
-                                        except Exception:
-                                            pass
-                                        return dv
-                                    except Exception:
-                                        return val
-                                return val
-                            # Integer
-                            if isinstance(ctype, _I):
-                                try:
-                                    return int(val) if isinstance(val, str) else val
-                                except Exception:
-                                    return val
-                            # Numeric/Float
-                            if _N is not None and isinstance(ctype, _N):
-                                try:
-                                    return float(val) if isinstance(val, str) else val
-                                except Exception:
-                                    return val
-                            if _F is not None and isinstance(ctype, _F):
-                                try:
-                                    return float(val) if isinstance(val, str) else val
-                                except Exception:
-                                    return val
-                            # Boolean
-                            if isinstance(ctype, _B):
-                                if isinstance(val, str):
-                                    lv = val.strip().lower()
-                                    if lv in ('true','t','1','yes','y'):
-                                        return True
-                                    if lv in ('false','f','0','no','n'):
-                                        return False
-                                return bool(val)
-                        except Exception:
-                            return val
-                        return val
+                # Coercion of JSON where values moved to core.utils.coerce_where_value
                 # Helper to recursively build relation JSON expressions
                 def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
                     """Build a JSON array aggregation for a list relation including nested relations.
@@ -2576,28 +2458,7 @@ class BerrySchema:
                         custom_where = getattr(btype_cls, '__root_custom_where__', None)
                     except Exception:
                         custom_where = None
-                    def _expr_from_where_dict(model_cls_local, wdict):
-                        exprs = []
-                        for col_name, op_map in (wdict or {}).items():
-                            try:
-                                col = model_cls_local.__table__.c.get(col_name)
-                            except Exception:
-                                col = None
-                            if col is None:
-                                raise ValueError(f"Unknown where column: {col_name}")
-                            for op_name, val in (op_map or {}).items():
-                                op_fn = OPERATOR_REGISTRY.get(op_name)
-                                if not op_fn:
-                                    raise ValueError(f"Unknown where operator: {op_name}")
-                                # Coerce where value(s) to column type
-                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                    val = [_coerce_where_value(col, v) for v in val]
-                                else:
-                                    val = _coerce_where_value(col, val)
-                                exprs.append(op_fn(col, val))
-                        if not exprs:
-                            return None
-                        return _and(*exprs)
+                    # Use shared where-dict -> SQLA expression builder
                     # Only enforce custom_where when explicitly enabled by context flag
                     if custom_where is not None and bool(getattr(info, 'context', {}) and info.context.get('enforce_user_gate')):
                         try:
