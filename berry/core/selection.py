@@ -154,7 +154,8 @@ class RelationSelectionExtractor:
                 if k in args_dict and args_dict[k] is not None:
                     cfg_dst[k] = args_dict[k]
         try:
-            field_nodes = getattr(info, 'field_nodes', None) or getattr(getattr(info, '_raw_info', None), 'field_nodes', None)
+            raw_info = getattr(info, '_raw_info', None)
+            field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None
         except Exception:
             field_nodes = None
         if field_nodes:
@@ -306,7 +307,8 @@ class RootSelectionExtractor:
                         return n
                     except Exception:
                         return None
-                field_nodes = getattr(info, 'field_nodes', None) or getattr(getattr(info, '_raw_info', None), 'field_nodes', None)
+                raw_info = getattr(info, '_raw_info', None)
+                field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None
                 if field_nodes:
                     root_nodes = [n for n in field_nodes if _name_ast(n) == root_field_name]
                     if root_nodes:

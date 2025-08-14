@@ -5,10 +5,7 @@ import asyncio
 import strawberry
 from sqlalchemy import select, func, text as _text
 from sqlalchemy import and_ as _and
-try:  # adapter abstraction
-    from .adapters import get_adapter  # type: ignore
-except Exception:  # pragma: no cover
-    get_adapter = None  # type: ignore
+from .adapters import get_adapter  # adapter abstraction
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
@@ -31,11 +28,7 @@ from .core.filters import FilterSpec, OPERATOR_REGISTRY, register_operator, norm
 from .core.selection import RelationSelectionExtractor, RootSelectionExtractor
 from .core.utils import Direction, dir_value as _dir_value, coerce_where_value as _coerce_where_value
 
-# Re-export public API for backward compatibility
-__all__ = [
-    'BerrySchema','BerryType','FieldDef','FieldDescriptor','field','relation','aggregate','count','custom','custom_object',
-    'FilterSpec','OPERATOR_REGISTRY','register_operator','RelationSelectionExtractor','RootSelectionExtractor','Direction'
-]
+__all__ = ['BerrySchema', 'BerryType']
 
 # --- Helper: Relation selection extraction (moved out of resolver closure) ---
 ## RelationSelectionExtractor imported from core.selection
@@ -71,12 +64,6 @@ class BerryType(metaclass=BerryTypeMeta):
 
 class BerrySchema:
     """Registry + dynamic Strawberry schema builder.
-
-    Current minimal capabilities:
-    - Registers BerryType subclasses
-    - Generates Strawberry object types with scalar & relation fields
-    - Adds root collection fields (pluralized) performing simple SELECT * queries
-    - Relation resolvers issue individual filtered queries (not optimized yet)
     """
     def __init__(self):
         self.types: Dict[str, Type[BerryType]] = {}
@@ -122,14 +109,6 @@ class BerrySchema:
         else:
             base = name
         return base.lower() + 's'
-
-    def _build_strawberry_type(self, name: str, bcls: Type[BerryType]):  # pragma: no cover
-        """Legacy single-pass builder retained for backward compatibility paths.
-
-        The new implementation uses a two-pass approach inside to_strawberry();
-        this method should not be invoked in the redesigned flow.
-        """
-        pass
 
     def to_strawberry(self):
         # Two-pass: create plain classes first
@@ -1054,16 +1033,7 @@ class BerrySchema:
                     dialect_name = session.get_bind().dialect.name.lower()
                 except Exception:
                     dialect_name = 'sqlite'
-                if get_adapter:
-                    adapter = get_adapter(dialect_name)
-                else:
-                    class _LegacyAdapter:
-                        def json_object(self,*a): return func.json_object(*a)
-                        def json_array_agg(self,e): return func.json_group_array(e)
-                        def json_array_coalesce(self,e): return func.coalesce(e,'[]')
-                        def supports_relation_pushdown(self): return True
-                        name = 'legacy'
-                    adapter = _LegacyAdapter()  # type: ignore
+                adapter = get_adapter(dialect_name)
                 def _json_object(*args):
                     return adapter.json_object(*args)
                 def _json_array_agg(expr):
@@ -1080,13 +1050,8 @@ class BerrySchema:
                 # Avoid selecting the full entity to keep SQL projections minimal.
                 select_columns: List[Any] = []
                 # Use extracted helper classes: relations and root field kinds
-                # Instantiate relation extractor in a backward-compatible way
-                _rel_extractor = RelationSelectionExtractor()  # type: ignore
-                try:
-                    # Ensure registry attribute is wired for extractor logic
-                    setattr(_rel_extractor, 'registry', self)
-                except Exception:
-                    pass
+                # Instantiate relation extractor with registry wired
+                _rel_extractor = RelationSelectionExtractor(self)  # type: ignore
                 requested_relations = _rel_extractor.extract(info, root_field_name, btype_cls)
                 # Normalize any AST-node leftovers in relation configs to plain Python types
                 def _coerce_literal(v: Any) -> Any:

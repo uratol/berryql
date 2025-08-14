@@ -1,10 +1,12 @@
-"""Experimental next-gen declarative Berry layer (clean-slate).
+"""Next-gen declarative Berry layer (clean-slate).
 
-This package is a prototype separate from existing `berryql` to allow
-greenfield API iteration without breaking current behavior.
+Public API:
+- BerrySchema, BerryType
+- field, relation, aggregate, count, custom, custom_object
 """
-from .registry import BerrySchema, BerryType, field, relation, aggregate, count
+from .registry import BerrySchema, BerryType
+from .core.fields import field, relation, aggregate, count, custom, custom_object
 
 __all__ = [
-    'BerrySchema', 'BerryType', 'field', 'relation', 'aggregate', 'count'
+    'BerrySchema', 'BerryType', 'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object'
 ]

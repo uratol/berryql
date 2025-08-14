@@ -7,7 +7,7 @@ from typing import Optional, List, Any
 from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
-from berry.registry import BerrySchema, BerryType, field, relation, aggregate, count, custom, custom_object
+from berry import BerrySchema, BerryType, field, relation, aggregate, count, custom, custom_object
 from tests.models import User, Post, PostComment  # type: ignore
 
 berry_schema = BerrySchema()
