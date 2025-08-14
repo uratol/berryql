@@ -22,6 +22,20 @@ class PostCommentQL(BerryType):
     created_at = field()
     post = relation('PostQL', single=True)
     author = relation('UserQL', single=True)
+    # Regular strawberry field with its own resolver
+    @strawberry.field
+    def content_preview(self) -> str | None:
+        try:
+            txt = getattr(self, 'content', None)
+            if txt is None:
+                m = getattr(self, '_model', None)
+                txt = getattr(m, 'content', None) if m is not None else None
+            if txt is None:
+                return None
+            s = str(txt)
+            return s if len(s) <= 10 else s[:10] + '...'
+        except Exception:
+            return None
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
@@ -66,6 +80,17 @@ class UserQL(BerryType):
     email = field()
     is_admin = field()
     created_at = field()
+    # Regular strawberry field with its own resolver
+    @strawberry.field
+    def name_upper(self) -> str | None:
+        try:
+            n = getattr(self, 'name', None)
+            if n is None:
+                m = getattr(self, '_model', None)
+                n = getattr(m, 'name', None) if m is not None else None
+            return str(n).upper() if n is not None else None
+        except Exception:
+            return None
     posts = relation('PostQL', arguments={
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),

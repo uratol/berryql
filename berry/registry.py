@@ -134,17 +134,25 @@ class BerrySchema:
         except Exception:
             self._auto_camel_case = False
             self._name_converter = None
+        # Always rebuild Strawberry runtime classes fresh per call to honor config changes
+        # and avoid stale definitions across multiple to_strawberry invocations.
+        self._st_types = {}
         # Two-pass: create plain classes first
         for name, bcls in self.types.items():
-            if name not in self._st_types:
-                base_namespace = {'__berry_registry__': self, '__doc__': f'Berry runtime type {name}'}
-                cls = type(name, (), base_namespace)
-                cls.__module__ = __name__
-                self._st_types[name] = cls
-        # Second pass: add fields & annotations before decoration
+            base_namespace = {'__berry_registry__': self, '__doc__': f'Berry runtime type {name}'}
+            cls = type(name, (), base_namespace)
+            cls.__module__ = __name__
+            self._st_types[name] = cls
+    # Second pass: add fields & annotations before decoration
         for name, bcls in self.types.items():
             st_cls = self._st_types[name]
             annotations: Dict[str, Any] = getattr(st_cls, '__annotations__', {}) or {}
+            # Also capture user-declared annotations on the BerryType subclass itself so we can
+            # expose regular strawberry fields (with their own resolvers) alongside Berry fields.
+            try:
+                user_annotations: Dict[str, Any] = getattr(bcls, '__annotations__', {}) or {}
+            except Exception:
+                user_annotations = {}
             # column type mapping
             column_type_map: Dict[str, Any] = {}
             if bcls.model and hasattr(bcls.model, '__table__'):
@@ -989,6 +997,60 @@ class BerrySchema:
                             return None
                         return _resolver
                     setattr(st_cls, fname, strawberry.field(_make_custom_obj_resolver()))
+            # Merge in any user-declared strawberry fields that are not part of Berry field defs.
+            # Strategy:
+            # 1) Copy attributes explicitly annotated on the BerryType subclass (classic dataclass-like fields).
+            # 2) Additionally scan class attributes for objects produced by @strawberry.field (method resolvers),
+            #    and copy them verbatim so strawberry.type can pick them up on the generated class.
+            try:
+                # 1) Copy annotated attributes
+                for uf, utype in (user_annotations or {}).items():
+                    if uf in bcls.__berry_fields__:
+                        continue  # skip berry-defined fields
+                    if uf in annotations:
+                        continue  # already defined
+                    if uf.startswith('__'):
+                        continue
+                    annotations[uf] = utype
+                    try:
+                        setattr(st_cls, uf, getattr(bcls, uf))
+                    except Exception:
+                        pass
+                # 2) Copy @strawberry.field method-based resolvers
+                for uf, val in vars(bcls).items():
+                    if uf in bcls.__berry_fields__:
+                        continue
+                    if uf in annotations or hasattr(st_cls, uf):
+                        continue
+                    if uf.startswith('__') or uf.startswith('_'):
+                        continue
+                    try:
+                        mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
+                        looks_strawberry = (
+                            mod.startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                        if looks_strawberry:
+                            # Rebuild a new strawberry.field bound to the generated class using the original resolver function
+                            fn = getattr(val, 'resolver', None)
+                            if fn is None:
+                                br = getattr(val, 'base_resolver', None)
+                                fn = getattr(br, 'func', None)
+                            if fn is None:
+                                fn = getattr(val, 'func', None)
+                            if callable(fn):
+                                # Let Strawberry infer the return type from the resolver; avoid injecting
+                                # potentially version-specific StrawberryAnnotation wrappers into __annotations__.
+                                setattr(st_cls, uf, strawberry.field(resolver=fn))
+                            else:
+                                # Fallback to copying as-is
+                                setattr(st_cls, uf, val)
+                    except Exception:
+                        # best-effort
+                        pass
+            except Exception:
+                pass
             st_cls.__annotations__ = annotations
         # Decorate all types now
         for name, cls in list(self._st_types.items()):
@@ -3307,15 +3369,16 @@ class BerrySchema:
         # Build the Schema honoring provided strawberry_config; keep backward compatibility.
         # Precedence: explicit strawberry_config -> default False (legacy behavior)
         if strawberry_config is not None:
-            # Try new-style config argument first
+            # First, try older Strawberry signature using auto_camel_case kwarg
             try:
-                return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
-            except TypeError:  # fallback for older strawberry versions
-                # Try to extract auto_camel_case from the provided config and pass directly
                 ac = getattr(strawberry_config, 'auto_camel_case', None)
+                return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
+            except TypeError:
+                # If unsupported, try newer signature with config kwarg
                 try:
-                    return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
+                    return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
                 except TypeError:
+                    # Last resort: build without config
                     return strawberry.Schema(Query)
         # Default: preserve previous library behavior (auto_camel_case=False)
         try:
