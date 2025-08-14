@@ -4,7 +4,7 @@ from tests.schema import UserQL, PostQL, PostCommentQL, schema as berry_strawber
 
 def test_userql_fields_shape():
     f = set(UserQL.__berry_fields__.keys())
-    assert {'id','name','email','is_admin','created_at','posts','post_comments','post_agg','post_agg_obj','new_posts','other_users','bloggers'} <= f
+    assert {'id','name','email','is_admin','created_at','posts','post_comments','post_agg','post_agg_obj'} <= f
 
 
 def test_postql_fields_shape():

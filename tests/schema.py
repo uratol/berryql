@@ -132,9 +132,6 @@ class UserQL(BerryType):
         from sqlalchemy import exists, select
         return exists(select(PostComment.id).where(PostComment.post_id == model_cls.id))
     posts_have_comments = relation('PostQL', where=_posts_have_comments_where)
-    new_posts = relation('PostQL', window='recent')
-    other_users = relation('UserQL', mode='exclude_self')
-    bloggers = relation('UserQL', mode='has_posts')
 
 # --- Domains: userDomain and blogDomain ---
 
