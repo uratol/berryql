@@ -72,7 +72,8 @@ class RelationSelectionExtractor:
             'target': target,
             'nested': {},
             'skip_pushdown': False,
-            'filter_args': {}
+            'filter_args': {},
+            'arg_specs': fdef.meta.get('arguments') if fdef.meta.get('arguments') is not None else None
         }
 
     def _children(self, sel: Any) -> list[Any]:
@@ -842,7 +843,27 @@ class BerrySchema:
                                 out[spec.alias or key] = spec
                         return out
                     def _make_relation_resolver(meta_copy=meta_copy, is_single_value=is_single, fname_local=fname, parent_btype_local=bcls):
-                        target_filters = _collect_declared_filters_for_target(meta_copy.get('target')) if meta_copy.get('target') else {}
+                        # Prefer per-relation arguments over target type __filters__
+                        target_filters: Dict[str, FilterSpec] = {}
+                        rel_args_spec = meta_copy.get('arguments')
+                        if isinstance(rel_args_spec, dict):
+                            for key, raw in rel_args_spec.items():
+                                try:
+                                    if callable(raw):
+                                        spec = FilterSpec(builder=raw)
+                                    else:
+                                        spec = _normalize_filter_spec(raw)
+                                except Exception:
+                                    continue
+                                if spec.ops and not spec.op:
+                                    for op_name in spec.ops:
+                                        base = spec.alias or key
+                                        arg_name = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
+                                        target_filters[arg_name] = spec.clone_with(op=op_name, ops=None)
+                                else:
+                                    target_filters[spec.alias or key] = spec
+                        elif meta_copy.get('target'):
+                            target_filters = _collect_declared_filters_for_target(meta_copy.get('target'))
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
@@ -1619,7 +1640,7 @@ class BerrySchema:
         QueryPlain = type('Query', (), {'__doc__': 'Auto-generated Berry root query (prototype).'})
         setattr(QueryPlain, '__module__', __name__)
         # Helper: collect declared filters from a BerryType (auto roots only)
-        def _collect_declared_filters(btype_cls_local):
+        def _collect_declared_filters(btype_cls_local, rel_args_spec: Optional[dict] = None):
             """Collect and expand declared filter specs.
 
             Expansion rules:
@@ -1629,10 +1650,14 @@ class BerrySchema:
             Returns: mapping of argument_name -> FilterSpec (with resolved single op).
             """
             out: Dict[str, FilterSpec] = {}
-            class_filters = getattr(btype_cls_local, '__filters__', {}) or {}
+            # Prefer explicit relation arguments spec when provided
+            class_filters = rel_args_spec if isinstance(rel_args_spec, dict) else (getattr(btype_cls_local, '__filters__', {}) or {})
             for key, raw in class_filters.items():
                 try:
-                    spec = _normalize_filter_spec(raw)
+                    if callable(raw):
+                        spec = FilterSpec(builder=raw)
+                    else:
+                        spec = _normalize_filter_spec(raw)
                 except Exception:
                     continue
                 if spec.ops and not spec.op:
@@ -1646,7 +1671,8 @@ class BerrySchema:
 
         # Core root resolver factory (used by auto roots and user-declared Query fields)
         def _make_root_resolver(model_cls, st_cls, btype_cls, root_field_name, relation_defaults: Optional[Dict[str, Any]] = None, is_single: bool = False):
-            declared_filters = _collect_declared_filters(btype_cls)
+            rel_args_spec = (relation_defaults or {}).get('arguments') if relation_defaults else None
+            declared_filters = _collect_declared_filters(btype_cls, rel_args_spec)
             # Precompute column -> python type mapping for argument type inference
             col_py_types: Dict[str, Any] = {}
             if model_cls is not None and hasattr(model_cls, '__table__'):
@@ -1915,7 +1941,8 @@ class BerrySchema:
                             if filter_args:
                                 target_btype = self.types.get(rel_cfg.get('target'))
                                 if target_btype:
-                                    class_filters = getattr(target_btype, '__filters__', {}) or {}
+                                    # Prefer relation-defined arguments spec when available
+                                    class_filters = rel_cfg.get('arg_specs') or getattr(target_btype, '__filters__', {}) or {}
                                     expanded: Dict[str, FilterSpec] = {}
                                     for key, raw in class_filters.items():
                                         try:
@@ -2401,9 +2428,9 @@ class BerrySchema:
                                 rel_cfg['skip_pushdown'] = True
                         except Exception:
                             pass
-                        # For single relations, also skip pushdown when filter args are present to avoid false negatives.
+                        # Skip pushdown when filter args are present; resolvers will apply them reliably.
                         try:
-                            if rel_cfg.get('single') and (rel_cfg.get('filter_args') or rel_cfg.get('where') is not None):
+                            if rel_cfg.get('filter_args'):
                                 rel_cfg['skip_pushdown'] = True
                         except Exception:
                             pass
@@ -2541,7 +2568,7 @@ class BerrySchema:
                                         target_btype = self.types.get(target_name)
                                         if target_btype:
                                             # replicate root filter expansion logic
-                                            class_filters = getattr(target_btype, '__filters__', {}) or {}
+                                            class_filters = rel_cfg.get('arg_specs') or getattr(target_btype, '__filters__', {}) or {}
                                             expanded: Dict[str, FilterSpec] = {}
                                             for key, raw in class_filters.items():
                                                 try:
@@ -2821,7 +2848,7 @@ class BerrySchema:
                                     if filter_args:
                                         target_btype = self.types.get(rel_cfg.get('target'))
                                         if target_btype:
-                                            class_filters = getattr(target_btype, '__filters__', {}) or {}
+                                            class_filters = rel_cfg_local.get('arg_specs') or getattr(target_btype, '__filters__', {}) or {}
                                             expanded: Dict[str, FilterSpec] = {}
                                             for key, raw in class_filters.items():
                                                 try:
@@ -3814,7 +3841,8 @@ class BerrySchema:
                     'order_by': fdef.meta.get('order_by'),
                     'order_dir': fdef.meta.get('order_dir'),
                     'order_multi': fdef.meta.get('order_multi') or [],
-                    'where': fdef.meta.get('where')
+                    'where': fdef.meta.get('where'),
+                    'arguments': fdef.meta.get('arguments')
                 }
                 is_single_root = bool(fdef.meta.get('single'))
                 root_resolver = _make_root_resolver(target_b.model, target_st, target_b, fname, relation_defaults=rel_defaults, is_single=is_single_root)

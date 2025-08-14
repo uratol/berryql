@@ -25,11 +25,6 @@ class PostCommentQL(BerryType):
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
-    # Declare filters for autogeneration (Phase 2 tests)
-    __filters__ = {
-        'title_ilike': {'column': 'title', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
-    'created_at': {'column': 'created_at', 'ops': ['gt','lt']},  # expands to created_at_gt / created_at_lt
-    }
     id = field()
     title = field()
     content = field()
@@ -62,17 +57,15 @@ class PostQL(BerryType):
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
-    __filters__ = {
-        'name_ilike': {'column': 'name', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
-        'created_at_between': {'column': 'created_at', 'op': 'between'},
-        'is_admin_eq': {'column': 'is_admin', 'op': 'eq'},
-    }
     id = field()
     name = field()
     email = field()
     is_admin = field()
     created_at = field()
-    posts = relation('PostQL')
+    posts = relation('PostQL', arguments={
+        'title_ilike': {'column': 'title', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
+        'created_at': {'column': 'created_at', 'ops': ['gt','lt']},
+    })
     post_comments = relation('PostCommentQL')
     post_agg = count('posts')
     # Object form of post aggregation (mirrors legacy PostAggType { count })
@@ -113,9 +106,18 @@ class Query:
             return {'id': {'eq': -1}}
         except Exception:
             return {'id': {'eq': -1}}
-    users = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users)
-    posts = relation('PostQL', order_by='id', order_dir='asc')
-    # Example: fetch a single user by id using where default; tests can still call users(name_ilike: ...)
-    userById = relation('UserQL', single=True, where='{"id": {"eq": 1}}')
+    users = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users, arguments={
+        'name_ilike': {'column': 'name', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
+        'created_at_between': {'column': 'created_at', 'op': 'between'},
+        'is_admin_eq': {'column': 'is_admin', 'op': 'eq'},
+    })
+    posts = relation('PostQL', order_by='id', order_dir='asc', arguments={
+        'title_ilike': {'column': 'title', 'op': 'ilike', 'transform': lambda v: f"%{v}%"},
+        'created_at': {'column': 'created_at', 'ops': ['gt','lt']},
+    })
+    # Example: fetch a single user by id using arguments mapping
+    userById = relation('UserQL', single=True, arguments={
+        'id': lambda model_cls, info, v: model_cls.__table__.c.get('id') == v
+    })
 
 schema = berry_schema.to_strawberry()
