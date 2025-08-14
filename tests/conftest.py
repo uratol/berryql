@@ -1,5 +1,9 @@
 """Test configuration and fixtures for BerryQL."""
 
+import warnings
+# Silence Strawberry's LazyType deprecation warnings to keep test output clean
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+
 from dotenv import load_dotenv
 import pytest
 import asyncio

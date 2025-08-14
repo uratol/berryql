@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints
 import asyncio
 import strawberry
@@ -14,6 +15,9 @@ from enum import Enum
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     class Registry: ...  # forward ref placeholder
+
+# Silence Strawberry's LazyType deprecation warnings to keep test output clean.
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
 try:  # Provide StrawberryInfo for type annotations
     from strawberry.types import Info as StrawberryInfo  # type: ignore
 except Exception:  # pragma: no cover
@@ -243,10 +247,18 @@ class BerrySchema:
                                     annotations[fname] = List[target_cls_ref]  # type: ignore[index]
                         else:
                             if not is_private:
-                                annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
+                                # Use real typing objects instead of string annotations to avoid LazyType warnings
+                                if is_single:
+                                    annotations[fname] = Optional[str]
+                                else:
+                                    annotations[fname] = List[str]  # type: ignore[index]
                     else:  # fallback placeholder
                         if not is_private:
-                            annotations[fname] = 'Optional[str]' if is_single else 'List[str]'
+                            # Use real typing objects instead of string annotations to avoid LazyType warnings
+                            if is_single:
+                                annotations[fname] = Optional[str]
+                            else:
+                                annotations[fname] = List[str]  # type: ignore[index]
                     meta_copy = dict(fdef.meta)
                     def _collect_declared_filters_for_target(target_type_name: str):
                         # Deprecated path: type-level __filters__ removed; keep stub for parity
@@ -1005,7 +1017,7 @@ class BerrySchema:
                             nt_cls = type(nested_type_name, (), {'__doc__': f'Auto object for {fname}'})
                             anns = {}
                             for k2, t2 in returns_spec.items():
-                                anns[k2] = Optional[t2] if t2 in (int, str, bool, float, datetime) else 'Optional[str]'
+                                anns[k2] = Optional[t2] if t2 in (int, str, bool, float, datetime) else Optional[str]
                                 setattr(nt_cls, k2, None)
                             nt_cls.__annotations__ = anns
                             self._st_types[nested_type_name] = strawberry.type(nt_cls)  # decorate immediately
@@ -1016,7 +1028,7 @@ class BerrySchema:
                     if nested_type is not None:
                         annotations[fname] = Optional[nested_type]
                     else:
-                        annotations[fname] = 'Optional[str]'
+                        annotations[fname] = Optional[str]
                     meta_copy = dict(fdef.meta)
                     # store nested type for resolver reconstruction
                     meta_copy['_nested_type'] = nested_type
@@ -1094,6 +1106,12 @@ class BerrySchema:
                 mod_globals = globals()
                 mod_globals.update({'Optional': Optional, 'List': List})
                 self._st_types[name] = strawberry.type(cls)  # type: ignore
+        # Expose generated Strawberry types in this module's globals to satisfy LazyType lookups
+        try:
+            for _tname, _tcls in self._st_types.items():
+                globals()[_tname] = _tcls
+        except Exception:
+            pass
         # Hand off to builder that assembles the Query type and Schema
         return self._build_query(strawberry_config=strawberry_config)
 
@@ -3198,97 +3216,133 @@ class BerrySchema:
         # Only add user-declared root fields
         if self._root_query_fields:
             _add_declared_root_fields_to_class(QueryPlain)
-        # Build and attach any declared domain fields
+        # Build and attach any declared domain fields (supports nested domains)
         if self._domains:
+            # Helper to (recursively) build a Strawberry type for a domain class and cache it
+            _domain_type_cache: Dict[Type[Any], Any] = {}
+
+            def _ensure_domain_type(dom_cls: Type[Any]):
+                # Return cached if already built
+                try:
+                    if dom_cls in _domain_type_cache:
+                        return _domain_type_cache[dom_cls]
+                except Exception:
+                    pass
+                type_name = f"{getattr(dom_cls, '__name__', 'Domain')}Type"
+                if type_name in self._st_types:
+                    DomSt_local = self._st_types[type_name]
+                    _domain_type_cache[dom_cls] = DomSt_local
+                    return DomSt_local
+                # Create plain runtime class
+                DomSt_local = type(type_name, (), {'__doc__': f'Domain container for {getattr(dom_cls, "__name__", type_name)}'})
+                # Ensure the class appears to live in this module to prevent LazyType path lookups
+                DomSt_local.__module__ = __name__
+                _domain_type_cache[dom_cls] = DomSt_local  # pre-cache to break cycles
+                ann_local: Dict[str, Any] = {}
+                # Attach relation fields from domain class
+                for fname, fval in list(vars(dom_cls).items()):
+                    if isinstance(fval, FieldDescriptor):
+                        fval.__set_name__(None, fname)
+                        fdef = fval.build(type_name)
+                        if fdef.kind != 'relation':
+                            continue
+                        target_name = fdef.meta.get('target')
+                        target_b = self.types.get(target_name) if target_name else None
+                        target_st = self._st_types.get(target_name) if target_name else None
+                        if not target_b or not target_b.model or not target_st:
+                            continue
+                        # Merge domain-level guard as default where if provided
+                        defaults = {
+                            'order_by': fdef.meta.get('order_by'),
+                            'order_dir': fdef.meta.get('order_dir'),
+                            'order_multi': fdef.meta.get('order_multi') or [],
+                            'where': fdef.meta.get('where'),
+                            'arguments': fdef.meta.get('arguments')
+                        }
+                        try:
+                            guard = getattr(dom_cls, '__domain_guard__', None)
+                        except Exception:
+                            guard = None
+                        if guard is not None and defaults.get('where') is None:
+                            defaults['where'] = guard
+                        is_single = bool(fdef.meta.get('single'))
+                        resolver = _make_root_resolver(target_b.model, target_st, target_b, fname, relation_defaults=defaults, is_single=is_single)
+                        if is_single:
+                            ann_local[fname] = Optional[target_st]  # type: ignore
+                        else:
+                            ann_local[fname] = List[target_st]  # type: ignore
+                        setattr(DomSt_local, fname, strawberry.field(resolver=resolver))
+                # Attach nested domain fields declared via DomainDescriptor
+                try:
+                    from .core.fields import DomainDescriptor as _DomDesc
+                except Exception:
+                    _DomDesc = None  # type: ignore
+                for fname, fval in list(vars(dom_cls).items()):
+                    if _DomDesc is not None and isinstance(fval, _DomDesc):
+                        # Determine field name and nested class
+                        child_cls = fval.domain_cls
+                        child_dom_st = _ensure_domain_type(child_cls)
+                        # Use concrete class reference in annotations to avoid LazyType deprecation warnings
+                        ann_local[fname] = child_dom_st  # type: ignore
+                        def _make_nested_resolver(ChildSt):
+                            async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+                                inst = ChildSt()
+                                setattr(inst, '__berry_registry__', getattr(self, '__berry_registry__', self))
+                                return inst
+                            return _resolver
+                        setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
+                # Copy any strawberry fields defined on the domain class (e.g., @strawberry.field)
+                for uf, val in list(vars(dom_cls).items()):
+                    if (_DomDesc is not None and isinstance(val, _DomDesc)) or isinstance(val, FieldDescriptor):
+                        continue
+                    if uf.startswith('__') or uf.startswith('_'):
+                        continue
+                    if hasattr(DomSt_local, uf):
+                        continue
+                    try:
+                        mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
+                        looks_st = (
+                            mod.startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                        if looks_st:
+                            fn = getattr(val, 'resolver', None)
+                            if fn is None:
+                                br = getattr(val, 'base_resolver', None)
+                                fn = getattr(br, 'func', None)
+                            if fn is None:
+                                fn = getattr(val, 'func', None)
+                            if callable(fn):
+                                setattr(DomSt_local, uf, strawberry.field(resolver=fn))
+                            else:
+                                setattr(DomSt_local, uf, val)
+                    except Exception:
+                        pass
+                DomSt_local.__annotations__ = ann_local
+                # Decorate and cache
+                self._st_types[type_name] = strawberry.type(DomSt_local)  # type: ignore
+                # Also export into module globals to satisfy any LazyType lookups by name
+                try:
+                    globals()[type_name] = self._st_types[type_name]
+                except Exception:
+                    pass
+                return self._st_types[type_name]
+
             for dom_name, cfg in list(self._domains.items()):
                 dom_cls = cfg.get('class')
                 if not dom_cls:
                     continue
-                # Build Strawberry type for domain if not yet built
-                type_name = f"{getattr(dom_cls, '__name__', dom_name)}Type"
-                if type_name in self._st_types:
-                    DomSt = self._st_types[type_name]
-                else:
-                    # Create plain runtime class
-                    DomSt = type(type_name, (), {'__doc__': f'Domain container for {dom_name}'})
-                    DomSt.__module__ = __name__
-                    ann: Dict[str, Any] = {}
-                    # Attach relation fields from domain class using same machinery as user-declared Query relations
-                    for fname, fval in list(vars(dom_cls).items()):
-                        if isinstance(fval, FieldDescriptor):
-                            fval.__set_name__(None, fname)
-                            fdef = fval.build(type_name)
-                            if fdef.kind != 'relation':
-                                continue
-                            target_name = fdef.meta.get('target')
-                            target_b = self.types.get(target_name) if target_name else None
-                            target_st = self._st_types.get(target_name) if target_name else None
-                            if not target_b or not target_b.model or not target_st:
-                                continue
-                            # Merge domain-level guard as default where if provided
-                            defaults = {
-                                'order_by': fdef.meta.get('order_by'),
-                                'order_dir': fdef.meta.get('order_dir'),
-                                'order_multi': fdef.meta.get('order_multi') or [],
-                                'where': fdef.meta.get('where'),
-                                'arguments': fdef.meta.get('arguments')
-                            }
-                            try:
-                                guard = getattr(dom_cls, '__domain_guard__', None)
-                            except Exception:
-                                guard = None
-                            if guard is not None and defaults.get('where') is None:
-                                defaults['where'] = guard
-                            is_single = bool(fdef.meta.get('single'))
-                            resolver = _make_root_resolver(target_b.model, target_st, target_b, fname, relation_defaults=defaults, is_single=is_single)
-                            if is_single:
-                                ann[fname] = Optional[target_st]  # type: ignore
-                            else:
-                                ann[fname] = List[target_st]  # type: ignore
-                            setattr(DomSt, fname, strawberry.field(resolver=resolver))
-                    # Copy any strawberry fields defined on the domain class (e.g., @strawberry.field)
-                    for uf, val in list(vars(dom_cls).items()):
-                        if isinstance(val, FieldDescriptor):
-                            continue
-                        if uf.startswith('__') or uf.startswith('_'):
-                            continue
-                        if hasattr(DomSt, uf):
-                            continue
-                        try:
-                            mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
-                            looks_st = (
-                                mod.startswith("strawberry")
-                                or hasattr(val, "resolver")
-                                or hasattr(val, "base_resolver")
-                            )
-                            if looks_st:
-                                fn = getattr(val, 'resolver', None)
-                                if fn is None:
-                                    br = getattr(val, 'base_resolver', None)
-                                    fn = getattr(br, 'func', None)
-                                if fn is None:
-                                    fn = getattr(val, 'func', None)
-                                if callable(fn):
-                                    setattr(DomSt, uf, strawberry.field(resolver=fn))
-                                else:
-                                    setattr(DomSt, uf, val)
-                        except Exception:
-                            pass
-                    DomSt.__annotations__ = ann
-                    # Decorate as strawberry type
-                    self._st_types[type_name] = strawberry.type(DomSt)  # type: ignore
-                    DomSt = self._st_types[type_name]
+                DomSt = _ensure_domain_type(dom_cls)
                 # Expose on Query as a field that returns the domain container instance
                 def _make_domain_resolver(DomSt_local):
                     async def _resolver(self, info: StrawberryInfo):  # noqa: D401
-                        # Provide a trivial instance to serve as parent for nested domain resolvers
                         inst = DomSt_local()
-                        # Pass through registry for relation resolvers on domain
                         setattr(inst, '__berry_registry__', self)
                         return inst
                     return _resolver
-                query_annotations[dom_name] = self._st_types[type_name]  # type: ignore
-                setattr(QueryPlain, dom_name, strawberry.field(resolver=_make_domain_resolver(self._st_types[type_name])))
+                query_annotations[dom_name] = DomSt  # type: ignore
+                setattr(QueryPlain, dom_name, strawberry.field(resolver=_make_domain_resolver(DomSt)))
         # Merge any regular @strawberry.field resolvers defined on the user Query class
         try:
             if getattr(self, '_user_query_cls', None) is not None:
@@ -3386,19 +3440,31 @@ class BerrySchema:
             # First, try older Strawberry signature using auto_camel_case kwarg
             try:
                 ac = getattr(strawberry_config, 'auto_camel_case', None)
-                return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                    return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
             except TypeError:
                 # If unsupported, try newer signature with config kwarg
                 try:
-                    return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                        return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
                 except TypeError:
                     # Last resort: build without config
-                    return strawberry.Schema(Query)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                        return strawberry.Schema(Query)
         # Default: preserve previous library behavior (auto_camel_case=False)
         try:
-            return strawberry.Schema(Query, auto_camel_case=False)  # type: ignore[arg-type]
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                return strawberry.Schema(Query, auto_camel_case=False)  # type: ignore[arg-type]
         except TypeError:  # pragma: no cover
             try:
-                return strawberry.Schema(Query, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                    return strawberry.Schema(Query, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
             except Exception:
-                return strawberry.Schema(Query)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+                    return strawberry.Schema(Query)

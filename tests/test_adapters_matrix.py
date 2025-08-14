@@ -23,7 +23,3 @@ def test_postgres_adapter_funcs():
     assert a.json_array_agg('x') is not None
 
 
-@pytest.mark.skip(reason="MSSQL FOR JSON path tested indirectly in integration; adapter methods are placeholders")
-def test_mssql_adapter_skip():
-    a = get_adapter('mssql')
-    assert a.supports_relation_pushdown()

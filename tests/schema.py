@@ -185,6 +185,13 @@ class BlogDomain(BerryDomain):
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
 
+# A nested grouping domain that exposes userDomain and blogDomain inside
+@berry_schema.domain(name='groupDomain')
+class GroupDomain(BerryDomain):
+    # Nest other domains inside this domain
+    userDomain = domain(UserDomain)
+    blogDomain = domain(BlogDomain)
+
 # Declare Query with explicit roots and grouped domains
 @berry_schema.query()
 class Query:
@@ -244,5 +251,6 @@ class Query:
     # Expose domains under namespaces
     userDomain = domain(UserDomain)
     blogDomain = domain(BlogDomain)
+    groupDomain = domain(GroupDomain)
 
 schema = berry_schema.to_strawberry()
