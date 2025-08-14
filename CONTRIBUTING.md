@@ -6,7 +6,7 @@ Thank you for your interest in contributing to BerryQL! This document provides g
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/berryql/berryql.git
+   git clone https://github.com/uratol/berryql.git
    cd berryql
    ```
 

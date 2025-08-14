@@ -1,5 +1,6 @@
 # Core runtime dependencies for BerryQL
-strawberry-graphql>=0.200.0
-sqlalchemy>=2.0.0
-graphql-core>=3.2.0
-inflection>=0.5.0
+# Keep minimal and broad to avoid conflicts for library consumers
+strawberry-graphql>=0.211.0
+sqlalchemy>=2.0.25
+graphql-core>=3.2.4
+inflection>=0.5.1

@@ -7,7 +7,7 @@ name = "berryql"
 version = "0.1.0"
 description = "A powerful GraphQL query optimization library for Strawberry GraphQL and SQLAlchemy"
 readme = "README.md"
-license = "MIT"
+license = { file = "LICENSE" }
 authors = [
     {name = "BerryQL Contributors"},
 ]
@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Database",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
@@ -28,34 +29,46 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "strawberry-graphql>=0.200.0",
-    "sqlalchemy>=2.0.0",
-    "graphql-core>=3.2.0",
-    "inflection>=0.5.0",
+    "strawberry-graphql>=0.211.0",
+    "sqlalchemy>=2.0.25",
+    "graphql-core>=3.2.4",
+    "inflection>=0.5.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=22.0.0",
-    "isort>=5.10.0",
-    "mypy>=1.0.0",
-    "flake8>=4.0.0",
-    "pre-commit>=2.15.0",
+    # Testing tools
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    # Linters/formatters
+    "black>=24.3",
+    "isort>=5.13",
+    "mypy>=1.10",
+    "flake8>=7.0",
+    "pre-commit>=3.7",
+    # Build/publish
+    "build>=1.2.1",
+    "twine>=5.0.0",
+    "check-manifest>=0.50",
 ]
 test = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "pytest-cov>=4.0.0",
-    "aiosqlite>=0.17.0",  # For testing with SQLite
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "aiosqlite>=0.19.0",
+]
+adapters = [
+    "asyncpg>=0.29.0",
+    "pyodbc>=5.2.0",
+    "python-dotenv>=1.0.1",
 ]
 
 [project.urls]
-Homepage = "https://github.com/berryql/berryql"
-Repository = "https://github.com/berryql/berryql"
-Documentation = "https://berryql.readthedocs.io"
-"Bug Tracker" = "https://github.com/berryql/berryql/issues"
+Homepage = "https://github.com/uratol/berryql"
+Repository = "https://github.com/uratol/berryql"
+Documentation = "https://github.com/uratol/berryql#readme"
+"Bug Tracker" = "https://github.com/uratol/berryql/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -63,7 +76,7 @@ include = ["berryql*"]
 
 [tool.black]
 line-length = 120
-target-version = ['py38', 'py39', 'py310', 'py311']
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
