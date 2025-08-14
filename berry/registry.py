@@ -76,6 +76,8 @@ class BerrySchema:
         self._st_types: Dict[str, Any] = {}
         # Optional: user-defined root Query fields (via @berry_schema.query)
         self._root_query_fields = None
+        # Keep reference to user-declared Query class to copy @strawberry.field methods
+        self._user_query_cls = None
 
     def register(self, cls: Type[BerryType]):
         self.types[cls.__name__] = cls
@@ -103,6 +105,8 @@ class BerrySchema:
                     v.__set_name__(None, k)
                     qfields[k] = v.build('Query')
             self._root_query_fields = qfields
+            # Save user-declared class for copying strawberry fields later
+            self._user_query_cls = cls
             return cls
         return deco
 
@@ -3309,6 +3313,40 @@ class BerrySchema:
         # Only add user-declared root fields
         if self._root_query_fields:
             _add_declared_root_fields_to_class(QueryPlain)
+        # Merge any regular @strawberry.field resolvers defined on the user Query class
+        try:
+            if getattr(self, '_user_query_cls', None) is not None:
+                for uf, val in vars(self._user_query_cls).items():
+                    # Skip Berry FieldDescriptors (already handled), dunders/private, and existing names
+                    if isinstance(val, FieldDescriptor):
+                        continue
+                    if uf.startswith('__') or uf.startswith('_'):
+                        continue
+                    if hasattr(QueryPlain, uf):
+                        continue
+                    try:
+                        mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
+                        looks_strawberry = (
+                            mod.startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                        if looks_strawberry:
+                            fn = getattr(val, 'resolver', None)
+                            if fn is None:
+                                br = getattr(val, 'base_resolver', None)
+                                fn = getattr(br, 'func', None)
+                            if fn is None:
+                                fn = getattr(val, 'func', None)
+                            if callable(fn):
+                                setattr(QueryPlain, uf, strawberry.field(resolver=fn))
+                            else:
+                                setattr(QueryPlain, uf, val)
+                    except Exception:
+                        # best-effort
+                        pass
+        except Exception:
+            pass
         # Add ping field
         async def _ping() -> str:  # noqa: D401
             return 'pong'

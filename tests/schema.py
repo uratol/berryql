@@ -168,4 +168,9 @@ class Query:
         }
     })
 
+    # Regular strawberry field on Query
+    @strawberry.field
+    def hello(self) -> str:
+        return "world"
+
 schema = berry_schema.to_strawberry()
