@@ -533,35 +533,13 @@ class BerrySchema:
                             stmt = _select(child_model_cls).where(fk_col == parent_id_val)
                             # Apply where from args and/or schema default
                             if related_where is not None or meta_copy.get('where') is not None:
-                                import json as _json
                                 # Strictly validate and apply argument-provided where
                                 if related_where is not None:
-                                    wdict = related_where
-                                    if isinstance(related_where, str):
-                                        try:
-                                            wdict = _json.loads(related_where)
-                                        except Exception as e:
-                                            raise ValueError(f"Invalid where JSON: {e}")
-                                    if wdict is not None and not isinstance(wdict, dict):
-                                        raise ValueError("where must be a JSON object")
-                                    if isinstance(wdict, dict):
-                                        exprs = []
-                                        for col_name, op_map in (wdict or {}).items():
-                                            col = child_model_cls.__table__.c.get(col_name)
-                                            if col is None:
-                                                raise ValueError(f"Unknown where column: {col_name}")
-                                            for op_name, val in (op_map or {}).items():
-                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                    val = [_coerce_where_value(col, v) for v in val]
-                                                else:
-                                                    val = _coerce_where_value(col, val)
-                                                op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                if not op_fn:
-                                                    raise ValueError(f"Unknown where operator: {op_name}")
-                                                exprs.append(op_fn(col, val))
-                                        if exprs:
-                                            from sqlalchemy import and_ as _and
-                                            stmt = stmt.where(_and(*exprs))
+                                    wdict = _to_where_dict(related_where, strict=True)
+                                    if wdict:
+                                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
+                                        if expr is not None:
+                                            stmt = stmt.where(expr)
                                 # Default where from schema meta: keep permissive
                                 dwhere = meta_copy.get('where')
                                 if dwhere is not None:
@@ -1670,15 +1648,16 @@ class BerrySchema:
                                 # Build join + optional where clauses for MSSQL
                                 join_parts = [f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{rel_name}_id]"]
                                 try:
-                                    import json as _json
                                     r_where = rel_cfg.get('where')
                                     if r_where is not None:
-                                        wdict_rel = r_where if not isinstance(r_where, str) else _json.loads(r_where)
-                                        join_parts.extend(adapter.where_from_dict(child_model_cls, wdict_rel))
+                                        wdict_rel = _to_where_dict(r_where, strict=True)
+                                        if wdict_rel:
+                                            join_parts.extend(adapter.where_from_dict(child_model_cls, wdict_rel))
                                     d_where = rel_cfg.get('default_where')
                                     if d_where is not None and isinstance(d_where, (dict, str)):
-                                        dwdict_rel = d_where if not isinstance(d_where, str) else _json.loads(d_where)
-                                        join_parts.extend(adapter.where_from_dict(child_model_cls, dwdict_rel))
+                                        dwdict_rel = _to_where_dict(d_where, strict=False)
+                                        if dwdict_rel:
+                                            join_parts.extend(adapter.where_from_dict(child_model_cls, dwdict_rel))
                                 except Exception:
                                     pass
                                 join_cond = ' AND '.join(join_parts)
