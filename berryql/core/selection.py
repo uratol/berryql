@@ -107,6 +107,77 @@ class RelationSelectionExtractor:
         return node
 
     def _walk_selected(self, sel: Any, btype: Any, out: Dict[str, Dict[str, Any]]):
+        # Helper: recursively populate nested config for a given relation node
+        def _collect_nested(sub_node: Any, parent_btype: Any, cfg: Dict[str, Any]):
+            if not sub_node:
+                return
+            sub_children = self._children(sub_node)
+            if not sub_children:
+                return
+            tgt_b = self.registry.types.get(getattr(getattr(parent_btype.__berry_fields__.get(cfg.get('relation_name') or ''), 'meta', {}), 'target', None)) if False else None  # placeholder not used
+            # Instead, infer the btype from cfg when available; fallback to scanning by names at runtime
+            # We accept that fields list is filled as we walk
+            for sub in sub_children:
+                sub_name = getattr(getattr(sub, 'name', None), 'value', None) or getattr(sub, 'name', None)
+                if not sub_name or str(sub_name).startswith('__'):
+                    continue
+                # target subtype map
+                try:
+                    target_name = cfg.get('target') or None
+                    tgt_b2 = self.registry.types.get(target_name) if target_name else None
+                    sub_fields_map = getattr(tgt_b2, '__berry_fields__', {}) if tgt_b2 else {}
+                except Exception:
+                    sub_fields_map = {}
+                py_sub = self._to_python(str(sub_name), sub_fields_map) if sub_fields_map else sub_name
+                sdef = sub_fields_map.get(py_sub) if sub_fields_map else None
+                if sdef:
+                    sub_name = py_sub
+                if not sdef or sdef.kind == 'scalar':
+                    if sub_name not in cfg['fields']:
+                        cfg['fields'].append(sub_name)
+                else:
+                    # nested relation inside cfg
+                    ncfg = cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sdef))
+                    # record its target for downstream builders
+                    ncfg['target'] = sdef.meta.get('target')
+                    # parse arguments for this nested sub-relation
+                    try:
+                        _nargs = getattr(sub, 'arguments', None)
+                        if isinstance(_nargs, dict):
+                            for narg_name, nval in _nargs.items():
+                                try:
+                                    nv_coerced = self._ast_value(nval, getattr(self, '_info', None))
+                                except Exception:
+                                    nv_coerced = nval
+                                if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
+                                    ncfg[narg_name] = nv_coerced
+                                    if narg_name == 'order_by':
+                                        ncfg['_has_explicit_order_by'] = True
+                                    if narg_name == 'order_multi':
+                                        ncfg['_has_explicit_order_multi'] = True
+                                    if narg_name == 'order_dir':
+                                        ncfg['_has_explicit_order_dir'] = True
+                                else:
+                                    ncfg['filter_args'][narg_name] = nv_coerced
+                        else:
+                            for narg in (_nargs or []):
+                                narg_name = getattr(getattr(narg, 'name', None), 'value', None) or getattr(narg, 'name', None)
+                                nraw = getattr(narg, 'value', None)
+                                nval = self._ast_value(nraw, getattr(self, '_info', None))
+                                if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
+                                    ncfg[narg_name] = nval
+                                    if narg_name == 'order_by':
+                                        ncfg['_has_explicit_order_by'] = True
+                                    if narg_name == 'order_multi':
+                                        ncfg['_has_explicit_order_multi'] = True
+                                    if narg_name == 'order_dir':
+                                        ncfg['_has_explicit_order_dir'] = True
+                                else:
+                                    ncfg['filter_args'][narg_name] = nval
+                    except Exception:
+                        pass
+                    # recurse deeper
+                    _collect_nested(sub, ncfg.get('target') and self.registry.types.get(ncfg.get('target')), ncfg)
         for child in self._children(sel):
             name = getattr(getattr(child, 'name', None), 'value', None) or getattr(child, 'name', None)
             if not name or name.startswith('__'):
@@ -157,81 +228,9 @@ class RelationSelectionExtractor:
                             rel_cfg['filter_args'][arg_name] = val
             except Exception:
                 pass
-            sub_children = self._children(child)
-            if sub_children:
-                tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
-                for sub in sub_children:
-                    sub_name = getattr(getattr(sub, 'name', None), 'value', None) or getattr(sub, 'name', None)
-                    if not sub_name or sub_name.startswith('__'):
-                        continue
-                    # target sub-field camelCase support
-                    sub_fields = getattr(tgt_b, '__berry_fields__', {}) if tgt_b else {}
-                    # Normalize nested field name
-                    py_sub = self._to_python(str(sub_name), sub_fields) if tgt_b else sub_name
-                    sub_def = sub_fields.get(py_sub) if tgt_b else None
-                    if sub_def:
-                        sub_name = py_sub
-                    if not sub_def or sub_def.kind == 'scalar':
-                        if sub_name not in rel_cfg['fields']:
-                            rel_cfg['fields'].append(sub_name)
-                    elif sub_def and sub_def.kind == 'relation':
-                        ncfg = rel_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
-                        try:
-                            _nargs = getattr(sub, 'arguments', None)
-                            if isinstance(_nargs, dict):
-                                for narg_name, nval in _nargs.items():
-                                    # Resolve variables for nested args too
-                                    try:
-                                        nv_coerced = self._ast_value(nval, getattr(self, '_info', None))
-                                    except Exception:
-                                        nv_coerced = nval
-                                    if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                                        ncfg[narg_name] = nv_coerced
-                                        if narg_name == 'order_by':
-                                            ncfg['_has_explicit_order_by'] = True
-                                        if narg_name == 'order_multi':
-                                            ncfg['_has_explicit_order_multi'] = True
-                                        if narg_name == 'order_dir':
-                                            ncfg['_has_explicit_order_dir'] = True
-                                    else:
-                                        ncfg['filter_args'][narg_name] = nv_coerced
-                            else:
-                                for narg in (_nargs or []):
-                                    narg_name = getattr(getattr(narg, 'name', None), 'value', None) or getattr(narg, 'name', None)
-                                    nraw = getattr(narg, 'value', None)
-                                    nval = self._ast_value(nraw, getattr(self, '_info', None))
-                                    if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                                        ncfg[narg_name] = nval
-                                        if narg_name == 'order_by':
-                                            ncfg['_has_explicit_order_by'] = True
-                                        if narg_name == 'order_multi':
-                                            ncfg['_has_explicit_order_multi'] = True
-                                        if narg_name == 'order_dir':
-                                            ncfg['_has_explicit_order_dir'] = True
-                                    else:
-                                        ncfg['filter_args'][narg_name] = nval
-                        except Exception:
-                            pass
-                        try:
-                            sub2_children = self._children(sub)
-                            if sub2_children:
-                                tgt_b2 = self.registry.types.get(sub_def.meta.get('target')) if sub_def.meta.get('target') else None
-                                for sub2 in sub2_children:
-                                    nname2 = getattr(getattr(sub2, 'name', None), 'value', None) or getattr(sub2, 'name', None)
-                                    if nname2 and not nname2.startswith('__'):
-                                        sfields2 = getattr(tgt_b2, '__berry_fields__', {}) if tgt_b2 else {}
-                                        py2 = self._to_python(str(nname2), sfields2) if tgt_b2 else nname2
-                                        sdef2 = sfields2.get(py2) if tgt_b2 else None
-                                        if sdef2:
-                                            nname2 = py2
-                                        if not sdef2 or sdef2.kind == 'scalar':
-                                            if nname2 not in ncfg['fields']:
-                                                ncfg['fields'].append(nname2)
-                        except Exception:
-                            pass
+            # Recursively collect nested under this relation
             try:
-                tgt = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
-                self._walk_selected(child, tgt, out)
+                _collect_nested(child, self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None, rel_cfg)
             except Exception:
                 pass
 
@@ -335,29 +334,40 @@ class RelationSelectionExtractor:
                         except Exception:
                             pass
                         tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
-                        for sub in _children_ast(rel_node):
-                            sub_name = _name_ast(sub)
-                            if not sub_name or sub_name.startswith('__'):
-                                continue
-                            sub_fields = getattr(tgt_b, '__berry_fields__', {}) if tgt_b else {}
-                            py_sub = self._to_python(str(sub_name), sub_fields) if tgt_b else sub_name
-                            sub_def = sub_fields.get(py_sub) if tgt_b else None
-                            if sub_def:
-                                sub_name = py_sub
-                            if not sub_def or sub_def.kind != 'relation':
-                                continue
-                            n_args = {}
-                            try:
-                                for na in getattr(sub, 'arguments', []) or []:
-                                    an = _name_ast(na)
-                                    av = self._ast_value(getattr(na, 'value', None), info)
-                                    if an == 'order_multi' and av is not None and not isinstance(av, list):
-                                        av = [av]
-                                    n_args[an] = av
-                            except Exception:
-                                pass
-                            ncfg = rel_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
-                            _merge_rel_args(ncfg, n_args)
+                        # Recursive AST nested collection
+                        def _collect_nested_ast(parent_node: Any, parent_b: Any, parent_cfg: Dict[str, Any]):
+                            for sub in _children_ast(parent_node):
+                                sub_name = _name_ast(sub)
+                                if not sub_name or sub_name.startswith('__'):
+                                    continue
+                                sub_fields = getattr(parent_b, '__berry_fields__', {}) if parent_b else {}
+                                py_sub = self._to_python(str(sub_name), sub_fields) if parent_b else sub_name
+                                sub_def = sub_fields.get(py_sub) if parent_b else None
+                                if sub_def:
+                                    sub_name = py_sub
+                                if not sub_def or sub_def.kind != 'relation':
+                                    # treat as scalar
+                                    if sub_name not in parent_cfg['fields']:
+                                        parent_cfg['fields'].append(sub_name)
+                                    continue
+                                n_args = {}
+                                try:
+                                    for na in getattr(sub, 'arguments', []) or []:
+                                        an = _name_ast(na)
+                                        av = self._ast_value(getattr(na, 'value', None), info)
+                                        if an == 'order_multi' and av is not None and not isinstance(av, list):
+                                            av = [av]
+                                        n_args[an] = av
+                                except Exception:
+                                    pass
+                                ncfg = parent_cfg['nested'].setdefault(sub_name, self._init_rel_cfg(sub_def))
+                                _merge_rel_args(ncfg, n_args)
+                                # ensure target stored
+                                ncfg['target'] = sub_def.meta.get('target')
+                                # recurse deeper
+                                nxt_b = self.registry.types.get(sub_def.meta.get('target')) if sub_def.meta.get('target') else None
+                                _collect_nested_ast(sub, nxt_b, ncfg)
+                        _collect_nested_ast(rel_node, tgt_b, rel_cfg)
             except Exception:
                 pass
         return out

@@ -28,6 +28,12 @@ class PostCommentQL(BerryType):
     # Force resolver fallback for nested path by using a callable where
     # (builders mark skip_pushdown when default_where is callable via meta['where']).
     likes = relation('PostCommentLikeQL', where=lambda M, info: (M.id > 0))
+    # Likes made by admin users only
+    admin_likes = relation(
+        'PostCommentLikeQL',
+        # Use JSON where for pushdown-friendly filter: in fixtures, admin user has id=1
+        where='{"user_id": {"eq": 1}}'
+    )
     # Regular strawberry field with its own resolver (preview of comment content)
     @strawberry.field
     def content_preview(self) -> str | None:

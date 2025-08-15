@@ -615,7 +615,72 @@ class BerrySchema:
                             parent_id_val = getattr(parent_model, 'id', None) if parent_model is not None else getattr(self, 'id', None)
                             if parent_id_val is None:
                                 return []
-                            stmt = _select(child_model_cls).where(fk_col == parent_id_val)
+                            # Determine requested scalar fields for this relation, prefer extractor meta from root if present
+                            requested_fields: list[str] = []
+                            try:
+                                meta_map0 = getattr(self, '_pushdown_meta', None)
+                                if isinstance(meta_map0, dict):
+                                    cfg = meta_map0.get(fname_local) or {}
+                                    req = cfg.get('fields') or []
+                                    if isinstance(req, (list, tuple)):
+                                        requested_fields = [str(x) for x in req]
+                            except Exception:
+                                requested_fields = []
+                            if not requested_fields:
+                                # Fallback to local AST for this resolver
+                                try:
+                                    raw_info = getattr(info, '_raw_info', None) or info
+                                    fnodes = list(getattr(raw_info, 'field_nodes', []) or [])
+                                    if fnodes:
+                                        node = fnodes[0]
+                                        selset = getattr(node, 'selection_set', None)
+                                        sels = list(getattr(selset, 'selections', []) or []) if selset is not None else []
+                                        for s in sels:
+                                            nm = None
+                                            try:
+                                                nobj = getattr(s, 'name', None)
+                                                nm = getattr(nobj, 'value', None) if nobj is not None else None
+                                                if nm is None:
+                                                    nm = getattr(s, 'name', None)
+                                            except Exception:
+                                                nm = None
+                                            if nm and not str(nm).startswith('__'):
+                                                requested_fields.append(str(nm))
+                                except Exception:
+                                    requested_fields = []
+                            # Build minimal column list: always include id for downstream nested resolvers; plus requested scalars if any
+                            cols = []
+                            id_expr = None
+                            try:
+                                id_expr = getattr(child_model_cls, '__table__', None)
+                                id_expr = id_expr.c.get('id') if id_expr is not None else None
+                                if id_expr is None:
+                                    id_expr = getattr(child_model_cls, 'id', None)
+                            except Exception:
+                                id_expr = getattr(child_model_cls, 'id', None)
+                            if id_expr is not None:
+                                cols.append(id_expr.label('id'))
+                            # Filter requested_fields to scalars known on target type
+                            try:
+                                scalars_on_target = {sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar'}
+                            except Exception:
+                                scalars_on_target = set()
+                            for fn in requested_fields:
+                                if fn == 'id':
+                                    continue
+                                if scalars_on_target and fn not in scalars_on_target:
+                                    continue
+                                try:
+                                    col_obj = child_model_cls.__table__.c.get(fn)
+                                except Exception:
+                                    col_obj = None
+                                if col_obj is not None:
+                                    cols.append(col_obj.label(fn))
+                            if cols:
+                                stmt = _select(*cols).select_from(child_model_cls).where(fk_col == parent_id_val)
+                            else:
+                                # Fallback to selecting id if nothing resolvable
+                                stmt = _select(id_expr).select_from(child_model_cls).where(fk_col == parent_id_val)
                             # Log potential N+1 for list relation when resolver runs a per-parent query
                             try:
                                 reason = None
@@ -772,17 +837,55 @@ class BerrySchema:
                                     raise ValueError("limit must be non-negative")
                                 stmt = stmt.limit(l)
                             result = await session.execute(stmt)
-                            rows = [r[0] for r in result.all()]
+                            rows = []
+                            try:
+                                rows = result.mappings().all()  # type: ignore[attr-defined]
+                            except Exception:
+                                rows = [getattr(r, '_mapping', None) or r for r in result.fetchall()]
                             results_list = []
-                            for row in rows:
-                                inst = target_cls_i()
-                                setattr(inst, '_model', row)
-                                for sf, sdef in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
-                                    if sdef.kind == 'scalar':
+                            for m in rows:
+                                # Build kwargs for dataclass init from mapping keys
+                                init_kwargs: Dict[str, Any] = {}
+                                try:
+                                    mapping_obj = getattr(m, '_mapping', None) or m
+                                except Exception:
+                                    mapping_obj = m
+                                try:
+                                    from collections.abc import Mapping as _Mapping  # type: ignore
+                                except Exception:
+                                    _Mapping = None  # type: ignore
+                                if (_Mapping is not None and isinstance(mapping_obj, _Mapping)) or isinstance(mapping_obj, dict):
+                                    try:
+                                        items_iter = mapping_obj.items()
+                                    except Exception:
+                                        items_iter = []  # type: ignore
+                                    for k, v in items_iter:
                                         try:
-                                            setattr(inst, sf, getattr(row, sf, None))
+                                            init_kwargs[str(k)] = v
                                         except Exception:
                                             pass
+                                else:
+                                    # Fallback sequence handling
+                                    try:
+                                        init_kwargs['id'] = mapping_obj[0]
+                                    except Exception:
+                                        pass
+                                try:
+                                    inst = target_cls_i(**init_kwargs)
+                                except Exception:
+                                    # Fallback to empty init if something went wrong
+                                    inst = target_cls_i()
+                                    # Best-effort set attributes
+                                    for k, v in init_kwargs.items():
+                                        try:
+                                            setattr(inst, k, v)
+                                        except Exception:
+                                            pass
+                                # Helper attribute for downstream resolvers (best-effort)
+                                try:
+                                    setattr(inst, '_model', None)
+                                except Exception:
+                                    pass
                                 results_list.append(inst)
                             return results_list
                         # Build dynamic wrapper to expose filter args
@@ -1186,13 +1289,14 @@ class BerrySchema:
                     requested_scalar_root or requested_custom_root or requested_custom_obj_root or requested_relations
                 )
                 # Coercion of JSON where values moved to core.utils.coerce_where_value
-                # Helper to recursively build relation JSON expressions
+                # Helper to recursively build relation JSON expressions (non-MSSQL)
                 def _build_list_relation_json(parent_model_cls, parent_btype, rel_cfg: Dict[str, Any]):
-                    """Build a JSON array aggregation for a list relation including nested relations.
+                    """Build a JSON array aggregation for a list relation including arbitrarily nested relations.
 
-                    This version targets non-MSSQL dialects using adapter.json_object/json_array_agg.
-                    It correlates the child selection to the parent model and any nested selection to
-                    the child limited subquery via limited_subq.c.id.
+                    - Correlates each nested level to its immediate parent (via limited_subq.c.id when applicable).
+                    - Uses json_build_object/json_agg with COALESCE([]) for arrays.
+                    - Preserves ordering, limit, offset at each depth.
+                    - Skips pushdown for a level if default_where is callable (records skip_reason on rel_cfg['nested']).
                     """
                     try:
                         target_name_i = rel_cfg.get('target')
@@ -1210,6 +1314,178 @@ class BerrySchema:
                                 break
                         if fk_col_i is None:
                             return None
+                        # Recursive builder for nested fields under a given subquery/model
+                        def _build_nested_fields_for_subq(current_subq, current_model_cls, nested_cfg: Dict[str, Any] | None):
+                            out_json_args: list[Any] = []
+                            for nname, ncfg in (nested_cfg or {}).items():
+                                try:
+                                    # Support callable default_where by evaluating to SQLAlchemy expressions when possible
+                                    n_target = ncfg.get('target')
+                                    nb = self.types.get(n_target)
+                                    if not nb or not nb.model:
+                                        continue
+                                    grand_model = nb.model
+                                    # FK grandchild -> current_model_cls
+                                    g_fk = None
+                                    for c in grand_model.__table__.columns:
+                                        for fk in c.foreign_keys:
+                                            if fk.column.table.name == current_model_cls.__table__.name:
+                                                g_fk = c
+                                                break
+                                        if g_fk is not None:
+                                            break
+                                    if g_fk is None:
+                                        continue
+                                    # Projected scalar fields for nested
+                                    n_cols = list(ncfg.get('fields') or [])
+                                    if n_cols:
+                                        # keep only valid scalar fields
+                                        try:
+                                            n_cols = [sf for sf in n_cols if getattr(grand_model.__table__.c, sf, None) is not None or sf in grand_model.__table__.columns]
+                                        except Exception:
+                                            pass
+                                    if not n_cols:
+                                        for sf2, sd2 in nb.__berry_fields__.items():
+                                            if sd2.kind == 'scalar':
+                                                n_cols.append(sf2)
+                                    is_single_nested = bool(ncfg.get('single') or False)
+                                    # Base select for nested correlated to current_subq.c.id
+                                    n_sel = (
+                                        select(*[getattr(grand_model, c) for c in (n_cols or ['id'])])
+                                        .select_from(grand_model)
+                                        .where(g_fk == getattr(current_subq.c, 'id'))
+                                        .correlate(current_subq)
+                                    )
+                                    # Apply nested where/default_where
+                                    try:
+                                        rr2 = ncfg.get('where')
+                                        if rr2 is not None:
+                                            if isinstance(rr2, (dict, str)):
+                                                wdict2 = _to_where_dict(rr2, strict=True)
+                                                if wdict2:
+                                                    expr2 = _expr_from_where_dict(grand_model, wdict2, strict=True)
+                                                    if expr2 is not None:
+                                                        n_sel = n_sel.where(expr2)
+                                            else:
+                                                try:
+                                                    expr2 = rr2(grand_model, info) if callable(rr2) else rr2
+                                                except Exception:
+                                                    expr2 = None
+                                                if expr2 is not None:
+                                                    n_sel = n_sel.where(expr2)
+                                        dr2 = ncfg.get('default_where')
+                                        if dr2 is not None:
+                                            if isinstance(dr2, (dict, str)):
+                                                wdict2 = _to_where_dict(dr2, strict=False)
+                                                if wdict2:
+                                                    expr2 = _expr_from_where_dict(grand_model, wdict2, strict=False)
+                                                    if expr2 is not None:
+                                                        n_sel = n_sel.where(expr2)
+                                            else:
+                                                try:
+                                                    expr2 = dr2(grand_model, info) if callable(dr2) else dr2
+                                                except Exception:
+                                                    expr2 = None
+                                                if expr2 is not None:
+                                                    n_sel = n_sel.where(expr2)
+                                    except Exception:
+                                        pass
+                                    # Ordering for nested
+                                    try:
+                                        ordered2 = False
+                                        n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
+                                        nmulti_raw = ncfg.get('order_multi') or []
+                                        nmulti: List[str] = self._normalize_order_multi_values(nmulti_raw)
+                                        for spec in nmulti:
+                                            cn, _, dd = spec.partition(':')
+                                            dd = (dd or _dir_value(ncfg.get('order_dir'))).lower()
+                                            if cn in n_allowed:
+                                                col2 = getattr(grand_model, cn, None)
+                                                if col2 is not None:
+                                                    n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
+                                                    ordered2 = True
+                                        if not ordered2 and ncfg.get('order_by') in n_allowed:
+                                            cn = ncfg.get('order_by')
+                                            dd = _dir_value(ncfg.get('order_dir'))
+                                            col2 = getattr(grand_model, cn, None)
+                                            if col2 is not None:
+                                                n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
+                                                ordered2 = True
+                                        if not ordered2 and 'id' in grand_model.__table__.columns:
+                                            n_sel = n_sel.order_by(getattr(grand_model, 'id').asc())
+                                    except Exception:
+                                        pass
+                                    # Pagination for nested
+                                    try:
+                                        if ncfg.get('offset') is not None:
+                                            n_sel = n_sel.offset(int(ncfg.get('offset')) if isinstance(ncfg.get('offset'), (int, str)) else ncfg.get('offset'))
+                                        if ncfg.get('limit') is not None:
+                                            n_sel = n_sel.limit(int(ncfg.get('limit')) if isinstance(ncfg.get('limit'), (int, str)) else ncfg.get('limit'))
+                                    except Exception:
+                                        pass
+                                    if is_single_nested:
+                                        # Build JSON object of the first matching nested row, including deeper nested fields
+                                        n_sel_single = n_sel.limit(1)
+                                        n_subq = n_sel_single.subquery()
+                                        n_row_args: List[Any] = []
+                                        for sf2 in (n_cols or ['id']):
+                                            n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
+                                        # recurse for deeper under this single
+                                        try:
+                                            deeper_args = _build_nested_fields_for_subq(n_subq, grand_model, ncfg.get('nested') or {})
+                                            if deeper_args:
+                                                n_row_args.extend(deeper_args)
+                                        except Exception:
+                                            pass
+                                        n_row_json = _json_object(*n_row_args)
+                                        n_single_select = select(n_row_json).select_from(n_subq).correlate(current_subq)
+                                        try:
+                                            n_json_scalar = n_single_select.scalar_subquery()
+                                        except Exception:
+                                            n_json_scalar = n_single_select
+                                        out_json_args.extend([_text(f"'{nname}'"), n_json_scalar])
+                                        try:
+                                            ncfg['from_pushdown'] = True
+                                            ncfg['skip_reason'] = None
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # Build JSON array for nested rows, including deeper nested fields
+                                        n_subq = n_sel.subquery()
+                                        n_row_args: List[Any] = []
+                                        for sf2 in (n_cols or ['id']):
+                                            n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
+                                        try:
+                                            deeper_args = _build_nested_fields_for_subq(n_subq, grand_model, ncfg.get('nested') or {})
+                                            if deeper_args:
+                                                n_row_args.extend(deeper_args)
+                                        except Exception:
+                                            pass
+                                        n_row_json = _json_object(*n_row_args)
+                                        n_agg = _json_array_agg(n_row_json)
+                                        if n_agg is None:
+                                            continue
+                                        n_json_array = select(_json_array_coalesce(n_agg)).select_from(n_subq).correlate(current_subq)
+                                        try:
+                                            n_json_scalar = n_json_array.scalar_subquery()
+                                        except Exception:
+                                            n_json_scalar = n_json_array
+                                        out_json_args.extend([_text(f"'{nname}'"), n_json_scalar])
+                                        try:
+                                            ncfg['from_pushdown'] = True
+                                            ncfg['skip_reason'] = None
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    # Skip this nested branch on error
+                                    try:
+                                        ncfg['from_pushdown'] = False
+                                        if not ncfg.get('skip_reason'):
+                                            ncfg['skip_reason'] = 'builder error'
+                                    except Exception:
+                                        pass
+                                    continue
+                            return out_json_args
                         # Scalars to project for child rows
                         requested_scalar_i = list(rel_cfg.get('fields') or [])
                         # Keep only valid scalar fields; drop unknowns or relations (e.g., camelCase names)
@@ -1332,16 +1608,32 @@ class BerrySchema:
                                     rr = getattr(rr, 'value')
                                 except Exception:
                                     pass
-                            wdict = _to_where_dict(rr, strict=True)
-                            if wdict:
-                                expr = _expr_from_where_dict(child_model_cls_i, wdict, strict=True)
+                            if isinstance(rr, (dict, str)):
+                                wdict = _to_where_dict(rr, strict=True)
+                                if wdict:
+                                    expr = _expr_from_where_dict(child_model_cls_i, wdict, strict=True)
+                                    if expr is not None:
+                                        inner_sel_i = inner_sel_i.where(expr)
+                            else:
+                                try:
+                                    expr = rr(child_model_cls_i, info) if callable(rr) else rr
+                                except Exception:
+                                    expr = None
                                 if expr is not None:
                                     inner_sel_i = inner_sel_i.where(expr)
                         dr = rel_cfg.get('default_where')
-                        if dr is not None and isinstance(dr, (dict, str)):
-                            wdict = _to_where_dict(dr, strict=False)
-                            if wdict:
-                                expr = _expr_from_where_dict(child_model_cls_i, wdict, strict=False)
+                        if dr is not None:
+                            if isinstance(dr, (dict, str)):
+                                wdict = _to_where_dict(dr, strict=False)
+                                if wdict:
+                                    expr = _expr_from_where_dict(child_model_cls_i, wdict, strict=False)
+                                    if expr is not None:
+                                        inner_sel_i = inner_sel_i.where(expr)
+                            else:
+                                try:
+                                    expr = dr(child_model_cls_i, info) if callable(dr) else dr
+                                except Exception:
+                                    expr = None
                                 if expr is not None:
                                     inner_sel_i = inner_sel_i.where(expr)
                         # Ordering for child (order_multi -> order_by -> id)
@@ -1379,125 +1671,16 @@ class BerrySchema:
                         except Exception:
                             pass
                         limited_subq_i = inner_sel_i.subquery()
-                        # Build per-row JSON object including requested scalars and nested relation JSON
+                        # Build per-row JSON object including requested scalars and nested relation JSON (recursive)
                         row_json_args_i: List[Any] = []
                         # Scalars
                         for sf in requested_scalar_i if requested_scalar_i else ['id']:
                             row_json_args_i.extend([_text(f"'{sf}'"), getattr(limited_subq_i.c, sf)])
-            # Nested relations under child
-                        for nname, ncfg in (rel_cfg.get('nested') or {}).items():
-                            try:
-                                n_target = ncfg.get('target')
-                                nb = self.types.get(n_target)
-                                if not nb or not nb.model:
-                                    continue
-                                grand_model = nb.model
-                                # FK grandchild -> child
-                                g_fk = None
-                                for c in grand_model.__table__.columns:
-                                    for fk in c.foreign_keys:
-                                        if fk.column.table.name == child_model_cls_i.__table__.name:
-                                            g_fk = c; break
-                                    if g_fk is not None:
-                                        break
-                                if g_fk is None:
-                                    continue
-                                # Projected scalar fields for nested
-                                n_cols = list(ncfg.get('fields') or [])
-                                if not n_cols:
-                                    for sf2, sd2 in nb.__berry_fields__.items():
-                                        if sd2.kind == 'scalar':
-                                            n_cols.append(sf2)
-                                is_single_nested = bool(ncfg.get('single') or False)
-                                # Base select for nested correlated to limited_subq_i.c.id
-                                n_sel = select(*[getattr(grand_model, c) for c in (n_cols or ['id'])])\
-                                    .select_from(grand_model)\
-                                    .where(g_fk == getattr(limited_subq_i.c, 'id'))\
-                                    .correlate(limited_subq_i)
-                                # Apply nested where/default_where
-                                try:
-                                    rr2 = ncfg.get('where')
-                                    if rr2 is not None:
-                                        wdict2 = _to_where_dict(rr2, strict=True)
-                                        if wdict2:
-                                            expr2 = _expr_from_where_dict(grand_model, wdict2, strict=True)
-                                            if expr2 is not None:
-                                                n_sel = n_sel.where(expr2)
-                                    dr2 = ncfg.get('default_where')
-                                    if dr2 is not None and isinstance(dr2, (dict, str)):
-                                        wdict2 = _to_where_dict(dr2, strict=False)
-                                        if wdict2:
-                                            expr2 = _expr_from_where_dict(grand_model, wdict2, strict=False)
-                                            if expr2 is not None:
-                                                n_sel = n_sel.where(expr2)
-                                except Exception:
-                                    pass
-                                # Ordering for nested
-                                try:
-                                    ordered2 = False
-                                    n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
-                                    nmulti_raw = ncfg.get('order_multi') or []
-                                    nmulti: List[str] = self._normalize_order_multi_values(nmulti_raw)
-                                    for spec in nmulti:
-                                        cn, _, dd = spec.partition(':')
-                                        dd = (dd or _dir_value(ncfg.get('order_dir'))).lower()
-                                        if cn in n_allowed:
-                                            col2 = getattr(grand_model, cn, None)
-                                            if col2 is not None:
-                                                n_sel = n_sel.order_by(col2.desc() if dd=='desc' else col2.asc())
-                                                ordered2 = True
-                                    if not ordered2 and ncfg.get('order_by') in n_allowed:
-                                        cn = ncfg.get('order_by')
-                                        dd = _dir_value(ncfg.get('order_dir'))
-                                        col2 = getattr(grand_model, cn, None)
-                                        if col2 is not None:
-                                            n_sel = n_sel.order_by(col2.desc() if dd=='desc' else col2.asc())
-                                            ordered2 = True
-                                    if not ordered2 and 'id' in grand_model.__table__.columns:
-                                        n_sel = n_sel.order_by(getattr(grand_model, 'id').asc())
-                                except Exception:
-                                    pass
-                                # Pagination for nested
-                                try:
-                                    if ncfg.get('offset') is not None:
-                                        n_sel = n_sel.offset(int(ncfg.get('offset')) if isinstance(ncfg.get('offset'), (int, str)) else ncfg.get('offset'))
-                                    if ncfg.get('limit') is not None:
-                                        n_sel = n_sel.limit(int(ncfg.get('limit')) if isinstance(ncfg.get('limit'), (int, str)) else ncfg.get('limit'))
-                                except Exception:
-                                    pass
-                                if is_single_nested:
-                                    # Build JSON object of the first matching nested row
-                                    n_sel_single = n_sel.limit(1)
-                                    n_subq = n_sel_single.subquery()
-                                    n_row_args: List[Any] = []
-                                    for sf2 in (n_cols or ['id']):
-                                        n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
-                                    n_row_json = _json_object(*n_row_args)
-                                    n_single_select = select(n_row_json).select_from(n_subq).correlate(limited_subq_i)
-                                    try:
-                                        n_json_scalar = n_single_select.scalar_subquery()
-                                    except Exception:
-                                        n_json_scalar = n_single_select
-                                    row_json_args_i.extend([_text(f"'{nname}'"), n_json_scalar])
-                                else:
-                                    # Build JSON array for nested rows
-                                    n_subq = n_sel.subquery()
-                                    n_row_args: List[Any] = []
-                                    for sf2 in (n_cols or ['id']):
-                                        n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
-                                    n_row_json = _json_object(*n_row_args)
-                                    n_agg = _json_array_agg(n_row_json)
-                                    if n_agg is None:
-                                        continue
-                                    n_json_array = select(_json_array_coalesce(n_agg)).select_from(n_subq).correlate(limited_subq_i)
-                                    try:
-                                        n_json_scalar = n_json_array.scalar_subquery()
-                                    except Exception:
-                                        n_json_scalar = n_json_array
-                                    row_json_args_i.extend([_text(f"'{nname}'"), n_json_scalar])
-                            except Exception:
-                                # If any nested building fails, just skip that nested branch
-                                continue
+                        # Nested relations under child (recursive)
+                        try:
+                            row_json_args_i.extend(_build_nested_fields_for_subq(limited_subq_i, child_model_cls_i, rel_cfg.get('nested') or {}))
+                        except Exception:
+                            pass
                         # Aggregate rows to JSON array
                         row_json_expr_i = _json_object(*row_json_args_i)
                         agg_inner_expr_i = _json_array_agg(row_json_expr_i)
@@ -1680,13 +1863,7 @@ class BerrySchema:
                 required_fk_parent_cols: set[str] = set()
                 try:
                     for rel_name, rel_cfg in list(requested_relations.items()):
-                        # mark skip_pushdown if default_where is callable
-                        try:
-                            dw = rel_cfg.get('default_where')
-                            if dw is not None and not isinstance(dw, (dict, str)):
-                                rel_cfg['skip_pushdown'] = True
-                        except Exception:
-                            pass
+                        # Collect helper FK columns for single relations; don't preemptively skip pushdown for callables
                         if rel_cfg.get('single'):
                             try:
                                 target_name = rel_cfg.get('target')
@@ -1702,217 +1879,218 @@ class BerrySchema:
                 rel_push_status: Dict[str, Dict[str, Any]] = {}
                 # Push down relation JSON arrays/objects
                 for rel_name, rel_cfg in requested_relations.items():
-                        # initialize status entry
-                        if rel_name not in rel_push_status:
-                            rel_push_status[rel_name] = {'pushed': False, 'reason': None}
-                        # Allow pushdown even when relation 'where' or filter args are provided.
-                        # Both JSON where and declared filter args are handled in the pushdown builders below.
-                        # Only skip when defaults are callable (require runtime context/evaluation per row).
-                        # If default_where is a callable, skip pushdown so resolver can apply it
+                    # initialize status entry
+                    if rel_name not in rel_push_status:
+                        rel_push_status[rel_name] = {'pushed': False, 'reason': None}
+                    # Allow pushdown even when relation 'where' or filter args are provided.
+                    # Both JSON where and declared filter args are handled in the pushdown builders below.
+                    target_name = rel_cfg.get('target')
+                    if not target_name:
                         try:
-                            dw = rel_cfg.get('default_where')
-                            if dw is not None and not isinstance(dw, (dict, str)):
-                                rel_cfg['skip_pushdown'] = True
-                                # record reason
-                                try:
-                                    rel_push_status[rel_name].update({'pushed': False, 'reason': 'default_where callable'})
-                                except Exception:
-                                    pass
+                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'no target type'})
                         except Exception:
                             pass
-                        if rel_cfg.get('skip_pushdown'):
-                            continue
-                        target_name = rel_cfg.get('target')
-                        if not target_name:
-                            try:
-                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no target type'})
-                            except Exception:
-                                pass
-                            continue
-                        target_b = self.types.get(target_name)
-                        if not target_b or not target_b.model:
-                            try:
-                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'target model missing'})
-                            except Exception:
-                                pass
-                            continue
-                        # Early validation of relation order_by for pushdown path
+                        continue
+                    target_b = self.types.get(target_name)
+                    if not target_b or not target_b.model:
                         try:
-                            allowed_fields_rel = [sf for sf, sd in target_b.__berry_fields__.items() if sd.kind == 'scalar']
+                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'target model missing'})
                         except Exception:
-                            allowed_fields_rel = []
-                        ob_rel = rel_cfg.get('order_by')
-                        if ob_rel and ob_rel not in allowed_fields_rel:
-                            raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
-                        child_model_cls = target_b.model
-                        # Determine FK
-                        fk_col = None
-                        for col in child_model_cls.__table__.columns:
-                            for fk in col.foreign_keys:
-                                if fk.column.table.name == model_cls.__table__.name:
-                                    fk_col = col
-                                    break
-                            if fk_col is not None:
+                            pass
+                        continue
+                    # Early validation of relation order_by for pushdown path
+                    try:
+                        allowed_fields_rel = [sf for sf, sd in target_b.__berry_fields__.items() if sd.kind == 'scalar']
+                    except Exception:
+                        allowed_fields_rel = []
+                    ob_rel = rel_cfg.get('order_by')
+                    if ob_rel and ob_rel not in allowed_fields_rel:
+                        raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
+                    child_model_cls = target_b.model
+                    # Determine FK
+                    fk_col = None
+                    for col in child_model_cls.__table__.columns:
+                        for fk in col.foreign_keys:
+                            if fk.column.table.name == model_cls.__table__.name:
+                                fk_col = col
                                 break
-                        if fk_col is None:
+                        if fk_col is not None:
+                            break
+                    if fk_col is None:
+                        try:
+                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
+                        except Exception:
+                            pass
+                        continue
+                    # Determine projected scalar fields
+                    requested_scalar = rel_cfg.get('fields') or []
+                    if rel_cfg.get('single'):
+                        # Single relation: build json object
+                        proj_cols = []
+                        if not requested_scalar:
+                            # default to all scalar fields of target
+                            for sf, sdef in target_b.__berry_fields__.items():
+                                if sdef.kind == 'scalar':
+                                    requested_scalar.append(sf)
+                        for sf in requested_scalar:
+                            if sf in child_model_cls.__table__.columns:
+                                proj_cols.append(sf)
+                        if mssql_mode:
+                            if not proj_cols:
+                                proj_cols = ['id']
+                            # Determine parent FK column name via helper; fallback inside helper to '<rel>_id'
+                            parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name) or f"{rel_name}_id"
+                            # Build join + optional where clauses for MSSQL
+                            join_parts = [
+                                f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{parent_fk_col_name}]"
+                            ]
                             try:
-                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
+                                r_where = rel_cfg.get('where')
+                                if r_where is not None:
+                                    wdict_rel = _to_where_dict(r_where, strict=True)
+                                    if wdict_rel:
+                                        join_parts.extend(adapter.where_from_dict(child_model_cls, wdict_rel))
+                                d_where = rel_cfg.get('default_where')
+                                if d_where is not None and isinstance(d_where, (dict, str)):
+                                    dwdict_rel = _to_where_dict(d_where, strict=False)
+                                    if dwdict_rel:
+                                        join_parts.extend(adapter.where_from_dict(child_model_cls, dwdict_rel))
                             except Exception:
                                 pass
-                            continue
-                        # Determine projected scalar fields
-                        requested_scalar = rel_cfg.get('fields') or []
-                        if rel_cfg.get('single'):
-                            # Single relation: build json object
-                            proj_cols = []
-                            if not requested_scalar:
-                                # default to all scalar fields of target
-                                for sf, sdef in target_b.__berry_fields__.items():
-                                    if sdef.kind == 'scalar':
-                                        requested_scalar.append(sf)
-                            for sf in requested_scalar:
-                                if sf in child_model_cls.__table__.columns:
-                                    proj_cols.append(sf)
-                            if mssql_mode:
-                                if not proj_cols:
-                                    proj_cols = ['id']
-                                # Determine parent FK column name via helper; fallback inside helper to '<rel>_id'
-                                parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name) or f"{rel_name}_id"
-                                # Build join + optional where clauses for MSSQL
-                                join_parts = [
-                                    f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{parent_fk_col_name}]"
-                                ]
+                            join_cond = ' AND '.join(join_parts)
+                            rel_expr = adapter.build_single_relation_json(
+                                child_table=child_model_cls.__tablename__,
+                                projected_columns=proj_cols,
+                                join_condition=join_cond,
+                            ).label(f"_pushrel_{rel_name}")
+                            select_columns.append(rel_expr)
+                        else:
+                            json_args: List[Any] = []
+                            for sf in proj_cols:
+                                json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
+                            json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
+                            # Determine parent FK column name via helper; fallback inside helper to '<rel>_id'
+                            parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name) or f"{rel_name}_id"
+                            # Require parent FK column to correlate; if absent, skip pushdown for this relation
+                            try:
+                                has_parent_fk = any(c.name == parent_fk_col_name for c in model_cls.__table__.columns)
+                            except Exception:
+                                has_parent_fk = False
+                            if not has_parent_fk:
+                                # Can't correlate reliably; skip pushdown
                                 try:
-                                    r_where = rel_cfg.get('where')
-                                    if r_where is not None:
-                                        wdict_rel = _to_where_dict(r_where, strict=True)
-                                        if wdict_rel:
-                                            join_parts.extend(adapter.where_from_dict(child_model_cls, wdict_rel))
-                                    d_where = rel_cfg.get('default_where')
-                                    if d_where is not None and isinstance(d_where, (dict, str)):
-                                        dwdict_rel = _to_where_dict(d_where, strict=False)
-                                        if dwdict_rel:
-                                            join_parts.extend(adapter.where_from_dict(child_model_cls, dwdict_rel))
+                                    rel_push_status[rel_name].update({'pushed': False, 'reason': f"missing parent column '{parent_fk_col_name}'"})
                                 except Exception:
                                     pass
-                                join_cond = ' AND '.join(join_parts)
-                                rel_expr = adapter.build_single_relation_json(
-                                    child_table=child_model_cls.__tablename__,
-                                    projected_columns=proj_cols,
-                                    join_condition=join_cond,
-                                ).label(f"_pushrel_{rel_name}")
-                                select_columns.append(rel_expr)
-                            else:
-                                json_args: List[Any] = []
-                                for sf in proj_cols:
-                                    json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
-                                json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
-                                # Determine parent FK column name via helper; fallback inside helper to '<rel>_id'
-                                parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name) or f"{rel_name}_id"
-                                # Require parent FK column to correlate; if absent, skip pushdown for this relation
-                                try:
-                                    has_parent_fk = any(c.name == parent_fk_col_name for c in model_cls.__table__.columns)
-                                except Exception:
-                                    has_parent_fk = False
-                                if not has_parent_fk:
-                                    # Can't correlate reliably; skip pushdown
-                                    try:
-                                        rel_push_status[rel_name].update({'pushed': False, 'reason': f"missing parent column '{parent_fk_col_name}'"})
-                                    except Exception:
-                                        pass
-                                    continue
-                                rel_subq = (
-                                    select(json_obj)
-                                    .select_from(child_model_cls)
-                                    .where(getattr(child_model_cls, 'id') == getattr(model_cls, parent_fk_col_name))
-                                    .correlate(model_cls)
-                                )
-                                # Apply relation-level JSON where/default_where if provided
-                                try:
-                                    r_where = rel_cfg.get('where')
-                                    if r_where is not None:
+                                continue
+                            rel_subq = (
+                                select(json_obj)
+                                .select_from(child_model_cls)
+                                .where(getattr(child_model_cls, 'id') == getattr(model_cls, parent_fk_col_name))
+                                .correlate(model_cls)
+                            )
+                            # Apply relation-level JSON where/default_where if provided
+                            try:
+                                r_where = rel_cfg.get('where')
+                                if r_where is not None:
+                                    if isinstance(r_where, (dict, str)):
                                         wdict_rel = _to_where_dict(r_where, strict=True)
                                         if wdict_rel:
                                             expr_rel = _expr_from_where_dict(child_model_cls, wdict_rel, strict=True)
                                             if expr_rel is not None:
                                                 rel_subq = rel_subq.where(expr_rel)
-                                    d_where = rel_cfg.get('default_where')
-                                    if d_where is not None and isinstance(d_where, (dict, str)):
+                                    else:
+                                        try:
+                                            expr_rel = r_where(child_model_cls, info) if callable(r_where) else r_where
+                                        except Exception:
+                                            expr_rel = None
+                                        if expr_rel is not None:
+                                            rel_subq = rel_subq.where(expr_rel)
+                                d_where = rel_cfg.get('default_where')
+                                if d_where is not None:
+                                    if isinstance(d_where, (dict, str)):
                                         dwdict_rel = _to_where_dict(d_where, strict=False)
                                         if dwdict_rel:
                                             expr_rel = _expr_from_where_dict(child_model_cls, dwdict_rel, strict=False)
                                             if expr_rel is not None:
                                                 rel_subq = rel_subq.where(expr_rel)
-                                except Exception:
-                                    raise
-                                # Apply filter args if any
-                                try:
-                                    filter_args = rel_cfg.get('filter_args') or {}
-                                    if filter_args:
-                                        # collect declared filters for target
-                                        target_btype = self.types.get(target_name)
-                                        if target_btype:
-                                            # replicate root filter expansion logic using only relation arg_specs
-                                            class_filters = rel_cfg.get('arg_specs') or {}
-                                            expanded: Dict[str, FilterSpec] = {}
-                                            for key, raw in class_filters.items():
+                                    else:
+                                        try:
+                                            expr_rel = d_where(child_model_cls, info) if callable(d_where) else d_where
+                                        except Exception:
+                                            expr_rel = None
+                                        if expr_rel is not None:
+                                            rel_subq = rel_subq.where(expr_rel)
+                            except Exception:
+                                raise
+                            # Apply filter args if any
+                            try:
+                                filter_args = rel_cfg.get('filter_args') or {}
+                                if filter_args:
+                                    # collect declared filters for target
+                                    target_btype = self.types.get(target_name)
+                                    if target_btype:
+                                        # replicate root filter expansion logic using only relation arg_specs
+                                        class_filters = rel_cfg.get('arg_specs') or {}
+                                        expanded: Dict[str, FilterSpec] = {}
+                                        for key, raw in class_filters.items():
+                                            try:
+                                                spec = _normalize_filter_spec(raw)
+                                            except Exception:
+                                                continue
+                                            if spec.ops and not spec.op:
+                                                for op_name in spec.ops:
+                                                    base = spec.alias or key
+                                                    if base.endswith(f"_{op_name}"):
+                                                        an = base
+                                                    else:
+                                                        an = f"{base}_{op_name}"
+                                                    expanded[an] = spec.clone_with(op=op_name, ops=None)
+                                            else:
+                                                expanded[spec.alias or key] = spec
+                                        for arg_name, val in filter_args.items():
+                                            f_spec = expanded.get(arg_name)
+                                            if not f_spec:
+                                                continue
+                                            if f_spec.transform:
                                                 try:
-                                                    spec = _normalize_filter_spec(raw)
+                                                    val = f_spec.transform(val)
                                                 except Exception:
                                                     continue
-                                                if spec.ops and not spec.op:
-                                                    for op_name in spec.ops:
-                                                        base = spec.alias or key
-                                                        if base.endswith(f"_{op_name}"):
-                                                            an = base
-                                                        else:
-                                                            an = f"{base}_{op_name}"
-                                                        expanded[an] = spec.clone_with(op=op_name, ops=None)
-                                                else:
-                                                    expanded[spec.alias or key] = spec
-                                            for arg_name, val in filter_args.items():
-                                                f_spec = expanded.get(arg_name)
-                                                if not f_spec:
+                                            expr = None
+                                            if f_spec.builder:
+                                                try:
+                                                    expr = f_spec.builder(child_model_cls, info, val)
+                                                except Exception:
+                                                    expr = None
+                                            elif f_spec.column:
+                                                try:
+                                                    col = child_model_cls.__table__.c.get(f_spec.column)
+                                                except Exception:
+                                                    col = None
+                                                if col is None:
                                                     continue
-                                                if f_spec.transform:
-                                                    try:
-                                                        val = f_spec.transform(val)
-                                                    except Exception:
-                                                        continue
-                                                expr = None
-                                                if f_spec.builder:
-                                                    try:
-                                                        expr = f_spec.builder(child_model_cls, info, val)
-                                                    except Exception:
-                                                        expr = None
-                                                elif f_spec.column:
-                                                    try:
-                                                        col = child_model_cls.__table__.c.get(f_spec.column)
-                                                    except Exception:
-                                                        col = None
-                                                    if col is None:
-                                                        continue
-                                                    op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
-                                                    if not op_fn:
-                                                        continue
-                                                    try:
-                                                        expr = op_fn(col, val)
-                                                    except Exception:
-                                                        expr = None
-                                                if expr is not None:
-                                                    rel_subq = rel_subq.where(expr)
-                                except Exception:
-                                    pass
-                                rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
-                                select_columns.append(rel_expr)
-                                try:
-                                    rel_push_status[rel_name].update({'pushed': True, 'reason': None})
-                                except Exception:
-                                    pass
-                        else:
-                            # List relation (possibly with nested) JSON aggregation
-                            # Rebuild list relation JSON: adapter-aware; MSSQL via FOR JSON PATH
-                            def _build_list_relation_json_adapter(parent_model_cls, parent_btype, rel_cfg_local):
+                                                op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                                if not op_fn:
+                                                    continue
+                                                try:
+                                                    expr = op_fn(col, val)
+                                                except Exception:
+                                                    expr = None
+                                            if expr is not None:
+                                                rel_subq = rel_subq.where(expr)
+                            except Exception:
+                                pass
+                            rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
+                            select_columns.append(rel_expr)
+                            try:
+                                rel_push_status[rel_name].update({'pushed': True, 'reason': None})
+                            except Exception:
+                                pass
+                    else:
+                        # List relation (possibly with nested) JSON aggregation
+                        # Rebuild list relation JSON: adapter-aware; MSSQL via FOR JSON PATH
+                        def _build_list_relation_json_adapter(parent_model_cls, parent_btype, rel_cfg_local):
                                 target_name_i = rel_cfg_local.get('target')
                                 target_b_i = self.types.get(target_name_i)
                                 if not target_b_i or not target_b_i.model:
@@ -2174,100 +2352,104 @@ class BerrySchema:
                                     if not order_parts and 'id' in child_model_cls_i.__table__.columns:
                                         order_parts.append(f"[{child_table}].[id] ASC")
                                     order_clause = ', '.join(order_parts) if order_parts else None
-                                    # Build nested subqueries for MSSQL if nested relations are requested
+                                    # Build nested subqueries for MSSQL if nested relations are requested (recursive)
                                     nested_subqueries: list[tuple[str, str]] = []
-                                    for nname, ncfg in (rel_cfg_local.get('nested') or {}).items():
-                                        n_target = ncfg.get('target')
-                                        nb = self.types.get(n_target)
-                                        if not nb or not nb.model:
-                                            continue
-                                        grand_model = nb.model
-                                        # use helper functions defined above for MSSQL where rendering
-                                        # FK from grandchild -> child
-                                        g_fk = None
-                                        for c in grand_model.__table__.columns:
-                                            for fk in c.foreign_keys:
-                                                if fk.column.table.name == child_model_cls_i.__table__.name:
-                                                    g_fk = c
+                                    def _mssql_build_nested_recursive(nname: str, ncfg: Dict[str, Any]) -> str | None:
+                                        try:
+                                            # If default_where is callable, ignore it for pushdown but keep nesting
+                                            dw2 = ncfg.get('default_where')
+                                            if dw2 is not None and not isinstance(dw2, (dict, str)):
+                                                try:
+                                                    ncfg['default_where_ignored'] = True
+                                                except Exception:
+                                                    pass
+                                            n_target = ncfg.get('target')
+                                            nb = self.types.get(n_target)
+                                            if not nb or not nb.model:
+                                                return None
+                                            g_model = nb.model
+                                            # FK from nested table -> child
+                                            g_fk = None
+                                            for c in g_model.__table__.columns:
+                                                for fk in c.foreign_keys:
+                                                    if fk.column.table.name == child_model_cls_i.__table__.name:
+                                                        g_fk = c
+                                                        break
+                                                if g_fk is not None:
                                                     break
-                                            if g_fk is not None:
-                                                break
-                                        if g_fk is None:
-                                            continue
-                                        n_cols = ncfg.get('fields') or []
-                                        if not n_cols:
-                                            for sf2, sd2 in nb.__berry_fields__.items():
-                                                if sd2.kind == 'scalar':
-                                                    n_cols.append(sf2)
-                                        n_col_select = ', '.join([f"[{grand_model.__tablename__}].[{c}] AS [{c}]" for c in (n_cols or ['id'])])
-                                        # where: correlate to child row id in MSSQL path
-                                        n_where_parts = [f"[{grand_model.__tablename__}].[{g_fk.name}] = [{child_table}].[id]"]
-                                        # apply JSON where/default_where if provided
-                                        try:
-                                            if ncfg.get('where') is not None:
-                                                wdict_raw = ncfg.get('where')
-                                                # Support GraphQL AST-like wrappers
-                                                if not isinstance(wdict_raw, (str, dict)) and hasattr(wdict_raw, 'value'):
+                                            if g_fk is None:
+                                                return None
+                                            # columns
+                                            n_cols = ncfg.get('fields') or []
+                                            if not n_cols:
+                                                for sf2, sd2 in nb.__berry_fields__.items():
+                                                    if sd2.kind == 'scalar':
+                                                        n_cols.append(sf2)
+                                            select_cols = ', '.join([f"[{g_model.__tablename__}].[{c}] AS [{c}]" for c in (n_cols or ['id'])])
+                                            # where
+                                            where_parts = [f"[{g_model.__tablename__}].[{g_fk.name}] = [{child_table}].[id]"]
+                                            try:
+                                                wdict = _to_where_dict(ncfg.get('where'), strict=True) if ncfg.get('where') is not None else None
+                                                if wdict:
+                                                    where_parts.extend(_mssql_where_from_dict(g_model, wdict))
+                                                dwdict = _to_where_dict(ncfg.get('default_where'), strict=False) if ncfg.get('default_where') is not None else None
+                                                if dwdict:
+                                                    where_parts.extend(_mssql_where_from_dict(g_model, dwdict))
+                                            except Exception:
+                                                pass
+                                            # order
+                                            order_clause_nested = adapter._build_order_clause(g_model, g_model.__tablename__, ncfg.get('order_by'), ncfg.get('order_dir'), self._normalize_order_multi_values(ncfg.get('order_multi') or []))
+                                            # deeper nested
+                                            deeper = ncfg.get('nested') or {}
+                                            nested_cols = ''
+                                            parts = []
+                                            for nn2, cfg2 in deeper.items():
+                                                inner = _mssql_build_nested_recursive(nn2, cfg2)
+                                                if inner is not None:
+                                                    parts.append(f"ISNULL(({inner}), '[]') AS [{nn2}]")
+                                            if parts:
+                                                nested_cols = ', ' + ', '.join(parts)
+                                            # pagination
+                                            pag_clause = ''
+                                            if ncfg.get('limit') is not None or ncfg.get('offset') is not None:
+                                                oc = order_clause_nested or adapter._build_order_clause(g_model, g_model.__tablename__, 'id', 'asc', None)
+                                                o = 0
+                                                try:
+                                                    o = int(ncfg.get('offset') or 0)
+                                                except Exception:
+                                                    o = 0
+                                                pag_clause = f" ORDER BY {oc} OFFSET {o} ROWS"
+                                                if ncfg.get('limit') is not None:
                                                     try:
-                                                        wdict_raw = getattr(wdict_raw, 'value')
+                                                        l2 = int(ncfg.get('limit'))
                                                     except Exception:
-                                                        pass
-                                                wdict = _to_where_dict(wdict_raw, strict=True)
-                                                # Strict validation via registry
-                                                for col_name, op_map in (wdict or {}).items():
-                                                    col = grand_model.__table__.c.get(col_name)
-                                                    if col is None:
-                                                        raise ValueError(f"Unknown where column: {col_name}")
-                                                    for op_name in (op_map or {}).keys():
-                                                        if op_name not in OPERATOR_REGISTRY:
-                                                            raise ValueError(f"Unknown where operator: {op_name}")
-                                                n_where_parts.extend(_mssql_where_from_dict(grand_model, wdict))
-                                            if ncfg.get('default_where') is not None and isinstance(ncfg.get('default_where'), (dict, str)):
-                                                dwdict = _to_where_dict(ncfg.get('default_where'), strict=False)
-                                                if dwdict is not None:
-                                                    n_where_parts.extend(_mssql_where_from_dict(grand_model, dwdict))
+                                                        l2 = ncfg.get('limit')
+                                                    pag_clause += f" FETCH NEXT {l2} ROWS ONLY"
+                                            elif order_clause_nested:
+                                                pag_clause = f" ORDER BY {order_clause_nested}"
+                                            where_clause = ' AND '.join(where_parts) if where_parts else '1=1'
+                                            sql = (
+                                                f"SELECT {select_cols}{nested_cols} FROM {g_model.__tablename__} "
+                                                f"WHERE {where_clause}{pag_clause} FOR JSON PATH"
+                                            )
+                                            try:
+                                                ncfg['from_pushdown'] = True
+                                                ncfg['skip_reason'] = None
+                                            except Exception:
+                                                pass
+                                            return sql
                                         except Exception:
-                                            pass
-                                        n_where = ' AND '.join(n_where_parts)
-                                        # order
-                                        n_order_parts: list[str] = []
-                                        # normalize potential AST for order_multi
-                                        nmulti = ncfg.get('order_multi') or []
-                                        try:
-                                            if hasattr(nmulti, 'values'):
-                                                nmulti = [ getattr(x, 'value', x) for x in getattr(nmulti, 'values', []) or [] ]
-                                        except Exception:
-                                            pass
-                                        for spec in (nmulti or []):
-                                            cn, _, dd = str(spec).partition(':')
-                                            dd = dd or _dir_value(ncfg.get('order_dir'))
-                                            n_order_parts.append(f"[{grand_model.__tablename__}].[{cn}] {'DESC' if (str(dd).lower()=='desc') else 'ASC'}")
-                                        if not n_order_parts and ncfg.get('order_by'):
-                                            cn = ncfg.get('order_by')
-                                            dd = _dir_value(ncfg.get('order_dir'))
-                                            n_order_parts.append(f"[{grand_model.__tablename__}].[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
-                                        # Add fallback ordering by id ASC when nothing specified
-                                        if not n_order_parts and 'id' in grand_model.__table__.columns:
-                                            n_order_parts.append(f"[{grand_model.__tablename__}].[id] ASC")
-                                        n_order_clause = (" ORDER BY " + ', '.join(n_order_parts)) if n_order_parts else ''
-                                        # Build nested SQL with pagination via adapter
-                                        n_lim = ncfg.get('limit')
-                                        n_off = ncfg.get('offset')
-                                        nested_sql = adapter.build_nested_list_sql(
-                                            alias=nname,
-                                            grand_model=grand_model,
-                                            child_table=child_table,
-                                            g_fk_col_name=g_fk.name,
-                                            fields=n_cols,
-                                            where_dict=ncfg.get('where'),
-                                            default_where=ncfg.get('default_where'),
-                                            order_by=ncfg.get('order_by'),
-                                            order_dir=ncfg.get('order_dir'),
-                                            order_multi=ncfg.get('order_multi'),
-                                            limit=n_lim,
-                                            offset=n_off,
-                                        )
-                                        nested_subqueries.append((nname, nested_sql))
+                                            try:
+                                                ncfg['from_pushdown'] = False
+                                                if not ncfg.get('skip_reason'):
+                                                    ncfg['skip_reason'] = 'builder error'
+                                            except Exception:
+                                                pass
+                                            return None
+                                    for nname, ncfg in (rel_cfg_local.get('nested') or {}).items():
+                                        sql_nested = _mssql_build_nested_recursive(nname, ncfg)
+                                        if sql_nested is not None:
+                                            nested_subqueries.append((nname, sql_nested))
                                     return adapter.build_list_relation_json(
                                         child_table=child_table,
                                         projected_columns=requested_scalar_i,
@@ -2424,7 +2606,7 @@ class BerrySchema:
                                             pass
                                 except Exception:
                                     pass
-                                # Apply ad-hoc JSON where for nested relation as well
+                                # Apply ad-hoc where for nested relation as well (support JSON or callables)
                                 # Strict for user-provided where
                                 rr = rel_cfg_local.get('where')
                                 if rr is not None:
@@ -2453,17 +2635,33 @@ class BerrySchema:
                                             rr = getattr(rr, 'value')
                                         except Exception:
                                             pass
-                                    wdict2 = _to_where_dict(rr, strict=True)
-                                    if wdict2 is not None:
-                                        expr2 = _expr_from_where_dict(child_model_cls_i, wdict2, strict=True)
+                                    if isinstance(rr, (dict, str)):
+                                        wdict2 = _to_where_dict(rr, strict=True)
+                                        if wdict2 is not None:
+                                            expr2 = _expr_from_where_dict(child_model_cls_i, wdict2, strict=True)
+                                            if expr2 is not None:
+                                                inner_sel_i = inner_sel_i.where(expr2)
+                                    else:
+                                        try:
+                                            expr2 = rr(child_model_cls_i, info) if callable(rr) else rr
+                                        except Exception:
+                                            expr2 = None
                                         if expr2 is not None:
                                             inner_sel_i = inner_sel_i.where(expr2)
                                 # Permissive for default_where
                                 dr = rel_cfg_local.get('default_where')
                                 if dr is not None:
-                                    wdict2 = _to_where_dict(dr, strict=False)
-                                    if wdict2 is not None:
-                                        expr2 = _expr_from_where_dict(child_model_cls_i, wdict2, strict=False)
+                                    if isinstance(dr, (dict, str)):
+                                        wdict2 = _to_where_dict(dr, strict=False)
+                                        if wdict2 is not None:
+                                            expr2 = _expr_from_where_dict(child_model_cls_i, wdict2, strict=False)
+                                            if expr2 is not None:
+                                                inner_sel_i = inner_sel_i.where(expr2)
+                                    else:
+                                        try:
+                                            expr2 = dr(child_model_cls_i, info) if callable(dr) else dr
+                                        except Exception:
+                                            expr2 = None
                                         if expr2 is not None:
                                             inner_sel_i = inner_sel_i.where(expr2)
                                 if rel_cfg_local.get('offset') is not None:
@@ -2489,40 +2687,52 @@ class BerrySchema:
                                     return None
                                 agg_query_i = select(_json_array_coalesce(agg_inner_expr_i)).select_from(limited_subq_i).correlate(parent_model_cls).scalar_subquery()
                                 return agg_query_i
-                            # Prefer nested-capable builder when nested relations are selected
+                        # Prefer nested-capable builder when nested relations are selected
+                        nested_expr = None
+                        try:
+                            if (rel_cfg.get('nested') or {}) and not mssql_mode:
+                                nested_expr = _build_list_relation_json(model_cls, btype_cls, rel_cfg)
+                        except Exception:
                             nested_expr = None
-                            try:
-                                if (rel_cfg.get('nested') or {}) and not mssql_mode:
-                                    nested_expr = _build_list_relation_json(model_cls, btype_cls, rel_cfg)
-                            except Exception:
-                                nested_expr = None
-                            if nested_expr is None:
-                                nested_expr = _build_list_relation_json_adapter(model_cls, btype_cls, rel_cfg)
-                            if nested_expr is not None:
-                                if mssql_mode:
-                                    # Wrap TextClause into a labeled column using scalar_subquery style text
-                                    try:
-                                        select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
-                                    except Exception:
-                                        from sqlalchemy import literal_column
-                                        select_columns.append(literal_column(str(nested_expr)).label(f"_pushrel_{rel_name}"))
-                                    try:
-                                        rel_push_status[rel_name].update({'pushed': True, 'reason': None})
-                                    except Exception:
-                                        pass
-                                else:
-                                    select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
-                                    try:
-                                        rel_push_status[rel_name].update({'pushed': True, 'reason': None})
-                                    except Exception:
-                                        pass
-                            else:
-                                # builder couldn't produce a pushdown expression
+                        if nested_expr is None:
+                            nested_expr = _build_list_relation_json_adapter(model_cls, btype_cls, rel_cfg)
+                        if nested_expr is not None:
+                            if mssql_mode:
+                                # Wrap TextClause into a labeled column using scalar_subquery style text
                                 try:
-                                    if not rel_push_status.get(rel_name, {}).get('reason'):
-                                        rel_push_status[rel_name].update({'pushed': False, 'reason': 'builder returned None'})
+                                    select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
+                                except Exception:
+                                    from sqlalchemy import literal_column
+                                    select_columns.append(literal_column(str(nested_expr)).label(f"_pushrel_{rel_name}"))
+                                try:
+                                    rel_push_status[rel_name].update({'pushed': True, 'reason': None})
                                 except Exception:
                                     pass
+                                try:
+                                    rr_entry = requested_relations.get(rel_name, {})
+                                    rr_entry['from_pushdown'] = True
+                                    rr_entry['skip_reason'] = None
+                                except Exception:
+                                    pass
+                            else:
+                                select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
+                                try:
+                                    rel_push_status[rel_name].update({'pushed': True, 'reason': None})
+                                except Exception:
+                                    pass
+                                try:
+                                    rr_entry = requested_relations.get(rel_name, {})
+                                    rr_entry['from_pushdown'] = True
+                                    rr_entry['skip_reason'] = None
+                                except Exception:
+                                    pass
+                        else:
+                            # builder couldn't produce a pushdown expression
+                            try:
+                                if not rel_push_status.get(rel_name, {}).get('reason'):
+                                    rel_push_status[rel_name].update({'pushed': False, 'reason': 'builder returned None'})
+                            except Exception:
+                                pass
                 stmt = select(*select_columns)
                 # Add minimal root columns directly into the SELECT to avoid pulling all entity columns
                 # Prefer selecting only requested scalars and id when relations are requested.
@@ -2976,8 +3186,72 @@ class BerrySchema:
                                                                         pass
                                                                     setattr(child_inst, sf, val)
                                                             setattr(child_inst, '_model', None)
-                                                            # Nested relations on this child (prefetch to avoid N+1)
+                                                            # Nested relations on this child (prefetch to avoid N+1) with recursion
                                                             try:
+                                                                def _hydrate_nested_list(parent_inst, parent_b, item_dict, nested_meta_src_map):
+                                                                    for nname_i, ndef_i in parent_b.__berry_fields__.items():
+                                                                        if ndef_i.kind != 'relation':
+                                                                            continue
+                                                                        raw_nested_i = item_dict.get(nname_i, None)
+                                                                        if raw_nested_i is None:
+                                                                            continue
+                                                                        import json as _json
+                                                                        try:
+                                                                            parsed_nested_i = _json.loads(raw_nested_i) if isinstance(raw_nested_i, (str, bytes)) else raw_nested_i
+                                                                        except Exception:
+                                                                            parsed_nested_i = None
+                                                                        n_target_i = self.types.get(ndef_i.meta.get('target')) if ndef_i.meta.get('target') else None
+                                                                        n_st_i = self._st_types.get(ndef_i.meta.get('target')) if ndef_i.meta.get('target') else None
+                                                                        if not n_target_i or not n_target_i.model or not n_st_i:
+                                                                            continue
+                                                                        if ndef_i.meta.get('single'):
+                                                                            if isinstance(parsed_nested_i, dict):
+                                                                                ni = n_st_i()
+                                                                                for nsf, nsdef in n_target_i.__berry_fields__.items():
+                                                                                    if nsdef.kind == 'scalar':
+                                                                                        setattr(ni, nsf, parsed_nested_i.get(nsf))
+                                                                                setattr(ni, '_model', None)
+                                                                                setattr(parent_inst, nname_i, ni)
+                                                                                setattr(parent_inst, f"_{nname_i}_prefetched", ni)
+                                                                            else:
+                                                                                setattr(parent_inst, nname_i, None)
+                                                                                setattr(parent_inst, f"_{nname_i}_prefetched", None)
+                                                                        else:
+                                                                            nlist_i = []
+                                                                            if isinstance(parsed_nested_i, list):
+                                                                                for nv_i in parsed_nested_i:
+                                                                                    if isinstance(nv_i, dict):
+                                                                                        ni = n_st_i()
+                                                                                        for nsf, nsdef in n_target_i.__berry_fields__.items():
+                                                                                            if nsdef.kind == 'scalar':
+                                                                                                setattr(ni, nsf, nv_i.get(nsf))
+                                                                                        setattr(ni, '_model', None)
+                                                                                        # recursively hydrate deeper nested under ni if any
+                                                                                        try:
+                                                                                            deeper_meta = (nested_meta_src_map.get(nname_i) or {}).get('nested') if isinstance(nested_meta_src_map, dict) else None
+                                                                                            _hydrate_nested_list(ni, n_target_i, nv_i, deeper_meta or {})
+                                                                                        except Exception:
+                                                                                            pass
+                                                                                        nlist_i.append(ni)
+                                                                            setattr(parent_inst, nname_i, nlist_i)
+                                                                            setattr(parent_inst, f"_{nname_i}_prefetched", nlist_i)
+                                                                        # record meta for this nested level
+                                                                        try:
+                                                                            meta_map_nested = getattr(parent_inst, '_pushdown_meta', None)
+                                                                            if meta_map_nested is None:
+                                                                                meta_map_nested = {}
+                                                                                setattr(parent_inst, '_pushdown_meta', meta_map_nested)
+                                                                            src_meta = (nested_meta_src_map.get(nname_i) or {}) if isinstance(nested_meta_src_map, dict) else {}
+                                                                            meta_map_nested[nname_i] = {
+                                                                                'limit': src_meta.get('limit'),
+                                                                                'offset': src_meta.get('offset'),
+                                                                                'from_pushdown': bool(src_meta.get('from_pushdown', True)),
+                                                                                'skip_reason': src_meta.get('skip_reason')
+                                                                            }
+                                                                        except Exception:
+                                                                            pass
+
+                                                                # First level nested under this child
                                                                 for nname, ndef in target_b.__berry_fields__.items():
                                                                     if ndef.kind != 'relation':
                                                                         continue
@@ -3016,11 +3290,19 @@ class BerrySchema:
                                                                                         if nsdef.kind == 'scalar':
                                                                                             setattr(ni, nsf, nv.get(nsf))
                                                                                     setattr(ni, '_model', None)
+                                                                                    # recursively hydrate deeper nested for each next level item
+                                                                                    try:
+                                                                                        parent_meta = requested_relations.get(rel_name, {})
+                                                                                        nested_meta_map = (parent_meta.get('nested') or {})
+                                                                                        deeper_meta = (nested_meta_map.get(nname) or {}).get('nested') or {}
+                                                                                        _hydrate_nested_list(ni, n_target, nv, deeper_meta)
+                                                                                    except Exception:
+                                                                                        pass
                                                                                     nlist.append(ni)
                                                                     # Pagination handled in SQL; no Python-side slicing
                                                                     setattr(child_inst, nname, nlist)
                                                                     setattr(child_inst, f"_{nname}_prefetched", nlist)
-                                                                    # record nested pushdown meta
+                                                                    # record nested pushdown meta (deep-aware)
                                                                     try:
                                                                         meta_map2 = getattr(child_inst, '_pushdown_meta', None)
                                                                         if meta_map2 is None:
@@ -3031,7 +3313,8 @@ class BerrySchema:
                                                                         meta_map2[nname] = {
                                                                             'limit': nested_meta_src.get('limit'),
                                                                             'offset': nested_meta_src.get('offset'),
-                                                                            'from_pushdown': True
+                                                                            'from_pushdown': bool(nested_meta_src.get('from_pushdown', True)),
+                                                                            'skip_reason': nested_meta_src.get('skip_reason')
                                                                         }
                                                                     except Exception:
                                                                         pass
