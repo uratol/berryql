@@ -410,145 +410,11 @@ class BerrySchema:
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
                             prefetch_attr = f'_{fname_local}_prefetched'
                             if hasattr(self, prefetch_attr):
-                                # If relation was prefetched (via root pushdown), still honor relation args
-                                # by applying in-memory filtering/ordering/pagination on the prefetched data.
+                                # If relation was prefetched via SQL pushdown, return it directly.
                                 prefetched = getattr(self, prefetch_attr)
-                                # Helper: apply JSON where dict onto a single object; returns bool
-                                def _match_where_obj(o: Any, where_dict: Any) -> bool:
-                                    if not isinstance(where_dict, dict):
-                                        return True
-                                    for col_name, op_map in (where_dict or {}).items():
-                                        v = getattr(o, col_name, None)
-                                        for op_name, val in (op_map or {}).items():
-                                            try:
-                                                if op_name == 'eq' and not (v == val):
-                                                    return False
-                                                if op_name == 'ne' and not (v != val):
-                                                    return False
-                                                if op_name == 'lt' and not (v < val):
-                                                    return False
-                                                if op_name == 'lte' and not (v <= val):
-                                                    return False
-                                                if op_name == 'gt' and not (v > val):
-                                                    return False
-                                                if op_name == 'gte' and not (v >= val):
-                                                    return False
-                                                if op_name in ('like','ilike'):
-                                                    s = '' if v is None else str(v)
-                                                    pat = '' if val is None else str(val)
-                                                    if op_name == 'ilike':
-                                                        s = s.lower(); pat = pat.lower()
-                                                    # crude % wildcard support: treat % as contains
-                                                    core = pat.replace('%','')
-                                                    if core not in s:
-                                                        return False
-                                                if op_name == 'in' and isinstance(val, (list, tuple, set)):
-                                                    if v not in val:
-                                                        return False
-                                                if op_name == 'between' and isinstance(val, (list, tuple)) and len(val) >= 2:
-                                                    if not (val[0] <= v <= val[1]):
-                                                        return False
-                                            except Exception:
-                                                return False
-                                    return True
-                                # Helper: apply declared filter args in-memory using column names
-                                def _apply_filter_args_list(objs: list[Any]) -> list[Any]:
-                                    if not _filter_args:
-                                        return objs
-                                    # Resolve FilterSpecs from declared target filters
-                                    if not target_filters:
-                                        return objs
-                                    out = []
-                                    for o in objs:
-                                        ok = True
-                                        for arg_name, raw_val in _filter_args.items():
-                                            if raw_val is None:
-                                                continue
-                                            f_spec = target_filters.get(arg_name)
-                                            if not f_spec:
-                                                continue
-                                            # Apply transform
-                                            val = raw_val
-                                            try:
-                                                if f_spec.transform:
-                                                    val = f_spec.transform(val)
-                                            except Exception:
-                                                pass
-                                            # Only column-based filters can be applied in-memory
-                                            col_name = f_spec.column
-                                            if not col_name:
-                                                continue
-                                            v = getattr(o, col_name, None)
-                                            try:
-                                                if f_spec.op == 'eq' and not (v == val):
-                                                    ok = False; break
-                                                if f_spec.op == 'ne' and not (v != val):
-                                                    ok = False; break
-                                                if f_spec.op == 'lt' and not (v < val):
-                                                    ok = False; break
-                                                if f_spec.op == 'lte' and not (v <= val):
-                                                    ok = False; break
-                                                if f_spec.op == 'gt' and not (v > val):
-                                                    ok = False; break
-                                                if f_spec.op == 'gte' and not (v >= val):
-                                                    ok = False; break
-                                                if f_spec.op == 'like' or f_spec.op == 'ilike':
-                                                    s = '' if v is None else str(v)
-                                                    pat = '' if val is None else str(val)
-                                                    if f_spec.op == 'ilike':
-                                                        s = s.lower(); pat = pat.lower()
-                                                    core = pat.replace('%','')
-                                                    if core not in s:
-                                                        ok = False; break
-                                                if f_spec.op == 'in' and isinstance(val, (list, tuple, set)):
-                                                    if v not in val:
-                                                        ok = False; break
-                                                if f_spec.op == 'between' and isinstance(val, (list, tuple)) and len(val) >= 2:
-                                                    if not (val[0] <= v <= val[1]):
-                                                        ok = False; break
-                                            except Exception:
-                                                pass
-                                        if ok:
-                                            out.append(o)
-                                    return out
-                                # Parse where JSON if provided
-                                import json as _json
-                                where_dict = None
-                                # Parse/validate where JSON strictly if provided
-                                if related_where is not None:
-                                    try:
-                                        where_dict = related_where
-                                        if isinstance(related_where, str):
-                                            where_dict = _json.loads(related_where)
-                                    except Exception as e:
-                                        raise ValueError(f"Invalid where JSON: {e}")
-                                    if where_dict is not None and not isinstance(where_dict, dict):
-                                        raise ValueError("where must be a JSON object")
                                 if is_single_value:
-                                    o = prefetched
-                                    if o is None:
-                                        return None
-                                    # Apply where
-                                    if where_dict and not _match_where_obj(o, where_dict):
-                                        return None
-                                    # Apply filter args
-                                    if target_filters and any(v is not None for v in _filter_args.values()):
-                                        if not _apply_filter_args_list([o]):
-                                            return None
-                                    return o
-                                # List relation
-                                lst = list(prefetched or [])
-                                # Apply where
-                                if where_dict:
-                                    lst = [o for o in lst if _match_where_obj(o, where_dict)]
-                                # Apply filter args (column-based only)
-                                lst = _apply_filter_args_list(lst)
-                                # Remove Python-level ordering: rely on DB ordering only
-                                # (Explicit or default ordering will be handled in SQL pushdown paths.)
-                                # Intentionally skip any Python-side sort of prefetched lists.
-                                # Do not apply Python-level pagination; pagination must be applied in SQL.
-                                # The prefetched data already reflects any limit/offset set at query time.
-                                return lst
+                                    return prefetched
+                                return list(prefetched or [])
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
                             parent_model = getattr(self, '_model', None)
@@ -1841,18 +1707,9 @@ class BerrySchema:
                     required_fk_parent_cols = set()
                 # Push down relation JSON arrays/objects
                 for rel_name, rel_cfg in requested_relations.items():
-                        # If a 'where' argument is provided, skip pushdown so resolver can apply it reliably.
-                        try:
-                            if rel_cfg.get('where') is not None:
-                                rel_cfg['skip_pushdown'] = True
-                        except Exception:
-                            pass
-                        # Skip pushdown when filter args are present; resolvers will apply them reliably.
-                        try:
-                            if rel_cfg.get('filter_args'):
-                                rel_cfg['skip_pushdown'] = True
-                        except Exception:
-                            pass
+                        # Allow pushdown even when relation 'where' or filter args are provided.
+                        # Both JSON where and declared filter args are handled in the pushdown builders below.
+                        # Only skip when defaults are callable (require runtime context/evaluation per row).
                         # If default_where is a callable, skip pushdown so resolver can apply it
                         try:
                             dw = rel_cfg.get('default_where')

@@ -39,6 +39,9 @@ async def test_relation_argument_title_ilike_is_pushed_down(db_session, sample_u
         # De-dup by text and operate on the unique shapes
         distinct_posts = list(dict.fromkeys(posts_selects))
 
+        # Ensure only one posts-related SELECT shape (no N+1)
+        assert len(distinct_posts) == 1, distinct_posts
+
         s = distinct_posts[0]
         # Ensure LIKE/ILIKE predicate is present. Allow bind parameters instead of literal value.
         has_like = (" ilike " in s) or (" like " in s)
