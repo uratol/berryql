@@ -48,3 +48,16 @@ class PostComment(Base):
     
     post = relationship("Post", back_populates="post_comments")
     author = relationship("User", back_populates="post_comments")
+    likes = relationship("PostCommentLike", back_populates="comment")
+
+
+class PostCommentLike(Base):
+    __tablename__ = 'post_comment_likes'
+    
+    id = Column(Integer, primary_key=True)
+    post_comment_id = Column(Integer, ForeignKey('post_comments.id'), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+    comment = relationship("PostComment", back_populates="likes")
+    user = relationship("User")

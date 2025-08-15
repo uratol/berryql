@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import User, Post, PostComment
+from .models import User, Post, PostComment, PostCommentLike
 
 
 async def create_sample_users(session: AsyncSession):
@@ -65,6 +65,25 @@ async def create_sample_comments(session: AsyncSession, users, posts):
     await session.flush()
     await session.commit()
     return post_comments
+async def create_sample_likes(session: AsyncSession, users, comments):
+    """Create and commit sample likes for comments."""
+    user1, user2, user3, _ = users
+    likes = [
+        PostCommentLike(post_comment_id=comments[0].id, user_id=user1.id),
+        PostCommentLike(post_comment_id=comments[0].id, user_id=user3.id),
+        PostCommentLike(post_comment_id=comments[1].id, user_id=user1.id),
+        PostCommentLike(post_comment_id=comments[2].id, user_id=user3.id),
+    ]
+    session.add_all(likes)
+    await session.flush()
+    await session.commit()
+    return likes
+
+
+@pytest.fixture(scope="function")
+async def sample_likes(db_session: AsyncSession, sample_comments, sample_users):
+    return await create_sample_likes(db_session, sample_users, sample_comments)
+
 
 
 @pytest.fixture(scope="function")
@@ -77,17 +96,20 @@ async def seed_populated_db(session: AsyncSession):
     users = await create_sample_users(session)
     posts = await create_sample_posts(session, users)
     comments = await create_sample_comments(session, users, posts)
+    likes = await create_sample_likes(session, users, comments)
     return {
         'users': users,
         'posts': posts,
         'post_comments': comments,
+        'post_comment_likes': likes,
     }
 
 
 @pytest.fixture(scope="function")
-async def populated_db(sample_users, sample_posts, sample_comments):
+async def populated_db(sample_users, sample_posts, sample_comments, sample_likes):
     return {
         'users': sample_users,
         'posts': sample_posts,
-        'post_comments': sample_comments
+    'post_comments': sample_comments,
+    'post_comment_likes': sample_likes,
     }

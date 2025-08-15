@@ -9,7 +9,7 @@ from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
 from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain
-from tests.models import User, Post, PostComment  # type: ignore
+from tests.models import User, Post, PostComment, PostCommentLike  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
@@ -25,7 +25,10 @@ class PostCommentQL(BerryType):
     created_at = field()
     post = relation('PostQL', single=True)
     author = relation('UserQL', single=True)
-    # Regular strawberry field with its own resolver
+    # Force resolver fallback for nested path by using a callable where
+    # (builders mark skip_pushdown when default_where is callable via meta['where']).
+    likes = relation('PostCommentLikeQL', where=lambda M, info: (M.id > 0))
+    # Regular strawberry field with its own resolver (preview of comment content)
     @strawberry.field
     def content_preview(self) -> str | None:
         try:
@@ -39,6 +42,13 @@ class PostCommentQL(BerryType):
             return s if len(s) <= 10 else s[:10] + '...'
         except Exception:
             return None
+@berry_schema.type(model=PostCommentLike)
+class PostCommentLikeQL(BerryType):
+    id = field()
+    post_comment_id = field()
+    user_id = field()
+    created_at = field()
+    user = relation('UserQL', single=True)
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
