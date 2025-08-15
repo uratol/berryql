@@ -2076,6 +2076,25 @@ class BerrySchema:
                                         import json as _json
                                         r_where = rel_cfg_local.get('where')
                                         if r_where is not None:
+                                            # Resolve GraphQL VariableNode using outer-scope info (like done later for nested relation path)
+                                            if not isinstance(r_where, (str, dict)) and hasattr(r_where, 'name'):
+                                                try:
+                                                    vname = getattr(getattr(r_where, 'name', None), 'value', None) or getattr(r_where, 'name', None)
+                                                    var_vals = None
+                                                    try:
+                                                        var_vals = getattr(info, 'variable_values', None)
+                                                    except Exception:
+                                                        var_vals = None
+                                                    if var_vals is None:
+                                                        try:
+                                                            raw_info = getattr(info, '_raw_info', None)
+                                                            var_vals = getattr(raw_info, 'variable_values', None) if raw_info is not None else None
+                                                        except Exception:
+                                                            var_vals = None
+                                                    if isinstance(var_vals, dict) and vname in var_vals:
+                                                        r_where = var_vals[vname]
+                                                except Exception:
+                                                    pass
                                             # Support GraphQL AST-like wrappers
                                             if not isinstance(r_where, (str, dict)) and hasattr(r_where, 'value'):
                                                 try:
@@ -2088,8 +2107,28 @@ class BerrySchema:
                                                     wdict_rel = _json.loads(r_where)
                                                 except Exception as e:
                                                     raise ValueError(f"Invalid where JSON: {e}")
+                                            # Accept only mapping-like objects for strict validation; attempt last-chance parse from string repr
                                             if wdict_rel is not None and not isinstance(wdict_rel, dict):
-                                                raise ValueError("where must be a JSON object")
+                                                try:
+                                                    from collections.abc import Mapping as _Mapping
+                                                    if isinstance(wdict_rel, _Mapping):
+                                                        wdict_rel = dict(wdict_rel)
+                                                    else:
+                                                        # Try to coerce from textual representation
+                                                        txt = wdict_rel.decode() if isinstance(wdict_rel, (bytes, bytearray)) else str(wdict_rel)
+                                                        s = txt.strip()
+                                                        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                                                            s = s[1:-1]
+                                                        try:
+                                                            wdict_rel = _json.loads(s)
+                                                        except Exception:
+                                                            try:
+                                                                import ast as _ast
+                                                                wdict_rel = _ast.literal_eval(s)
+                                                            except Exception:
+                                                                raise ValueError("where must be a JSON object")
+                                                except Exception:
+                                                    raise ValueError("where must be a JSON object")
                                             # Strict: validate columns and operators
                                             for col_name, op_map in (wdict_rel or {}).items():
                                                 col = child_model_cls_i.__table__.c.get(col_name)
