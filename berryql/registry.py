@@ -205,6 +205,118 @@ class BerrySchema:
             base = name
         return base.lower() + 's'
 
+    # ---------- DRY helpers ----------
+    def _sa_python_type(self, sqlatype: Any) -> Any:
+        """Map a SQLAlchemy column type to a Python (annotation) type.
+
+        Handles common primitives and PostgreSQL-specific wrappers (UUID, ARRAY, JSONB).
+        Defaults to str for unknown types (safe GraphQL scalar mapping).
+        """
+        try:
+            if isinstance(sqlatype, Integer):
+                return int
+            if isinstance(sqlatype, String):
+                return str
+            if isinstance(sqlatype, Boolean):
+                return bool
+            if isinstance(sqlatype, DateTime):
+                return datetime
+            if isinstance(sqlatype, PG_UUID):
+                return _py_uuid.UUID
+            if isinstance(sqlatype, PG_ARRAY):
+                inner = getattr(sqlatype, 'item_type', None)
+                inner_t = self._sa_python_type(inner) if inner is not None else str
+                # guard List typing for non-subscriptable case
+                try:
+                    return List[inner_t]  # type: ignore[index]
+                except Exception:
+                    return list
+            if isinstance(sqlatype, PG_JSONB):
+                return str
+        except Exception:
+            pass
+        return str
+
+    def _build_column_type_map(self, model_cls: Any) -> Dict[str, Any]:
+        """Return a mapping of column name -> Python type for the given ORM model."""
+        out: Dict[str, Any] = {}
+        try:
+            if model_cls is not None and hasattr(model_cls, '__table__'):
+                for col in model_cls.__table__.columns:
+                    out[col.name] = self._sa_python_type(getattr(col, 'type', None))
+        except Exception:
+            pass
+        return out
+
+    def _expand_filter_args(self, arg_spec: Optional[Dict[str, Any]]) -> Dict[str, 'FilterSpec']:
+        """Normalize a relation arguments specification to concrete FilterSpecs keyed by arg name.
+
+        - Supports single op via .op and multi-op via .ops with suffixes.
+        - Accepts raw values compatible with normalize_filter_spec, or callables as builder-only specs.
+        """
+        if not isinstance(arg_spec, dict):
+            return {}
+        expanded: Dict[str, FilterSpec] = {}
+        for key, raw in arg_spec.items():
+            try:
+                if callable(raw):
+                    spec = FilterSpec(builder=raw)
+                else:
+                    spec = _normalize_filter_spec(raw)
+            except Exception:
+                continue
+            if spec.ops and not spec.op:
+                for op_name in spec.ops:
+                    base = spec.alias or key
+                    an = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
+                    expanded[an] = spec.clone_with(op=op_name, ops=None)
+            else:
+                expanded[spec.alias or key] = spec
+        return expanded
+
+    def _normalize_order_multi_values(self, multi: Any) -> List[str]:
+        """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
+        norm: List[str] = []
+        try:
+            for spec in (multi or []):
+                try:
+                    norm.append(str(getattr(spec, 'value', spec)))
+                except Exception:
+                    norm.append(str(spec))
+        except Exception:
+            pass
+        return norm
+
+    def _get_context_lock(self, info: 'StrawberryInfo') -> 'asyncio.Lock':
+        """Return a per-request asyncio.Lock stored on info.context to serialize DB access when needed."""
+        try:
+            ctx = getattr(info, 'context', None)
+        except Exception:
+            ctx = None
+        lock = None
+        if isinstance(ctx, dict):
+            lock = ctx.get('_berry_db_lock')
+            if lock is None:
+                lock = asyncio.Lock()
+                try:
+                    ctx['_berry_db_lock'] = lock
+                except Exception:
+                    pass
+        elif ctx is not None:
+            try:
+                lock = getattr(ctx, '_berry_db_lock')
+            except Exception:
+                lock = None
+            if lock is None:
+                lock = asyncio.Lock()
+                try:
+                    setattr(ctx, '_berry_db_lock', lock)
+                except Exception:
+                    pass
+        if lock is None:
+            lock = asyncio.Lock()
+        return lock
+
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
         # Persist naming behavior for extractor logic
         try:
@@ -243,41 +355,7 @@ class BerrySchema:
             except Exception:
                 user_annotations = {}
             # column type mapping
-            column_type_map: Dict[str, Any] = {}
-            if bcls.model and hasattr(bcls.model, '__table__'):
-                for col in bcls.model.__table__.columns:
-                    if isinstance(col.type, Integer):
-                        py_t = int
-                    elif isinstance(col.type, String):
-                        py_t = str
-                    elif isinstance(col.type, Boolean):
-                        py_t = bool
-                    elif isinstance(col.type, DateTime):
-                        py_t = datetime
-                    elif isinstance(col.type, PG_UUID):
-                        py_t = _py_uuid.UUID
-                    elif isinstance(col.type, PG_ARRAY):
-                        # Map ARRAY(inner) to List[inner_type]
-                        inner = getattr(col.type, 'item_type', None)
-                        if isinstance(inner, Integer):
-                            inner_t = int
-                        elif isinstance(inner, String):
-                            inner_t = str
-                        elif isinstance(inner, Boolean):
-                            inner_t = bool
-                        elif isinstance(inner, DateTime):
-                            inner_t = datetime
-                        elif isinstance(inner, PG_UUID):
-                            inner_t = _py_uuid.UUID
-                        else:
-                            inner_t = str
-                        py_t = List[inner_t]  # type: ignore[index]
-                    elif isinstance(col.type, PG_JSONB):
-                        # Expose JSON as string by default to avoid custom scalars; can be adjusted per field
-                        py_t = str
-                    else:
-                        py_t = str
-                    column_type_map[col.name] = py_t
+            column_type_map: Dict[str, Any] = self._build_column_type_map(getattr(bcls, 'model', None))
             for fname, fdef in bcls.__berry_fields__.items():
                 is_private = isinstance(fname, str) and fname.startswith('_')
                 if hasattr(st_cls, fname):
@@ -326,24 +404,7 @@ class BerrySchema:
                         # overlay relation-specific arguments
                         rel_args_spec = meta_copy.get('arguments')
                         if isinstance(rel_args_spec, dict):
-                            tmp: Dict[str, FilterSpec] = {}
-                            for key, raw in rel_args_spec.items():
-                                try:
-                                    if callable(raw):
-                                        spec = FilterSpec(builder=raw)
-                                    else:
-                                        spec = _normalize_filter_spec(raw)
-                                except Exception:
-                                    continue
-                                if spec.ops and not spec.op:
-                                    for op_name in spec.ops:
-                                        base = spec.alias or key
-                                        arg_name = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
-                                        tmp[arg_name] = spec.clone_with(op=op_name, ops=None)
-                                else:
-                                    tmp[spec.alias or key] = spec
-                            # overlay
-                            target_filters.update(tmp)
+                            target_filters.update(self._expand_filter_args(rel_args_spec))
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
@@ -864,36 +925,7 @@ class BerrySchema:
                         target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
                         col_type_map: Dict[str, Any] = {}
                         if target_b and target_b.model and hasattr(target_b.model, '__table__'):
-                            for col in target_b.model.__table__.columns:
-                                if isinstance(col.type, Integer):
-                                    col_type_map[col.name] = int
-                                elif isinstance(col.type, String):
-                                    col_type_map[col.name] = str
-                                elif isinstance(col.type, Boolean):
-                                    col_type_map[col.name] = bool
-                                elif isinstance(col.type, DateTime):
-                                    col_type_map[col.name] = datetime
-                                elif isinstance(col.type, PG_UUID):
-                                    col_type_map[col.name] = _py_uuid.UUID
-                                elif isinstance(col.type, PG_ARRAY):
-                                    inner = getattr(col.type, 'item_type', None)
-                                    if isinstance(inner, Integer):
-                                        inner_t = int
-                                    elif isinstance(inner, String):
-                                        inner_t = str
-                                    elif isinstance(inner, Boolean):
-                                        inner_t = bool
-                                    elif isinstance(inner, DateTime):
-                                        inner_t = datetime
-                                    elif isinstance(inner, PG_UUID):
-                                        inner_t = _py_uuid.UUID
-                                    else:
-                                        inner_t = str
-                                    col_type_map[col.name] = List[inner_t]  # type: ignore[index]
-                                elif isinstance(col.type, PG_JSONB):
-                                    col_type_map[col.name] = str
-                                else:
-                                    col_type_map[col.name] = str
+                            col_type_map = self._build_column_type_map(target_b.model)
                         for a, spec in target_filters.items():
                             base_t = str
                             if spec.column and spec.column in col_type_map:
@@ -1210,39 +1242,7 @@ class BerrySchema:
             rel_args_spec = (relation_defaults or {}).get('arguments') if relation_defaults else None
             declared_filters = _collect_declared_filters(btype_cls, rel_args_spec)
             # Precompute column -> python type mapping for argument type inference
-            col_py_types: Dict[str, Any] = {}
-            if model_cls is not None and hasattr(model_cls, '__table__'):
-                for col in model_cls.__table__.columns:
-                    if isinstance(col.type, Integer):
-                        py_t = int
-                    elif isinstance(col.type, String):
-                        py_t = str
-                    elif isinstance(col.type, Boolean):
-                        py_t = bool
-                    elif isinstance(col.type, DateTime):
-                        py_t = datetime
-                    elif isinstance(col.type, PG_UUID):
-                        py_t = _py_uuid.UUID
-                    elif isinstance(col.type, PG_ARRAY):
-                        inner = getattr(col.type, 'item_type', None)
-                        if isinstance(inner, Integer):
-                            inner_t = int
-                        elif isinstance(inner, String):
-                            inner_t = str
-                        elif isinstance(inner, Boolean):
-                            inner_t = bool
-                        elif isinstance(inner, DateTime):
-                            inner_t = datetime
-                        elif isinstance(inner, PG_UUID):
-                            inner_t = _py_uuid.UUID
-                        else:
-                            inner_t = str
-                        py_t = List[inner_t]  # type: ignore[index]
-                    elif isinstance(col.type, PG_JSONB):
-                        py_t = str
-                    else:
-                        py_t = str
-                    col_py_types[col.name] = py_t
+            col_py_types: Dict[str, Any] = self._build_column_type_map(model_cls)
 
             # Build argument annotations dynamically
             filter_arg_types: Dict[str, Any] = {}
@@ -1274,32 +1274,7 @@ class BerrySchema:
                     return adapter.json_array_coalesce(expr)
                 # Acquire per-context lock to avoid concurrent AsyncSession use (esp. MSSQL/pyodbc limitations)
                 # info.context may be a dict or an object; handle both safely.
-                try:
-                    ctx = getattr(info, 'context', None)
-                except Exception:
-                    ctx = None
-                lock = None
-                if isinstance(ctx, dict):
-                    lock = ctx.get('_berry_db_lock')
-                    if lock is None:
-                        lock = asyncio.Lock()
-                        try:
-                            ctx['_berry_db_lock'] = lock
-                        except Exception:
-                            pass
-                elif ctx is not None:
-                    try:
-                        lock = getattr(ctx, '_berry_db_lock')
-                    except Exception:
-                        lock = None
-                    if lock is None:
-                        lock = asyncio.Lock()
-                        try:
-                            setattr(ctx, '_berry_db_lock', lock)
-                        except Exception:
-                            pass
-                if lock is None:
-                    lock = asyncio.Lock()
+                lock = self._get_context_lock(info)
                 # Collect custom field expressions for pushdown
                 custom_fields: List[tuple[str, Any]] = []
                 custom_object_fields: List[tuple[str, List[str], Any]] = []  # (field, column_labels, returns_spec)
@@ -1493,12 +1468,7 @@ class BerrySchema:
                             allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
                             multi = rel_cfg.get('order_multi') or []
                             # Normalize possible AST nodes to strings
-                            nmulti: List[str] = []
-                            for spec in multi:
-                                try:
-                                    nmulti.append(str(getattr(spec, 'value', spec)))
-                                except Exception:
-                                    nmulti.append(str(spec))
+                            nmulti: List[str] = self._normalize_order_multi_values(multi)
                             for spec in nmulti:
                                 cn, _, dd = spec.partition(':')
                                 dd = (dd or _dir_value(rel_cfg.get('order_dir'))).lower()
@@ -1610,12 +1580,7 @@ class BerrySchema:
                                     ordered2 = False
                                     n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
                                     nmulti_raw = ncfg.get('order_multi') or []
-                                    nmulti: List[str] = []
-                                    for spec in nmulti_raw:
-                                        try:
-                                            nmulti.append(str(getattr(spec, 'value', spec)))
-                                        except Exception:
-                                            nmulti.append(str(spec))
+                                    nmulti: List[str] = self._normalize_order_multi_values(nmulti_raw)
                                     for spec in nmulti:
                                         cn, _, dd = spec.partition(':')
                                         dd = (dd or _dir_value(ncfg.get('order_dir'))).lower()
@@ -2242,7 +2207,7 @@ class BerrySchema:
                                     if rel_cfg_local.get('_has_explicit_order_by'):
                                         multi = []
                                     # If explicit order_multi provided, use it as-is; otherwise, keep whatever defaults are present
-                                    for spec in multi:
+                                    for spec in self._normalize_order_multi_values(multi):
                                         try:
                                             cn, _, dd = str(spec).partition(':')
                                             dd = dd or _dir_value(rel_cfg_local.get('order_dir'))
@@ -2423,12 +2388,7 @@ class BerrySchema:
                                         # If an explicit single order_by was provided by the query, ignore any multi (including defaults)
                                         if rel_cfg_local.get('_has_explicit_order_by'):
                                             multi_i_raw = []
-                                        multi_i: list[str] = []
-                                        for spec in multi_i_raw:
-                                            try:
-                                                multi_i.append(str(getattr(spec, 'value', spec)))
-                                            except Exception:
-                                                multi_i.append(str(spec))
+                                        multi_i: list[str] = self._normalize_order_multi_values(multi_i_raw)
                                         for spec in multi_i:
                                             cn, _, dd = spec.partition(':')
                                             dd = (dd or 'asc').lower()
