@@ -566,30 +566,12 @@ class BerrySchema:
                                 dwhere = meta_copy.get('where')
                                 if dwhere is not None:
                                     if isinstance(dwhere, (dict, str)):
-                                        try:
-                                            wdict = dwhere
-                                            if isinstance(dwhere, str):
-                                                wdict = _json.loads(dwhere)
-                                        except Exception:
-                                            wdict = None
-                                        exprs = []
-                                        for col_name, op_map in (wdict or {}).items():
-                                            col = child_model_cls.__table__.c.get(col_name)
-                                            if col is None:
-                                                continue
-                                            for op_name, val in (op_map or {}).items():
-                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                    val = [_coerce_where_value(col, v) for v in val]
-                                                else:
-                                                    val = _coerce_where_value(col, val)
-                                                op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                if not op_fn:
-                                                    raise ValueError(f"Unknown where operator: {op_name}")
-                                                exprs.append(op_fn(col, val))
-                                        if exprs:
-                                            from sqlalchemy import and_ as _and
-                                            stmt = stmt.where(_and(*exprs))
-                                    else:
+                                        wdict = _to_where_dict(dwhere, strict=False)
+                                        if wdict:
+                                            expr = _expr_from_where_dict(child_model_cls, wdict, strict=False)
+                                            if expr is not None:
+                                                stmt = stmt.where(expr)
+                                    elif callable(dwhere):
                                         expr = dwhere(child_model_cls, info)
                                         if expr is not None:
                                             stmt = stmt.where(expr)
@@ -1265,68 +1247,18 @@ class BerrySchema:
                                     rr = getattr(rr, 'value')
                                 except Exception:
                                     pass
-                            wdict = rr
-                            if isinstance(rr, str):
-                                try:
-                                    wdict = _json.loads(rr)
-                                except Exception as e:
-                                    raise ValueError(f"Invalid where JSON: {e}")
-                            from collections.abc import Mapping as _Mapping
-                            if wdict is not None and not isinstance(wdict, _Mapping):
-                                # Last-chance: try to parse via JSON from its string representation
-                                txt = wdict.decode() if isinstance(wdict, bytes) else str(wdict)
-                                s = txt.strip()
-                                # unwrap single/double quotes once
-                                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-                                    s = s[1:-1]
-                                try:
-                                    wdict = _json.loads(s)
-                                except Exception:
-                                    # try Python literal_eval (handles single-quoted dict repr)
-                                    try:
-                                        import ast as _ast
-                                        wdict = _ast.literal_eval(s)
-                                    except Exception:
-                                        raise ValueError("where must be a JSON object")
-                            exprs = []
-                            for col_name, op_map in (wdict or {}).items():
-                                col = child_model_cls_i.__table__.c.get(col_name)
-                                if col is None:
-                                    raise ValueError(f"Unknown where column: {col_name}")
-                                for op_name, val in (op_map or {}).items():
-                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                        val = [_coerce_where_value(col, v) for v in val]
-                                    else:
-                                        val = _coerce_where_value(col, val)
-                                    op_fn = OPERATOR_REGISTRY.get(op_name)
-                                    if not op_fn:
-                                        raise ValueError(f"Unknown where operator: {op_name}")
-                                    exprs.append(op_fn(col, val))
-                            if exprs:
-                                inner_sel_i = inner_sel_i.where(_and(*exprs))
+                            wdict = _to_where_dict(rr, strict=True)
+                            if wdict:
+                                expr = _expr_from_where_dict(child_model_cls_i, wdict, strict=True)
+                                if expr is not None:
+                                    inner_sel_i = inner_sel_i.where(expr)
                         dr = rel_cfg.get('default_where')
                         if dr is not None and isinstance(dr, (dict, str)):
-                            import json as _json
-                            try:
-                                wdict = dr if not isinstance(dr, str) else _json.loads(dr)
-                            except Exception:
-                                wdict = None
-                            exprs = []
-                            for col_name, op_map in (wdict or {}).items():
-                                col = child_model_cls_i.__table__.c.get(col_name)
-                                if col is None:
-                                    continue
-                                for op_name, val in (op_map or {}).items():
-                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                        val = [_coerce_where_value(col, v) for v in val]
-                                    else:
-                                        val = _coerce_where_value(col, val)
-                                    op_fn = OPERATOR_REGISTRY.get(op_name)
-                                    if not op_fn:
-                                        continue
-                                    exprs.append(op_fn(col, val))
-                            if exprs:
-                                inner_sel_i = inner_sel_i.where(_and(*exprs))
+                            wdict = _to_where_dict(dr, strict=False)
+                            if wdict:
+                                expr = _expr_from_where_dict(child_model_cls_i, wdict, strict=False)
+                                if expr is not None:
+                                    inner_sel_i = inner_sel_i.where(expr)
                         # Ordering for child (order_multi -> order_by -> id)
                         try:
                             ordered = False
@@ -1399,45 +1331,20 @@ class BerrySchema:
                                     .correlate(limited_subq_i)
                                 # Apply nested where/default_where
                                 try:
-                                    import json as _json
                                     rr2 = ncfg.get('where')
                                     if rr2 is not None:
-                                        wdict = rr2 if not isinstance(rr2, str) else _json.loads(rr2)
-                                        exprs = []
-                                        for col_name2, op_map2 in (wdict or {}).items():
-                                            col2 = grand_model.__table__.c.get(col_name2)
-                                            if col2 is None:
-                                                continue
-                                            for op_name2, val2 in (op_map2 or {}).items():
-                                                if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
-                                                    val2 = [_coerce_where_value(col2, v) for v in val2]
-                                                else:
-                                                    val2 = _coerce_where_value(col2, val2)
-                                                op_fn2 = OPERATOR_REGISTRY.get(op_name2)
-                                                if not op_fn2:
-                                                    continue
-                                                exprs.append(op_fn2(col2, val2))
-                                        if exprs:
-                                            n_sel = n_sel.where(_and(*exprs))
+                                        wdict2 = _to_where_dict(rr2, strict=True)
+                                        if wdict2:
+                                            expr2 = _expr_from_where_dict(grand_model, wdict2, strict=True)
+                                            if expr2 is not None:
+                                                n_sel = n_sel.where(expr2)
                                     dr2 = ncfg.get('default_where')
                                     if dr2 is not None and isinstance(dr2, (dict, str)):
-                                        wdict = dr2 if not isinstance(dr2, str) else _json.loads(dr2)
-                                        exprs = []
-                                        for col_name2, op_map2 in (wdict or {}).items():
-                                            col2 = grand_model.__table__.c.get(col_name2)
-                                            if col2 is None:
-                                                continue
-                                            for op_name2, val2 in (op_map2 or {}).items():
-                                                if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
-                                                    val2 = [_coerce_where_value(col2, v) for v in val2]
-                                                else:
-                                                    val2 = _coerce_where_value(col2, val2)
-                                                op_fn2 = OPERATOR_REGISTRY.get(op_name2)
-                                                if not op_fn2:
-                                                    continue
-                                                exprs.append(op_fn2(col2, val2))
-                                        if exprs:
-                                            n_sel = n_sel.where(_and(*exprs))
+                                        wdict2 = _to_where_dict(dr2, strict=False)
+                                        if wdict2:
+                                            expr2 = _expr_from_where_dict(grand_model, wdict2, strict=False)
+                                            if expr2 is not None:
+                                                n_sel = n_sel.where(expr2)
                                 except Exception:
                                     pass
                                 # Ordering for nested
@@ -1802,55 +1709,20 @@ class BerrySchema:
                                 )
                                 # Apply relation-level JSON where/default_where if provided
                                 try:
-                                    import json as _json
                                     r_where = rel_cfg.get('where')
                                     if r_where is not None:
-                                        wdict_rel = r_where
-                                        if isinstance(r_where, str):
-                                            try:
-                                                wdict_rel = _json.loads(r_where)
-                                            except Exception as e:
-                                                raise ValueError(f"Invalid where JSON: {e}")
-                                        if wdict_rel is not None and not isinstance(wdict_rel, dict):
-                                            raise ValueError("where must be a JSON object")
-                                        exprs = []
-                                        for col_name, op_map in (wdict_rel or {}).items():
-                                            col = child_model_cls.__table__.c.get(col_name)
-                                            if col is None:
-                                                raise ValueError(f"Unknown where column: {col_name}")
-                                            for op_name, val in (op_map or {}).items():
-                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                    val = [_coerce_where_value(col, v) for v in val]
-                                                else:
-                                                    val = _coerce_where_value(col, val)
-                                                op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                if not op_fn:
-                                                    raise ValueError(f"Unknown where operator: {op_name}")
-                                                exprs.append(op_fn(col, val))
-                                        if exprs:
-                                            rel_subq = rel_subq.where(_and(*exprs))
+                                        wdict_rel = _to_where_dict(r_where, strict=True)
+                                        if wdict_rel:
+                                            expr_rel = _expr_from_where_dict(child_model_cls, wdict_rel, strict=True)
+                                            if expr_rel is not None:
+                                                rel_subq = rel_subq.where(expr_rel)
                                     d_where = rel_cfg.get('default_where')
                                     if d_where is not None and isinstance(d_where, (dict, str)):
-                                        try:
-                                            dwdict_rel = d_where if not isinstance(d_where, str) else _json.loads(d_where)
-                                        except Exception:
-                                            dwdict_rel = None
-                                        exprs = []
-                                        for col_name, op_map in (dwdict_rel or {}).items():
-                                            col = child_model_cls.__table__.c.get(col_name)
-                                            if col is None:
-                                                continue
-                                            for op_name, val in (op_map or {}).items():
-                                                if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                    val = [_coerce_where_value(col, v) for v in val]
-                                                else:
-                                                    val = _coerce_where_value(col, val)
-                                                op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                if not op_fn:
-                                                    continue
-                                                exprs.append(op_fn(col, val))
-                                        if exprs:
-                                            rel_subq = rel_subq.where(_and(*exprs))
+                                        dwdict_rel = _to_where_dict(d_where, strict=False)
+                                        if dwdict_rel:
+                                            expr_rel = _expr_from_where_dict(child_model_cls, dwdict_rel, strict=False)
+                                            if expr_rel is not None:
+                                                rel_subq = rel_subq.where(expr_rel)
                                 except Exception:
                                     raise
                                 # Apply filter args if any
