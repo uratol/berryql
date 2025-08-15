@@ -142,8 +142,14 @@ async def test_users_posts_id_only_projection(db_session, sample_users):
             # Should not involve other tables like post_comments
             assert not _mentions_table(sql, "post_comments"), sql
 
-        # Ensure ordering by created_at desc is applied in the posts subquery
-        assert any("order by posts.created_at desc" in sql for sql in posts_selects), posts_selects
+        # Ensure ordering by created_at desc is applied in the posts subquery (support MSSQL quoting)
+        def _has_order_by_created_desc(s: str) -> bool:
+            return (
+                "order by posts.created_at desc" in s
+                or "order by [posts].[created_at] desc" in s
+                or 'order by "posts".created_at desc' in s
+            )
+        assert any(_has_order_by_created_desc(sql) for sql in posts_selects), posts_selects
 
         # Globally, ensure we never touch post_comments table in any captured SQL
         for sql in lowered_norm:
@@ -180,7 +186,14 @@ async def test_sql_level_where_and_order_defaults_and_args(db_session, sample_us
                 assert res1.errors is None, res1.errors
                 lowered_norm = [" ".join(s.lower().split()) for s in statements]
                 posts_selects = [s for s in lowered_norm if " from posts" in s or ' from "posts"' in s or ' from [posts]' in s]
-                assert any("order by posts.created_at desc" in s for s in posts_selects), posts_selects
+                # Support adapter-specific quoting styles
+                def _has_order_by_created_desc(s: str) -> bool:
+                    return (
+                        "order by posts.created_at desc" in s
+                        or "order by [posts].[created_at] desc" in s
+                        or 'order by "posts".created_at desc' in s
+                    )
+                assert any(_has_order_by_created_desc(s) for s in posts_selects), posts_selects
 
                 # 2) Explicit args: override ORDER BY to id asc and add WHERE range
                 statements.clear()
@@ -198,13 +211,21 @@ async def test_sql_level_where_and_order_defaults_and_args(db_session, sample_us
                 assert res2.errors is None, res2.errors
                 lowered_norm = [" ".join(s.lower().split()) for s in statements]
                 posts_selects = [s for s in lowered_norm if " from posts" in s or ' from "posts"' in s or ' from [posts]' in s]
-                # ORDER BY id asc present
-                assert any("order by posts.id asc" in s for s in posts_selects), posts_selects
-                # WHERE must include author_id correlation or parameterized predicate
-                assert any(" where " in s and "posts.author_id" in s for s in posts_selects), posts_selects
+                # ORDER BY id asc present (support MSSQL quoting)
+                def _has_order_by_id_asc(s: str) -> bool:
+                    return (
+                        "order by posts.id asc" in s
+                        or "order by [posts].[id] asc" in s
+                        or 'order by "posts".id asc' in s
+                    )
+                assert any(_has_order_by_id_asc(s) for s in posts_selects), posts_selects
+                # WHERE must include author_id correlation or parameterized predicate (support quoting)
+                def _mentions_col(s: str, table: str, col: str) -> bool:
+                    return (f"{table}.{col}" in s) or (f'"{table}".{col}' in s) or (f"[{table}].[{col}]" in s)
+                assert any(" where " in s and _mentions_col(s, "posts", "author_id") for s in posts_selects), posts_selects
                 # WHERE created_at gt and lt present (as two predicates)
-                assert any("posts.created_at" in s and " > " in s for s in posts_selects), posts_selects
-                assert any("posts.created_at" in s and " < " in s for s in posts_selects), posts_selects
+                assert any(_mentions_col(s, "posts", "created_at") and " > " in s for s in posts_selects), posts_selects
+                assert any(_mentions_col(s, "posts", "created_at") and " < " in s for s in posts_selects), posts_selects
 
                 # 3) Default WHERE via relation posts_recent on User
                 statements.clear()
@@ -216,8 +237,8 @@ async def test_sql_level_where_and_order_defaults_and_args(db_session, sample_us
                 lowered_norm = [" ".join(s.lower().split()) for s in statements]
                 posts_selects = [s for s in lowered_norm if " from posts" in s or ' from "posts"' in s or ' from [posts]' in s]
                 # Ensure default where is pushed into SQL (author_id predicate present)
-                assert any(" where " in s and "posts.author_id" in s for s in posts_selects), posts_selects
-                assert any("posts.created_at" in s and " > " in s for s in posts_selects), posts_selects
+                assert any(" where " in s and _mentions_col(s, "posts", "author_id") for s in posts_selects), posts_selects
+                assert any(_mentions_col(s, "posts", "created_at") and " > " in s for s in posts_selects), posts_selects
         finally:
                 try:
                         event.remove(engine, "before_cursor_execute", _capture)

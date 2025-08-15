@@ -2324,6 +2324,9 @@ class BerrySchema:
                                             cn = ncfg.get('order_by')
                                             dd = _dir_value(ncfg.get('order_dir'))
                                             n_order_parts.append(f"[{grand_model.__tablename__}].[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
+                                        # Add fallback ordering by id ASC when nothing specified
+                                        if not n_order_parts and 'id' in grand_model.__table__.columns:
+                                            n_order_parts.append(f"[{grand_model.__tablename__}].[id] ASC")
                                         n_order_clause = (" ORDER BY " + ', '.join(n_order_parts)) if n_order_parts else ''
                                         try:
                                             n_lim = adapter._as_int(ncfg.get('limit')) if hasattr(adapter, '_as_int') else int(ncfg.get('limit')) if ncfg.get('limit') is not None else None
@@ -3082,55 +3085,11 @@ class BerrySchema:
                                                                                             setattr(ni, nsf, nv.get(nsf))
                                                                                     setattr(ni, '_model', None)
                                                                                     nlist.append(ni)
-                                                                    # Apply Python-side filtering/pagination for nested if requested (ordering removed; rely on DB)
+                                                                    # Apply Python-side pagination for nested if requested (ordering and where handled in SQL)
                                                                     try:
                                                                         parent_rel_meta = requested_relations.get(rel_name, {})
                                                                         nested_meta_src = (parent_rel_meta.get('nested') or {}).get(nname, {})
-                                                                        # ordering intentionally not applied in Python
-                                                                        # where
-                                                                        def _apply_where_py(objs, where_dict):
-                                                                            if not isinstance(where_dict, dict):
-                                                                                return objs
-                                                                            def _match(o):
-                                                                                for col_name2, op_map2 in (where_dict or {}).items():
-                                                                                    v = getattr(o, col_name2, None)
-                                                                                    for op_name2, val2 in (op_map2 or {}).items():
-                                                                                        if op_name2 == 'eq' and not (v == val2):
-                                                                                            return False
-                                                                                        if op_name2 == 'ne' and not (v != val2):
-                                                                                            return False
-                                                                                        if op_name2 == 'lt' and not (v < val2):
-                                                                                            return False
-                                                                                        if op_name2 == 'lte' and not (v <= val2):
-                                                                                            return False
-                                                                                        if op_name2 == 'gt' and not (v > val2):
-                                                                                            return False
-                                                                                        if op_name2 == 'gte' and not (v >= val2):
-                                                                                            return False
-                                                                                        if op_name2 == 'like' or op_name2 == 'ilike':
-                                                                                            try:
-                                                                                                s = (v or '')
-                                                                                                pat = str(val2 or '')
-                                                                                                if op_name2 == 'ilike':
-                                                                                                    s = str(s).lower(); pat = pat.lower()
-                                                                                                # naive % handling: contains
-                                                                                                pat2 = pat.replace('%','')
-                                                                                                if pat2 not in s:
-                                                                                                    return False
-                                                                                            except Exception:
-                                                                                                return False
-                                                                                return True
-                                                                            return [o for o in objs if _match(o)]
-                                                                        nwhere = nested_meta_src.get('where')
-                                                                        try:
-                                                                            import json as _json
-                                                                            if isinstance(nwhere, str):
-                                                                                nwhere = _json.loads(nwhere)
-                                                                        except Exception:
-                                                                            pass
-                                                                        if nwhere:
-                                                                            nlist = _apply_where_py(nlist, nwhere)
-                                                                        # pagination
+                                                                        # pagination only
                                                                         noffset = nested_meta_src.get('offset')
                                                                         nlimit = nested_meta_src.get('limit')
                                                                         try:
@@ -3174,52 +3133,10 @@ class BerrySchema:
                                                     pass
                                                 except Exception:
                                                     pass
-                                                # Apply Python-side filtering/pagination for top-level relation if needed
+                                                # Apply Python-side pagination for top-level relation if needed (where handled in SQL)
                                                 try:
                                                     rel_cfg_meta = requested_relations.get(rel_name, {})
-                                                    # where
-                                                    rwhere = rel_cfg_meta.get('where')
-                                                    try:
-                                                        import json as _json
-                                                        if isinstance(rwhere, str):
-                                                            rwhere = _json.loads(rwhere)
-                                                    except Exception:
-                                                        pass
-                                                    def _apply_where_py_top(objs, where_dict):
-                                                        if not isinstance(where_dict, dict):
-                                                            return objs
-                                                        def _match(o):
-                                                            for col_name2, op_map2 in (where_dict or {}).items():
-                                                                v = getattr(o, col_name2, None)
-                                                                for op_name2, val2 in (op_map2 or {}).items():
-                                                                    if op_name2 == 'eq' and not (v == val2):
-                                                                        return False
-                                                                    if op_name2 == 'ne' and not (v != val2):
-                                                                        return False
-                                                                    if op_name2 == 'lt' and not (v < val2):
-                                                                        return False
-                                                                    if op_name2 == 'lte' and not (v <= val2):
-                                                                        return False
-                                                                    if op_name2 == 'gt' and not (v > val2):
-                                                                        return False
-                                                                    if op_name2 == 'gte' and not (v >= val2):
-                                                                        return False
-                                                                    if op_name2 == 'like' or op_name2 == 'ilike':
-                                                                        try:
-                                                                            s = (v or '')
-                                                                            pat = str(val2 or '')
-                                                                            if op_name2 == 'ilike':
-                                                                                s = str(s).lower(); pat = pat.lower()
-                                                                            pat2 = pat.replace('%','')
-                                                                            if pat2 not in s:
-                                                                                return False
-                                                                        except Exception:
-                                                                            return False
-                                                            return True
-                                                        return [o for o in objs if _match(o)]
-                                                    if rwhere:
-                                                        tmp_list = _apply_where_py_top(tmp_list, rwhere)
-                                                    # offset/limit
+                                                    # offset/limit only
                                                     roffset = rel_cfg_meta.get('offset')
                                                     rlimit = rel_cfg_meta.get('limit')
                                                     try:
