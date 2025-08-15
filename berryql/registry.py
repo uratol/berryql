@@ -46,6 +46,8 @@ from .core.utils import (
     coerce_literal as _coerce_literal,
     normalize_relation_cfg as _normalize_rel_cfg,
     expr_from_where_dict as _expr_from_where_dict,
+    to_where_dict as _to_where_dict,
+    normalize_order_multi_values as _norm_order_multi,
 )
 
 __all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
@@ -276,16 +278,7 @@ class BerrySchema:
 
     def _normalize_order_multi_values(self, multi: Any) -> List[str]:
         """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
-        norm: List[str] = []
-        try:
-            for spec in (multi or []):
-                try:
-                    norm.append(str(getattr(spec, 'value', spec)))
-                except Exception:
-                    norm.append(str(spec))
-        except Exception:
-            pass
-        return norm
+        return _norm_order_multi(multi)
 
     def _get_context_lock(self, info: 'StrawberryInfo') -> 'asyncio.Lock':
         """Return a per-request asyncio.Lock stored on info.context to serialize DB access when needed."""
@@ -452,58 +445,19 @@ class BerrySchema:
                                     stmt = _select(child_model_cls).where(getattr(child_model_cls, 'id') == candidate_fk_val)
                                     # Apply JSON where if provided (argument and schema default)
                                     if related_where is not None or meta_copy.get('where') is not None:
-                                        try:
-                                            import json as _json
-                                            # apply arg where
-                                            if related_where is not None:
-                                                wdict = related_where
-                                                if isinstance(related_where, str):
-                                                    try:
-                                                        wdict = _json.loads(related_where)
-                                                    except Exception as e:
-                                                        raise ValueError(f"Invalid where JSON: {e}")
-                                                exprs = []
-                                                for col_name, op_map in (wdict or {}).items():
-                                                    col = child_model_cls.__table__.c.get(col_name)
-                                                    if col is None:
-                                                        raise ValueError(f"Unknown where column: {col_name}")
-                                                    for op_name, val in (op_map or {}).items():
-                                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                            val = [_coerce_where_value(col, v) for v in val]
-                                                        else:
-                                                            val = _coerce_where_value(col, val)
-                                                        op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                        if not op_fn:
-                                                            raise ValueError(f"Unknown where operator: {op_name}")
-                                                        exprs.append(op_fn(col, val))
-                                                if exprs:
-                                                    from sqlalchemy import and_ as _and
-                                                    stmt = stmt.where(_and(*exprs))
-                                            # apply default where from schema
-                                            dwhere = meta_copy.get('where')
-                                            if dwhere is not None:
-                                                wdict = dwhere
-                                                if isinstance(dwhere, str):
-                                                    wdict = _json.loads(dwhere)
-                                                exprs = []
-                                                for col_name, op_map in (wdict or {}).items():
-                                                    col = child_model_cls.__table__.c.get(col_name)
-                                                    if col is None:
-                                                        continue
-                                                    for op_name, val in (op_map or {}).items():
-                                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                                            val = [_coerce_where_value(col, v) for v in val]
-                                                        else:
-                                                            val = _coerce_where_value(col, val)
-                                                        op_fn = OPERATOR_REGISTRY.get(op_name)
-                                                        if not op_fn:
-                                                            continue
-                                                        exprs.append(op_fn(col, val))
-                                                if exprs:
-                                                    from sqlalchemy import and_ as _and
-                                                    stmt = stmt.where(_and(*exprs))
-                                        except Exception:
-                                            pass
+                                        # Strict for user-provided; permissive for schema default
+                                        wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
+                                        if wdict_arg:
+                                            expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
+                                            if expr is not None:
+                                                stmt = stmt.where(expr)
+                                        dwhere = meta_copy.get('where')
+                                        if dwhere is not None:
+                                            wdict_def = _to_where_dict(dwhere, strict=False)
+                                            if wdict_def:
+                                                expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=False)
+                                                if expr is not None:
+                                                    stmt = stmt.where(expr)
                                     # Add filter where clauses
                                     for arg_name, val in _filter_args.items():
                                         if val is None:

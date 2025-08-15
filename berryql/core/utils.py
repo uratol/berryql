@@ -199,8 +199,14 @@ def normalize_relation_cfg(cfg: Dict[str, Any]) -> None:
     for n in list((cfg.get('nested') or {}).values()):
         normalize_relation_cfg(n)
 
-def expr_from_where_dict(model_cls, wdict: Dict[str, Any]):
-    """Build a SQLAlchemy conjunction from simple where dict: {col: {op: val}}."""
+def expr_from_where_dict(model_cls, wdict: Dict[str, Any], *, strict: bool = True):
+    """Build a SQLAlchemy conjunction from simple where dict: {col: {op: val}}.
+
+    Args:
+        model_cls: SQLAlchemy model class with __table__.
+        wdict: where dict.
+        strict: when False, unknown columns/operators are ignored instead of raising.
+    """
     from .utils import coerce_where_value  # local import to avoid cycles
     exprs: List[Any] = []
     for col_name, op_map in (wdict or {}).items():
@@ -209,11 +215,17 @@ def expr_from_where_dict(model_cls, wdict: Dict[str, Any]):
         except Exception:
             col = None
         if col is None:
-            raise ValueError(f"Unknown where column: {col_name}")
+            if strict:
+                raise ValueError(f"Unknown where column: {col_name}")
+            else:
+                continue
         for op_name, val in (op_map or {}).items():
             op_fn = OPERATOR_REGISTRY.get(op_name)
             if not op_fn:
-                raise ValueError(f"Unknown where operator: {op_name}")
+                if strict:
+                    raise ValueError(f"Unknown where operator: {op_name}")
+                else:
+                    continue
             # Coerce values to match column types
             if op_name in ('in', 'between') and isinstance(val, (list, tuple)):
                 val = [coerce_where_value(col, v) for v in val]
@@ -223,6 +235,49 @@ def expr_from_where_dict(model_cls, wdict: Dict[str, Any]):
     if not exprs:
         return None
     return _and(*exprs)
+
+def to_where_dict(val: Any, *, strict: bool = True) -> Optional[Dict[str, Any]]:
+    """Parse a where value into a dict.
+
+    - Accepts dict directly.
+    - Accepts JSON string and parses it.
+    - Returns None when input is None or empty.
+    - When strict=False, returns None on parse/type errors instead of raising.
+    """
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        try:
+            import json as _json
+            parsed = _json.loads(s)
+        except Exception as e:
+            if strict:
+                raise ValueError(f"Invalid where JSON: {e}")
+            return None
+        if not isinstance(parsed, dict):
+            if strict:
+                raise ValueError("where must be a JSON object")
+            return None
+        return parsed
+    if strict:
+        raise ValueError("where must be a JSON object or JSON string")
+    return None
+
+def normalize_order_multi_values(multi: Any) -> List[str]:
+    """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
+    norm: List[str] = []
+    try:
+        for spec in (multi or []):
+            try:
+                norm.append(str(getattr(spec, 'value', spec)))
+            except Exception:
+                norm.append(str(spec))
+    except Exception:
+        pass
+    return norm
 
 # --- Context helpers ---
 def get_db_session(info_or_ctx: Any) -> Any | None:
@@ -250,31 +305,34 @@ def get_db_session(info_or_ctx: Any) -> Any | None:
                 v = get(k, None)
             except (KeyError, AttributeError, TypeError):
                 v = None
-            except Exception as e:
-                # Unexpected errors shouldn't be hidden
-                raise
+            except Exception:
+                # Treat unexpected context get errors as missing; continue
+                v = None
             if v is not None:
                 return v
-    # Mapping access via __getitem__
+    # Mapping access via __getitem__ (guard non-subscriptable contexts)
     for k in candidates:
         try:
             v = ctx[k]  # type: ignore[index]
-        except KeyError:
+        except (KeyError, TypeError, AttributeError):
             v = None
         except Exception:
-            # Unexpected errors shouldn't be hidden
-            raise
+            # Treat unexpected context index errors as missing; continue
+            v = None
         if v is not None:
             return v
-    # Attribute access
+    # Attribute access (safe getattr with default)
     for k in candidates:
-        try:
-            v = getattr(ctx, k)
-        except AttributeError:
-            v = None
-        except Exception:
-            # Unexpected errors shouldn't be hidden
-            raise
+        v = getattr(ctx, k, None)
         if v is not None:
             return v
+    # FastAPI/Starlette-style: context has request.state.db_session
+    try:
+        req = getattr(ctx, 'request', None)
+        state = getattr(req, 'state', None) if req is not None else None
+        v = getattr(state, 'db_session', None) if state is not None else None
+        if v is not None:
+            return v
+    except Exception:
+        pass
     return None
