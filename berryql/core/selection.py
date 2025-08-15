@@ -49,7 +49,11 @@ class RelationSelectionExtractor:
             'order_by': def_ob, 'order_dir': def_od, 'order_multi': list(def_om) if isinstance(def_om, (list, tuple)) else ([def_om] if def_om else []),
             'where': None, 'default_where': fdef.meta.get('where') if fdef.meta.get('where') is not None else None,
             'single': single, 'target': target, 'nested': {}, 'skip_pushdown': False,
-            'filter_args': {}, 'arg_specs': fdef.meta.get('arguments') if fdef.meta.get('arguments') is not None else None
+            'filter_args': {}, 'arg_specs': fdef.meta.get('arguments') if fdef.meta.get('arguments') is not None else None,
+            # Flags to distinguish explicit args from defaults (used for precedence rules)
+            '_has_explicit_order_by': False,
+            '_has_explicit_order_dir': False,
+            '_has_explicit_order_multi': False,
         }
 
     def _children(self, sel: Any) -> list[Any]:
@@ -97,6 +101,12 @@ class RelationSelectionExtractor:
                     for arg_name, val in _args.items():
                         if arg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
                             rel_cfg[arg_name] = val
+                            if arg_name == 'order_by':
+                                rel_cfg['_has_explicit_order_by'] = True
+                            if arg_name == 'order_multi':
+                                rel_cfg['_has_explicit_order_multi'] = True
+                            if arg_name == 'order_dir':
+                                rel_cfg['_has_explicit_order_dir'] = True
                         else:
                             rel_cfg['filter_args'][arg_name] = val
                 else:
@@ -106,6 +116,12 @@ class RelationSelectionExtractor:
                         val = self._ast_value(raw_val, getattr(sel, 'info', None))
                         if arg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
                             rel_cfg[arg_name] = val
+                            if arg_name == 'order_by':
+                                rel_cfg['_has_explicit_order_by'] = True
+                            if arg_name == 'order_multi':
+                                rel_cfg['_has_explicit_order_multi'] = True
+                            if arg_name == 'order_dir':
+                                rel_cfg['_has_explicit_order_dir'] = True
                         else:
                             rel_cfg['filter_args'][arg_name] = val
             except Exception:
@@ -135,6 +151,12 @@ class RelationSelectionExtractor:
                                 for narg_name, nval in _nargs.items():
                                     if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
                                         ncfg[narg_name] = nval
+                                        if narg_name == 'order_by':
+                                            ncfg['_has_explicit_order_by'] = True
+                                        if narg_name == 'order_multi':
+                                            ncfg['_has_explicit_order_multi'] = True
+                                        if narg_name == 'order_dir':
+                                            ncfg['_has_explicit_order_dir'] = True
                                     else:
                                         ncfg['filter_args'][narg_name] = nval
                             else:
@@ -144,6 +166,12 @@ class RelationSelectionExtractor:
                                     nval = self._ast_value(nraw, getattr(sel, 'info', None))
                                     if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
                                         ncfg[narg_name] = nval
+                                        if narg_name == 'order_by':
+                                            ncfg['_has_explicit_order_by'] = True
+                                        if narg_name == 'order_multi':
+                                            ncfg['_has_explicit_order_multi'] = True
+                                        if narg_name == 'order_dir':
+                                            ncfg['_has_explicit_order_dir'] = True
                                     else:
                                         ncfg['filter_args'][narg_name] = nval
                         except Exception:
@@ -205,6 +233,13 @@ class RelationSelectionExtractor:
             for k in ('limit','offset','order_by','order_dir','order_multi','where'):
                 if k in args_dict and args_dict[k] is not None:
                     cfg_dst[k] = args_dict[k]
+            # Record explicitness flags for precedence rules
+            if 'order_by' in args_dict and args_dict.get('order_by') is not None:
+                cfg_dst['_has_explicit_order_by'] = True
+            if 'order_multi' in args_dict and args_dict.get('order_multi') is not None:
+                cfg_dst['_has_explicit_order_multi'] = True
+            if 'order_dir' in args_dict and args_dict.get('order_dir') is not None:
+                cfg_dst['_has_explicit_order_dir'] = True
         try:
             raw_info = getattr(info, '_raw_info', None)
             field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None

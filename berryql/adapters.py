@@ -202,7 +202,7 @@ class MSSQLAdapter(BaseAdapter):
             parts.append(f"[{table_alias}].[id] ASC")
         return ', '.join(parts) if parts else None
 
-    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None) -> str:
+    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None) -> str:
         n_cols = fields or []
         if not n_cols:
             for c in grand_model.__table__.columns:
@@ -224,11 +224,21 @@ class MSSQLAdapter(BaseAdapter):
             where_parts.extend(self.where_from_dict(grand_model, _as_dict(default_where)))
         n_where = ' AND '.join(where_parts)
         n_order = self._build_order_clause(grand_model, grand_model.__tablename__, order_by, order_dir, order_multi)
-        n_order_clause = f" ORDER BY {n_order}" if n_order else ''
-        n_top = f"TOP ({self._as_int(limit)}) " if limit is not None else ''
-        return f"SELECT {n_top}{n_col_select} FROM {grand_model.__tablename__} WHERE {n_where}{n_order_clause} FOR JSON PATH"
+        # Build pagination using ORDER BY ... OFFSET/FETCH to support offset reliably
+        pag_clause = ''
+        if limit is not None or offset is not None:
+            if not n_order:
+                # Fallback to id asc to satisfy OFFSET/FETCH requirement
+                n_order = self._build_order_clause(grand_model, grand_model.__tablename__, 'id', 'asc', None)
+            o = self._as_int(offset) or 0
+            pag_clause = f" ORDER BY {n_order} OFFSET {o} ROWS"
+            if limit is not None:
+                pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
+        elif n_order:
+            pag_clause = f" ORDER BY {n_order}"
+        return f"SELECT {n_col_select} FROM {grand_model.__tablename__} WHERE {n_where}{pag_clause} FOR JSON PATH"
 
-    def build_relation_list_json_full(self, *, parent_table: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
+    def build_relation_list_json_full(self, *, parent_table: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, offset: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
         """Assemble full MSSQL JSON aggregation for a to-many relation with optional nested arrays.
 
         nested: list of dicts, each with keys: alias, model, fk_col_name, fields, where, default_where, order_by, order_dir, order_multi, limit
@@ -274,13 +284,24 @@ class MSSQLAdapter(BaseAdapter):
                     order_dir=n.get('order_dir'),
                     order_multi=n.get('order_multi'),
                     limit=n.get('limit'),
+                    offset=n.get('offset'),
                 )
                 nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
             nested_cols = ', ' + ', '.join(nested_parts) if nested_parts else ''
-        top_clause = f"TOP ({self._as_int(limit)}) " if limit is not None else ''
-        order_sql = (f" ORDER BY {order_clause}" if order_clause else '')
+        # Pagination using ORDER BY ... OFFSET/FETCH to support offset reliably
+        pag_clause = ''
+        if limit is not None or offset is not None:
+            # Ensure we have an order clause
+            if not order_clause:
+                order_clause = self._build_order_clause(child_model, child_model.__tablename__, 'id', 'asc', None)
+            o = self._as_int(offset) or 0
+            pag_clause = f" ORDER BY {order_clause} OFFSET {o} ROWS"
+            if limit is not None:
+                pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
+        elif order_clause:
+            pag_clause = f" ORDER BY {order_clause}"
         raw = (
-            f"ISNULL((SELECT {top_clause}{select_cols}{nested_cols} FROM {child_model.__tablename__} WHERE {where_clause}{order_sql} FOR JSON PATH),'[]')"
+            f"ISNULL((SELECT {select_cols}{nested_cols} FROM {child_model.__tablename__} WHERE {where_clause}{pag_clause} FOR JSON PATH),'[]')"
         )
         return _text(raw)
     def build_single_relation_json(self, *, child_table: str, projected_columns: list[str], join_condition: str) -> Any:
@@ -300,7 +321,7 @@ class MSSQLAdapter(BaseAdapter):
         )
         return _text(raw)
 
-    def build_list_relation_json(self, *, child_table: str, projected_columns: list[str], where_condition: str, limit: int | None, order_by: str | None, nested_subqueries: list[tuple[str, str]] | None = None) -> Any:
+    def build_list_relation_json(self, *, child_table: str, projected_columns: list[str], where_condition: str, limit: int | None, offset: int | None, order_by: str | None, nested_subqueries: list[tuple[str, str]] | None = None) -> Any:
         """Build a FOR JSON PATH list aggregation for a to-many relation.
 
         nested_subqueries: list of (alias, subquery_sql producing JSON array string), each will be selected
@@ -313,10 +334,20 @@ class MSSQLAdapter(BaseAdapter):
             # Ensure each nested is wrapped in ISNULL(...) to always return '[]'
             nested_parts = [f"ISNULL(({sql}), '[]') AS [{alias}]" for alias, sql in nested_subqueries]
             nested_cols = (', ' + ', '.join(nested_parts)) if nested_parts else ''
-        top_clause = f"TOP ({self._as_int(limit)}) " if limit is not None else ''
-        order_clause = f" ORDER BY {order_by}" if order_by else ''
+        # Pagination using ORDER BY ... OFFSET/FETCH to support offset
+        pag_clause = ''
+        if limit is not None or offset is not None:
+            ob = order_by
+            if not ob:
+                ob = f"[{child_table}].[id] ASC"
+            o = self._as_int(offset) or 0
+            pag_clause = f" ORDER BY {ob} OFFSET {o} ROWS"
+            if limit is not None:
+                pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
+        elif order_by:
+            pag_clause = f" ORDER BY {order_by}"
         raw = (
-            f"ISNULL((SELECT {top_clause}{select_cols}{nested_cols} FROM {child_table} WHERE {where_condition}{order_clause} FOR JSON PATH),'[]')"
+            f"ISNULL((SELECT {select_cols}{nested_cols} FROM {child_table} WHERE {where_condition}{pag_clause} FOR JSON PATH),'[]')"
         )
         return _text(raw)
 

@@ -148,6 +148,7 @@ async def test_users_posts_id_only_projection(db_session, sample_users):
                 "order by posts.created_at desc" in s
                 or "order by [posts].[created_at] desc" in s
                 or 'order by "posts".created_at desc' in s
+                or "order by [posts].[created_at] desc for json path" in s
             )
         assert any(_has_order_by_created_desc(sql) for sql in posts_selects), posts_selects
 
@@ -217,6 +218,7 @@ async def test_sql_level_where_and_order_defaults_and_args(db_session, sample_us
                         "order by posts.id asc" in s
                         or "order by [posts].[id] asc" in s
                         or 'order by "posts".id asc' in s
+                        or "order by [posts].[id] asc offset" in s
                     )
                 assert any(_has_order_by_id_asc(s) for s in posts_selects), posts_selects
                 # WHERE must include author_id correlation or parameterized predicate (support quoting)

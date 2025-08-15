@@ -485,20 +485,8 @@ class BerrySchema:
                                 # Remove Python-level ordering: rely on DB ordering only
                                 # (Explicit or default ordering will be handled in SQL pushdown paths.)
                                 # Intentionally skip any Python-side sort of prefetched lists.
-                                pass
-                                # Apply pagination
-                                try:
-                                    o = int(offset) if offset is not None else None
-                                except Exception:
-                                    o = offset if offset is not None else None
-                                try:
-                                    l = int(limit) if limit is not None else None
-                                except Exception:
-                                    l = limit if limit is not None else None
-                                if isinstance(o, int) and o > 0:
-                                    lst = lst[o:]
-                                if isinstance(l, int):
-                                    lst = lst[:l]
+                                # Do not apply Python-level pagination; pagination must be applied in SQL.
+                                # The prefetched data already reflects any limit/offset set at query time.
                                 return lst
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
@@ -756,9 +744,11 @@ class BerrySchema:
                                 except Exception:
                                     col_obj = None
                                 if col_obj is not None:
-                                    descending = _dir_value(order_dir) == 'desc'
+                                    # If no order_dir provided, default to ASC when explicit order_by is present
+                                    descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
                                     try:
                                         stmt = stmt.order_by(col_obj.desc() if descending else col_obj.asc())
+                                        applied_any = True
                                     except Exception:
                                         raise
                             # Apply default ordering from schema meta if still no order applied
@@ -2248,6 +2238,10 @@ class BerrySchema:
                                         allowed_fields = []
                                     order_parts: list[str] = []
                                     multi = (rel_cfg_local.get('order_multi') or [])
+                                    # If explicit order_by provided by the query, it must override any multi ordering
+                                    if rel_cfg_local.get('_has_explicit_order_by'):
+                                        multi = []
+                                    # If explicit order_multi provided, use it as-is; otherwise, keep whatever defaults are present
                                     for spec in multi:
                                         try:
                                             cn, _, dd = str(spec).partition(':')
@@ -2258,7 +2252,11 @@ class BerrySchema:
                                             pass
                                     if not order_parts and rel_cfg_local.get('order_by') in allowed_fields:
                                         cn = rel_cfg_local.get('order_by')
-                                        dd = _dir_value(rel_cfg_local.get('order_dir'))
+                                        # If order_dir wasn't set explicitly in the query and only defaults exist, prefer ASC for explicit order_by
+                                        if rel_cfg_local.get('_has_explicit_order_by') and not rel_cfg_local.get('_has_explicit_order_dir'):
+                                            dd = 'asc'
+                                        else:
+                                            dd = _dir_value(rel_cfg_local.get('order_dir'))
                                         order_parts.append(f"[{child_table}].[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
                                     if not order_parts and 'id' in child_model_cls_i.__table__.columns:
                                         order_parts.append(f"[{child_table}].[id] ASC")
@@ -2328,14 +2326,22 @@ class BerrySchema:
                                         if not n_order_parts and 'id' in grand_model.__table__.columns:
                                             n_order_parts.append(f"[{grand_model.__tablename__}].[id] ASC")
                                         n_order_clause = (" ORDER BY " + ', '.join(n_order_parts)) if n_order_parts else ''
-                                        try:
-                                            n_lim = adapter._as_int(ncfg.get('limit')) if hasattr(adapter, '_as_int') else int(ncfg.get('limit')) if ncfg.get('limit') is not None else None
-                                        except Exception:
-                                            n_lim = None
-                                        n_top = f"TOP ({n_lim}) " if n_lim is not None else ''
-                                        # where/default_where (JSON): not applied in MSSQL nested builder to keep simple; future enhancement can mirror PG/SQLite
-                                        nested_sql = (
-                                            f"SELECT {n_top}{n_col_select} FROM {grand_model.__tablename__} WHERE {n_where}{n_order_clause} FOR JSON PATH"
+                                        # Build nested SQL with pagination via adapter
+                                        n_lim = ncfg.get('limit')
+                                        n_off = ncfg.get('offset')
+                                        nested_sql = adapter.build_nested_list_sql(
+                                            alias=nname,
+                                            grand_model=grand_model,
+                                            child_table=child_table,
+                                            g_fk_col_name=g_fk.name,
+                                            fields=n_cols,
+                                            where_dict=ncfg.get('where'),
+                                            default_where=ncfg.get('default_where'),
+                                            order_by=ncfg.get('order_by'),
+                                            order_dir=ncfg.get('order_dir'),
+                                            order_multi=ncfg.get('order_multi'),
+                                            limit=n_lim,
+                                            offset=n_off,
                                         )
                                         nested_subqueries.append((nname, nested_sql))
                                     return adapter.build_list_relation_json(
@@ -2343,6 +2349,7 @@ class BerrySchema:
                                         projected_columns=requested_scalar_i,
                                         where_condition=where_clause,
                                         limit=rel_cfg_local.get('limit'),
+                                        offset=rel_cfg_local.get('offset'),
                                         order_by=order_clause,
                                         nested_subqueries=nested_subqueries or None,
                                     )
@@ -2413,6 +2420,9 @@ class BerrySchema:
                                     # Normalize explicit order_multi from query args
                                     try:
                                         multi_i_raw = rel_cfg_local.get('order_multi') or []
+                                        # If an explicit single order_by was provided by the query, ignore any multi (including defaults)
+                                        if rel_cfg_local.get('_has_explicit_order_by'):
+                                            multi_i_raw = []
                                         multi_i: list[str] = []
                                         for spec in multi_i_raw:
                                             try:
@@ -2436,7 +2446,11 @@ class BerrySchema:
                                             if hasattr(ob, 'value'):
                                                 ob = getattr(ob, 'value')
                                             if ob and ob in allowed_order_fields_i:
-                                                dir_v = _dir_value(rel_cfg_local.get('order_dir'))
+                                                # If order_by was provided explicitly, and order_dir wasn't, default to ASC (ignore defaults)
+                                                if rel_cfg_local.get('_has_explicit_order_by') and not rel_cfg_local.get('_has_explicit_order_dir'):
+                                                    dir_v = 'asc'
+                                                else:
+                                                    dir_v = _dir_value(rel_cfg_local.get('order_dir'))
                                                 col = getattr(child_model_cls_i, ob, None)
                                                 if col is not None:
                                                     inner_sel_i = inner_sel_i.order_by(col.desc() if dir_v=='desc' else col.asc())
@@ -3085,29 +3099,7 @@ class BerrySchema:
                                                                                             setattr(ni, nsf, nv.get(nsf))
                                                                                     setattr(ni, '_model', None)
                                                                                     nlist.append(ni)
-                                                                    # Apply Python-side pagination for nested if requested (ordering and where handled in SQL)
-                                                                    try:
-                                                                        parent_rel_meta = requested_relations.get(rel_name, {})
-                                                                        nested_meta_src = (parent_rel_meta.get('nested') or {}).get(nname, {})
-                                                                        # pagination only
-                                                                        noffset = nested_meta_src.get('offset')
-                                                                        nlimit = nested_meta_src.get('limit')
-                                                                        try:
-                                                                            if noffset is not None:
-                                                                                noffset = int(noffset)
-                                                                        except Exception:
-                                                                            pass
-                                                                        try:
-                                                                            if nlimit is not None:
-                                                                                nlimit = int(nlimit)
-                                                                        except Exception:
-                                                                            pass
-                                                                        if isinstance(noffset, int) and noffset > 0:
-                                                                            nlist = nlist[noffset:]
-                                                                        if isinstance(nlimit, int):
-                                                                            nlist = nlist[:nlimit]
-                                                                    except Exception:
-                                                                        pass
+                                                                    # Pagination handled in SQL; no Python-side slicing
                                                                     setattr(child_inst, nname, nlist)
                                                                     setattr(child_inst, f"_{nname}_prefetched", nlist)
                                                                     # record nested pushdown meta
@@ -3133,28 +3125,7 @@ class BerrySchema:
                                                     pass
                                                 except Exception:
                                                     pass
-                                                # Apply Python-side pagination for top-level relation if needed (where handled in SQL)
-                                                try:
-                                                    rel_cfg_meta = requested_relations.get(rel_name, {})
-                                                    # offset/limit only
-                                                    roffset = rel_cfg_meta.get('offset')
-                                                    rlimit = rel_cfg_meta.get('limit')
-                                                    try:
-                                                        if roffset is not None:
-                                                            roffset = int(roffset)
-                                                    except Exception:
-                                                        pass
-                                                    try:
-                                                        if rlimit is not None:
-                                                            rlimit = int(rlimit)
-                                                    except Exception:
-                                                        pass
-                                                    if isinstance(roffset, int) and roffset > 0:
-                                                        tmp_list = tmp_list[roffset:]
-                                                    if isinstance(rlimit, int):
-                                                        tmp_list = tmp_list[:rlimit]
-                                                except Exception:
-                                                    pass
+                                                # Pagination handled in SQL; no Python-side slicing
                                                 built_value = tmp_list
                                         else:
                                             built_value = parsed_value
