@@ -64,6 +64,32 @@ class RelationSelectionExtractor:
         try:
             if node is None:
                 return None
+            # Resolve GraphQL variable references to concrete values using info.variable_values
+            try:
+                kind = getattr(node, 'kind', None)
+                is_var = bool(kind and 'Variable' in str(kind))
+            except Exception:
+                is_var = False
+            if is_var:
+                try:
+                    name_node = getattr(node, 'name', None)
+                    var_name = getattr(name_node, 'value', None) if name_node is not None else None
+                except Exception:
+                    var_name = None
+                if var_name:
+                    var_vals = None
+                    try:
+                        var_vals = getattr(info, 'variable_values', None)
+                    except Exception:
+                        var_vals = None
+                    if not isinstance(var_vals, dict):
+                        try:
+                            raw = getattr(info, '_raw_info', None)
+                            var_vals = getattr(raw, 'variable_values', None) if raw is not None else None
+                        except Exception:
+                            var_vals = None
+                    if isinstance(var_vals, dict) and var_name in var_vals:
+                        return var_vals[var_name]
             vals = getattr(node, 'values', None)
             if vals is not None:
                 return [self._ast_value(v, info) for v in vals]
@@ -99,8 +125,13 @@ class RelationSelectionExtractor:
                 _args = getattr(child, 'arguments', None)
                 if isinstance(_args, dict):
                     for arg_name, val in _args.items():
+                        # Resolve variables/AST even if arguments come as a dict
+                        try:
+                            v_coerced = self._ast_value(val, getattr(self, '_info', None))
+                        except Exception:
+                            v_coerced = val
                         if arg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                            rel_cfg[arg_name] = val
+                            rel_cfg[arg_name] = v_coerced
                             if arg_name == 'order_by':
                                 rel_cfg['_has_explicit_order_by'] = True
                             if arg_name == 'order_multi':
@@ -108,12 +139,12 @@ class RelationSelectionExtractor:
                             if arg_name == 'order_dir':
                                 rel_cfg['_has_explicit_order_dir'] = True
                         else:
-                            rel_cfg['filter_args'][arg_name] = val
+                            rel_cfg['filter_args'][arg_name] = v_coerced
                 else:
                     for arg in (_args or []):
                         arg_name = getattr(getattr(arg, 'name', None), 'value', None) or getattr(arg, 'name', None)
                         raw_val = getattr(arg, 'value', None)
-                        val = self._ast_value(raw_val, getattr(sel, 'info', None))
+                        val = self._ast_value(raw_val, getattr(self, '_info', None))
                         if arg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
                             rel_cfg[arg_name] = val
                             if arg_name == 'order_by':
@@ -149,8 +180,13 @@ class RelationSelectionExtractor:
                             _nargs = getattr(sub, 'arguments', None)
                             if isinstance(_nargs, dict):
                                 for narg_name, nval in _nargs.items():
+                                    # Resolve variables for nested args too
+                                    try:
+                                        nv_coerced = self._ast_value(nval, getattr(self, '_info', None))
+                                    except Exception:
+                                        nv_coerced = nval
                                     if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                                        ncfg[narg_name] = nval
+                                        ncfg[narg_name] = nv_coerced
                                         if narg_name == 'order_by':
                                             ncfg['_has_explicit_order_by'] = True
                                         if narg_name == 'order_multi':
@@ -158,12 +194,12 @@ class RelationSelectionExtractor:
                                         if narg_name == 'order_dir':
                                             ncfg['_has_explicit_order_dir'] = True
                                     else:
-                                        ncfg['filter_args'][narg_name] = nval
+                                        ncfg['filter_args'][narg_name] = nv_coerced
                             else:
                                 for narg in (_nargs or []):
                                     narg_name = getattr(getattr(narg, 'name', None), 'value', None) or getattr(narg, 'name', None)
                                     nraw = getattr(narg, 'value', None)
-                                    nval = self._ast_value(nraw, getattr(sel, 'info', None))
+                                    nval = self._ast_value(nraw, getattr(self, '_info', None))
                                     if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
                                         ncfg[narg_name] = nval
                                         if narg_name == 'order_by':
@@ -201,6 +237,11 @@ class RelationSelectionExtractor:
 
     def extract(self, info: Any, root_field_name: str, btype: Any) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
+        # Stash info for use during selected_fields traversal
+        try:
+            setattr(self, '_info', info)
+        except Exception:
+            pass
         try:
             fields = getattr(info, 'selected_fields', None)
             for f in (fields or []):

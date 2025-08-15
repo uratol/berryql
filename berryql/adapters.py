@@ -202,7 +202,7 @@ class MSSQLAdapter(BaseAdapter):
             parts.append(f"[{table_alias}].[id] ASC")
         return ', '.join(parts) if parts else None
 
-    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None) -> str:
+    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None) -> str:
         n_cols = fields or []
         if not n_cols:
             for c in grand_model.__table__.columns:
@@ -222,6 +222,8 @@ class MSSQLAdapter(BaseAdapter):
             where_parts.extend(self.where_from_dict(grand_model, _as_dict(where_dict)))
         if default_where:
             where_parts.extend(self.where_from_dict(grand_model, _as_dict(default_where)))
+        if extra_where_sql:
+            where_parts.extend([str(x) for x in extra_where_sql if x])
         n_where = ' AND '.join(where_parts)
         n_order = self._build_order_clause(grand_model, grand_model.__tablename__, order_by, order_dir, order_multi)
         # Build pagination using ORDER BY ... OFFSET/FETCH to support offset reliably
@@ -285,6 +287,7 @@ class MSSQLAdapter(BaseAdapter):
                     order_multi=n.get('order_multi'),
                     limit=n.get('limit'),
                     offset=n.get('offset'),
+                    extra_where_sql=None,
                 )
                 nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
             nested_cols = ', ' + ', '.join(nested_parts) if nested_parts else ''

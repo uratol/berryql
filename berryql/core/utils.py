@@ -122,7 +122,45 @@ def normalize_relation_cfg(cfg: Dict[str, Any]) -> None:
         return
     for key in ('limit', 'offset', 'order_by', 'order_dir', 'where', 'default_where'):
         if key in cfg:
-            cfg[key] = coerce_literal(cfg.get(key))
+            val = coerce_literal(cfg.get(key))
+            # Best-effort: if 'where' or 'default_where' is a JSON string, parse into dict
+            if key in ('where', 'default_where'):
+                # unwrap single-item containers
+                try:
+                    if isinstance(val, (list, tuple)) and len(val) == 1:
+                        val = val[0]
+                except Exception:
+                    pass
+                # decode bytes
+                if isinstance(val, (bytes, bytearray)):
+                    try:
+                        val = val.decode('utf-8')
+                    except Exception:
+                        val = str(val)
+                if isinstance(val, str):
+                    s = val.strip()
+                    if (s.startswith('{') and s.endswith('}')) or (s.startswith('"{') and s.endswith('}"')):
+                        import json as _json
+                        import ast as _ast
+                        try:
+                            parsed = _json.loads(s)
+                            # Unwrap if still a JSON string up to two times
+                            unwrap = 0
+                            while isinstance(parsed, str) and unwrap < 2:
+                                try:
+                                    parsed = _json.loads(parsed)
+                                except Exception:
+                                    break
+                                unwrap += 1
+                            val = parsed
+                        except Exception:
+                            # Try Python literal_eval as last resort (e.g., single-quoted dicts)
+                            try:
+                                val = _ast.literal_eval(s)
+                            except Exception:
+                                # keep original to let builders raise a consistent error later
+                                pass
+            cfg[key] = val
     # order_multi
     if 'order_multi' in cfg and cfg.get('order_multi') is not None:
         try:
