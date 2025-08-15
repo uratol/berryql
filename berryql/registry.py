@@ -10,6 +10,8 @@ from .adapters import get_adapter  # adapter abstraction
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
+import uuid as _py_uuid
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -252,6 +254,27 @@ class BerrySchema:
                         py_t = bool
                     elif isinstance(col.type, DateTime):
                         py_t = datetime
+                    elif isinstance(col.type, PG_UUID):
+                        py_t = _py_uuid.UUID
+                    elif isinstance(col.type, PG_ARRAY):
+                        # Map ARRAY(inner) to List[inner_type]
+                        inner = getattr(col.type, 'item_type', None)
+                        if isinstance(inner, Integer):
+                            inner_t = int
+                        elif isinstance(inner, String):
+                            inner_t = str
+                        elif isinstance(inner, Boolean):
+                            inner_t = bool
+                        elif isinstance(inner, DateTime):
+                            inner_t = datetime
+                        elif isinstance(inner, PG_UUID):
+                            inner_t = _py_uuid.UUID
+                        else:
+                            inner_t = str
+                        py_t = List[inner_t]  # type: ignore[index]
+                    elif isinstance(col.type, PG_JSONB):
+                        # Expose JSON as string by default to avoid custom scalars; can be adjusted per field
+                        py_t = str
                     else:
                         py_t = str
                     column_type_map[col.name] = py_t
@@ -871,6 +894,25 @@ class BerrySchema:
                                     col_type_map[col.name] = bool
                                 elif isinstance(col.type, DateTime):
                                     col_type_map[col.name] = datetime
+                                elif isinstance(col.type, PG_UUID):
+                                    col_type_map[col.name] = _py_uuid.UUID
+                                elif isinstance(col.type, PG_ARRAY):
+                                    inner = getattr(col.type, 'item_type', None)
+                                    if isinstance(inner, Integer):
+                                        inner_t = int
+                                    elif isinstance(inner, String):
+                                        inner_t = str
+                                    elif isinstance(inner, Boolean):
+                                        inner_t = bool
+                                    elif isinstance(inner, DateTime):
+                                        inner_t = datetime
+                                    elif isinstance(inner, PG_UUID):
+                                        inner_t = _py_uuid.UUID
+                                    else:
+                                        inner_t = str
+                                    col_type_map[col.name] = List[inner_t]  # type: ignore[index]
+                                elif isinstance(col.type, PG_JSONB):
+                                    col_type_map[col.name] = str
                                 else:
                                     col_type_map[col.name] = str
                         for a, spec in target_filters.items():
@@ -1200,6 +1242,25 @@ class BerrySchema:
                         py_t = bool
                     elif isinstance(col.type, DateTime):
                         py_t = datetime
+                    elif isinstance(col.type, PG_UUID):
+                        py_t = _py_uuid.UUID
+                    elif isinstance(col.type, PG_ARRAY):
+                        inner = getattr(col.type, 'item_type', None)
+                        if isinstance(inner, Integer):
+                            inner_t = int
+                        elif isinstance(inner, String):
+                            inner_t = str
+                        elif isinstance(inner, Boolean):
+                            inner_t = bool
+                        elif isinstance(inner, DateTime):
+                            inner_t = datetime
+                        elif isinstance(inner, PG_UUID):
+                            inner_t = _py_uuid.UUID
+                        else:
+                            inner_t = str
+                        py_t = List[inner_t]  # type: ignore[index]
+                    elif isinstance(col.type, PG_JSONB):
+                        py_t = str
                     else:
                         py_t = str
                     col_py_types[col.name] = py_t
@@ -1275,9 +1336,8 @@ class BerrySchema:
                 # Using shared helpers from core.utils
                 for rel_cfg in list(requested_relations.values()):
                     _normalize_rel_cfg(rel_cfg)
-                # Use no-arg RootSelectionExtractor to maintain broad compatibility
-                # Ensure we don't pass registry into RootSelectionExtractor constructor
-                root_selected = RootSelectionExtractor().extract(info, root_field_name, btype_cls)
+                # Use RootSelectionExtractor with registry for naming conversion (camelCase support)
+                root_selected = RootSelectionExtractor(self).extract(info, root_field_name, btype_cls)
                 requested_scalar_root: set[str] = set(root_selected.get('scalars', set()))
                 requested_custom_root: set[str] = set(root_selected.get('custom', set()))
                 requested_custom_obj_root: set[str] = set(root_selected.get('custom_object', set()))
@@ -2510,6 +2570,12 @@ class BerrySchema:
                 try:
                     base_root_cols: list[Any] = []
                     effective_root_cols: set[str] = set(requested_scalar_root or set())
+                    # Always include primary id when available to ensure hydration works in nested/domain contexts
+                    try:
+                        if hasattr(model_cls, 'id') and 'id' not in effective_root_cols:
+                            effective_root_cols.add('id')
+                    except Exception:
+                        pass
                     # Include id when any relation is requested (needed for correlation)
                     if requested_relations:
                         effective_root_cols.add('id')

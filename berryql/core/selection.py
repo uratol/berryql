@@ -284,8 +284,19 @@ class RelationSelectionExtractor:
 
 class RootSelectionExtractor:
     def __init__(self, registry: Any | None = None):
-        # Currently unused but kept for parity/signature consistency
+        # Keep reference to registry for naming conversion (camelCase <-> snake_case)
         self.registry = registry or getattr(self, 'registry', None)
+
+    def _to_camel(self, name: str) -> str:
+        # Convert snake_case to lowerCamelCase
+        if not name:
+            return name
+        parts = name.split('_')
+        if not parts:
+            return name
+        head = parts[0]
+        tail = ''.join(p.capitalize() for p in parts[1:])
+        return head + tail
     def _children(self, node: Any) -> list[Any]:
         selset = getattr(node, 'selection_set', None)
         if selset is not None and getattr(selset, 'selections', None) is not None:
@@ -338,6 +349,22 @@ class RootSelectionExtractor:
         out = {'scalars': set(), 'relations': set(), 'custom': set(), 'custom_object': set(), 'aggregate': set()}
         if info is None:
             return out
+        # Build candidate root field names to handle auto camelCase
+        candidates = {root_field_name}
+        try:
+            # Prefer explicit name converter if available
+            name_conv = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
+            if callable(name_conv):
+                try:
+                    candidates.add(name_conv(root_field_name))
+                except Exception:
+                    pass
+            # Fallback to naive snake->camel when auto_camel_case is enabled
+            if getattr(self.registry, '_auto_camel_case', False):
+                candidates.add(self._to_camel(root_field_name))
+        except Exception:
+            # best-effort; keep original only
+            pass
         try:
             fields = getattr(info, 'selected_fields', None)
             frags = None
@@ -346,7 +373,7 @@ class RootSelectionExtractor:
             except Exception:
                 frags = None
             for f in (fields or []):
-                if getattr(f, 'name', None) == root_field_name:
+                if getattr(f, 'name', None) in candidates:
                     fake = type('Sel', (), {})()
                     setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
                     self._walk(fake, out, btype, frags)
@@ -374,7 +401,7 @@ class RootSelectionExtractor:
                 raw_info = getattr(info, '_raw_info', None)
                 field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None
                 if field_nodes:
-                    root_nodes = [n for n in field_nodes if _name_ast(n) == root_field_name]
+                    root_nodes = [n for n in field_nodes if _name_ast(n) in candidates]
                     if root_nodes:
                         root_node = root_nodes[0]
                         for child in _children_ast(root_node):
