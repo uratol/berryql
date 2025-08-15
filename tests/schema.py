@@ -52,7 +52,7 @@ class PostQL(BerryType):
         'created_at_between': lambda M, info, v: (M.created_at.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None),
         'is_admin_eq': lambda M, info, v: M.is_admin == (bool(v) if isinstance(v, str) else v),
     })
-    post_comments = relation('PostCommentQL', order_by='id')
+    post_comments = relation('PostCommentQL', order_by='created_at', order_dir='desc')
     post_comments_agg = count('post_comments')
     # Demonstration custom field: total length of all comment contents for the post
     def _comment_text_len_builder(model_cls):

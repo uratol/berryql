@@ -107,19 +107,19 @@ async def test_invalid_order_field_ignored(db_session, populated_db):
 @pytest.mark.asyncio
 async def test_nested_relation_prefetched_respects_default_and_explicit_order(db_session, populated_db):
         # Fetch posts with nested post_comments; resolver may prefetch comments, and ordering must still apply.
-        # 1) Default meta ordering on relation (id asc)
+        # 1) Default meta ordering on relation (created_at desc)
         q1 = """
         query {
             posts(limit: 1) {
                 id
-                post_comments { id }
+                post_comments { id created_at }
             }
         }
         """
         res1 = await berry_schema.execute(q1, context_value={'db_session': db_session})
         assert res1.errors is None, res1.errors
-        ids_default = [c['id'] for c in res1.data['posts'][0]['post_comments']]
-        assert ids_default == sorted(ids_default)
+        created_default = [c['created_at'] for c in res1.data['posts'][0]['post_comments']]
+        assert created_default == sorted(created_default, reverse=True)
         # 2) Explicit override should take precedence over default meta
         q2 = """
         query {
