@@ -115,6 +115,8 @@ class UserQL(BerryType):
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    # Test-only: default JSON where to verify SQL-level default WHERE pushdown
+    posts_recent = relation('PostQL', where='{"created_at": {"gt": "1900-01-01T00:00:00"}}')
     post_comments = relation('PostCommentQL')
     post_agg = count('posts')
     # Object form of post aggregation (mirrors legacy PostAggType { count })

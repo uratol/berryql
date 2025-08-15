@@ -153,3 +153,73 @@ async def test_users_posts_id_only_projection(db_session, sample_users):
             event.remove(engine, "before_cursor_execute", _capture)
         except Exception:
             pass
+
+
+@pytest.mark.asyncio
+async def test_sql_level_where_and_order_defaults_and_args(db_session, sample_users):
+        # Capture executed SELECT statements
+        engine = db_session.get_bind()
+        statements: list[str] = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+                try:
+                        if str(statement).lstrip().upper().startswith("SELECT"):
+                                statements.append(str(statement))
+                except Exception:
+                        pass
+
+        from tests.schema import schema as berry_schema
+
+        event.listen(engine, "before_cursor_execute", _capture)
+        try:
+                # 1) Defaults: User.posts has default ORDER BY created_at desc
+                q1 = """
+                query { users { posts { id } } }
+                """
+                res1 = await berry_schema.execute(q1, context_value={"db_session": db_session})
+                assert res1.errors is None, res1.errors
+                lowered_norm = [" ".join(s.lower().split()) for s in statements]
+                posts_selects = [s for s in lowered_norm if " from posts" in s or ' from "posts"' in s or ' from [posts]' in s]
+                assert any("order by posts.created_at desc" in s for s in posts_selects), posts_selects
+
+                # 2) Explicit args: override ORDER BY to id asc and add WHERE range
+                statements.clear()
+                q2 = """
+                query {
+                    users(name_ilike: "Alice") {
+                        id
+                        posts(order_by: "id", order_dir: asc, where: "{\\"created_at\\": {\\"gt\\": \\\"1900-01-01T00:00:00\\\", \\\"lt\\": \\\"2100-01-01T00:00:00\\\"}}") {
+                            id
+                        }
+                    }
+                }
+                """
+                res2 = await berry_schema.execute(q2, context_value={"db_session": db_session})
+                assert res2.errors is None, res2.errors
+                lowered_norm = [" ".join(s.lower().split()) for s in statements]
+                posts_selects = [s for s in lowered_norm if " from posts" in s or ' from "posts"' in s or ' from [posts]' in s]
+                # ORDER BY id asc present
+                assert any("order by posts.id asc" in s for s in posts_selects), posts_selects
+                # WHERE must include author_id correlation or parameterized predicate
+                assert any(" where " in s and "posts.author_id" in s for s in posts_selects), posts_selects
+                # WHERE created_at gt and lt present (as two predicates)
+                assert any("posts.created_at" in s and " > " in s for s in posts_selects), posts_selects
+                assert any("posts.created_at" in s and " < " in s for s in posts_selects), posts_selects
+
+                # 3) Default WHERE via relation posts_recent on User
+                statements.clear()
+                q3 = """
+                query { users { posts_recent { id } } }
+                """
+                res3 = await berry_schema.execute(q3, context_value={"db_session": db_session})
+                assert res3.errors is None, res3.errors
+                lowered_norm = [" ".join(s.lower().split()) for s in statements]
+                posts_selects = [s for s in lowered_norm if " from posts" in s or ' from "posts"' in s or ' from [posts]' in s]
+                # Ensure default where is pushed into SQL (author_id predicate present)
+                assert any(" where " in s and "posts.author_id" in s for s in posts_selects), posts_selects
+                assert any("posts.created_at" in s and " > " in s for s in posts_selects), posts_selects
+        finally:
+                try:
+                        event.remove(engine, "before_cursor_execute", _capture)
+                except Exception:
+                        pass
