@@ -482,59 +482,10 @@ class BerrySchema:
                                     lst = [o for o in lst if _match_where_obj(o, where_dict)]
                                 # Apply filter args (column-based only)
                                 lst = _apply_filter_args_list(lst)
-                                # Apply ordering
-                                try:
-                                    # Determine allowed order fields from target to validate explicit args
-                                    allowed_order = None
-                                    try:
-                                        target_name_i = meta_copy.get('target')
-                                        if target_name_i:
-                                            target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
-                                            if target_cls_i is not None:
-                                                allowed_order = getattr(target_cls_i, '__ordering__', None)
-                                                if allowed_order is None:
-                                                    # derive from scalar fields of the Berry type
-                                                    t_b = self.__berry_registry__.types.get(target_name_i)
-                                                    if t_b is not None:
-                                                        allowed_order = [sf for sf, sd in t_b.__berry_fields__.items() if sd.kind == 'scalar']
-                                    except Exception:
-                                        allowed_order = None
-                                    specs = []
-                                    for spec in (order_multi or []) or []:
-                                        cn, _, dd = str(spec).partition(':')
-                                        dd = (dd or _dir_value(order_dir)).lower()
-                                        # Only apply explicit multi-order if column is allowed (mirror DB path)
-                                        if not allowed_order or cn in allowed_order:
-                                            specs.append((cn, dd))
-                                    if specs:
-                                        for cn, dd in reversed(specs):
-                                            lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
-                                    else:
-                                        if order_by:
-                                            # Validate single order_by explicitly against allowed list, if known
-                                            if allowed_order is not None and order_by not in allowed_order:
-                                                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
-                                            dd = _dir_value(order_dir)
-                                            lst.sort(key=lambda o: getattr(o, order_by, None), reverse=(dd=='desc'))
-                                        else:
-                                            # No explicit order args; honor schema defaults from relation meta
-                                            def_dir = _dir_value(meta_copy.get('order_dir'))
-                                            meta_multi = meta_copy.get('order_multi') or []
-                                            if meta_multi:
-                                                defaults = []
-                                                for ms in meta_multi:
-                                                    cn, _, dd = str(ms).partition(':')
-                                                    dd = (dd or def_dir).lower()
-                                                    defaults.append((cn, dd))
-                                                for cn, dd in reversed(defaults):
-                                                    lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
-                                            else:
-                                                cn = meta_copy.get('order_by')
-                                                if cn:
-                                                    dd = def_dir
-                                                    lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
-                                except Exception:
-                                    pass
+                                # Remove Python-level ordering: rely on DB ordering only
+                                # (Explicit or default ordering will be handled in SQL pushdown paths.)
+                                # Intentionally skip any Python-side sort of prefetched lists.
+                                pass
                                 # Apply pagination
                                 try:
                                     o = int(offset) if offset is not None else None
@@ -2450,16 +2401,15 @@ class BerrySchema:
                                 except Exception:
                                     pass
                                 try:
-                                    # Apply ordering (multi -> single). Normalize AST artifacts to strings.
+                                    # Apply ordering (multi -> single), honoring schema defaults when no explicit args.
                                     ordered_i = False
                                     try:
                                         allowed_order_fields_i = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
                                     except Exception:
                                         allowed_order_fields_i = []
-                                    # 1) order_multi
+                                    # Normalize explicit order_multi from query args
                                     try:
                                         multi_i_raw = rel_cfg_local.get('order_multi') or []
-                                        # Normalize to list[str]
                                         multi_i: list[str] = []
                                         for spec in multi_i_raw:
                                             try:
@@ -2476,7 +2426,7 @@ class BerrySchema:
                                                     ordered_i = True
                                     except Exception:
                                         pass
-                                    # 2) order_by/order_dir (only if no multi applied)
+                                    # Single explicit order
                                     if not ordered_i:
                                         try:
                                             ob = rel_cfg_local.get('order_by')
@@ -2490,7 +2440,45 @@ class BerrySchema:
                                                     ordered_i = True
                                         except Exception:
                                             pass
-                                    # 3) fallback: id asc if exists
+                                    # If no explicit args, apply schema default relation meta
+                                    if not ordered_i:
+                                        try:
+                                            def_dir = _dir_value(getattr(target_b_i.__berry_fields__.get(rel_cfg_local.get('relation_name') or ''), 'meta', {}).get('order_dir') if False else rel_cfg_local.get('order_dir'))
+                                        except Exception:
+                                            def_dir = _dir_value(None)
+                                        # Use relation meta captured on rel_cfg_local if present
+                                        try:
+                                            meta_multi = rel_cfg_local.get('default_order_multi') or rel_cfg_local.get('order_multi_default') or []
+                                        except Exception:
+                                            meta_multi = []
+                                        if meta_multi:
+                                            try:
+                                                specs_def: list[tuple[str,str]] = []
+                                                for ms in meta_multi:
+                                                    cn, _, dd = str(ms).partition(':')
+                                                    dd = (dd or def_dir).lower()
+                                                    if cn in allowed_order_fields_i:
+                                                        specs_def.append((cn, dd))
+                                                for cn, dd in reversed(specs_def):
+                                                    col = getattr(child_model_cls_i, cn, None)
+                                                    if col is not None:
+                                                        inner_sel_i = inner_sel_i.order_by(col.desc() if dd=='desc' else col.asc())
+                                                        ordered_i = True
+                                            except Exception:
+                                                pass
+                                        if not ordered_i:
+                                            try:
+                                                cn = rel_cfg_local.get('default_order_by') or None
+                                                if not cn:
+                                                    cn = rel_cfg_local.get('order_by') if rel_cfg_local.get('order_by') in allowed_order_fields_i else None
+                                                if cn and cn in allowed_order_fields_i:
+                                                    col = getattr(child_model_cls_i, cn, None)
+                                                    if col is not None:
+                                                        inner_sel_i = inner_sel_i.order_by(col.desc() if def_dir=='desc' else col.asc())
+                                                        ordered_i = True
+                                            except Exception:
+                                                pass
+                                    # final fallback: id asc
                                     if not ordered_i:
                                         try:
                                             if 'id' in child_model_cls_i.__table__.columns:
@@ -3094,24 +3082,11 @@ class BerrySchema:
                                                                                             setattr(ni, nsf, nv.get(nsf))
                                                                                     setattr(ni, '_model', None)
                                                                                     nlist.append(ni)
-                                                                    # Apply Python-side ordering/filtering/pagination for nested if requested
+                                                                    # Apply Python-side filtering/pagination for nested if requested (ordering removed; rely on DB)
                                                                     try:
                                                                         parent_rel_meta = requested_relations.get(rel_name, {})
                                                                         nested_meta_src = (parent_rel_meta.get('nested') or {}).get(nname, {})
-                                                                        # ordering
-                                                                        nmulti = nested_meta_src.get('order_multi') or []
-                                                                        nby = nested_meta_src.get('order_by')
-                                                                        ndir = _dir_value(nested_meta_src.get('order_dir'))
-                                                                        if nmulti:
-                                                                            specs = []
-                                                                            for spec in nmulti:
-                                                                                cn, _, dd = str(spec).partition(':')
-                                                                                dd = (dd or 'asc').lower()
-                                                                                specs.append((cn, dd))
-                                                                            for cn, dd in reversed(specs):
-                                                                                nlist.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
-                                                                        elif nby:
-                                                                            nlist.sort(key=lambda o: getattr(o, nby, None), reverse=(ndir=='desc'))
+                                                                        # ordering intentionally not applied in Python
                                                                         # where
                                                                         def _apply_where_py(objs, where_dict):
                                                                             if not isinstance(where_dict, dict):
@@ -3194,23 +3169,9 @@ class BerrySchema:
                                                             except Exception:
                                                                 pass
                                                             tmp_list.append(child_inst)
-                                                # Apply Python-side ordering if specified (ensures correct order when subquery dropped ORDER BY)
+                                                # Remove Python-side ordering for top-level relation; rely on DB ordering
                                                 try:
-                                                    rel_cfg_meta = requested_relations.get(rel_name, {})
-                                                    multi_specs = rel_cfg_meta.get('order_multi') or []
-                                                    single_by = rel_cfg_meta.get('order_by')
-                                                    single_dir = _dir_value(rel_cfg_meta.get('order_dir'))
-                                                    if multi_specs:
-                                                        # apply multi-key sort, last key first for stability
-                                                        specs = []
-                                                        for spec in multi_specs:
-                                                            cn, _, dd = str(spec).partition(':')
-                                                            dd = (dd or 'asc').lower()
-                                                            specs.append((cn, dd))
-                                                        for cn, dd in reversed(specs):
-                                                            tmp_list.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
-                                                    elif single_by:
-                                                        tmp_list.sort(key=lambda o: getattr(o, single_by, None), reverse=(single_dir=='desc'))
+                                                    pass
                                                 except Exception:
                                                     pass
                                                 # Apply Python-side filtering/pagination for top-level relation if needed

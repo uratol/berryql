@@ -40,9 +40,13 @@ class RelationSelectionExtractor:
     def _init_rel_cfg(self, fdef: Any) -> Dict[str, Any]:
         single = bool(fdef.meta.get('single') or (fdef.meta.get('mode') == 'single'))
         target = fdef.meta.get('target')
+        # Default ordering values come from relation field meta; query args will override later in extract
+        def_ob = fdef.meta.get('order_by') if fdef.meta.get('order_by') is not None else None
+        def_od = fdef.meta.get('order_dir') if fdef.meta.get('order_dir') is not None else None
+        def_om = fdef.meta.get('order_multi') if fdef.meta.get('order_multi') is not None else []
         return {
             'fields': [], 'limit': None, 'offset': None,
-            'order_by': None, 'order_dir': None, 'order_multi': [],
+            'order_by': def_ob, 'order_dir': def_od, 'order_multi': list(def_om) if isinstance(def_om, (list, tuple)) else ([def_om] if def_om else []),
             'where': None, 'default_where': fdef.meta.get('where') if fdef.meta.get('where') is not None else None,
             'single': single, 'target': target, 'nested': {}, 'skip_pushdown': False,
             'filter_args': {}, 'arg_specs': fdef.meta.get('arguments') if fdef.meta.get('arguments') is not None else None

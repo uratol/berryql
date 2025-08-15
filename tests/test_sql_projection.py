@@ -124,13 +124,26 @@ async def test_users_posts_id_only_projection(db_session, sample_users):
             # Prefer no joins at root; relation handled via subselect or separate query
             assert " join " not in sql, sql
 
-        # Posts SELECTs must not project unrelated post columns; allow author_id in WHERE
-        forbidden_post_cols = [" title", " content", " created_at", " posts.title", " posts.content", " posts.created_at", ' "posts".title', ' "posts".content', ' "posts".created_at', " [posts].title", " [posts].content", " [posts].created_at"]
+        # Posts SELECTs must not project unrelated post columns; allow author_id in WHERE.
+        # created_at may appear in ORDER BY due to default relation ordering.
+        forbidden_post_cols = [
+            " title",
+            " content",
+            " posts.title",
+            " posts.content",
+            ' "posts".title',
+            ' "posts".content',
+            " [posts].title",
+            " [posts].content",
+        ]
         for sql in posts_selects:
             for tok in forbidden_post_cols:
                 assert tok not in sql, f"Unexpected post column in SQL: {tok} -> {sql}"
             # Should not involve other tables like post_comments
             assert not _mentions_table(sql, "post_comments"), sql
+
+        # Ensure ordering by created_at desc is applied in the posts subquery
+        assert any("order by posts.created_at desc" in sql for sql in posts_selects), posts_selects
 
         # Globally, ensure we never touch post_comments table in any captured SQL
         for sql in lowered_norm:
