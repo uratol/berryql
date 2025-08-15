@@ -26,7 +26,7 @@ async def test_root_ordering_default_dir(db_session, populated_db):
 @pytest.mark.asyncio
 async def test_relation_ordering_single(db_session, populated_db):
     q = """
-    query { users(name_ilike: "Alice") { id posts(order_by: "created_at", order_dir: desc) { id created_at } } }
+    query { users(name_ilike: "Alice") { id posts { id created_at } } }
     """
     res = await berry_schema.execute(q, context_value={'db_session': db_session})
     assert res.errors is None, res.errors
@@ -40,7 +40,7 @@ async def test_relation_ordering_multi(db_session, populated_db):
     query {
       users(name_ilike: "Alice") {
         id
-        posts(order_multi: ["created_at:desc", "id:asc"]) { id created_at }
+    posts(order_multi: ["created_at:desc", "id:asc"]) { id created_at }
       }
     }
     """

@@ -110,7 +110,7 @@ class UserQL(BerryType):
             return str(n).upper() if n is not None else None
         except Exception:
             return None
-    posts = relation('PostQL', arguments={
+    posts = relation('PostQL', order_by='created_at', order_dir='desc', arguments={
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),

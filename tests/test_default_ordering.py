@@ -60,3 +60,16 @@ async def test_query_overrides_default_order_comments_relation(db_session, popul
     assert res.errors is None, res.errors
     ids = [c['id'] for c in res.data['posts'][0]['post_comments']]
     assert ids == sorted(ids, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_default_ordering_user_posts_relation(db_session, populated_db):
+  # User.posts should default to created_at desc without explicit args
+  q = """
+  query { users(name_ilike: "Alice") { id posts { id created_at } } }
+  """
+  res = await berry_schema.execute(q, context_value={'db_session': db_session})
+  assert res.errors is None, res.errors
+  posts = res.data['users'][0]['posts']
+  created = [p['created_at'] for p in posts]
+  assert created == sorted(created, reverse=True)
