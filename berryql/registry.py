@@ -484,17 +484,55 @@ class BerrySchema:
                                 lst = _apply_filter_args_list(lst)
                                 # Apply ordering
                                 try:
+                                    # Determine allowed order fields from target to validate explicit args
+                                    allowed_order = None
+                                    try:
+                                        target_name_i = meta_copy.get('target')
+                                        if target_name_i:
+                                            target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
+                                            if target_cls_i is not None:
+                                                allowed_order = getattr(target_cls_i, '__ordering__', None)
+                                                if allowed_order is None:
+                                                    # derive from scalar fields of the Berry type
+                                                    t_b = self.__berry_registry__.types.get(target_name_i)
+                                                    if t_b is not None:
+                                                        allowed_order = [sf for sf, sd in t_b.__berry_fields__.items() if sd.kind == 'scalar']
+                                    except Exception:
+                                        allowed_order = None
                                     specs = []
                                     for spec in (order_multi or []) or []:
                                         cn, _, dd = str(spec).partition(':')
                                         dd = (dd or _dir_value(order_dir)).lower()
-                                        specs.append((cn, dd))
+                                        # Only apply explicit multi-order if column is allowed (mirror DB path)
+                                        if not allowed_order or cn in allowed_order:
+                                            specs.append((cn, dd))
                                     if specs:
                                         for cn, dd in reversed(specs):
                                             lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
-                                    elif order_by:
-                                        dd = _dir_value(order_dir)
-                                        lst.sort(key=lambda o: getattr(o, order_by, None), reverse=(dd=='desc'))
+                                    else:
+                                        if order_by:
+                                            # Validate single order_by explicitly against allowed list, if known
+                                            if allowed_order is not None and order_by not in allowed_order:
+                                                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
+                                            dd = _dir_value(order_dir)
+                                            lst.sort(key=lambda o: getattr(o, order_by, None), reverse=(dd=='desc'))
+                                        else:
+                                            # No explicit order args; honor schema defaults from relation meta
+                                            def_dir = _dir_value(meta_copy.get('order_dir'))
+                                            meta_multi = meta_copy.get('order_multi') or []
+                                            if meta_multi:
+                                                defaults = []
+                                                for ms in meta_multi:
+                                                    cn, _, dd = str(ms).partition(':')
+                                                    dd = (dd or def_dir).lower()
+                                                    defaults.append((cn, dd))
+                                                for cn, dd in reversed(defaults):
+                                                    lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
+                                            else:
+                                                cn = meta_copy.get('order_by')
+                                                if cn:
+                                                    dd = def_dir
+                                                    lst.sort(key=lambda o: getattr(o, cn, None), reverse=(dd=='desc'))
                                 except Exception:
                                     pass
                                 # Apply pagination

@@ -58,6 +58,30 @@ async def test_relation_ordering_multi(db_session, populated_db):
     for ids in groups.values():
         assert ids == sorted(ids)
 
+
+@pytest.mark.asyncio
+async def test_relation_ordering_multi_prefetched(db_session, populated_db):
+        # Force a user with multiple posts; order by two columns and confirm stable ordering in-memory as well
+        q = """
+        query {
+            users(name_ilike: "Alice") {
+                id
+                posts(order_multi: ["created_at:desc", "id:asc"]) { id created_at }
+            }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={'db_session': db_session})
+        assert res.errors is None, res.errors
+        posts = res.data['users'][0]['posts']
+        created = [p['created_at'] for p in posts]
+        assert created == sorted(created, reverse=True)
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for p in posts:
+                groups[p['created_at']].append(p['id'])
+        for ids in groups.values():
+                assert ids == sorted(ids)
+
 @pytest.mark.asyncio
 async def test_relation_ordering_with_pagination(db_session, populated_db):
     q = """
@@ -78,3 +102,50 @@ async def test_invalid_order_field_ignored(db_session, populated_db):
     res = await berry_schema.execute(q, context_value={'db_session': db_session})
     assert res.errors is not None
     assert any('Invalid order_by' in str(e) for e in res.errors)
+
+
+@pytest.mark.asyncio
+async def test_nested_relation_prefetched_respects_default_and_explicit_order(db_session, populated_db):
+        # Fetch posts with nested post_comments; resolver may prefetch comments, and ordering must still apply.
+        # 1) Default meta ordering on relation (id asc)
+        q1 = """
+        query {
+            posts(limit: 1) {
+                id
+                post_comments { id }
+            }
+        }
+        """
+        res1 = await berry_schema.execute(q1, context_value={'db_session': db_session})
+        assert res1.errors is None, res1.errors
+        ids_default = [c['id'] for c in res1.data['posts'][0]['post_comments']]
+        assert ids_default == sorted(ids_default)
+        # 2) Explicit override should take precedence over default meta
+        q2 = """
+        query {
+            posts(limit: 1) {
+                id
+                post_comments(order_by: "id", order_dir: desc) { id }
+            }
+        }
+        """
+        res2 = await berry_schema.execute(q2, context_value={'db_session': db_session})
+        assert res2.errors is None, res2.errors
+        ids_desc = [c['id'] for c in res2.data['posts'][0]['post_comments']]
+        assert ids_desc == sorted(ids_desc, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_invalid_order_field_on_relation_raises(db_session, populated_db):
+        # Ensure invalid order_by on a nested relation produces an error (matches DB path validation)
+        q = """
+        query {
+            posts(limit: 1) {
+                id
+                post_comments(order_by: "__nope__") { id }
+            }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={'db_session': db_session})
+        assert res.errors is not None
+        assert any('Invalid order_by' in str(e) for e in res.errors)
