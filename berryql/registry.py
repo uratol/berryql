@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
+import logging
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints
 import asyncio
@@ -21,6 +22,9 @@ if TYPE_CHECKING:  # pragma: no cover - type checking only
 
 # Silence Strawberry's LazyType deprecation warnings to keep test output clean.
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+
+# Project logger
+_logger = logging.getLogger("berryql")
 try:  # Provide StrawberryInfo for type annotations
     from strawberry.types import Info as StrawberryInfo  # type: ignore
 except Exception:  # pragma: no cover
@@ -442,6 +446,28 @@ class BerrySchema:
                                 # Apply filters via query if any filter args passed
                                 if any(v is not None for v in _filter_args.values()) or related_where is not None:
                                     from sqlalchemy import select as _select
+                                    # Log potential N+1 when no prefetched value and we need a targeted select
+                                    try:
+                                        reason = None
+                                        try:
+                                            meta_map = getattr(self, '_pushdown_meta', None)
+                                            if isinstance(meta_map, dict):
+                                                reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                                        except Exception:
+                                            reason = None
+                                        if reason:
+                                            _logger.warning(
+                                                "berryql: falling back to per-parent select for single relation '%s' (reason=%s)",
+                                                fname_local,
+                                                reason,
+                                            )
+                                        else:
+                                            _logger.warning(
+                                                "berryql: falling back to per-parent select for single relation '%s' (no pushdown)",
+                                                fname_local,
+                                            )
+                                    except Exception:
+                                        pass
                                     stmt = _select(child_model_cls).where(getattr(child_model_cls, 'id') == candidate_fk_val)
                                     # Apply JSON where if provided (argument and schema default)
                                     if related_where is not None or meta_copy.get('where') is not None:
@@ -497,6 +523,28 @@ class BerrySchema:
                                     result = await session.execute(stmt.limit(1))
                                     row = result.scalar_one_or_none()
                                 else:
+                                    # Log potential N+1 when doing a direct get per parent
+                                    try:
+                                        reason = None
+                                        try:
+                                            meta_map = getattr(self, '_pushdown_meta', None)
+                                            if isinstance(meta_map, dict):
+                                                reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                                        except Exception:
+                                            reason = None
+                                        if reason:
+                                            _logger.warning(
+                                                "berryql: falling back to per-parent get() for single relation '%s' (reason=%s)",
+                                                fname_local,
+                                                reason,
+                                            )
+                                        else:
+                                            _logger.warning(
+                                                "berryql: falling back to per-parent get() for single relation '%s' (no pushdown)",
+                                                fname_local,
+                                            )
+                                    except Exception:
+                                        pass
                                     row = await session.get(child_model_cls, candidate_fk_val)
                                 if not row:
                                     return None
@@ -531,6 +579,28 @@ class BerrySchema:
                             if parent_id_val is None:
                                 return []
                             stmt = _select(child_model_cls).where(fk_col == parent_id_val)
+                            # Log potential N+1 for list relation when resolver runs a per-parent query
+                            try:
+                                reason = None
+                                try:
+                                    meta_map = getattr(self, '_pushdown_meta', None)
+                                    if isinstance(meta_map, dict):
+                                        reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                                except Exception:
+                                    reason = None
+                                if reason:
+                                    _logger.warning(
+                                        "berryql: falling back to per-parent query for relation '%s' (reason=%s)",
+                                        fname_local,
+                                        reason,
+                                    )
+                                else:
+                                    _logger.warning(
+                                        "berryql: falling back to per-parent query for relation '%s' (no lateral pushdown)",
+                                        fname_local,
+                                    )
+                            except Exception:
+                                pass
                             # Apply where from args and/or schema default
                             if related_where is not None or meta_copy.get('where') is not None:
                                 # Strictly validate and apply argument-provided where
@@ -1589,8 +1659,13 @@ class BerrySchema:
                                 pass
                 except Exception:
                     required_fk_parent_cols = set()
+                # Track per-relation pushdown status and skip reasons
+                rel_push_status: Dict[str, Dict[str, Any]] = {}
                 # Push down relation JSON arrays/objects
                 for rel_name, rel_cfg in requested_relations.items():
+                        # initialize status entry
+                        if rel_name not in rel_push_status:
+                            rel_push_status[rel_name] = {'pushed': False, 'reason': None}
                         # Allow pushdown even when relation 'where' or filter args are provided.
                         # Both JSON where and declared filter args are handled in the pushdown builders below.
                         # Only skip when defaults are callable (require runtime context/evaluation per row).
@@ -1599,15 +1674,28 @@ class BerrySchema:
                             dw = rel_cfg.get('default_where')
                             if dw is not None and not isinstance(dw, (dict, str)):
                                 rel_cfg['skip_pushdown'] = True
+                                # record reason
+                                try:
+                                    rel_push_status[rel_name].update({'pushed': False, 'reason': 'default_where callable'})
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         if rel_cfg.get('skip_pushdown'):
                             continue
                         target_name = rel_cfg.get('target')
                         if not target_name:
+                            try:
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no target type'})
+                            except Exception:
+                                pass
                             continue
                         target_b = self.types.get(target_name)
                         if not target_b or not target_b.model:
+                            try:
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'target model missing'})
+                            except Exception:
+                                pass
                             continue
                         # Early validation of relation order_by for pushdown path
                         try:
@@ -1628,6 +1716,10 @@ class BerrySchema:
                             if fk_col is not None:
                                 break
                         if fk_col is None:
+                            try:
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
+                            except Exception:
+                                pass
                             continue
                         # Determine projected scalar fields
                         requested_scalar = rel_cfg.get('fields') or []
@@ -1679,6 +1771,10 @@ class BerrySchema:
                                     has_parent_fk = False
                                 if not has_parent_fk:
                                     # Can't correlate reliably; skip pushdown
+                                    try:
+                                        rel_push_status[rel_name].update({'pushed': False, 'reason': f"missing parent column '{rel_name}_id'"})
+                                    except Exception:
+                                        pass
                                     continue
                                 rel_subq = (
                                     select(json_obj)
@@ -1764,6 +1860,10 @@ class BerrySchema:
                                     pass
                                 rel_expr = rel_subq.limit(1).scalar_subquery().label(f"_pushrel_{rel_name}")
                                 select_columns.append(rel_expr)
+                                try:
+                                    rel_push_status[rel_name].update({'pushed': True, 'reason': None})
+                                except Exception:
+                                    pass
                         else:
                             # List relation (possibly with nested) JSON aggregation
                             # Rebuild list relation JSON: adapter-aware; MSSQL via FOR JSON PATH
@@ -2361,8 +2461,23 @@ class BerrySchema:
                                     except Exception:
                                         from sqlalchemy import literal_column
                                         select_columns.append(literal_column(str(nested_expr)).label(f"_pushrel_{rel_name}"))
+                                    try:
+                                        rel_push_status[rel_name].update({'pushed': True, 'reason': None})
+                                    except Exception:
+                                        pass
                                 else:
                                     select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
+                                    try:
+                                        rel_push_status[rel_name].update({'pushed': True, 'reason': None})
+                                    except Exception:
+                                        pass
+                            else:
+                                # builder couldn't produce a pushdown expression
+                                try:
+                                    if not rel_push_status.get(rel_name, {}).get('reason'):
+                                        rel_push_status[rel_name].update({'pushed': False, 'reason': 'builder returned None'})
+                                except Exception:
+                                    pass
                 stmt = select(*select_columns)
                 # Add minimal root columns directly into the SELECT to avoid pulling all entity columns
                 # Prefer selecting only requested scalars and id when relations are requested.
@@ -2901,10 +3016,32 @@ class BerrySchema:
                                         meta_map[rel_name] = {
                                             'limit': rel_cfg.get('limit'),
                                             'offset': rel_cfg.get('offset'),
-                                            'from_pushdown': True
+                                            'from_pushdown': True,
+                                            'skip_reason': None
                                         }
                                         # Don't assign to public attribute; resolver will read _prefetched and
                                         # still apply per-call filters/order/pagination deterministically.
+                                    else:
+                                        # Relation was requested but not pushed down: record skip reason
+                                        try:
+                                            meta_map = getattr(inst, '_pushdown_meta', None)
+                                            if meta_map is None:
+                                                meta_map = {}
+                                                setattr(inst, '_pushdown_meta', meta_map)
+                                            rel_meta_src = requested_relations.get(rel_name, {})
+                                            reason_txt = None
+                                            try:
+                                                reason_txt = (rel_push_status.get(rel_name) or {}).get('reason')
+                                            except Exception:
+                                                reason_txt = None
+                                            meta_map[rel_name] = {
+                                                'limit': rel_meta_src.get('limit'),
+                                                'offset': rel_meta_src.get('offset'),
+                                                'from_pushdown': False,
+                                                'skip_reason': reason_txt,
+                                            }
+                                        except Exception:
+                                            pass
                             # populate aggregate count cache from pushdown columns
                             if count_aggregates:
                                 cache = getattr(inst, '_agg_cache', None)
