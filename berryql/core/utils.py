@@ -243,38 +243,38 @@ def get_db_session(info_or_ctx: Any) -> Any | None:
         return None
     candidates = ('db_session', 'db', 'session', 'async_session')
     # Mapping-like access with .get
-    try:
-        get = getattr(ctx, 'get', None)
-        if callable(get):
-            for k in candidates:
-                try:
-                    v = get(k, None)
-                except Exception:
-                    v = None
-                if v is not None:
-                    return v
-    except Exception:
-        pass
+    get = getattr(ctx, 'get', None)
+    if callable(get):
+        for k in candidates:
+            try:
+                v = get(k, None)
+            except (KeyError, AttributeError, TypeError):
+                v = None
+            except Exception as e:
+                # Unexpected errors shouldn't be hidden
+                raise
+            if v is not None:
+                return v
     # Mapping access via __getitem__
-    try:
-        for k in candidates:
-            try:
-                v = ctx[k]  # type: ignore[index]
-            except Exception:
-                v = None
-            if v is not None:
-                return v
-    except Exception:
-        pass
+    for k in candidates:
+        try:
+            v = ctx[k]  # type: ignore[index]
+        except KeyError:
+            v = None
+        except Exception:
+            # Unexpected errors shouldn't be hidden
+            raise
+        if v is not None:
+            return v
     # Attribute access
-    try:
-        for k in candidates:
-            try:
-                v = getattr(ctx, k)
-            except Exception:
-                v = None
-            if v is not None:
-                return v
-    except Exception:
-        pass
+    for k in candidates:
+        try:
+            v = getattr(ctx, k)
+        except AttributeError:
+            v = None
+        except Exception:
+            # Unexpected errors shouldn't be hidden
+            raise
+        if v is not None:
+            return v
     return None
