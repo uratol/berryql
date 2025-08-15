@@ -284,6 +284,43 @@ class BerrySchema:
         """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
         return _norm_order_multi(multi)
 
+    def _find_parent_fk_column_name(self, parent_model_cls: Any, child_model_cls: Any, rel_name: str) -> Optional[str]:
+        """Return the name of the FK column on parent that references child, or a conventional '<rel>_id' fallback.
+
+        Tries model metadata first (parent __table__ foreign_keys targeting child's table).
+        Falls back to '<rel>_id' when present. Returns None when not found.
+        """
+        # Prefer model metadata foreign key discovery
+        try:
+            if parent_model_cls is not None and hasattr(parent_model_cls, '__table__') and \
+               child_model_cls is not None and hasattr(child_model_cls, '__table__'):
+                for pc in parent_model_cls.__table__.columns:
+                    for fk in pc.foreign_keys:
+                        try:
+                            if fk.column.table.name == child_model_cls.__table__.name:
+                                return pc.name
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+        # Conventional fallback: '<relation>_id'
+        fallback = f"{rel_name}_id"
+        try:
+            if parent_model_cls is not None:
+                # check via table columns when possible
+                if hasattr(parent_model_cls, '__table__'):
+                    try:
+                        if any(c.name == fallback for c in parent_model_cls.__table__.columns):
+                            return fallback
+                    except Exception:
+                        pass
+                # lenient: hasattr on ORM class attribute
+                if hasattr(parent_model_cls, fallback):
+                    return fallback
+        except Exception:
+            pass
+        return None
+
     def _get_context_lock(self, info: 'StrawberryInfo') -> 'asyncio.Lock':
         """Return a per-request asyncio.Lock stored on info.context to serialize DB access when needed."""
         try:
@@ -1651,12 +1688,14 @@ class BerrySchema:
                         except Exception:
                             pass
                         if rel_cfg.get('single'):
-                            fk_col_name = f"{rel_name}_id"
                             try:
-                                if hasattr(model_cls, fk_col_name):
-                                    required_fk_parent_cols.add(fk_col_name)
+                                target_name = rel_cfg.get('target')
+                                child_model_cls = (self.types.get(target_name).model if target_name and self.types.get(target_name) else None)
                             except Exception:
-                                pass
+                                child_model_cls = None
+                            parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
+                            if parent_fk_col_name is not None:
+                                required_fk_parent_cols.add(parent_fk_col_name)
                 except Exception:
                     required_fk_parent_cols = set()
                 # Track per-relation pushdown status and skip reasons
@@ -1737,8 +1776,12 @@ class BerrySchema:
                             if mssql_mode:
                                 if not proj_cols:
                                     proj_cols = ['id']
+                                # Determine parent FK column name via helper; fallback inside helper to '<rel>_id'
+                                parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name) or f"{rel_name}_id"
                                 # Build join + optional where clauses for MSSQL
-                                join_parts = [f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{rel_name}_id]"]
+                                join_parts = [
+                                    f"[{child_model_cls.__tablename__}].[id] = [{model_cls.__tablename__}].[{parent_fk_col_name}]"
+                                ]
                                 try:
                                     r_where = rel_cfg.get('where')
                                     if r_where is not None:
@@ -1764,22 +1807,24 @@ class BerrySchema:
                                 for sf in proj_cols:
                                     json_args.extend([_text(f"'{sf}'"), getattr(child_model_cls, sf)])
                                 json_obj = _json_object(*json_args) if json_args else _json_object(_text("'id'"), getattr(child_model_cls, 'id'))
-                                # Require parent <rel>_id column to correlate; if absent, skip pushdown for this relation
+                                # Determine parent FK column name via helper; fallback inside helper to '<rel>_id'
+                                parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name) or f"{rel_name}_id"
+                                # Require parent FK column to correlate; if absent, skip pushdown for this relation
                                 try:
-                                    has_parent_fk = any(c.name == f"{rel_name}_id" for c in model_cls.__table__.columns)
+                                    has_parent_fk = any(c.name == parent_fk_col_name for c in model_cls.__table__.columns)
                                 except Exception:
                                     has_parent_fk = False
                                 if not has_parent_fk:
                                     # Can't correlate reliably; skip pushdown
                                     try:
-                                        rel_push_status[rel_name].update({'pushed': False, 'reason': f"missing parent column '{rel_name}_id'"})
+                                        rel_push_status[rel_name].update({'pushed': False, 'reason': f"missing parent column '{parent_fk_col_name}'"})
                                     except Exception:
                                         pass
                                     continue
                                 rel_subq = (
                                     select(json_obj)
                                     .select_from(child_model_cls)
-                                    .where(getattr(child_model_cls, 'id') == getattr(model_cls, f"{rel_name}_id"))
+                                    .where(getattr(child_model_cls, 'id') == getattr(model_cls, parent_fk_col_name))
                                     .correlate(model_cls)
                                 )
                                 # Apply relation-level JSON where/default_where if provided
