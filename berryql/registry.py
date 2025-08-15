@@ -630,18 +630,15 @@ class BerrySchema:
                                                     val = _coerce_where_value(col, val)
                                                 op_fn = OPERATOR_REGISTRY.get(op_name)
                                                 if not op_fn:
-                                                    continue
+                                                    raise ValueError(f"Unknown where operator: {op_name}")
                                                 exprs.append(op_fn(col, val))
                                         if exprs:
                                             from sqlalchemy import and_ as _and
                                             stmt = stmt.where(_and(*exprs))
                                     else:
-                                        try:
-                                            expr = dwhere(child_model_cls, info)
-                                            if expr is not None:
-                                                stmt = stmt.where(expr)
-                                        except Exception:
-                                            pass
+                                        expr = dwhere(child_model_cls, info)
+                                        if expr is not None:
+                                            stmt = stmt.where(expr)
                             # Ad-hoc JSON where for relation list if present on selection
                             rel_meta_map = getattr(self, '_pushdown_meta', None)  # not reliable; read from extractor cfg instead
                             # Ordering (multi then single) if column whitelist permits
@@ -1285,49 +1282,97 @@ class BerrySchema:
                         except Exception:
                             pass
                         # Relation JSON where/default_where for child
-                        try:
-                            rr = rel_cfg.get('where')
-                            dr = rel_cfg.get('default_where')
-                            if rr is not None:
-                                import json as _json
-                                wdict = rr if not isinstance(rr, str) else _json.loads(rr)
-                                exprs = []
-                                for col_name, op_map in (wdict or {}).items():
-                                    col = child_model_cls_i.__table__.c.get(col_name)
-                                    if col is None:
-                                        continue
-                                    for op_name, val in (op_map or {}).items():
-                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                            val = [_coerce_where_value(col, v) for v in val]
-                                        else:
-                                            val = _coerce_where_value(col, val)
-                                        op_fn = OPERATOR_REGISTRY.get(op_name)
-                                        if not op_fn:
-                                            continue
-                                        exprs.append(op_fn(col, val))
-                                if exprs:
-                                    inner_sel_i = inner_sel_i.where(_and(*exprs))
-                            if dr is not None and isinstance(dr, (dict, str)):
-                                import json as _json
+                        # Be strict for user-provided 'where': invalid JSON must raise; keep default_where permissive.
+                        rr = rel_cfg.get('where')
+                        if rr is not None:
+                            import json as _json
+                            # Resolve GraphQL VariableNode using outer-scope info
+                            if not isinstance(rr, (str, dict)) and hasattr(rr, 'name'):
+                                try:
+                                    vname = getattr(getattr(rr, 'name', None), 'value', None) or getattr(rr, 'name', None)
+                                    var_vals = None
+                                    try:
+                                        var_vals = getattr(info, 'variable_values', None)
+                                    except Exception:
+                                        var_vals = None
+                                    if var_vals is None:
+                                        try:
+                                            raw_info = getattr(info, '_raw_info', None)
+                                            var_vals = getattr(raw_info, 'variable_values', None) if raw_info is not None else None
+                                        except Exception:
+                                            var_vals = None
+                                    if isinstance(var_vals, dict) and vname in var_vals:
+                                        rr = var_vals[vname]
+                                except Exception:
+                                    pass
+                            # Support GraphQL AST-like wrappers (e.g., StringValueNode)
+                            if not isinstance(rr, (str, dict)) and hasattr(rr, 'value'):
+                                try:
+                                    rr = getattr(rr, 'value')
+                                except Exception:
+                                    pass
+                            wdict = rr
+                            if isinstance(rr, str):
+                                try:
+                                    wdict = _json.loads(rr)
+                                except Exception as e:
+                                    raise ValueError(f"Invalid where JSON: {e}")
+                            from collections.abc import Mapping as _Mapping
+                            if wdict is not None and not isinstance(wdict, _Mapping):
+                                # Last-chance: try to parse via JSON from its string representation
+                                txt = wdict.decode() if isinstance(wdict, bytes) else str(wdict)
+                                s = txt.strip()
+                                # unwrap single/double quotes once
+                                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                                    s = s[1:-1]
+                                try:
+                                    wdict = _json.loads(s)
+                                except Exception:
+                                    # try Python literal_eval (handles single-quoted dict repr)
+                                    try:
+                                        import ast as _ast
+                                        wdict = _ast.literal_eval(s)
+                                    except Exception:
+                                        raise ValueError("where must be a JSON object")
+                            exprs = []
+                            for col_name, op_map in (wdict or {}).items():
+                                col = child_model_cls_i.__table__.c.get(col_name)
+                                if col is None:
+                                    raise ValueError(f"Unknown where column: {col_name}")
+                                for op_name, val in (op_map or {}).items():
+                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                        val = [_coerce_where_value(col, v) for v in val]
+                                    else:
+                                        val = _coerce_where_value(col, val)
+                                    op_fn = OPERATOR_REGISTRY.get(op_name)
+                                    if not op_fn:
+                                        raise ValueError(f"Unknown where operator: {op_name}")
+                                    exprs.append(op_fn(col, val))
+                            if exprs:
+                                inner_sel_i = inner_sel_i.where(_and(*exprs))
+                        dr = rel_cfg.get('default_where')
+                        if dr is not None and isinstance(dr, (dict, str)):
+                            import json as _json
+                            try:
                                 wdict = dr if not isinstance(dr, str) else _json.loads(dr)
-                                exprs = []
-                                for col_name, op_map in (wdict or {}).items():
-                                    col = child_model_cls_i.__table__.c.get(col_name)
-                                    if col is None:
+                            except Exception:
+                                wdict = None
+                            exprs = []
+                            for col_name, op_map in (wdict or {}).items():
+                                col = child_model_cls_i.__table__.c.get(col_name)
+                                if col is None:
+                                    continue
+                                for op_name, val in (op_map or {}).items():
+                                    if op_name in ('in','between') and isinstance(val, (list, tuple)):
+                                        val = [_coerce_where_value(col, v) for v in val]
+                                    else:
+                                        val = _coerce_where_value(col, val)
+                                    op_fn = OPERATOR_REGISTRY.get(op_name)
+                                    if not op_fn:
                                         continue
-                                    for op_name, val in (op_map or {}).items():
-                                        if op_name in ('in','between') and isinstance(val, (list, tuple)):
-                                            val = [_coerce_where_value(col, v) for v in val]
-                                        else:
-                                            val = _coerce_where_value(col, val)
-                                        op_fn = OPERATOR_REGISTRY.get(op_name)
-                                        if not op_fn:
-                                            continue
-                                        exprs.append(op_fn(col, val))
-                                if exprs:
-                                    inner_sel_i = inner_sel_i.where(_and(*exprs))
-                        except Exception:
-                            pass
+                                    exprs.append(op_fn(col, val))
+                            if exprs:
+                                inner_sel_i = inner_sel_i.where(_and(*exprs))
                         # Ordering for child (order_multi -> order_by -> id)
                         try:
                             ordered = False
@@ -2031,6 +2076,12 @@ class BerrySchema:
                                         import json as _json
                                         r_where = rel_cfg_local.get('where')
                                         if r_where is not None:
+                                            # Support GraphQL AST-like wrappers
+                                            if not isinstance(r_where, (str, dict)) and hasattr(r_where, 'value'):
+                                                try:
+                                                    r_where = getattr(r_where, 'value')
+                                                except Exception:
+                                                    pass
                                             wdict_rel = r_where
                                             if isinstance(r_where, str):
                                                 try:
@@ -2039,6 +2090,15 @@ class BerrySchema:
                                                     raise ValueError(f"Invalid where JSON: {e}")
                                             if wdict_rel is not None and not isinstance(wdict_rel, dict):
                                                 raise ValueError("where must be a JSON object")
+                                            # Strict: validate columns and operators
+                                            for col_name, op_map in (wdict_rel or {}).items():
+                                                col = child_model_cls_i.__table__.c.get(col_name)
+                                                if col is None:
+                                                    raise ValueError(f"Unknown where column: {col_name}")
+                                                for op_name, val in (op_map or {}).items():
+                                                    # Reference OPERATOR_REGISTRY for allowed ops
+                                                    if op_name not in OPERATOR_REGISTRY:
+                                                        raise ValueError(f"Unknown where operator: {op_name}")
                                             where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, wdict_rel))
                                         d_where = rel_cfg_local.get('default_where')
                                         if d_where is not None and isinstance(d_where, (dict, str)):
@@ -2050,6 +2110,55 @@ class BerrySchema:
                                                     dwdict_rel = None
                                             if dwdict_rel is not None:
                                                 where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, dwdict_rel))
+                                        # Apply relation filter_args to MSSQL where parts
+                                        try:
+                                            fa = rel_cfg_local.get('filter_args') or {}
+                                            if fa:
+                                                # Build expanded spec map from arg_specs
+                                                class_filters = rel_cfg_local.get('arg_specs') or {}
+                                                expanded: Dict[str, FilterSpec] = {}
+                                                for key, raw in class_filters.items():
+                                                    try:
+                                                        spec = _normalize_filter_spec(raw)
+                                                    except Exception:
+                                                        continue
+                                                    if spec.ops and not spec.op:
+                                                        for op_name in spec.ops:
+                                                            base = spec.alias or key
+                                                            an = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
+                                                            expanded[an] = spec.clone_with(op=op_name, ops=None)
+                                                    else:
+                                                        expanded[spec.alias or key] = spec
+                                                # Helper to add where from mapping
+                                                def _add_wdict(col_name: str, op_name: str, value: Any):
+                                                    # Add wildcards for like/ilike when not present
+                                                    if op_name in ('like','ilike') and isinstance(value, str):
+                                                        if '%' not in value and '_' not in value:
+                                                            value = f"%{value}%"
+                                                    where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, {col_name: {op_name: value}}))
+                                                for arg_name, val in fa.items():
+                                                    f_spec = expanded.get(arg_name)
+                                                    if f_spec and f_spec.transform:
+                                                        try:
+                                                            val = f_spec.transform(val)
+                                                        except Exception:
+                                                            pass
+                                                    if f_spec and f_spec.column:
+                                                        opn = f_spec.op or 'eq'
+                                                        _add_wdict(f_spec.column, opn, val)
+                                                        continue
+                                                    # Fallback: derive from arg_name suffix (e.g., title_ilike)
+                                                    try:
+                                                        an = str(arg_name)
+                                                        if '_' in an:
+                                                            base, suffix = an.rsplit('_', 1)
+                                                            opn = suffix.lower()
+                                                            if opn in OPERATOR_REGISTRY and base in child_model_cls_i.__table__.columns:
+                                                                _add_wdict(base, opn, val)
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         raise
                                     where_clause = ' AND '.join(where_parts_rel)
@@ -2116,8 +2225,22 @@ class BerrySchema:
                                             import json as _json
                                             if ncfg.get('where') is not None:
                                                 wdict = ncfg.get('where')
+                                                # Support GraphQL AST-like wrappers
+                                                if not isinstance(wdict, (str, dict)) and hasattr(wdict, 'value'):
+                                                    try:
+                                                        wdict = getattr(wdict, 'value')
+                                                    except Exception:
+                                                        pass
                                                 if isinstance(wdict, str):
                                                     wdict = _json.loads(wdict)
+                                                # Strict: validate columns/operators for user-provided where
+                                                for col_name, op_map in (wdict or {}).items():
+                                                    col = grand_model.__table__.c.get(col_name)
+                                                    if col is None:
+                                                        raise ValueError(f"Unknown where column: {col_name}")
+                                                    for op_name in (op_map or {}).keys():
+                                                        if op_name not in OPERATOR_REGISTRY:
+                                                            raise ValueError(f"Unknown where operator: {op_name}")
                                                 n_where_parts.extend(_mssql_where_from_dict(grand_model, wdict))
                                             if ncfg.get('default_where') is not None and isinstance(ncfg.get('default_where'), (dict, str)):
                                                 dwdict = ncfg.get('default_where')
@@ -2323,65 +2446,96 @@ class BerrySchema:
                                 except Exception:
                                     pass
                                 # Apply ad-hoc JSON where for nested relation as well
-                                try:
-                                    rr = rel_cfg_local.get('where')
-                                    dr = rel_cfg_local.get('default_where')
-                                    if rr is not None:
-                                        import json as _json
-                                        wdict2 = rr
-                                        if isinstance(rr, str):
+                                # Strict for user-provided where
+                                rr = rel_cfg_local.get('where')
+                                if rr is not None:
+                                    import json as _json
+                                    # Resolve GraphQL VariableNode using outer-scope info
+                                    if not isinstance(rr, (str, dict)) and hasattr(rr, 'name'):
+                                        try:
+                                            vname = getattr(getattr(rr, 'name', None), 'value', None) or getattr(rr, 'name', None)
+                                            var_vals = None
+                                            try:
+                                                var_vals = getattr(info, 'variable_values', None)
+                                            except Exception:
+                                                var_vals = None
+                                            if var_vals is None:
+                                                try:
+                                                    raw_info = getattr(info, '_raw_info', None)
+                                                    var_vals = getattr(raw_info, 'variable_values', None) if raw_info is not None else None
+                                                except Exception:
+                                                    var_vals = None
+                                            if isinstance(var_vals, dict) and vname in var_vals:
+                                                rr = var_vals[vname]
+                                        except Exception:
+                                            pass
+                                    # Support GraphQL AST-like wrappers
+                                    if not isinstance(rr, (str, dict)) and hasattr(rr, 'value'):
+                                        try:
+                                            rr = getattr(rr, 'value')
+                                        except Exception:
+                                            pass
+                                    wdict2 = rr
+                                    if isinstance(rr, str):
+                                        try:
                                             wdict2 = _json.loads(rr)
-                                        expr_rr = None
+                                        except Exception as e:
+                                            raise ValueError(f"Invalid where JSON: {e}")
+                                    from collections.abc import Mapping as _Mapping
+                                    if wdict2 is not None and not isinstance(wdict2, _Mapping):
+                                        # Last-chance: try to parse from string form
+                                        txt2 = wdict2.decode() if isinstance(wdict2, bytes) else str(wdict2)
+                                        s2 = txt2.strip()
+                                        if (s2.startswith('"') and s2.endswith('"')) or (s2.startswith("'") and s2.endswith("'")):
+                                            s2 = s2[1:-1]
                                         try:
-                                            exprs2 = []
-                                            for col_name2, op_map2 in (wdict2 or {}).items():
-                                                col2 = child_model_cls_i.__table__.c.get(col_name2)
-                                                if col2 is None:
-                                                    continue
-                                                for op_name2, val2 in (op_map2 or {}).items():
-                                                    if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
-                                                        val2 = [_coerce_where_value(col2, v) for v in val2]
-                                                    else:
-                                                        val2 = _coerce_where_value(col2, val2)
-                                                    op_fn2 = OPERATOR_REGISTRY.get(op_name2)
-                                                    if not op_fn2:
-                                                        continue
-                                                    exprs2.append(op_fn2(col2, val2))
-                                            if exprs2:
-                                                expr_rr = _and(*exprs2)
+                                            wdict2 = _json.loads(s2)
                                         except Exception:
-                                            expr_rr = None
-                                        if expr_rr is not None:
-                                            inner_sel_i = inner_sel_i.where(expr_rr)
-                                    if dr is not None:
-                                        import json as _json
-                                        wdict2 = dr
-                                        if isinstance(dr, str):
-                                            wdict2 = _json.loads(dr)
-                                        expr_rr = None
-                                        try:
-                                            exprs2 = []
-                                            for col_name2, op_map2 in (wdict2 or {}).items():
-                                                col2 = child_model_cls_i.__table__.c.get(col_name2)
-                                                if col2 is None:
-                                                    continue
-                                                for op_name2, val2 in (op_map2 or {}).items():
-                                                    if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
-                                                        val2 = [_coerce_where_value(col2, v) for v in val2]
-                                                    else:
-                                                        val2 = _coerce_where_value(col2, val2)
-                                                    op_fn2 = OPERATOR_REGISTRY.get(op_name2)
-                                                    if not op_fn2:
-                                                        continue
-                                                    exprs2.append(op_fn2(col2, val2))
-                                            if exprs2:
-                                                expr_rr = _and(*exprs2)
-                                        except Exception:
-                                            expr_rr = None
-                                        if expr_rr is not None:
-                                            inner_sel_i = inner_sel_i.where(expr_rr)
-                                except Exception:
-                                    pass
+                                            try:
+                                                import ast as _ast
+                                                wdict2 = _ast.literal_eval(s2)
+                                            except Exception:
+                                                raise ValueError("where must be a JSON object")
+                                    exprs2 = []
+                                    for col_name2, op_map2 in (wdict2 or {}).items():
+                                        col2 = child_model_cls_i.__table__.c.get(col_name2)
+                                        if col2 is None:
+                                            raise ValueError(f"Unknown where column: {col_name2}")
+                                        for op_name2, val2 in (op_map2 or {}).items():
+                                            if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
+                                                val2 = [_coerce_where_value(col2, v) for v in val2]
+                                            else:
+                                                val2 = _coerce_where_value(col2, val2)
+                                            op_fn2 = OPERATOR_REGISTRY.get(op_name2)
+                                            if not op_fn2:
+                                                raise ValueError(f"Unknown where operator: {op_name2}")
+                                            exprs2.append(op_fn2(col2, val2))
+                                    if exprs2:
+                                        inner_sel_i = inner_sel_i.where(_and(*exprs2))
+                                # Permissive for default_where
+                                dr = rel_cfg_local.get('default_where')
+                                if dr is not None:
+                                    import json as _json
+                                    try:
+                                        wdict2 = dr if not isinstance(dr, str) else _json.loads(dr)
+                                    except Exception:
+                                        wdict2 = None
+                                    exprs2 = []
+                                    for col_name2, op_map2 in (wdict2 or {}).items():
+                                        col2 = child_model_cls_i.__table__.c.get(col_name2)
+                                        if col2 is None:
+                                            continue
+                                        for op_name2, val2 in (op_map2 or {}).items():
+                                            if op_name2 in ('in','between') and isinstance(val2, (list, tuple)):
+                                                val2 = [_coerce_where_value(col2, v) for v in val2]
+                                            else:
+                                                val2 = _coerce_where_value(col2, val2)
+                                            op_fn2 = OPERATOR_REGISTRY.get(op_name2)
+                                            if not op_fn2:
+                                                continue
+                                            exprs2.append(op_fn2(col2, val2))
+                                    if exprs2:
+                                        inner_sel_i = inner_sel_i.where(_and(*exprs2))
                                 if rel_cfg_local.get('offset') is not None:
                                     try:
                                         inner_sel_i = inner_sel_i.offset(int(rel_cfg_local['offset']))

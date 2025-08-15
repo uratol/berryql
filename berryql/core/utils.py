@@ -2,6 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional, Dict, List
+import os
 import strawberry
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from sqlalchemy import and_ as _and
