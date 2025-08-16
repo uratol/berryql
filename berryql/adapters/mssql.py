@@ -177,7 +177,7 @@ class MSSQLAdapter(BaseAdapter):
             parts.append(f"[{table_alias}].[id] ASC")
         return ', '.join(parts) if parts else None
 
-    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None) -> str:
+    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None, nested_children: list[dict] | None = None) -> str:
         n_cols = fields or []
         if not n_cols:
             for c in grand_model.__table__.columns:
@@ -187,19 +187,63 @@ class MSSQLAdapter(BaseAdapter):
         # accept both dict and JSON string
         import json as _json
         def _as_dict(maybe):
+            # Accept dict or JSON string only; ignore callables/expressions
+            if isinstance(maybe, dict):
+                return maybe
             if isinstance(maybe, str):
                 try:
-                    return _json.loads(maybe)
+                    v = _json.loads(maybe)
+                    return v if isinstance(v, dict) else None
                 except Exception:
                     return None
-            return maybe
-        if where_dict:
-            where_parts.extend(self.where_from_dict(grand_model, _as_dict(where_dict)))
-        if default_where:
-            where_parts.extend(self.where_from_dict(grand_model, _as_dict(default_where)))
+            return None
+        wdict = _as_dict(where_dict)
+        if wdict:
+            where_parts.extend(self.where_from_dict(grand_model, wdict))
+        dwdict = _as_dict(default_where)
+        if dwdict:
+            where_parts.extend(self.where_from_dict(grand_model, dwdict))
         if extra_where_sql:
             where_parts.extend([str(x) for x in extra_where_sql if x])
         n_where = ' AND '.join(where_parts)
+        # Handle nested-of-nested arrays: build JSON subqueries correlated to grand_model.id
+        nested_cols = ''
+        if nested_children:
+            n_parts: list[str] = []
+            for nn in nested_children:
+                try:
+                    sub_alias = nn.get('alias')
+                    sub_model = nn.get('model')
+                    sub_fk = nn.get('fk_col_name')
+                    sub_fields = nn.get('fields')
+                    sub_where = nn.get('where')
+                    sub_default_where = nn.get('default_where')
+                    sub_order_by = nn.get('order_by')
+                    sub_order_dir = nn.get('order_dir')
+                    sub_order_multi = nn.get('order_multi')
+                    sub_limit = nn.get('limit')
+                    sub_offset = nn.get('offset')
+                    sub_sql = self.build_nested_list_sql(
+                        alias=sub_alias,
+                        grand_model=sub_model,
+                        child_table=grand_model.__tablename__,
+                        g_fk_col_name=sub_fk,
+                        fields=sub_fields,
+                        where_dict=sub_where,
+                        default_where=sub_default_where,
+                        order_by=sub_order_by,
+                        order_dir=sub_order_dir,
+                        order_multi=sub_order_multi,
+                        limit=sub_limit,
+                        offset=sub_offset,
+                        extra_where_sql=None,
+                        nested_children=None,
+                    )
+                    n_parts.append(f"ISNULL(({sub_sql}), '[]') AS [{sub_alias}]")
+                except Exception:
+                    continue
+            if n_parts:
+                nested_cols = ', ' + ', '.join(n_parts)
         n_order = self._build_order_clause(grand_model, grand_model.__tablename__, order_by, order_dir, order_multi)
         # Build pagination using ORDER BY ... OFFSET/FETCH to support offset reliably
         pag_clause = ''
@@ -213,7 +257,7 @@ class MSSQLAdapter(BaseAdapter):
                 pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
         elif n_order:
             pag_clause = f" ORDER BY {n_order}"
-        return f"SELECT {n_col_select} FROM {grand_model.__tablename__} WHERE {n_where}{pag_clause} FOR JSON PATH"
+        return f"SELECT {n_col_select}{nested_cols} FROM {grand_model.__tablename__} WHERE {n_where}{pag_clause} FOR JSON PATH"
 
     def build_relation_list_json_full(self, *, parent_table: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, offset: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
         """Assemble full MSSQL JSON aggregation for a to-many relation with optional nested arrays.
@@ -226,12 +270,16 @@ class MSSQLAdapter(BaseAdapter):
         where_parts_rel: list[str] = [f"[{child_model.__tablename__}].[{fk_col_name}] = [{parent_table}].[id]"]
         import json as _json
         def _as_dict(maybe):
+            # Accept dict or JSON string only; ignore callables/expressions
+            if isinstance(maybe, dict):
+                return maybe
             if isinstance(maybe, str):
                 try:
-                    return _json.loads(maybe)
+                    v = _json.loads(maybe)
+                    return v if isinstance(v, dict) else None
                 except Exception:
                     return None
-            return maybe
+            return None
         wdict = _as_dict(rel_where)
         if wdict:
             where_parts_rel.extend(self.where_from_dict(child_model, wdict))
@@ -249,6 +297,13 @@ class MSSQLAdapter(BaseAdapter):
                 alias = n.get('alias')
                 gm = n.get('model')
                 gfk = n.get('fk_col_name')
+                # Prepare nested-of-nested specs if any
+                n_children = []
+                try:
+                    for nn in (n.get('nested') or []):
+                        n_children.append(nn)
+                except Exception:
+                    n_children = []
                 nsql = self.build_nested_list_sql(
                     alias=alias,
                     grand_model=gm,
@@ -263,6 +318,7 @@ class MSSQLAdapter(BaseAdapter):
                     limit=n.get('limit'),
                     offset=n.get('offset'),
                     extra_where_sql=None,
+                    nested_children=n_children or None,
                 )
                 nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
             nested_cols = ', ' + ', '.join(nested_parts) if nested_parts else ''
@@ -329,3 +385,4 @@ class MSSQLAdapter(BaseAdapter):
             f"ISNULL((SELECT {select_cols}{nested_cols} FROM {child_table} WHERE {where_condition}{pag_clause} FOR JSON PATH),'[]')"
         )
         return _text(raw)
+
