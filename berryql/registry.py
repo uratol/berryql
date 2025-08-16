@@ -2265,11 +2265,43 @@ class BerrySchema:
                                                     if op_name not in OPERATOR_REGISTRY:
                                                         raise ValueError(f"Unknown where operator: {op_name}")
                                             where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, wdict_rel))
+                                        else:
+                                            # Callable or SQLAlchemy clause: include as raw SQL in WHERE
+                                            try:
+                                                expr_rel = r_where(child_model_cls_i, info) if callable(r_where) else r_where
+                                            except Exception:
+                                                expr_rel = None
+                                            if expr_rel is not None:
+                                                try:
+                                                    sql_snippet = str(getattr(expr_rel, 'compile')(compile_kwargs={"literal_binds": True}))
+                                                except Exception:
+                                                    try:
+                                                        sql_snippet = str(expr_rel)
+                                                    except Exception:
+                                                        sql_snippet = None
+                                                if sql_snippet:
+                                                    where_parts_rel.append(f"({sql_snippet})")
                                         d_where = rel_cfg_local.get('default_where')
                                         if d_where is not None and isinstance(d_where, (dict, str)):
                                             dwdict_rel = _to_where_dict(d_where, strict=False)
                                             if dwdict_rel is not None:
                                                 where_parts_rel.extend(_mssql_where_from_dict(child_model_cls_i, dwdict_rel))
+                                        elif d_where is not None:
+                                            # Callable default_where -> permissive: include if builds successfully
+                                            try:
+                                                expr_def = d_where(child_model_cls_i, info) if callable(d_where) else d_where
+                                            except Exception:
+                                                expr_def = None
+                                            if expr_def is not None:
+                                                try:
+                                                    sql_snippet = str(getattr(expr_def, 'compile')(compile_kwargs={"literal_binds": True}))
+                                                except Exception:
+                                                    try:
+                                                        sql_snippet = str(expr_def)
+                                                    except Exception:
+                                                        sql_snippet = None
+                                                if sql_snippet:
+                                                    where_parts_rel.append(f"({sql_snippet})")
                                         # Apply relation filter_args to MSSQL where parts
                                         try:
                                             fa = rel_cfg_local.get('filter_args') or {}
@@ -2354,7 +2386,7 @@ class BerrySchema:
                                     order_clause = ', '.join(order_parts) if order_parts else None
                                     # Build nested subqueries for MSSQL if nested relations are requested (recursive)
                                     nested_subqueries: list[tuple[str, str]] = []
-                                    def _mssql_build_nested_recursive(nname: str, ncfg: Dict[str, Any]) -> str | None:
+                                    def _mssql_build_nested_recursive(nname: str, ncfg: Dict[str, Any], current_parent_model, current_parent_table: str) -> str | None:
                                         try:
                                             # If default_where is callable, ignore it for pushdown but keep nesting
                                             dw2 = ncfg.get('default_where')
@@ -2372,7 +2404,8 @@ class BerrySchema:
                                             g_fk = None
                                             for c in g_model.__table__.columns:
                                                 for fk in c.foreign_keys:
-                                                    if fk.column.table.name == child_model_cls_i.__table__.name:
+                                                    # Correlate to the current parent model/table, not always the top-level child
+                                                    if fk.column.table.name == current_parent_model.__table__.name:
                                                         g_fk = c
                                                         break
                                                 if g_fk is not None:
@@ -2386,15 +2419,52 @@ class BerrySchema:
                                                     if sd2.kind == 'scalar':
                                                         n_cols.append(sf2)
                                             select_cols = ', '.join([f"[{g_model.__tablename__}].[{c}] AS [{c}]" for c in (n_cols or ['id'])])
-                                            # where
-                                            where_parts = [f"[{g_model.__tablename__}].[{g_fk.name}] = [{child_table}].[id]"]
+                                            # where: correlate to the CURRENT parent table row
+                                            where_parts = [
+                                                f"[{g_model.__tablename__}].[{g_fk.name}] = [{current_parent_table}].[id]"
+                                            ]
                                             try:
-                                                wdict = _to_where_dict(ncfg.get('where'), strict=True) if ncfg.get('where') is not None else None
-                                                if wdict:
-                                                    where_parts.extend(_mssql_where_from_dict(g_model, wdict))
-                                                dwdict = _to_where_dict(ncfg.get('default_where'), strict=False) if ncfg.get('default_where') is not None else None
-                                                if dwdict:
-                                                    where_parts.extend(_mssql_where_from_dict(g_model, dwdict))
+                                                w_raw = ncfg.get('where')
+                                                if w_raw is not None:
+                                                    wdict = _to_where_dict(w_raw, strict=True) if isinstance(w_raw, (dict, str)) else None
+                                                    if wdict:
+                                                        where_parts.extend(_mssql_where_from_dict(g_model, wdict))
+                                                    else:
+                                                        # Callable/SQLA clause
+                                                        try:
+                                                            expr_n = w_raw(g_model, info) if callable(w_raw) else w_raw
+                                                        except Exception:
+                                                            expr_n = None
+                                                        if expr_n is not None:
+                                                            try:
+                                                                sql_snippet = str(getattr(expr_n, 'compile')(compile_kwargs={"literal_binds": True}))
+                                                            except Exception:
+                                                                try:
+                                                                    sql_snippet = str(expr_n)
+                                                                except Exception:
+                                                                    sql_snippet = None
+                                                            if sql_snippet:
+                                                                where_parts.append(f"({sql_snippet})")
+                                                d_raw = ncfg.get('default_where')
+                                                if d_raw is not None:
+                                                    dwdict = _to_where_dict(d_raw, strict=False) if isinstance(d_raw, (dict, str)) else None
+                                                    if dwdict:
+                                                        where_parts.extend(_mssql_where_from_dict(g_model, dwdict))
+                                                    else:
+                                                        try:
+                                                            expr_d = d_raw(g_model, info) if callable(d_raw) else d_raw
+                                                        except Exception:
+                                                            expr_d = None
+                                                        if expr_d is not None:
+                                                            try:
+                                                                sql_snippet = str(getattr(expr_d, 'compile')(compile_kwargs={"literal_binds": True}))
+                                                            except Exception:
+                                                                try:
+                                                                    sql_snippet = str(expr_d)
+                                                                except Exception:
+                                                                    sql_snippet = None
+                                                            if sql_snippet:
+                                                                where_parts.append(f"({sql_snippet})")
                                             except Exception:
                                                 pass
                                             # order
@@ -2404,7 +2474,13 @@ class BerrySchema:
                                             nested_cols = ''
                                             parts = []
                                             for nn2, cfg2 in deeper.items():
-                                                inner = _mssql_build_nested_recursive(nn2, cfg2)
+                                                # Recurse with this level as the new parent context
+                                                inner = _mssql_build_nested_recursive(
+                                                    nn2,
+                                                    cfg2,
+                                                    g_model,
+                                                    g_model.__tablename__,
+                                                )
                                                 if inner is not None:
                                                     parts.append(f"ISNULL(({inner}), '[]') AS [{nn2}]")
                                             if parts:
@@ -2447,7 +2523,13 @@ class BerrySchema:
                                                 pass
                                             return None
                                     for nname, ncfg in (rel_cfg_local.get('nested') or {}).items():
-                                        sql_nested = _mssql_build_nested_recursive(nname, ncfg)
+                                        # Start recursion with the immediate child as the parent context
+                                        sql_nested = _mssql_build_nested_recursive(
+                                            nname,
+                                            ncfg,
+                                            child_model_cls_i,
+                                            child_table,
+                                        )
                                         if sql_nested is not None:
                                             nested_subqueries.append((nname, sql_nested))
                                     return adapter.build_list_relation_json(
