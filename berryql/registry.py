@@ -11,6 +11,7 @@ from .adapters import get_adapter  # adapter abstraction
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
+from sqlalchemy.types import TypeDecorator as _SATypeDecorator
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
 import uuid as _py_uuid
 from datetime import datetime
@@ -220,6 +221,23 @@ class BerrySchema:
         Defaults to str for unknown types (safe GraphQL scalar mapping).
         """
         try:
+            # Unwrap TypeDecorator when possible and special-case BinaryArray
+            if isinstance(sqlatype, _SATypeDecorator):
+                # Special-case our BinaryArray -> List[str]
+                try:
+                    if type(sqlatype).__name__.lower() == 'binaryarray':
+                        return List[str]  # type: ignore[index]
+                except Exception:
+                    pass
+                # Try to recurse into underlying impl
+                try:
+                    inner_impl = getattr(sqlatype, 'impl', None)
+                    if inner_impl is not None and inner_impl is not sqlatype:
+                        t = self._sa_python_type(inner_impl)
+                        if t is not None:
+                            return t
+                except Exception:
+                    pass
             if isinstance(sqlatype, Integer):
                 return int
             if isinstance(sqlatype, String):

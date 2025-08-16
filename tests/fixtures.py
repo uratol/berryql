@@ -31,11 +31,11 @@ async def create_sample_posts(session: AsyncSession, users):
     user1, user2, user3, _ = users
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     posts = [
-        Post(title="First Post", content="Hello world!", author_id=user1.id, created_at=now - timedelta(minutes=60)),
-        Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id, created_at=now - timedelta(minutes=45)),
-        Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id, created_at=now - timedelta(minutes=30)),
-        Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id, created_at=now - timedelta(minutes=15)),
-        Post(title="Getting Started", content="A beginner's guide", author_id=user3.id, created_at=now - timedelta(minutes=5)),
+    Post(title="First Post", content="Hello world!", author_id=user1.id, created_at=now - timedelta(minutes=60), binary_blobs=[b"a", b"b", b"c"]),
+    Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id, created_at=now - timedelta(minutes=45), binary_blobs=[b"x", b"y"]),
+    Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id, created_at=now - timedelta(minutes=30), binary_blobs=None),
+    Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id, created_at=now - timedelta(minutes=15), binary_blobs=[b"\x00\x01\x02"]),
+    Post(title="Getting Started", content="A beginner's guide", author_id=user3.id, created_at=now - timedelta(minutes=5), binary_blobs=[]),
     ]
     session.add_all(posts)
     await session.flush()
