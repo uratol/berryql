@@ -22,7 +22,19 @@ async def test_deep_nested_pushdown_one_select(engine, db_session, populated_db)
     try:
         query = {
             'query': (
-                '{ users { id name posts { post_comments { id likes { id } admin_likes { id user_id } } } } } '
+                '''{
+  users {
+    id
+    name
+    posts {
+      post_comments {
+        id
+        likes { id user { email } }
+        admin_likes { id user_id post { author { name } } }
+      }
+    }
+  }
+}'''
             )
         }
         res = await schema.execute(query['query'], context_value={'db_session': db_session})
@@ -48,10 +60,33 @@ async def test_deep_nested_pushdown_one_select(engine, db_session, populated_db)
         # Since pushdown returns only like ids at this depth, validate concrete IDs
         like_ids = sorted([lk.get('id') for lk in all_likes if lk is not None])
         assert like_ids == [1, 2, 3, 4], f"Unexpected like ids: {like_ids}"
+        # Validate liker emails by id based on fixtures
+        likes_by_id = {lk.get('id'): lk for lk in all_likes if lk is not None}
+        expected_emails_by_like_id = {
+            1: 'alice@example.com',
+            2: 'charlie@example.com',
+            3: 'alice@example.com',
+            4: 'charlie@example.com',
+        }
+        for lid, expected_email in expected_emails_by_like_id.items():
+            assert lid in likes_by_id, f"Missing like id {lid} in response"
+            user_obj = (likes_by_id[lid] or {}).get('user')
+            if user_obj:
+                assert user_obj.get('email') == expected_email, (
+                    f"Like {lid} email mismatch: {user_obj.get('email')} != {expected_email}"
+                )
         # Admin likes should be a subset: only likes by admin user (id=1) -> ids [1, 3]
         admin_like_ids = sorted([lk.get('id') for lk in all_admin_likes if lk is not None])
         assert admin_like_ids == [1, 3], f"Unexpected admin_like ids: {admin_like_ids}"
         assert all((lk.get('user_id') == 1) for lk in all_admin_likes), f"Non-admin like found in admin_likes: {all_admin_likes}"
+        # And each admin like carries the post author name (post1 author is Alice Johnson)
+        for alk in all_admin_likes:
+            post_obj = (alk or {}).get('post')
+            author_obj = (post_obj or {}).get('author') if post_obj else None
+            if author_obj:
+                assert author_obj.get('name') == 'Alice Johnson', (
+                    f"Admin like {alk.get('id')} has unexpected post author: {author_obj}"
+                )
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", before_cursor_execute)
 

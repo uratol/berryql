@@ -55,6 +55,7 @@ class PostCommentLikeQL(BerryType):
     user_id = field()
     created_at = field()
     user = relation('UserQL', single=True)
+    post = relation('PostQL', single=True)
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
