@@ -10,6 +10,196 @@ class RelationSQLBuilders:
         self.registry = registry
 
     # --- helpers -------------------------------------------------------------
+    def _prepare_requested_scalar_fields(
+        self,
+        *,
+        target_btype,
+        child_model_cls,
+        rel_cfg: Dict[str, Any] | None,
+        include_helper_fk_for_single_nested: bool = True,
+    ) -> List[str]:
+        """Return a sanitized list of scalar fields to project for the child model.
+
+        - Honors rel_cfg['fields'] if provided and filters to known scalar fields.
+        - Otherwise includes all scalar berry fields on target type.
+        - Optionally includes helper FK columns for child's single nested relations that are requested.
+        - Always ensures 'id' is included when available for correlation.
+        """
+        rel_cfg = rel_cfg or {}
+        requested: List[str] = list(rel_cfg.get('fields') or [])
+        try:
+            if requested:
+                tmp: list[str] = []
+                for sf in requested:
+                    sdef = getattr(target_btype, '__berry_fields__', {}).get(sf)
+                    if sdef and sdef.kind == 'scalar':
+                        tmp.append(sf)
+                requested = tmp
+        except Exception:
+            pass
+        if not requested:
+            try:
+                for sf, sdef in getattr(target_btype, '__berry_fields__', {}).items():
+                    if sdef.kind == 'scalar':
+                        requested.append(sf)
+            except Exception:
+                requested = []
+        if include_helper_fk_for_single_nested:
+            try:
+                nested_requested = set((rel_cfg.get('nested') or {}).keys())
+                for r2, d2 in getattr(target_btype, '__berry_fields__', {}).items():
+                    meta = (getattr(d2, 'meta', {}) or {})
+                    if (
+                        d2.kind == 'relation'
+                        and (meta.get('single') or meta.get('mode') == 'single')
+                        and r2 in nested_requested
+                    ):
+                        fk2 = f"{r2}_id"
+                        try:
+                            if fk2 in child_model_cls.__table__.columns and fk2 not in requested:
+                                requested.append(fk2)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        try:
+            if 'id' in child_model_cls.__table__.columns and 'id' not in requested:
+                requested.append('id')
+        except Exception:
+            pass
+        return requested
+
+    def _build_single_child_select_sqla(
+        self,
+        *,
+        parent_model_cls,
+        child_model_cls,
+        pfk_col_name: str,
+        projected_columns: List[str],
+        rel_where: Any,
+        rel_default_where: Any,
+        filter_args: Dict[str, Any] | None,
+        arg_specs: Dict[str, Any] | None,
+        to_where_dict,
+        expr_from_where_dict,
+        info,
+    ):
+        """Build a correlated SA select for a single relation (parent has FK to child).
+
+        Applies where/default_where, filter args, ordering fallback to id, and limit 1.
+        """
+        cols = projected_columns or ['id']
+        child_id_col = getattr(child_model_cls, 'id')
+        parent_fk_col = getattr(parent_model_cls, pfk_col_name)
+        inner_cols = [getattr(child_model_cls, c) for c in cols]
+        sel = (
+            select(*inner_cols)
+            .select_from(child_model_cls)
+            .where(child_id_col == parent_fk_col)
+            .correlate(parent_model_cls)
+            .limit(1)
+        )
+        # where/default_where
+        sel = self._apply_where_sqla(
+            sel,
+            child_model_cls,
+            rel_where,
+            strict=True,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
+        sel = self._apply_where_sqla(
+            sel,
+            child_model_cls,
+            rel_default_where,
+            strict=False,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
+        # filter args
+        expanded_specs = self._expand_arg_specs(arg_specs or {})
+        sel = self._apply_filter_args_sqla(sel, child_model_cls, info, filter_args or {}, expanded_specs)
+        # ensure deterministic ordering when not unique
+        try:
+            if 'id' in child_model_cls.__table__.columns:
+                sel = sel.order_by(getattr(child_model_cls, 'id').asc())
+        except Exception:
+            pass
+        return sel
+
+    def _build_list_child_select_sqla(
+        self,
+        *,
+        parent_model_cls,
+        child_model_cls,
+        fk_child_to_parent_col,
+        projected_columns: List[str],
+        rel_cfg: Dict[str, Any],
+        to_where_dict,
+        expr_from_where_dict,
+        info,
+    ):
+        """Build a correlated SA select for a to-many relation (child has FK to parent).
+
+        Applies relation where/default_where, filter args, ordering (order_multi -> order_by -> id), and pagination.
+        """
+        inner_cols = [getattr(child_model_cls, c) for c in (projected_columns or ['id'])]
+        sel = (
+            select(*inner_cols)
+            .select_from(child_model_cls)
+            .where(fk_child_to_parent_col == parent_model_cls.id)
+            .correlate(parent_model_cls)
+        )
+        # where/default_where
+        sel = self._apply_where_sqla(
+            sel,
+            child_model_cls,
+            rel_cfg.get('where'),
+            strict=True,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
+        sel = self._apply_where_sqla(
+            sel,
+            child_model_cls,
+            rel_cfg.get('default_where'),
+            strict=False,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
+        # filter args
+        expanded_specs = self._expand_arg_specs(rel_cfg.get('arg_specs') or {})
+        sel = self._apply_filter_args_sqla(sel, child_model_cls, info, rel_cfg.get('filter_args') or {}, expanded_specs)
+        # ordering
+        try:
+            allowed = [
+                sf for sf, sd in self.registry.types[rel_cfg.get('target')].__berry_fields__.items() if sd.kind == 'scalar'
+            ] if rel_cfg.get('target') in self.registry.types else []
+        except Exception:
+            allowed = []
+        try:
+            from ..core.utils import dir_value as _dir_value
+        except Exception:
+            def _dir_value(x):
+                return (x or 'asc')
+        sel = self._apply_ordering_sqla(
+            sel,
+            child_model_cls,
+            allowed,
+            order_by=rel_cfg.get('order_by'),
+            order_dir=rel_cfg.get('order_dir'),
+            order_multi=self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
+            dir_value_fn=_dir_value,
+            default_dir_for_multi='asc',
+            fallback_id=True,
+        )
+        # pagination
+        sel = self._apply_pagination_sqla(sel, rel_cfg.get('limit'), rel_cfg.get('offset'))
+        return sel
     def _expand_arg_specs(self, arg_specs: Dict[str, Any] | None) -> Dict[str, Any]:
         """Normalize filter arg specs: expand ops to concrete names and honor aliases.
 
@@ -349,6 +539,13 @@ class RelationSQLBuilders:
                 adapter=adapter,
                 info=info,
             )
+            # Apply filter args best-effort on MSSQL single relation as well
+            try:
+                fa = filter_args or {}
+                expanded = self._expand_arg_specs(arg_specs or {})
+                where_parts = self._apply_filter_args_mssql(where_parts, child_model_cls, fa, expanded, adapter)
+            except Exception:
+                pass
             where_sql = ' AND '.join(where_parts)
             # Use adapter helper for a single object
             return adapter.build_single_relation_json(
@@ -357,31 +554,15 @@ class RelationSQLBuilders:
                 join_condition=where_sql,
             )
         # Non-MSSQL: correlated select limited to 1, return JSON object or null
-        child_id_col = getattr(child_model_cls, 'id')
-        parent_fk_col = getattr(parent_model_cls, pfk)
-        inner_cols = [getattr(child_model_cls, c) for c in cols]
-        inner_sel = (
-            select(*inner_cols)
-            .select_from(child_model_cls)
-            .where(child_id_col == parent_fk_col)
-            .correlate(parent_model_cls)
-            .limit(1)
-        )
-        # Apply where/default_where (supports dict/str/callable)
-        inner_sel = self._apply_where_sqla(
-            inner_sel,
-            child_model_cls,
-            rel_where,
-            strict=True,
-            to_where_dict=to_where_dict,
-            expr_from_where_dict=expr_from_where_dict,
-            info=info,
-        )
-        inner_sel = self._apply_where_sqla(
-            inner_sel,
-            child_model_cls,
-            rel_default_where,
-            strict=False,
+        inner_sel = self._build_single_child_select_sqla(
+            parent_model_cls=parent_model_cls,
+            child_model_cls=child_model_cls,
+            pfk_col_name=pfk,
+            projected_columns=cols,
+            rel_where=rel_where,
+            rel_default_where=rel_default_where,
+            filter_args=filter_args,
+            arg_specs=arg_specs,
             to_where_dict=to_where_dict,
             expr_from_where_dict=expr_from_where_dict,
             info=info,
@@ -812,15 +993,24 @@ class RelationSQLBuilders:
     ):
         mssql_mode = getattr(adapter, 'name', '') == 'mssql'
         child_table = child_model_cls.__tablename__
-        # Add helper FK columns for nested single backrefs (safe no-op if absent)
-        requested_scalar_local: list[str] = list(requested_scalar or ['id'])
+        # Prepare projected scalar fields consistently across adapters
         try:
-            nested = rel_cfg.get('nested') or {}
-            target_name = rel_cfg.get('target')
-            target_b = self.registry.types.get(target_name) if target_name else None
-            requested_scalar_local = self._ensure_helper_fk_for_single_nested(requested_scalar_local, child_model_cls, target_b, nested)
+            target_b = self.registry.types.get(rel_cfg.get('target')) if rel_cfg.get('target') else None
         except Exception:
-            pass
+            target_b = None
+        requested_scalar_local: list[str]
+        try:
+            if target_b is not None and getattr(target_b, 'model', None) is not None:
+                requested_scalar_local = self._prepare_requested_scalar_fields(
+                    target_btype=target_b,
+                    child_model_cls=child_model_cls,
+                    rel_cfg=rel_cfg,
+                    include_helper_fk_for_single_nested=True,
+                )
+            else:
+                requested_scalar_local = list(requested_scalar or ['id'])
+        except Exception:
+            requested_scalar_local = list(requested_scalar or ['id'])
         if mssql_mode:
             parent_table = parent_model_cls.__tablename__
             # If there are nested relations selected under this list relation, use the
@@ -1047,58 +1237,16 @@ class RelationSQLBuilders:
                 nested_subqueries=None,
             )
         # Non-MSSQL: correlated aggregation
-        inner_cols = [getattr(child_model_cls, c) for c in (requested_scalar_local or ['id'])]
-        inner_sel = (
-            select(*inner_cols)
-            .select_from(child_model_cls)
-            .where(fk_child_to_parent_col == parent_model_cls.id)
-            .correlate(parent_model_cls)
-        )
-        # where/default where (supports dict/str/callable)
-        inner_sel = self._apply_where_sqla(
-            inner_sel,
-            child_model_cls,
-            rel_cfg.get('where'),
-            strict=True,
+        inner_sel = self._build_list_child_select_sqla(
+            parent_model_cls=parent_model_cls,
+            child_model_cls=child_model_cls,
+            fk_child_to_parent_col=fk_child_to_parent_col,
+            projected_columns=(requested_scalar_local or ['id']),
+            rel_cfg=rel_cfg,
             to_where_dict=to_where_dict,
             expr_from_where_dict=expr_from_where_dict,
             info=info,
         )
-        inner_sel = self._apply_where_sqla(
-            inner_sel,
-            child_model_cls,
-            rel_cfg.get('default_where'),
-            strict=False,
-            to_where_dict=to_where_dict,
-            expr_from_where_dict=expr_from_where_dict,
-            info=info,
-        )
-        # filter args (SQLA expr path)
-        expanded_specs = self._expand_arg_specs(rel_cfg.get('arg_specs') or {})
-        inner_sel = self._apply_filter_args_sqla(inner_sel, child_model_cls, info, rel_cfg.get('filter_args') or {}, expanded_specs)
-        # ordering
-        try:
-            allowed = [sf for sf, sd in self.registry.types[rel_cfg.get('target')].__berry_fields__.items() if sd.kind == 'scalar'] if rel_cfg.get('target') in self.registry.types else []
-        except Exception:
-            allowed = []
-        try:
-            from ..core.utils import dir_value as _dir_value
-        except Exception:
-            def _dir_value(x):
-                return (x or 'asc')
-        inner_sel = self._apply_ordering_sqla(
-            inner_sel,
-            child_model_cls,
-            allowed,
-            order_by=rel_cfg.get('order_by'),
-            order_dir=rel_cfg.get('order_dir'),
-            order_multi=self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
-            dir_value_fn=_dir_value,
-            default_dir_for_multi='asc',
-            fallback_id=True,
-        )
-        # pagination
-        inner_sel = self._apply_pagination_sqla(inner_sel, rel_cfg.get('limit'), rel_cfg.get('offset'))
         limited_subq = inner_sel.subquery()
         row_json_expr = json_object_fn(*self._json_row_args_from_subq(limited_subq, (requested_scalar_local or ['id'])))
         agg_inner_expr = json_array_agg_fn(row_json_expr)
