@@ -1,5 +1,6 @@
 from __future__ import annotations
 from sqlalchemy import func, text as _text, literal
+from sqlalchemy.dialects.postgresql import BYTEA as _PG_BYTEA
 from .base import BaseAdapter
 
 class PostgresAdapter(BaseAdapter):
