@@ -10,6 +10,275 @@ class RelationSQLBuilders:
         self.registry = registry
 
     # --- helpers -------------------------------------------------------------
+    def _expand_arg_specs(self, arg_specs: Dict[str, Any] | None) -> Dict[str, Any]:
+        """Normalize filter arg specs: expand ops to concrete names and honor aliases.
+
+        Returns a dict mapping effective arg name -> spec (possibly cloned with concrete op).
+        """
+        if not arg_specs:
+            return {}
+        try:
+            from ..core.filters import normalize_filter_spec as _normalize_filter_spec
+        except Exception:
+            return {}
+        expanded: Dict[str, Any] = {}
+        for key, raw in (arg_specs or {}).items():
+            try:
+                spec = _normalize_filter_spec(raw)
+            except Exception:
+                continue
+            if getattr(spec, 'ops', None) and not getattr(spec, 'op', None):
+                for op_name in spec.ops:
+                    base = spec.alias or key
+                    an = base if str(base).endswith(f"_{op_name}") else f"{base}_{op_name}"
+                    try:
+                        expanded[an] = spec.clone_with(op=op_name, ops=None)
+                    except Exception:
+                        continue
+            else:
+                expanded[spec.alias or key] = spec
+        return expanded
+
+    def _apply_filter_args_sqla(self, sel, model_cls, info, filter_args: Dict[str, Any] | None, expanded_specs: Dict[str, Any]):
+        """Apply filter_args using SQLAlchemy expressions."""
+        if not filter_args:
+            return sel
+        try:
+            from ..core.filters import OPERATOR_REGISTRY
+        except Exception:
+            OPERATOR_REGISTRY = {}
+        for arg_name, val in (filter_args or {}).items():
+            f_spec = expanded_specs.get(arg_name)
+            if not f_spec:
+                continue
+            if getattr(f_spec, 'transform', None):
+                try:
+                    val = f_spec.transform(val)
+                except Exception:
+                    continue
+            expr = None
+            if getattr(f_spec, 'builder', None):
+                try:
+                    expr = f_spec.builder(model_cls, info, val)
+                except Exception:
+                    expr = None
+            elif getattr(f_spec, 'column', None):
+                try:
+                    col = model_cls.__table__.c.get(f_spec.column)
+                except Exception:
+                    col = None
+                if col is None:
+                    continue
+                op_fn = OPERATOR_REGISTRY.get(getattr(f_spec, 'op', None) or 'eq')
+                if not op_fn:
+                    continue
+                try:
+                    expr = op_fn(col, val)
+                except Exception:
+                    expr = None
+            if expr is not None:
+                sel = sel.where(expr)
+        return sel
+
+    def _apply_filter_args_mssql(self, where_parts: List[str], model_cls, filter_args: Dict[str, Any] | None, expanded_specs: Dict[str, Any], adapter):
+        """Translate filter_args into MSSQL where fragments using adapter.where_from_dict.
+
+        Extends where_parts in-place and returns it.
+        """
+        if not filter_args:
+            return where_parts
+        try:
+            from ..core.filters import OPERATOR_REGISTRY
+        except Exception:
+            OPERATOR_REGISTRY = {}
+
+        def _add(col_name: str, op_name: str, value: Any):
+            v = value
+            if op_name in ('like', 'ilike') and isinstance(v, str) and '%' not in v and '_' not in v:
+                v = f"%{v}%"
+            try:
+                where_parts.extend(adapter.where_from_dict(model_cls, {col_name: {op_name: v}}))
+            except Exception:
+                pass
+
+        for arg_name, val in (filter_args or {}).items():
+            f_spec = expanded_specs.get(arg_name)
+            if f_spec:
+                if getattr(f_spec, 'transform', None):
+                    try:
+                        val = f_spec.transform(val)
+                    except Exception:
+                        pass
+                if getattr(f_spec, 'column', None):
+                    _add(f_spec.column, getattr(f_spec, 'op', None) or 'eq', val)
+                    continue
+            # Fallback to suffix operators when spec not found
+            try:
+                an = str(arg_name)
+                if '_' in an:
+                    base, suffix = an.rsplit('_', 1)
+                    if suffix.lower() in OPERATOR_REGISTRY and base in model_cls.__table__.columns:
+                        _add(base, suffix.lower(), val)
+            except Exception:
+                pass
+        return where_parts
+
+    def _apply_where_sqla(self, sel, model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, info):
+        """Apply a where/default_where value (dict/str/callable/expr) to a SQLAlchemy selectable."""
+        v = self._resolve_graphql_value(info, value)
+        if v is None:
+            return sel
+        if isinstance(v, (dict, str)):
+            if strict:
+                # In strict mode, propagate errors to match previous behavior
+                wdict = to_where_dict(v, strict=True)
+            else:
+                try:
+                    wdict = to_where_dict(v, strict=False)
+                except Exception:
+                    wdict = None
+            if wdict:
+                if strict:
+                    expr = expr_from_where_dict(model_cls, wdict, strict=True)
+                else:
+                    try:
+                        expr = expr_from_where_dict(model_cls, wdict, strict=False)
+                    except Exception:
+                        expr = None
+                if expr is not None:
+                    sel = sel.where(expr)
+            return sel
+        # callable or direct expression
+        try:
+            expr = v(model_cls, info) if callable(v) else v
+        except Exception:
+            expr = None
+        if expr is not None:
+            sel = sel.where(expr)
+        return sel
+
+    def _mssql_where_from_value(self, where_parts: List[str], model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, adapter, info) -> List[str]:
+        """Append MSSQL WHERE fragments for dict/str values. Validates strict=True via SQLAlchemy path.
+
+        Callable/default expressions are handled by the caller when needed.
+        """
+        v = self._resolve_graphql_value(info, value)
+        if v is None:
+            return where_parts
+        if isinstance(v, (dict, str)):
+            if strict:
+                # In strict mode propagate parse errors
+                wdict = to_where_dict(v, strict=True)
+            else:
+                try:
+                    wdict = to_where_dict(v, strict=False)
+                except Exception:
+                    wdict = None
+            if wdict:
+                if strict:
+                    # validate to raise on malformed/unknowns
+                    _ = expr_from_where_dict(model_cls, wdict, strict=True)
+                try:
+                    where_parts.extend(adapter.where_from_dict(model_cls, wdict))
+                except Exception:
+                    pass
+        return where_parts
+
+    def _json_row_args_from_subq(self, subq, columns: List[str] | None) -> List[Any]:
+        args: List[Any] = []
+        cols = columns or ['id']
+        for c in cols:
+            args.extend([_text(f"'{c}'"), getattr(subq.c, c)])
+        return args
+
+    @staticmethod
+    def _ensure_helper_fk_for_single_nested(requested: List[str], child_model_cls, target_b, nested_map: Dict[str, Any]) -> List[str]:
+        out = list(requested or ['id'])
+        try:
+            for rname, fdef in (getattr(target_b, '__berry_fields__', {}) or {}).items():
+                try:
+                    is_rel = getattr(fdef, 'kind', None) == 'relation'
+                    meta = getattr(fdef, 'meta', {}) or {}
+                    if is_rel and (meta.get('single') or meta.get('mode') == 'single') and rname in (nested_map or {}):
+                        fk_col_name = f"{rname}_id"
+                        try:
+                            if fk_col_name in child_model_cls.__table__.columns and fk_col_name not in out:
+                                out.append(fk_col_name)
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _apply_ordering_sqla(
+        self,
+        sel,
+        model_cls,
+        allowed_fields: List[str] | None,
+        *,
+        order_by: Optional[str],
+        order_dir: Optional[str],
+        order_multi: List[str] | None,
+        dir_value_fn=None,
+        default_dir_for_multi: str = 'asc',
+        fallback_id: bool = True,
+    ):
+        ordered = False
+        for spec in (order_multi or []):
+            cn, _, dd = spec.partition(':')
+            dd = (dd or default_dir_for_multi).lower()
+            if not allowed_fields or cn in allowed_fields:
+                col = getattr(model_cls, cn, None)
+                if col is not None:
+                    sel = sel.order_by(col.desc() if dd == 'desc' else col.asc())
+                    ordered = True
+        if not ordered and (not allowed_fields or order_by in (allowed_fields or [])):
+            if order_by:
+                dd = None
+                try:
+                    dd = (dir_value_fn(order_dir) if dir_value_fn else order_dir) or 'asc'
+                except Exception:
+                    dd = (order_dir or 'asc')
+                dd = dd.lower()
+                col = getattr(model_cls, order_by, None)
+                if col is not None:
+                    sel = sel.order_by(col.desc() if dd == 'desc' else col.asc())
+                    ordered = True
+        if fallback_id and not ordered:
+            try:
+                if 'id' in model_cls.__table__.columns:
+                    sel = sel.order_by(getattr(model_cls, 'id').asc())
+            except Exception:
+                pass
+        return sel
+
+    @staticmethod
+    def _effective_order_dir(cfg: Dict[str, Any] | None) -> Optional[str]:
+        if not cfg:
+            return None
+        try:
+            if cfg.get('_has_explicit_order_by') and not cfg.get('_has_explicit_order_dir'):
+                return 'asc'
+        except Exception:
+            pass
+        return cfg.get('order_dir')
+
+    @staticmethod
+    def _apply_pagination_sqla(sel, limit, offset):
+        try:
+            if offset is not None:
+                o = offset
+                sel = sel.offset(int(o) if isinstance(o, (int, str)) else o)
+            if limit is not None:
+                l = limit
+                sel = sel.limit(int(l) if isinstance(l, (int, str)) else l)
+        except Exception:
+            # Best-effort; ignore pagination errors
+            pass
+        return sel
+
     @staticmethod
     def _resolve_graphql_value(info, raw):
         v = raw
@@ -59,22 +328,27 @@ class RelationSQLBuilders:
             where_parts: list[str] = [
                 f"[{child_table}].[{pfk}] = [{parent_table}].[id]"
             ]
-            r_where = self._resolve_graphql_value(info, rel_where)
-            if r_where is not None and isinstance(r_where, (dict, str)):
-                # strict=True must raise for malformed and unknowns
-                wdict = to_where_dict(r_where, strict=True)
-                if wdict:
-                    # validate using SQLA path to raise on unknowns/operators
-                    _ = expr_from_where_dict(child_model_cls, wdict, strict=True)
-                    where_parts.extend(adapter.where_from_dict(child_model_cls, wdict))
-            d_where = self._resolve_graphql_value(info, rel_default_where)
-            if d_where is not None and isinstance(d_where, (dict, str)):
-                try:
-                    dwdict = to_where_dict(d_where, strict=False)
-                except Exception:
-                    dwdict = None
-                if dwdict:
-                    where_parts.extend(adapter.where_from_dict(child_model_cls, dwdict))
+            # Apply relation where/default_where fragments
+            where_parts = self._mssql_where_from_value(
+                where_parts,
+                child_model_cls,
+                rel_where,
+                strict=True,
+                to_where_dict=to_where_dict,
+                expr_from_where_dict=expr_from_where_dict,
+                adapter=adapter,
+                info=info,
+            )
+            where_parts = self._mssql_where_from_value(
+                where_parts,
+                child_model_cls,
+                rel_default_where,
+                strict=False,
+                to_where_dict=to_where_dict,
+                expr_from_where_dict=expr_from_where_dict,
+                adapter=adapter,
+                info=info,
+            )
             where_sql = ' AND '.join(where_parts)
             # Use adapter helper for a single object
             return adapter.build_single_relation_json(
@@ -93,31 +367,27 @@ class RelationSQLBuilders:
             .correlate(parent_model_cls)
             .limit(1)
         )
-        r_where = self._resolve_graphql_value(info, rel_where)
-        if r_where is not None and isinstance(r_where, (dict, str)):
-            wdict = to_where_dict(r_where, strict=True)
-            if wdict:
-                expr = expr_from_where_dict(child_model_cls, wdict, strict=True)
-                if expr is not None:
-                    inner_sel = inner_sel.where(expr)
-        d_where = self._resolve_graphql_value(info, rel_default_where)
-        if d_where is not None and isinstance(d_where, (dict, str)):
-            try:
-                dwdict = to_where_dict(d_where, strict=False)
-            except Exception:
-                dwdict = None
-            if dwdict:
-                try:
-                    expr = expr_from_where_dict(child_model_cls, dwdict, strict=False)
-                except Exception:
-                    expr = None
-                if expr is not None:
-                    inner_sel = inner_sel.where(expr)
+        # Apply where/default_where (supports dict/str/callable)
+        inner_sel = self._apply_where_sqla(
+            inner_sel,
+            child_model_cls,
+            rel_where,
+            strict=True,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
+        inner_sel = self._apply_where_sqla(
+            inner_sel,
+            child_model_cls,
+            rel_default_where,
+            strict=False,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
         limited = inner_sel.subquery()
-        args: List[Any] = []
-        for c in cols:
-            args.extend([_text(f"'{c}'"), getattr(limited.c, c)])
-        obj_expr = json_object_fn(*args)
+        obj_expr = json_object_fn(*self._json_row_args_from_subq(limited, cols))
         query = select(obj_expr).select_from(limited).correlate(parent_model_cls)
         try:
             return query.scalar_subquery()
@@ -548,15 +818,7 @@ class RelationSQLBuilders:
             nested = rel_cfg.get('nested') or {}
             target_name = rel_cfg.get('target')
             target_b = self.registry.types.get(target_name) if target_name else None
-            if target_b:
-                for rname, fdef in (target_b.__berry_fields__ or {}).items():
-                    if getattr(fdef, 'kind', None) == 'relation' and (fdef.meta.get('single') or fdef.meta.get('mode') == 'single') and rname in nested:
-                        fk_col_name = f"{rname}_id"
-                        try:
-                            if fk_col_name in child_model_cls.__table__.columns and fk_col_name not in requested_scalar_local:
-                                requested_scalar_local.append(fk_col_name)
-                        except Exception:
-                            pass
+            requested_scalar_local = self._ensure_helper_fk_for_single_nested(requested_scalar_local, child_model_cls, target_b, nested)
         except Exception:
             pass
         if mssql_mode:
@@ -604,12 +866,7 @@ class RelationSQLBuilders:
                         except Exception:
                             n_fields_i = []
                         # order_dir default ASC if order_by explicit without dir
-                        n_effective_dir_i = ncfg_i.get('order_dir')
-                        try:
-                            if ncfg_i.get('_has_explicit_order_by') and not ncfg_i.get('_has_explicit_order_dir'):
-                                n_effective_dir_i = 'asc'
-                        except Exception:
-                            pass
+                        n_effective_dir_i = self._effective_order_dir(ncfg_i)
                         # Recurse for deeper nests under this node
                         child_specs_i: list[dict] = []
                         try:
@@ -694,12 +951,7 @@ class RelationSQLBuilders:
                     })
                 # Build full JSON for the list relation, including nested arrays
                 # Compute effective top-level order_dir: ASC when order_by explicit without explicit dir
-                effective_order_dir = rel_cfg.get('order_dir')
-                try:
-                    if rel_cfg.get('_has_explicit_order_by') and not rel_cfg.get('_has_explicit_order_dir'):
-                        effective_order_dir = 'asc'
-                except Exception:
-                    pass
+                effective_order_dir = self._effective_order_dir(rel_cfg)
                 return adapter.build_relation_list_json_full(
                     parent_table=parent_table,
                     child_model=child_model_cls,
@@ -717,21 +969,26 @@ class RelationSQLBuilders:
             # No nested relations: use simple JSON list builder with optional filters/order
             # correlate and compose relation-level where
             where_parts_rel: list[str] = [f"[{child_table}].[{fk_child_to_parent_col.name}] = [{parent_table}].[id]"]
-            r_where = self._resolve_graphql_value(info, rel_cfg.get('where'))
-            if r_where is not None and isinstance(r_where, (dict, str)):
-                wdict_rel = to_where_dict(r_where, strict=True)
-                if wdict_rel:
-                    # validate to raise on unknowns/operators
-                    _ = expr_from_where_dict(child_model_cls, wdict_rel, strict=True)
-                    where_parts_rel.extend(adapter.where_from_dict(child_model_cls, wdict_rel))
-            d_where = self._resolve_graphql_value(info, rel_cfg.get('default_where'))
-            if d_where is not None and isinstance(d_where, (dict, str)):
-                try:
-                    dwdict_rel = to_where_dict(d_where, strict=False)
-                except Exception:
-                    dwdict_rel = None
-                if dwdict_rel:
-                    where_parts_rel.extend(adapter.where_from_dict(child_model_cls, dwdict_rel))
+            where_parts_rel = self._mssql_where_from_value(
+                where_parts_rel,
+                child_model_cls,
+                rel_cfg.get('where'),
+                strict=True,
+                to_where_dict=to_where_dict,
+                expr_from_where_dict=expr_from_where_dict,
+                adapter=adapter,
+                info=info,
+            )
+            where_parts_rel = self._mssql_where_from_value(
+                where_parts_rel,
+                child_model_cls,
+                rel_cfg.get('default_where'),
+                strict=False,
+                to_where_dict=to_where_dict,
+                expr_from_where_dict=expr_from_where_dict,
+                adapter=adapter,
+                info=info,
+            )
             # Callable default_where: emit a correlated EXISTS against any grandchild that FK's to child
             try:
                 d_where_raw = rel_cfg.get('default_where')
@@ -766,54 +1023,13 @@ class RelationSQLBuilders:
             # filter args best-effort (MSSQL string path)
             try:
                 fa = rel_cfg.get('filter_args') or {}
-                if fa:
-                    expanded: Dict[str, Any] = {}
-                    for key, raw in (rel_cfg.get('arg_specs') or {}).items():
-                        try:
-                            from ..core.filters import normalize_filter_spec as _norm
-                            spec = _norm(raw)
-                        except Exception:
-                            continue
-                        if getattr(spec, 'ops', None) and not getattr(spec, 'op', None):
-                            for op_name in spec.ops:
-                                base = spec.alias or key
-                                an = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
-                                expanded[an] = spec.clone_with(op=op_name, ops=None)
-                        else:
-                            expanded[spec.alias or key] = spec
-                    from ..core.filters import OPERATOR_REGISTRY
-                    def _add(col_name: str, op_name: str, value: Any):
-                        if op_name in ('like', 'ilike') and isinstance(value, str) and '%' not in value and '_' not in value:
-                            value = f"%{value}%"
-                        where_parts_rel.extend(adapter.where_from_dict(child_model_cls, {col_name: {op_name: value}}))
-                    for arg_name, val in fa.items():
-                        f_spec = expanded.get(arg_name)
-                        if f_spec and f_spec.transform:
-                            try:
-                                val = f_spec.transform(val)
-                            except Exception:
-                                pass
-                        if f_spec and f_spec.column:
-                            _add(f_spec.column, f_spec.op or 'eq', val)
-                            continue
-                        try:
-                            an = str(arg_name)
-                            if '_' in an:
-                                base, suffix = an.rsplit('_', 1)
-                                if suffix.lower() in OPERATOR_REGISTRY and base in child_model_cls.__table__.columns:
-                                    _add(base, suffix.lower(), val)
-                        except Exception:
-                            pass
+                expanded = self._expand_arg_specs(rel_cfg.get('arg_specs') or {})
+                where_parts_rel = self._apply_filter_args_mssql(where_parts_rel, child_model_cls, fa, expanded, adapter)
             except Exception:
                 pass
             where_clause = ' AND '.join(where_parts_rel)
             # Respect explicit order_by without order_dir -> default ASC (override relation default)
-            effective_order_dir2 = rel_cfg.get('order_dir')
-            try:
-                if rel_cfg.get('_has_explicit_order_by') and not rel_cfg.get('_has_explicit_order_dir'):
-                    effective_order_dir2 = 'asc'
-            except Exception:
-                pass
+            effective_order_dir2 = self._effective_order_dir(rel_cfg)
             order_clause = adapter.build_order_clause(
                 child_model_cls,
                 child_table,
@@ -838,127 +1054,53 @@ class RelationSQLBuilders:
             .where(fk_child_to_parent_col == parent_model_cls.id)
             .correlate(parent_model_cls)
         )
-        # where/default where
-        r_where = self._resolve_graphql_value(info, rel_cfg.get('where'))
-        if r_where is not None and isinstance(r_where, (dict, str)):
-            wdict = to_where_dict(r_where, strict=True)
-            if wdict:
-                expr = expr_from_where_dict(child_model_cls, wdict, strict=True)
-                if expr is not None:
-                    inner_sel = inner_sel.where(expr)
-        d_where = self._resolve_graphql_value(info, rel_cfg.get('default_where'))
-        if d_where is not None and isinstance(d_where, (dict, str)):
-            try:
-                wdict = to_where_dict(d_where, strict=False)
-            except Exception:
-                wdict = None
-            if wdict:
-                try:
-                    expr = expr_from_where_dict(child_model_cls, wdict, strict=False)
-                except Exception:
-                    expr = None
-                if expr is not None:
-                    inner_sel = inner_sel.where(expr)
-        elif callable(rel_cfg.get('default_where')):
-            # Apply callable default where by building a SQLAlchemy expression against the child model
-            try:
-                expr = rel_cfg.get('default_where')(child_model_cls, info)
-            except Exception:
-                expr = None
-            if expr is not None:
-                inner_sel = inner_sel.where(expr)
+        # where/default where (supports dict/str/callable)
+        inner_sel = self._apply_where_sqla(
+            inner_sel,
+            child_model_cls,
+            rel_cfg.get('where'),
+            strict=True,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
+        inner_sel = self._apply_where_sqla(
+            inner_sel,
+            child_model_cls,
+            rel_cfg.get('default_where'),
+            strict=False,
+            to_where_dict=to_where_dict,
+            expr_from_where_dict=expr_from_where_dict,
+            info=info,
+        )
         # filter args (SQLA expr path)
-        fa = rel_cfg.get('filter_args') or {}
-        if fa:
-            expanded: Dict[str, Any] = {}
-            for key, raw in (rel_cfg.get('arg_specs') or {}).items():
-                try:
-                    from ..core.filters import normalize_filter_spec as _norm
-                    spec = _norm(raw)
-                except Exception:
-                    continue
-                if getattr(spec, 'ops', None) and not getattr(spec, 'op', None):
-                    for op_name in spec.ops:
-                        base = spec.alias or key
-                        an = base if base.endswith(f"_{op_name}") else f"{base}_{op_name}"
-                        expanded[an] = spec.clone_with(op=op_name, ops=None)
-                else:
-                    expanded[spec.alias or key] = spec
-            from ..core.filters import OPERATOR_REGISTRY
-            for arg_name, val in fa.items():
-                f_spec = expanded.get(arg_name)
-                if not f_spec:
-                    continue
-                if f_spec.transform:
-                    try:
-                        val = f_spec.transform(val)
-                    except Exception:
-                        continue
-                expr = None
-                if f_spec.builder:
-                    try:
-                        expr = f_spec.builder(child_model_cls, info, val)
-                    except Exception:
-                        expr = None
-                elif f_spec.column:
-                    try:
-                        col = child_model_cls.__table__.c.get(f_spec.column)
-                    except Exception:
-                        col = None
-                    if col is None:
-                        continue
-                    op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
-                    if not op_fn:
-                        continue
-                    try:
-                        expr = op_fn(col, val)
-                    except Exception:
-                        expr = None
-                if expr is not None:
-                    inner_sel = inner_sel.where(expr)
+        expanded_specs = self._expand_arg_specs(rel_cfg.get('arg_specs') or {})
+        inner_sel = self._apply_filter_args_sqla(inner_sel, child_model_cls, info, rel_cfg.get('filter_args') or {}, expanded_specs)
         # ordering
         try:
-            ordered = False
             allowed = [sf for sf, sd in self.registry.types[rel_cfg.get('target')].__berry_fields__.items() if sd.kind == 'scalar'] if rel_cfg.get('target') in self.registry.types else []
-            for spec in self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []):
-                cn, _, dd = spec.partition(':')
-                dd = (dd or 'asc').lower()
-                if cn in allowed:
-                    col = getattr(child_model_cls, cn, None)
-                    if col is not None:
-                        inner_sel = inner_sel.order_by(col.desc() if dd == 'desc' else col.asc())
-                        ordered = True
-            if not ordered and rel_cfg.get('order_by') in allowed:
-                ob = rel_cfg.get('order_by')
-                dir_v = rel_cfg.get('order_dir')
-                try:
-                    from ..core.utils import dir_value as _dir_value
-                    dd = _dir_value(dir_v)
-                except Exception:
-                    dd = 'asc'
-                col = getattr(child_model_cls, ob, None)
-                if col is not None:
-                    inner_sel = inner_sel.order_by(col.desc() if dd == 'desc' else col.asc())
-                    ordered = True
-            if not ordered and 'id' in child_model_cls.__table__.columns:
-                inner_sel = inner_sel.order_by(getattr(child_model_cls, 'id').asc())
         except Exception:
-            pass
-        # pagination
+            allowed = []
         try:
-            if rel_cfg.get('offset') is not None:
-                o = rel_cfg.get('offset')
-                inner_sel = inner_sel.offset(int(o) if isinstance(o, (int, str)) else o)
-            if rel_cfg.get('limit') is not None:
-                l = rel_cfg.get('limit')
-                inner_sel = inner_sel.limit(int(l) if isinstance(l, (int, str)) else l)
+            from ..core.utils import dir_value as _dir_value
         except Exception:
-            pass
+            def _dir_value(x):
+                return (x or 'asc')
+        inner_sel = self._apply_ordering_sqla(
+            inner_sel,
+            child_model_cls,
+            allowed,
+            order_by=rel_cfg.get('order_by'),
+            order_dir=rel_cfg.get('order_dir'),
+            order_multi=self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
+            dir_value_fn=_dir_value,
+            default_dir_for_multi='asc',
+            fallback_id=True,
+        )
+        # pagination
+        inner_sel = self._apply_pagination_sqla(inner_sel, rel_cfg.get('limit'), rel_cfg.get('offset'))
         limited_subq = inner_sel.subquery()
-        row_json_args: List[Any] = []
-        for sf in (requested_scalar_local or ['id']):
-            row_json_args.extend([_text(f"'{sf}'"), getattr(limited_subq.c, sf)])
-        row_json_expr = json_object_fn(*row_json_args)
+        row_json_expr = json_object_fn(*self._json_row_args_from_subq(limited_subq, (requested_scalar_local or ['id'])))
         agg_inner_expr = json_array_agg_fn(row_json_expr)
         if agg_inner_expr is None:
             return None
