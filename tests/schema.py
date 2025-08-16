@@ -64,8 +64,8 @@ class PostQL(BerryType):
     content = field()
     author_id = field()
     created_at = field()
-    # Array of base64-encoded strings representing binary blobs (when using Postgres)
-    binary_blobs = field()
+    # Base64-encoded single binary blob across dialects
+    binary_blob = field()
     author = relation('UserQL', single=True, arguments={
         'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
         'created_at_between': lambda M, info, v: (M.created_at.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None),

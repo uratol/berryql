@@ -23,17 +23,16 @@ def _normalize_blobs(v):
 
 
 @pytest.mark.asyncio
-async def test_posts_binary_blobs_graphql(db_session, sample_posts):
+async def test_posts_binary_blob_graphql(db_session, sample_posts):
     q = """
-    query { posts(order_by: "id") { id binary_blobs } }
+    query { posts(order_by: "id") { id binary_blob } }
     """
     res = await schema.execute(q, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
     posts = res.data["posts"]
-    # On Postgres we expect base64 strings, on SQLite it's JSON strings as well (when supported)
-    # Values seeded in fixtures
-    assert posts[0]["binary_blobs"] is None or posts[0]["binary_blobs"] == ["YQ==", "Yg==", "Yw=="]
-    assert posts[1]["binary_blobs"] is None or posts[1]["binary_blobs"] == ["eA==", "eQ=="]
-    assert posts[2]["binary_blobs"] is None
-    assert posts[3]["binary_blobs"] is None or posts[3]["binary_blobs"] == ["AAEC"]
-    assert posts[4]["binary_blobs"] is None or posts[4]["binary_blobs"] == []
+    # Base64 values seeded in fixtures
+    assert posts[0]["binary_blob"] == "YQ=="  # b"a"
+    assert posts[1]["binary_blob"] == "eA=="  # b"x"
+    assert posts[2]["binary_blob"] is None
+    assert posts[3]["binary_blob"] == "AAEC"  # b"\x00\x01\x02"
+    assert posts[4]["binary_blob"] is None

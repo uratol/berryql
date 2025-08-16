@@ -221,12 +221,18 @@ class BerrySchema:
         Defaults to str for unknown types (safe GraphQL scalar mapping).
         """
         try:
-            # Unwrap TypeDecorator when possible and special-case BinaryArray
+            # Unwrap TypeDecorator when possible and special-case BinaryBlob/BinaryArray
             if isinstance(sqlatype, _SATypeDecorator):
                 # Special-case our BinaryArray -> List[str]
                 try:
                     if type(sqlatype).__name__.lower() == 'binaryarray':
                         return List[str]  # type: ignore[index]
+                except Exception:
+                    pass
+                # Special-case our BinaryBlob -> str
+                try:
+                    if type(sqlatype).__name__.lower() == 'binaryblob':
+                        return str
                 except Exception:
                     pass
                 # Try to recurse into underlying impl
