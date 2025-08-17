@@ -1,6 +1,6 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
-from sqlalchemy import select, text as _text
+from typing import Any, Dict, List, Optional, Tuple
+from sqlalchemy import select, text as _text, literal_column
 
 # Centralized SQL builders. Keep registry thin and DRY.
 
@@ -1261,3 +1261,146 @@ class RelationSQLBuilders:
             return agg_query.scalar_subquery()
         except Exception:
             return agg_query
+
+    # --- custom field pushdown ------------------------------------------------
+    def build_custom_scalar_pushdown(
+        self,
+        *,
+        model_cls,
+        field_name: str,
+        builder: Any,
+    ) -> Any | None:
+            """Attempt to build a pushdown SQL expression for a @custom field.
+
+            - Calls builder(model_cls) only; skips if it requires session/info to avoid N+1.
+            - If the builder returns a selectable, converts to scalar_subquery when single column.
+            - Returns a labeled SQL expression or None if it cannot safely be pushed down.
+            """
+            if builder is None:
+                return None
+            import inspect
+            try:
+                # Only support builder(model_cls) to avoid needing a session in pushdown phase
+                if len(inspect.signature(builder).parameters) == 1:
+                    expr = builder(model_cls)
+                else:
+                    return None
+            except Exception:
+                return None
+            if expr is None:
+                return None
+            try:
+                from sqlalchemy.sql import Select as _Select  # type: ignore
+            except Exception:
+                _Select = None  # type: ignore
+            try:
+                if _Select is not None and isinstance(expr, _Select):
+                    # Use scalar_subquery when single column select
+                    try:
+                        if len(expr.selected_columns) == 1:  # type: ignore[attr-defined]
+                            expr = expr.scalar_subquery()
+                    except Exception:
+                        pass
+                # Ensure label for mapping access
+                if hasattr(expr, 'label'):
+                    expr = expr.label(field_name)
+            except Exception:
+                return None
+            return expr
+
+    def build_custom_object_pushdown(
+        self,
+        *,
+        model_cls,
+        field_name: str,
+        builder: Any,
+        adapter,
+        json_object_fn,
+        info,
+    ) -> Tuple[List[Any], List[str]] | None:
+            """Build pushdown columns for a @custom_object field.
+
+            Returns a tuple: (select_columns_to_add, label_names). On non-MSSQL, it returns a
+            single JSON object scalar labeled as one column; on MSSQL, it returns multiple labeled
+            scalar columns to reconstruct the object in Python.
+            """
+            if builder is None:
+                return None
+            import inspect
+            try:
+                if len(inspect.signature(builder).parameters) == 1:
+                    expr_sel = builder(model_cls)
+                else:
+                    return None  # skip builders that need session/info
+            except Exception:
+                return None
+            if expr_sel is None:
+                return None
+            try:
+                from sqlalchemy.sql import Select as _Select  # type: ignore
+            except Exception:
+                _Select = None  # type: ignore
+            if _Select is None or not isinstance(expr_sel, _Select):
+                return None
+            # Gather selected columns and build scalar subqueries per column
+            try:
+                sel_cols = list(getattr(expr_sel, 'selected_columns', []))  # type: ignore[attr-defined]
+            except Exception:
+                sel_cols = []
+            key_exprs: list[tuple[str, Any]] = []
+            agg_pairs: list[tuple[str, Any]] = []  # (key, aggregate/labeled expr)
+            for col in sel_cols:
+                try:
+                    labeled = col
+                    col_name = getattr(labeled, 'name', None) or getattr(labeled, 'key', None)
+                    if not col_name:
+                        col_name = f"{field_name}_{len(key_exprs)}"
+                        labeled = col.label(col_name)
+                    agg_pairs.append((col_name, labeled))
+                    subq = select(labeled)
+                    try:
+                        for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
+                            subq = subq.select_from(_from)
+                    except Exception:
+                        pass
+                    for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
+                        subq = subq.where(_w)
+                    subq_expr = subq.scalar_subquery() if hasattr(subq, 'scalar_subquery') else subq
+                    key_exprs.append((col_name, subq_expr))
+                except Exception:
+                    continue
+            if not key_exprs:
+                return None
+            is_mssql = getattr(adapter, 'name', '') == 'mssql'
+            select_columns: list[Any] = []
+            labels: list[str] = []
+            if is_mssql:
+                # Expose each key as a labeled scalar column; registry will reconstruct Python object
+                for k, v in key_exprs:
+                    lbl = f"_pushcf_{field_name}__{k}"
+                    try:
+                        select_columns.append(v.label(lbl))
+                    except Exception:
+                        select_columns.append(literal_column(str(v)).label(lbl))
+                    labels.append(lbl)
+                return (select_columns, labels)
+            # Non-MSSQL: build a single JSON object using aggregated expressions
+            json_args: list[Any] = []
+            for k, agg_expr in agg_pairs:
+                json_args.extend([_text(f"'{k}'"), agg_expr])
+            inner = select(json_object_fn(*json_args))
+            try:
+                for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
+                    inner = inner.select_from(_from)
+            except Exception:
+                pass
+            for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
+                inner = inner.where(_w)
+            try:
+                json_obj_expr = inner.scalar_subquery()
+            except Exception:
+                json_obj_expr = inner
+            json_label = f"_pushcf_{field_name}"
+            select_columns.append(json_obj_expr.label(json_label))
+            labels.append(json_label)
+            return (select_columns, labels)
