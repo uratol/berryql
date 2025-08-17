@@ -94,47 +94,6 @@ class PostQL(BerryType):
         returns={'min_created_at': datetime, 'comments_count': int}
     )
 
-    # Helpers for previews (Python-side post-processing)
-    @staticmethod
-    def _preview_one(c: Any) -> str | None:
-        try:
-            if c is None:
-                return None
-            txt = getattr(c, 'content', None)
-            if txt is None:
-                return None
-            s = str(txt)
-            return s if len(s) <= 10 else s[:10] + '...'
-        except Exception:
-            return None
-
-    @staticmethod
-    def _preview_many(items: list[Any]) -> list[str]:
-        out: list[str] = []
-        try:
-            for c in (items or []):
-                v = PostQL._preview_one(c)
-                if v is not None:
-                    out.append(v)
-        except Exception:
-            return out
-        return out
-
-    # Public relation field with Python post-processing (not translated to SQL)
-    # First comment preview as a single scalar
-    first_comment_preview = relation(
-        'PostCommentQL',
-        single=True,
-        order_by='created_at',
-    )
-    # All comment previews: map each related comment to truncated content
-    comment_previews = relation(
-        'PostCommentQL',
-        single=False,
-        order_by='created_at',
-    # Simplified: no post_process/returns; clients can use PostCommentQL.content_preview
-    )
-
 @berry_schema.type(model=User)
 class UserQL(BerryType):
     id = field()

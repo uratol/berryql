@@ -1689,7 +1689,7 @@ class BerrySchema:
                     if ob_rel and ob_rel not in allowed_fields_rel:
                         raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     child_model_cls = target_b.model
-                    # Determine FK from child -> parent (list case) or use for single also when parent has no FK to child
+                    # Determine FK
                     fk_col = None
                     for col in child_model_cls.__table__.columns:
                         for fk in col.foreign_keys:
@@ -1698,11 +1698,23 @@ class BerrySchema:
                                 break
                         if fk_col is not None:
                             break
+                    if fk_col is None:
+                        try:
+                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
+                        except Exception:
+                            pass
+                        continue
                     # Determine projected scalar fields
                     requested_scalar = rel_cfg.get('fields') or []
                     if rel_cfg.get('single'):
                         # If this single relation is a computed wrapper over another relation (source),
                         # skip pushdown here and let the resolver reuse the source's prefetched value.
+                        try:
+                            if btype_cls.__berry_fields__.get(rel_name) and btype_cls.__berry_fields__[rel_name].meta.get('source'):
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'computed from source'})
+                                continue
+                        except Exception:
+                            pass
                         # Single relation: build json object
                         # Projected columns
                         proj_cols: list[str] = []
@@ -1713,45 +1725,29 @@ class BerrySchema:
                         for sf in requested_scalar:
                             if sf in child_model_cls.__table__.columns:
                                 proj_cols.append(sf)
-                        # Prefer parent->child FK; otherwise use child->parent FK with ordering and TOP 1
+                        # Determine FK helper name for correlation
                         parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
-                        if parent_fk_col_name:
-                            rel_expr_core = _sql_builders.build_single_relation_object(
-                                adapter=adapter,
-                                parent_model_cls=model_cls,
-                                child_model_cls=child_model_cls,
-                                rel_name=rel_name,
-                                projected_columns=proj_cols,
-                                parent_fk_col_name=parent_fk_col_name,
-                                json_object_fn=_json_object,
-                                json_array_coalesce_fn=_json_array_coalesce,
-                                to_where_dict=_to_where_dict,
-                                expr_from_where_dict=_expr_from_where_dict,
-                                info=info,
-                                rel_where=rel_cfg.get('where'),
-                                rel_default_where=rel_cfg.get('default_where'),
-                                filter_args=rel_cfg.get('filter_args') or {},
-                                arg_specs=rel_cfg.get('arg_specs') or {},
-                            )
-                        elif fk_col is not None:
-                            # Correlate via child->parent and use order/limit 1
-                            rel_expr_core = _sql_builders.build_single_relation_object_from_child_fk(
-                                adapter=adapter,
-                                parent_model_cls=model_cls,
-                                child_model_cls=child_model_cls,
-                                fk_child_to_parent_col=fk_col,
-                                projected_columns=proj_cols,
-                                rel_cfg=rel_cfg,
-                                json_object_fn=_json_object,
-                                to_where_dict=_to_where_dict,
-                                expr_from_where_dict=_expr_from_where_dict,
-                                info=info,
-                            )
-                        else:
-                            rel_expr_core = None
+                        # Delegate to builders
+                        rel_expr_core = _sql_builders.build_single_relation_object(
+                            adapter=adapter,
+                            parent_model_cls=model_cls,
+                            child_model_cls=child_model_cls,
+                            rel_name=rel_name,
+                            projected_columns=proj_cols,
+                            parent_fk_col_name=parent_fk_col_name,
+                            json_object_fn=_json_object,
+                            json_array_coalesce_fn=_json_array_coalesce,
+                            to_where_dict=_to_where_dict,
+                            expr_from_where_dict=_expr_from_where_dict,
+                            info=info,
+                            rel_where=rel_cfg.get('where'),
+                            rel_default_where=rel_cfg.get('default_where'),
+                            filter_args=rel_cfg.get('filter_args') or {},
+                            arg_specs=rel_cfg.get('arg_specs') or {},
+                        )
                         if rel_expr_core is None:
                             try:
-                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK'})
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'builder returned None'})
                             except Exception:
                                 pass
                             continue
