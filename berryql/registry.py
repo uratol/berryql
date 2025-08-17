@@ -1468,44 +1468,12 @@ class BerrySchema:
                         # Include only if explicitly requested
                         if cf_name not in requested_custom_root:
                             continue
-                        # Try centralized builder; fall back to local minimal builder if method missing
-                        expr = None
-                        try:
-                            expr = RelationSQLBuilders(self).build_custom_scalar_pushdown(
-                                model_cls=model_cls,
-                                field_name=cf_name,
-                                builder=cf_def.meta.get('builder')
-                            )
-                        except AttributeError:
-                            # Fallback: only support builder(model_cls); label and scalar_subquery if needed
-                            builder = cf_def.meta.get('builder')
-                            if builder is not None:
-                                try:
-                                    import inspect
-                                    if len(inspect.signature(builder).parameters) == 1:
-                                        raw = builder(model_cls)
-                                    else:
-                                        raw = None
-                                except Exception:
-                                    raw = None
-                                if raw is not None:
-                                    try:
-                                        from sqlalchemy.sql import Select as _Select  # type: ignore
-                                    except Exception:
-                                        _Select = None  # type: ignore
-                                    if _Select is not None and isinstance(raw, _Select):
-                                        try:
-                                            if len(raw.selected_columns) == 1:  # type: ignore[attr-defined]
-                                                raw = raw.scalar_subquery()
-                                        except Exception:
-                                            pass
-                                    try:
-                                        if hasattr(raw, 'label'):
-                                            expr = raw.label(cf_name)
-                                        else:
-                                            expr = raw
-                                    except Exception:
-                                        expr = None
+                        # Use centralized builder
+                        expr = RelationSQLBuilders(self).build_custom_scalar_pushdown(
+                            model_cls=model_cls,
+                            field_name=cf_name,
+                            builder=cf_def.meta.get('builder')
+                        )
                         if expr is None:
                             continue
                         custom_fields.append((cf_name, expr))
@@ -1514,67 +1482,15 @@ class BerrySchema:
                         # Include only if explicitly requested
                         if cf_name not in requested_custom_obj_root:
                             continue
-                        # Try centralized builder; fall back to local minimal builder if method missing
-                        built = None
-                        try:
-                            built = RelationSQLBuilders(self).build_custom_object_pushdown(
-                                model_cls=model_cls,
-                                field_name=cf_name,
-                                builder=cf_def.meta.get('builder'),
-                                adapter=adapter,
-                                json_object_fn=_json_object,
-                                info=info,
-                            )
-                        except AttributeError:
-                            # Fallback for non-MSSQL: turn a selectable from builder(model_cls) into a JSON object
-                            builder = cf_def.meta.get('builder')
-                            is_mssql = hasattr(adapter, 'name') and adapter.name == 'mssql'
-                            if builder is not None and not is_mssql:
-                                try:
-                                    import inspect
-                                    if len(inspect.signature(builder).parameters) == 1:
-                                        expr_sel = builder(model_cls)
-                                    else:
-                                        expr_sel = None
-                                except Exception:
-                                    expr_sel = None
-                                if expr_sel is not None:
-                                    try:
-                                        from sqlalchemy.sql import Select as _Select  # type: ignore
-                                    except Exception:
-                                        _Select = None  # type: ignore
-                                    if _Select is not None and isinstance(expr_sel, _Select):
-                                        # Build a single JSON object scalar column labeled for hydration
-                                        try:
-                                            sel_cols = list(getattr(expr_sel, 'selected_columns', []))  # type: ignore[attr-defined]
-                                        except Exception:
-                                            sel_cols = []
-                                        json_args = []
-                                        for col in sel_cols or []:
-                                            try:
-                                                name = getattr(col, 'name', None) or getattr(col, 'key', None) or 'v'
-                                                labeled = col if getattr(col, 'name', None) else col.label(str(name))
-                                                json_args.extend([_text(f"'{name}'"), labeled])
-                                            except Exception:
-                                                continue
-                                        if json_args:
-                                            inner = select(_json_object(*json_args))
-                                            try:
-                                                for _from in expr_sel.get_final_froms():  # type: ignore[attr-defined]
-                                                    inner = inner.select_from(_from)
-                                            except Exception:
-                                                pass
-                                            for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
-                                                inner = inner.where(_w)
-                                            try:
-                                                json_expr = inner.scalar_subquery()
-                                            except Exception:
-                                                json_expr = inner
-                                            label = f"_pushcf_{cf_name}"
-                                            try:
-                                                built = ([json_expr.label(label)], [label])
-                                            except Exception:
-                                                built = ([json_expr], [label])
+                        # Use centralized builder
+                        built = RelationSQLBuilders(self).build_custom_object_pushdown(
+                            model_cls=model_cls,
+                            field_name=cf_name,
+                            builder=cf_def.meta.get('builder'),
+                            adapter=adapter,
+                            json_object_fn=_json_object,
+                            info=info,
+                        )
                         if built is None:
                             continue
                         cols_to_add, labels = built
