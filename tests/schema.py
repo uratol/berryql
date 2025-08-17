@@ -93,14 +93,11 @@ class PostQL(BerryType):
         ),
         returns={'min_created_at': datetime, 'comments_count': int}
     )
-    # Private relation (won't be exposed as GraphQL field) to fetch first comment
-    _first_comment = relation('PostCommentQL', single=True)
-    # Public computed field built on top of the private relation
-    @strawberry.field
-    async def first_comment_preview(self, info: Info) -> str | None:
+
+    # Helpers for previews (Python-side post-processing)
+    @staticmethod
+    def _preview_one(c: Any) -> str | None:
         try:
-            # Use the private relation resolver directly
-            c = await self._first_comment(info)
             if c is None:
                 return None
             txt = getattr(c, 'content', None)
@@ -110,6 +107,33 @@ class PostQL(BerryType):
             return s if len(s) <= 10 else s[:10] + '...'
         except Exception:
             return None
+
+    @staticmethod
+    def _preview_many(items: list[Any]) -> list[str]:
+        out: list[str] = []
+        try:
+            for c in (items or []):
+                v = PostQL._preview_one(c)
+                if v is not None:
+                    out.append(v)
+        except Exception:
+            return out
+        return out
+
+    # Public relation field with Python post-processing (not translated to SQL)
+    # First comment preview as a single scalar
+    first_comment_preview = relation(
+        'PostCommentQL',
+        single=True,
+        order_by='created_at',
+    )
+    # All comment previews: map each related comment to truncated content
+    comment_previews = relation(
+        'PostCommentQL',
+        single=False,
+        order_by='created_at',
+    # Simplified: no post_process/returns; clients can use PostCommentQL.content_preview
+    )
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):

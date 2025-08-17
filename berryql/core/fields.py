@@ -75,7 +75,7 @@ def relation(target: Any = None, *, single: bool | None = None, **meta) -> Field
     Use on both root Query/Domain classes and nested Berry types to model
     one-to-many or one-to-one relations.
 
-    Args:
+        Args:
         target: Target Berry type, either as the class itself or its name
             (string). When omitted, the registry may infer it from conventions.
         single: When True, the relation returns at most one object (one-to-one).
@@ -89,6 +89,16 @@ def relation(target: Any = None, *, single: bool | None = None, **meta) -> Field
               ``lambda M, info, v: <SA expression>`` or dict specifications
               {"column": <str>, "op": <str>, "transform": <callable>} to
               drive filtering.
+                        - post_process: Python callable applied to the hydrated relation
+                            value(s) right before returning from the resolver. It is never
+                            translated to SQL. Signature suggestions:
+                                single=True:  fn(child_instance, info) -> Any
+                                single=False: fn(list_of_child_instances, info) -> Any
+                            The callable may be sync or async.
+                        - returns: Optional Python type for the GraphQL field when using
+                            post_process to return a non-target type (e.g., str). For list
+                            relations, provide the element type (e.g., str); the schema will
+                            expose List[returns].
 
     Examples:
         class PostQL(BerryType):

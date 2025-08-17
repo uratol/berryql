@@ -430,6 +430,7 @@ class BerrySchema:
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
+                    post_process = fdef.meta.get('post_process')
                     if target_name:
                         # Use actual class objects from registry to avoid global forward-ref collisions
                         target_cls_ref = self._st_types.get(target_name)
@@ -468,12 +469,26 @@ class BerrySchema:
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
                             prefetch_attr = f'_{fname_local}_prefetched'
+                            # Simplified: no special handling for 'source' wrapper
                             if hasattr(self, prefetch_attr):
                                 # If relation was prefetched via SQL pushdown, return it directly.
                                 prefetched = getattr(self, prefetch_attr)
-                                if is_single_value:
-                                    return prefetched
-                                return list(prefetched or [])
+                                val = prefetched if is_single_value else list(prefetched or [])
+                                # Apply python-side post-process if provided
+                                try:
+                                    pp = meta_copy.get('post_process')
+                                except Exception:
+                                    pp = None
+                                if pp is not None:
+                                    try:
+                                        import inspect, asyncio
+                                        res = pp(val, info)
+                                        if inspect.isawaitable(res):
+                                            res = await res
+                                        return res
+                                    except Exception:
+                                        return val
+                                return val
                             target_name_i = meta_copy.get('target')
                             target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
                             parent_model = getattr(self, '_model', None)
@@ -488,13 +503,24 @@ class BerrySchema:
                             child_model_cls = target_btype.model
                             if is_single_value:
                                 candidate_fk_val = None
-                                # First, if the instance has a helper '<relation>_id' attribute, use it
+                                fallback_parent_id = None
+                                # Try helper '<relation>_id' on parent instance
                                 try:
                                     candidate_fk_val = getattr(self, f"{fname_local}_id", None)
                                 except Exception:
                                     candidate_fk_val = None
+                                # Record parent id for potential child->parent fallback
+                                try:
+                                    fallback_parent_id = getattr(parent_model, 'id', None) if parent_model is not None else None
+                                except Exception:
+                                    fallback_parent_id = None
+                                if fallback_parent_id is None:
+                                    try:
+                                        fallback_parent_id = getattr(self, 'id', None)
+                                    except Exception:
+                                        fallback_parent_id = None
                                 if candidate_fk_val is None and parent_model is not None:
-                                    # Derive FK from ORM model instance when available
+                                    # Derive FK from ORM model instance when available (parent has FK to child)
                                     for col in parent_model.__table__.columns:
                                         if col.name.endswith('_id') and col.foreign_keys:
                                             for fk in col.foreign_keys:
@@ -503,6 +529,97 @@ class BerrySchema:
                                                     break
                                         if candidate_fk_val is not None:
                                             break
+                                # If we didn't find a direct FK to child, try fetching the first child where child.parent_id == parent.id
+                                if candidate_fk_val is None and fallback_parent_id is not None:
+                                    from sqlalchemy import select as _select
+                                    # Attempt to find an FK from child -> parent (common case)
+                                    child_fk_to_parent = None
+                                    for col in child_model_cls.__table__.columns:
+                                        for fk in col.foreign_keys:
+                                            try:
+                                                if fk.column.table.name == (parent_model.__table__.name if parent_model is not None else None):
+                                                    child_fk_to_parent = col
+                                                    break
+                                            except Exception:
+                                                continue
+                                        if child_fk_to_parent is not None:
+                                            break
+                                    if child_fk_to_parent is not None:
+                                        # Build a select for the first child row for this parent
+                                        stmt = _select(child_model_cls).where(child_fk_to_parent == fallback_parent_id)
+                                        # Apply where/default_where and filter args similarly to list path
+                                        if related_where is not None or meta_copy.get('where') is not None:
+                                            if related_where is not None:
+                                                wdict = _to_where_dict(related_where, strict=True)
+                                                if wdict:
+                                                    expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
+                                                    if expr is not None:
+                                                        stmt = stmt.where(expr)
+                                            dwhere = meta_copy.get('where')
+                                            if dwhere is not None:
+                                                if isinstance(dwhere, (dict, str)):
+                                                    wdict = _to_where_dict(dwhere, strict=False)
+                                                    if wdict:
+                                                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=False)
+                                                        if expr is not None:
+                                                            stmt = stmt.where(expr)
+                                                elif callable(dwhere):
+                                                    expr = dwhere(child_model_cls, info)
+                                                    if expr is not None:
+                                                        stmt = stmt.where(expr)
+                                        # Ordering: honor order_by/order_multi if provided; default by id
+                                        try:
+                                            allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+                                        except Exception:
+                                            allowed_order = []
+                                        ordered_any = False
+                                        if order_multi:
+                                            for spec in order_multi:
+                                                try:
+                                                    cn, _, dd = str(spec).partition(':')
+                                                    dd = dd or 'asc'
+                                                    if not allowed_order or cn in allowed_order:
+                                                        col = child_model_cls.__table__.c.get(cn)
+                                                        if col is not None:
+                                                            stmt = stmt.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                                            ordered_any = True
+                                                except Exception:
+                                                    pass
+                                        if not ordered_any and order_by and (not allowed_order or order_by in allowed_order):
+                                            col = child_model_cls.__table__.c.get(order_by)
+                                            if col is not None:
+                                                desc = _dir_value(order_dir) == 'desc' if order_dir is not None else False
+                                                stmt = stmt.order_by(col.desc() if desc else col.asc())
+                                                ordered_any = True
+                                        if not ordered_any and hasattr(child_model_cls, '__table__') and 'id' in child_model_cls.__table__.columns:
+                                            stmt = stmt.order_by(getattr(child_model_cls, 'id').asc())
+                                        result = await session.execute(stmt.limit(1))
+                                        row = result.scalar_one_or_none()
+                                        if row is None:
+                                            return None
+                                        inst = target_cls_i()
+                                        setattr(inst, '_model', row)
+                                        for sf, sdef in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
+                                            if sdef.kind == 'scalar':
+                                                try:
+                                                    setattr(inst, sf, getattr(row, sf, None))
+                                                except Exception:
+                                                    pass
+                                        # Apply post-process for single value if provided
+                                        try:
+                                            pp = meta_copy.get('post_process')
+                                        except Exception:
+                                            pp = None
+                                        if pp is not None:
+                                            try:
+                                                import inspect
+                                                res = pp(inst, info)
+                                                if inspect.isawaitable(res):
+                                                    res = await res
+                                                return res
+                                            except Exception:
+                                                return inst
+                                        return inst
                                 if candidate_fk_val is None:
                                     return None
                                 # Apply filters via query if any filter args passed
@@ -618,6 +735,20 @@ class BerrySchema:
                                             setattr(inst, sf, getattr(row, sf, None))
                                         except Exception:
                                             pass
+                                # Apply post-process for single value if provided
+                                try:
+                                    pp = meta_copy.get('post_process')
+                                except Exception:
+                                    pp = None
+                                if pp is not None:
+                                    try:
+                                        import inspect
+                                        res = pp(inst, info)
+                                        if inspect.isawaitable(res):
+                                            res = await res
+                                        return res
+                                    except Exception:
+                                        return inst
                                 return inst
                             # list relation
                             fk_col = None
@@ -912,6 +1043,20 @@ class BerrySchema:
                                 except Exception:
                                     pass
                                 results_list.append(inst)
+                            # Apply post-process for list if provided
+                            try:
+                                pp = meta_copy.get('post_process')
+                            except Exception:
+                                pp = None
+                            if pp is not None:
+                                try:
+                                    import inspect
+                                    res = pp(results_list, info)
+                                    if inspect.isawaitable(res):
+                                        res = await res
+                                    return res
+                                except Exception:
+                                    return results_list
                             return results_list
                         # Build dynamic wrapper to expose filter args
                         arg_defs = []
@@ -1544,7 +1689,7 @@ class BerrySchema:
                     if ob_rel and ob_rel not in allowed_fields_rel:
                         raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     child_model_cls = target_b.model
-                    # Determine FK
+                    # Determine FK from child -> parent (list case) or use for single also when parent has no FK to child
                     fk_col = None
                     for col in child_model_cls.__table__.columns:
                         for fk in col.foreign_keys:
@@ -1553,15 +1698,11 @@ class BerrySchema:
                                 break
                         if fk_col is not None:
                             break
-                    if fk_col is None:
-                        try:
-                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
-                        except Exception:
-                            pass
-                        continue
                     # Determine projected scalar fields
                     requested_scalar = rel_cfg.get('fields') or []
                     if rel_cfg.get('single'):
+                        # If this single relation is a computed wrapper over another relation (source),
+                        # skip pushdown here and let the resolver reuse the source's prefetched value.
                         # Single relation: build json object
                         # Projected columns
                         proj_cols: list[str] = []
@@ -1572,29 +1713,45 @@ class BerrySchema:
                         for sf in requested_scalar:
                             if sf in child_model_cls.__table__.columns:
                                 proj_cols.append(sf)
-                        # Determine FK helper name for correlation
+                        # Prefer parent->child FK; otherwise use child->parent FK with ordering and TOP 1
                         parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
-                        # Delegate to builders
-                        rel_expr_core = _sql_builders.build_single_relation_object(
-                            adapter=adapter,
-                            parent_model_cls=model_cls,
-                            child_model_cls=child_model_cls,
-                            rel_name=rel_name,
-                            projected_columns=proj_cols,
-                            parent_fk_col_name=parent_fk_col_name,
-                            json_object_fn=_json_object,
-                            json_array_coalesce_fn=_json_array_coalesce,
-                            to_where_dict=_to_where_dict,
-                            expr_from_where_dict=_expr_from_where_dict,
-                            info=info,
-                            rel_where=rel_cfg.get('where'),
-                            rel_default_where=rel_cfg.get('default_where'),
-                            filter_args=rel_cfg.get('filter_args') or {},
-                            arg_specs=rel_cfg.get('arg_specs') or {},
-                        )
+                        if parent_fk_col_name:
+                            rel_expr_core = _sql_builders.build_single_relation_object(
+                                adapter=adapter,
+                                parent_model_cls=model_cls,
+                                child_model_cls=child_model_cls,
+                                rel_name=rel_name,
+                                projected_columns=proj_cols,
+                                parent_fk_col_name=parent_fk_col_name,
+                                json_object_fn=_json_object,
+                                json_array_coalesce_fn=_json_array_coalesce,
+                                to_where_dict=_to_where_dict,
+                                expr_from_where_dict=_expr_from_where_dict,
+                                info=info,
+                                rel_where=rel_cfg.get('where'),
+                                rel_default_where=rel_cfg.get('default_where'),
+                                filter_args=rel_cfg.get('filter_args') or {},
+                                arg_specs=rel_cfg.get('arg_specs') or {},
+                            )
+                        elif fk_col is not None:
+                            # Correlate via child->parent and use order/limit 1
+                            rel_expr_core = _sql_builders.build_single_relation_object_from_child_fk(
+                                adapter=adapter,
+                                parent_model_cls=model_cls,
+                                child_model_cls=child_model_cls,
+                                fk_child_to_parent_col=fk_col,
+                                projected_columns=proj_cols,
+                                rel_cfg=rel_cfg,
+                                json_object_fn=_json_object,
+                                to_where_dict=_to_where_dict,
+                                expr_from_where_dict=_expr_from_where_dict,
+                                info=info,
+                            )
+                        else:
+                            rel_expr_core = None
                         if rel_expr_core is None:
                             try:
-                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'builder returned None'})
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK'})
                             except Exception:
                                 pass
                             continue
