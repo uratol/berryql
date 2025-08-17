@@ -44,6 +44,7 @@ T = TypeVar('T')
 from .core.fields import FieldDef, FieldDescriptor, field, relation, aggregate, count, custom, custom_object, DomainDescriptor
 from .core.filters import FilterSpec, OPERATOR_REGISTRY, register_operator, normalize_filter_spec as _normalize_filter_spec
 from .core.selection import RelationSelectionExtractor, RootSelectionExtractor
+from .core.analyzer import QueryAnalyzer
 from .core.utils import (
     Direction,
     dir_value as _dir_value,
@@ -1441,25 +1442,13 @@ class BerrySchema:
                 # (e.g., id and any explicitly requested scalars) plus pushdown expressions.
                 # Avoid selecting the full entity to keep SQL projections minimal.
                 select_columns: List[Any] = []
-                # Use extracted helper classes: relations and root field kinds
-                # Instantiate relation extractor with registry wired
-                _rel_extractor = RelationSelectionExtractor(self)  # type: ignore
-                requested_relations = _rel_extractor.extract(info, root_field_name, btype_cls)
-                # Normalize any AST-node leftovers in relation configs to plain Python types
-                # Using shared helpers from core.utils
-                for rel_cfg in list(requested_relations.values()):
-                    _normalize_rel_cfg(rel_cfg)
-                # Use RootSelectionExtractor with registry for naming conversion (camelCase support)
-                root_selected = RootSelectionExtractor(self).extract(info, root_field_name, btype_cls)
-                requested_scalar_root: set[str] = set(root_selected.get('scalars', set()))
-                requested_custom_root: set[str] = set(root_selected.get('custom', set()))
-                requested_custom_obj_root: set[str] = set(root_selected.get('custom_object', set()))
-                requested_aggregates_root: set[str] = set(root_selected.get('aggregate', set()))
-                # Determine if we successfully extracted any selection at all. If yes, include
-                # only explicitly requested custom/aggregate fields; if not, keep legacy behavior.
-                selection_extracted = bool(
-                    requested_scalar_root or requested_custom_root or requested_custom_obj_root or requested_relations
-                )
+                # Centralized query analysis: requested fields/relations and helper FKs
+                _plan = QueryAnalyzer(self).analyze(info, root_field_name, btype_cls)
+                requested_relations = _plan.requested_relations
+                requested_scalar_root = _plan.requested_scalar_root
+                requested_custom_root = _plan.requested_custom_root
+                requested_custom_obj_root = _plan.requested_custom_obj_root
+                requested_aggregates_root = _plan.requested_aggregates_root
                 # Coercion of JSON where values moved to core.utils.coerce_where_value
                 # Helper calls to RelationSQLBuilders are instantiated inline where needed
                 # Prepare pushdown COUNT aggregates (centralized)
@@ -1517,20 +1506,7 @@ class BerrySchema:
                 # whenever a single relation is requested so resolvers can operate even if pushdown
                 # isn't used (or additional filtering is applied at resolve time).
                 required_fk_parent_cols: set[str] = set()
-                try:
-                    for rel_name, rel_cfg in list(requested_relations.items()):
-                        # Collect helper FK columns for single relations; don't preemptively skip pushdown for callables
-                        if rel_cfg.get('single'):
-                            try:
-                                target_name = rel_cfg.get('target')
-                                child_model_cls = (self.types.get(target_name).model if target_name and self.types.get(target_name) else None)
-                            except Exception:
-                                child_model_cls = None
-                            parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
-                            if parent_fk_col_name is not None:
-                                required_fk_parent_cols.add(parent_fk_col_name)
-                except Exception:
-                    required_fk_parent_cols = set()
+                required_fk_parent_cols: set[str] = set(_plan.required_fk_parent_cols or set())
                 # Track per-relation pushdown status and skip reasons
                 rel_push_status: Dict[str, Dict[str, Any]] = {}
                 # Push down relation JSON arrays/objects
