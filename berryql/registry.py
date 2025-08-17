@@ -54,7 +54,7 @@ from .core.utils import (
     to_where_dict as _to_where_dict,
     normalize_order_multi_values as _norm_order_multi,
 )
-from .sql.builders import RelationSQLBuilders
+from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 
 __all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
 
@@ -1461,8 +1461,9 @@ class BerrySchema:
                 )
                 # Coercion of JSON where values moved to core.utils.coerce_where_value
                 # Helper calls to RelationSQLBuilders are instantiated inline where needed
-                # Prepare pushdown COUNT aggregates (replace batch later)
-                count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, subquery_def)
+                # Prepare pushdown COUNT aggregates (centralized)
+                count_aggregates: List[tuple[str, Any]] = []  # (agg_field_name, def)
+                # Also build select_columns for count aggregates
                 for cf_name, cf_def in btype_cls.__berry_fields__.items():
                     if cf_def.kind == 'custom':
                         # Include only if explicitly requested
@@ -1497,35 +1498,18 @@ class BerrySchema:
                         for c in cols_to_add:
                             select_columns.append(c)
                         custom_object_fields.append((cf_name, labels, cf_def.meta.get('returns')))
-                    elif cf_def.kind == 'aggregate':
-                        # Only handle count aggregates for pushdown
-                        op = cf_def.meta.get('op')
-                        ops = cf_def.meta.get('ops') or []
-                        is_count = op == 'count' or 'count' in ops
-                        if is_count:
-                            # Include only if explicitly requested
-                            if cf_name not in requested_aggregates_root:
-                                continue
-                            source_rel = cf_def.meta.get('source')
-                            rel_def = btype_cls.__berry_fields__.get(source_rel)
-                            if rel_def and rel_def.kind == 'relation':
-                                target_name = rel_def.meta.get('target')
-                                target_b = self.types.get(target_name)
-                                if target_b and target_b.model:
-                                    child_model_cls = target_b.model
-                                    # find FK from child to parent
-                                    fk_col = None
-                                    for col in child_model_cls.__table__.columns:
-                                        for fk in col.foreign_keys:
-                                            if fk.column.table.name == model_cls.__table__.name:
-                                                fk_col = col
-                                                break
-                                        if fk_col is not None:
-                                            break
-                                    if fk_col is not None:
-                                        subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
-                                        select_columns.append(subq_cnt)
-                                        count_aggregates.append((cf_name, cf_def))
+                    elif cf_def.kind == 'aggregate' and cf_name in requested_aggregates_root:
+                        # centralized below; delay collecting to single pass
+                        pass
+                # centralized aggregate construction
+                cols_aggs, meta_aggs = RootSQLBuilders(self).build_count_aggregates(
+                    model_cls=model_cls,
+                    btype_cls=btype_cls,
+                    requested_aggregates=requested_aggregates_root,
+                )
+                for c in cols_aggs:
+                    select_columns.append(c)
+                count_aggregates.extend(meta_aggs)
                 # MSSQL special handling: we'll emulate JSON aggregation via FOR JSON PATH
                 mssql_mode = hasattr(adapter, 'name') and adapter.name == 'mssql'
                 # Determine helper FK columns on parent for single relations. Include them proactively
@@ -1751,220 +1735,38 @@ class BerrySchema:
                 # Add minimal root columns directly into the SELECT to avoid pulling all entity columns
                 # Prefer selecting only requested scalars and id when relations are requested.
                 try:
-                    base_root_cols: list[Any] = []
-                    effective_root_cols: set[str] = set(requested_scalar_root or set())
-                    # Always include primary id when available to ensure hydration works in nested/domain contexts
-                    try:
-                        if hasattr(model_cls, 'id') and 'id' not in effective_root_cols:
-                            effective_root_cols.add('id')
-                    except Exception:
-                        pass
-                    # Include id when any relation is requested (needed for correlation)
-                    if requested_relations:
-                        effective_root_cols.add('id')
-                    # Include any required FK helper columns for resolvers
-                    for fk in required_fk_parent_cols:
-                        effective_root_cols.add(fk)
-                    # Label columns explicitly so RowMapping uses plain keys (e.g., 'id', 'author_id')
-                    for sf in effective_root_cols:
-                        if hasattr(model_cls, sf):
-                            try:
-                                col_obj = getattr(model_cls, sf)
-                                base_root_cols.append(col_obj.label(sf))
-                            except Exception:
-                                base_root_cols.append(getattr(model_cls, sf))
+                    base_root_cols = RootSQLBuilders(self).build_base_root_columns(
+                        model_cls=model_cls,
+                        requested_scalar_root=requested_scalar_root,
+                        requested_relations=requested_relations,
+                        required_fk_parent_cols=required_fk_parent_cols,
+                    )
                     if base_root_cols or select_columns:
                         stmt = select(*base_root_cols, *select_columns)
                     else:
-                        # Nothing explicit to project; fall back to entity
                         stmt = select(model_cls)
                 except Exception:
-                    # Fallback if anything above fails
                     stmt = select(model_cls)
                 else:
                 # ----- Phase 2 filtering (argument-driven) -----
-                    where_clauses = []
-                    # Apply optional context-aware root custom where if provided on BerryType
-                    try:
-                        custom_where = getattr(btype_cls, '__root_custom_where__', None)
-                    except Exception:
-                        custom_where = None
-                    # Use shared where-dict -> SQLA expression builder
-                    # Only enforce custom_where when explicitly enabled by context flag
-                    try:
-                        _ctx = getattr(info, 'context', None)
-                    except Exception:
-                        _ctx = None
-                    enforce_gate = False
-                    if isinstance(_ctx, dict):
-                        enforce_gate = bool(_ctx.get('enforce_user_gate'))
-                    elif _ctx is not None:
-                        try:
-                            enforce_gate = bool(getattr(_ctx, 'enforce_user_gate', False))
-                        except Exception:
-                            enforce_gate = False
-                    if custom_where is not None and enforce_gate:
-                        try:
-                            cw_val = custom_where(model_cls, info) if callable(custom_where) else custom_where
-                        except Exception:
-                            cw_val = None
-                        if cw_val is not None:
-                            # accept raw SQLAlchemy expression or simple dict form {col: {op: val}}
-                            try:
-                                # Heuristic: dict-like -> build expression
-                                if isinstance(cw_val, dict):
-                                    expr_obj = _expr_from_where_dict(model_cls, cw_val)
-                                else:
-                                    expr_obj = cw_val
-                                if expr_obj is not None:
-                                    where_clauses.append(expr_obj)
-                            except Exception:
-                                pass
-                    # Apply ad-hoc raw where if provided by user/defaults
-                    if raw_where is not None:
-                        wdict = raw_where
-                        # Allow callable: (model_cls, info) -> dict/JSON or SA expr
-                        if callable(raw_where):
-                            wdict = raw_where(model_cls, info)
-                        expr2 = None
-                        # Try dict/JSON first
-                        try:
-                            wdict_parsed = _to_where_dict(wdict, strict=True) if not isinstance(wdict, dict) else wdict
-                        except Exception as e:
-                            # If not parseable and not a dict, treat as potential SA expr; if it's a string, raise
-                            if isinstance(wdict, str):
-                                raise ValueError(f"Invalid where JSON: {e}")
-                            wdict_parsed = None
-                        if isinstance(wdict_parsed, dict):
-                            expr2 = _expr_from_where_dict(model_cls, wdict_parsed)
-                        else:
-                            # assume SQLAlchemy expression or None
-                            expr2 = wdict if not isinstance(wdict, str) else None
-                        if expr2 is None and isinstance(wdict, str):
-                            raise ValueError("where must be a JSON object")
-                        if expr2 is not None:
-                            where_clauses.append(expr2)
-                    for arg_name, value in _passed_filter_args.items():
-                        if value is None:
-                            continue
-                        f_spec = declared_filters.get(arg_name)
-                        if not f_spec:
-                            raise ValueError(f"Unknown filter argument: {arg_name}")
-                        # transform value
-                        if f_spec.transform:
-                            try:
-                                value = f_spec.transform(value)
-                            except Exception as e:
-                                raise ValueError(f"Filter transform failed for {arg_name}: {e}")
-                        expr = None
-                        if f_spec.builder:
-                            try:
-                                expr = f_spec.builder(model_cls, info, value)
-                            except Exception as e:
-                                raise ValueError(f"Filter builder failed for {arg_name}: {e}")
-                        elif f_spec.column:
-                            try:
-                                col = model_cls.__table__.c.get(f_spec.column)
-                            except Exception:
-                                col = None
-                            if col is None:
-                                raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
-                            op_name = f_spec.op or 'eq'
-                            op_fn = OPERATOR_REGISTRY.get(op_name)
-                            if not op_fn:
-                                raise ValueError(f"Unknown filter operator: {op_name} for argument {arg_name}")
-                            try:
-                                expr = op_fn(col, value)
-                            except Exception as e:
-                                raise ValueError(f"Filter operation failed for {arg_name}: {e}")
-                        if expr is not None:
-                            where_clauses.append(expr)
-                    if where_clauses:
-                        for wc in where_clauses:
-                            try:
-                                stmt = stmt.where(wc)
-                            except Exception:
-                                pass
-                    # Apply ordering (whitelist) before pagination
-                    if order_multi:
-                        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
-                        if allowed_order_fields is None:
-                            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-                        for spec in (order_multi or []):
-                            try:
-                                cn, _, dd = str(spec).partition(':')
-                                dd = (dd or 'asc').lower()
-                                if cn not in allowed_order_fields:
-                                    continue
-                                col = model_cls.__table__.c.get(cn)
-                                if col is None:
-                                    continue
-                                stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
-                            except Exception:
-                                pass
-                    elif order_by:
-                        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
-                        if allowed_order_fields is None:
-                            # default allow scalar field names
-                            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-                        if order_by not in allowed_order_fields:
-                            raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order_fields}")
-                        try:
-                            col = model_cls.__table__.c.get(order_by)
-                        except Exception:
-                            col = None
-                        if col is None:
-                            raise ValueError(f"Unknown order_by column: {order_by}")
-                        dir_v = _dir_value(order_dir)
-                        if dir_v not in ('asc','desc'):
-                            raise ValueError(f"Invalid order_dir '{order_dir}'. Use asc or desc")
-                        try:
-                            stmt = stmt.order_by(col.desc() if dir_v == 'desc' else col.asc())
-                        except Exception as e:
-                            raise
-                    else:
-                        # Apply default ordering from type meta if present
-                        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
-                        if allowed_order_fields is None:
-                            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-                        def_dir = _dir_value(getattr(btype_cls, '__default_order_dir__', None))
-                        default_multi = getattr(btype_cls, '__default_order_multi__', None) or []
-                        default_by = getattr(btype_cls, '__default_order_by__', None)
-                        try:
-                            applied_default = False
-                            if default_multi:
-                                for spec in default_multi:
-                                    cn, _, dd = str(spec).partition(':')
-                                    dd = dd or def_dir
-                                    if cn in allowed_order_fields:
-                                        col = model_cls.__table__.c.get(cn)
-                                        if col is not None:
-                                            stmt = stmt.order_by(col.desc() if (dd=='desc') else col.asc())
-                                            applied_default = True
-                            elif default_by and default_by in allowed_order_fields:
-                                col = model_cls.__table__.c.get(default_by)
-                                if col is not None:
-                                    stmt = stmt.order_by(col.desc() if def_dir=='desc' else col.asc())
-                                    applied_default = True
-                        except Exception:
-                            pass
-                    if offset is not None:
-                        try:
-                            o = int(offset)
-                        except Exception:
-                            raise ValueError("offset must be an integer")
-                        if o < 0:
-                            raise ValueError("offset must be non-negative")
-                        if o:
-                            stmt = stmt.offset(o)
-                    if limit is not None:
-                        try:
-                            l = int(limit)
-                        except Exception:
-                            raise ValueError("limit must be an integer")
-                        if l < 0:
-                            raise ValueError("limit must be non-negative")
-                        stmt = stmt.limit(l)
+                    stmt = RootSQLBuilders(self).apply_root_filters(
+                        stmt,
+                        model_cls=model_cls,
+                        btype_cls=btype_cls,
+                        info=info,
+                        raw_where=raw_where,
+                        declared_filters=declared_filters,
+                        passed_filter_args=_passed_filter_args,
+                    )
+                    stmt = RootSQLBuilders(self).apply_ordering(
+                        stmt,
+                        model_cls=model_cls,
+                        btype_cls=btype_cls,
+                        order_by=order_by,
+                        order_dir=order_dir,
+                        order_multi=order_multi,
+                    )
+                    stmt = RootSQLBuilders(self).apply_pagination(stmt, limit=limit, offset=offset)
                     async with lock:
                         result = await session.execute(stmt)
                         sa_rows = result.fetchall()

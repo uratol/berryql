@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
-from sqlalchemy import select, text as _text, literal_column
+from sqlalchemy import select, text as _text, literal_column, func
 
 # Centralized SQL builders. Keep registry thin and DRY.
 
@@ -1404,3 +1404,257 @@ class RelationSQLBuilders:
             select_columns.append(json_obj_expr.label(json_label))
             labels.append(json_label)
             return (select_columns, labels)
+
+
+# Root-level helpers to keep registry resolver thin
+class RootSQLBuilders:
+    def __init__(self, registry):
+        self.registry = registry
+
+    def build_count_aggregates(self, *, model_cls, btype_cls, requested_aggregates: set[str]) -> tuple[list[Any], list[tuple[str, Any]]]:
+        cols: list[Any] = []
+        meta: list[tuple[str, Any]] = []
+        try:
+            for cf_name, cf_def in getattr(btype_cls, '__berry_fields__', {}).items():
+                try:
+                    if cf_def.kind != 'aggregate':
+                        continue
+                    op = cf_def.meta.get('op')
+                    ops = cf_def.meta.get('ops') or []
+                    is_count = op == 'count' or 'count' in ops
+                    if not is_count:
+                        continue
+                    if cf_name not in requested_aggregates:
+                        continue
+                    source_rel = cf_def.meta.get('source')
+                    rel_def = getattr(btype_cls, '__berry_fields__', {}).get(source_rel)
+                    if not (rel_def and rel_def.kind == 'relation'):
+                        continue
+                    target_name = rel_def.meta.get('target')
+                    target_b = self.registry.types.get(target_name)
+                    if not (target_b and target_b.model):
+                        continue
+                    child_model_cls = target_b.model
+                    fk_col = None
+                    for col in child_model_cls.__table__.columns:
+                        for fk in col.foreign_keys:
+                            if fk.column.table.name == model_cls.__table__.name:
+                                fk_col = col
+                                break
+                        if fk_col is not None:
+                            break
+                    if fk_col is None:
+                        continue
+                    subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
+                    cols.append(subq_cnt)
+                    meta.append((cf_name, cf_def))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return cols, meta
+
+    def build_base_root_columns(self, *, model_cls, requested_scalar_root: set[str], requested_relations: Dict[str, Any], required_fk_parent_cols: set[str]) -> list[Any]:
+        base_root_cols: list[Any] = []
+        effective_root_cols: set[str] = set(requested_scalar_root or set())
+        try:
+            if hasattr(model_cls, 'id') and 'id' not in effective_root_cols:
+                effective_root_cols.add('id')
+        except Exception:
+            pass
+        if requested_relations:
+            effective_root_cols.add('id')
+        for fk in (required_fk_parent_cols or set()):
+            effective_root_cols.add(fk)
+        for sf in effective_root_cols:
+            if hasattr(model_cls, sf):
+                try:
+                    col_obj = getattr(model_cls, sf)
+                    base_root_cols.append(col_obj.label(sf))
+                except Exception:
+                    try:
+                        base_root_cols.append(getattr(model_cls, sf))
+                    except Exception:
+                        pass
+        return base_root_cols
+
+    def apply_root_filters(self, stmt, *, model_cls, btype_cls, info, raw_where, declared_filters: Dict[str, Any], passed_filter_args: Dict[str, Any]):
+        from ..core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
+        where_clauses = []
+        # gating
+        try:
+            _ctx = getattr(info, 'context', None)
+        except Exception:
+            _ctx = None
+        enforce_gate = False
+        if isinstance(_ctx, dict):
+            enforce_gate = bool(_ctx.get('enforce_user_gate'))
+        elif _ctx is not None:
+            try:
+                enforce_gate = bool(getattr(_ctx, 'enforce_user_gate', False))
+            except Exception:
+                enforce_gate = False
+        try:
+            custom_where = getattr(btype_cls, '__root_custom_where__', None)
+        except Exception:
+            custom_where = None
+        if custom_where is not None and enforce_gate:
+            try:
+                cw_val = custom_where(model_cls, info) if callable(custom_where) else custom_where
+            except Exception:
+                cw_val = None
+            if cw_val is not None:
+                try:
+                    if isinstance(cw_val, dict):
+                        expr_obj = _expr_from_where_dict(model_cls, cw_val)
+                    else:
+                        expr_obj = cw_val
+                    if expr_obj is not None:
+                        where_clauses.append(expr_obj)
+                except Exception:
+                    pass
+        # raw where
+        if raw_where is not None:
+            wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
+            expr2 = None
+            try:
+                wdict_parsed = _to_where_dict(wdict, strict=True) if not isinstance(wdict, dict) else wdict
+            except Exception as e:
+                if isinstance(wdict, str):
+                    raise ValueError(f"Invalid where JSON: {e}")
+                wdict_parsed = None
+            if isinstance(wdict_parsed, dict):
+                expr2 = _expr_from_where_dict(model_cls, wdict_parsed)
+            else:
+                expr2 = wdict if not isinstance(wdict, str) else None
+            if expr2 is None and isinstance(wdict, str):
+                raise ValueError("where must be a JSON object")
+            if expr2 is not None:
+                where_clauses.append(expr2)
+        # filter args
+        from ..core.filters import OPERATOR_REGISTRY
+        for arg_name, value in (passed_filter_args or {}).items():
+            if value is None:
+                continue
+            f_spec = declared_filters.get(arg_name)
+            if not f_spec:
+                raise ValueError(f"Unknown filter argument: {arg_name}")
+            if getattr(f_spec, 'transform', None):
+                try:
+                    value = f_spec.transform(value)
+                except Exception as e:
+                    raise ValueError(f"Filter transform failed for {arg_name}: {e}")
+            expr = None
+            if getattr(f_spec, 'builder', None):
+                try:
+                    expr = f_spec.builder(model_cls, info, value)
+                except Exception as e:
+                    raise ValueError(f"Filter builder failed for {arg_name}: {e}")
+            elif getattr(f_spec, 'column', None):
+                try:
+                    col = model_cls.__table__.c.get(f_spec.column)
+                except Exception:
+                    col = None
+                if col is None:
+                    raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
+                op_name = f_spec.op or 'eq'
+                op_fn = OPERATOR_REGISTRY.get(op_name)
+                if not op_fn:
+                    raise ValueError(f"Unknown filter operator: {op_name} for argument {arg_name}")
+                try:
+                    expr = op_fn(col, value)
+                except Exception as e:
+                    raise ValueError(f"Filter operation failed for {arg_name}: {e}")
+            if expr is not None:
+                where_clauses.append(expr)
+        for wc in where_clauses:
+            try:
+                stmt = stmt.where(wc)
+            except Exception:
+                pass
+        return stmt
+
+    def apply_ordering(self, stmt, *, model_cls, btype_cls, order_by, order_dir, order_multi):
+        from ..core.utils import dir_value as _dir_value
+        # multi first
+        if order_multi:
+            allowed_order_fields = getattr(btype_cls, '__ordering__', None)
+            if allowed_order_fields is None:
+                allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
+            for spec in (order_multi or []):
+                try:
+                    cn, _, dd = str(spec).partition(':')
+                    dd = (dd or 'asc').lower()
+                    if cn not in allowed_order_fields:
+                        continue
+                    col = model_cls.__table__.c.get(cn)
+                    if col is None:
+                        continue
+                    stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
+                except Exception:
+                    pass
+            return stmt
+        # single order_by
+        if order_by:
+            allowed_order_fields = getattr(btype_cls, '__ordering__', None)
+            if allowed_order_fields is None:
+                allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
+            if order_by not in allowed_order_fields:
+                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order_fields}")
+            try:
+                col = model_cls.__table__.c.get(order_by)
+            except Exception:
+                col = None
+            if col is None:
+                raise ValueError(f"Unknown order_by column: {order_by}")
+            dv = _dir_value(order_dir)
+            if dv not in ('asc','desc'):
+                raise ValueError(f"Invalid order_dir '{order_dir}'. Use asc or desc")
+            try:
+                stmt = stmt.order_by(col.desc() if dv=='desc' else col.asc())
+            except Exception:
+                pass
+            return stmt
+        # defaults
+        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
+        if allowed_order_fields is None:
+            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
+        def_dir = _dir_value(getattr(btype_cls, '__default_order_dir__', None))
+        default_multi = getattr(btype_cls, '__default_order_multi__', None) or []
+        default_by = getattr(btype_cls, '__default_order_by__', None)
+        try:
+            if default_multi:
+                for spec in default_multi:
+                    cn, _, dd = str(spec).partition(':')
+                    dd = dd or def_dir
+                    if cn in allowed_order_fields:
+                        col = model_cls.__table__.c.get(cn)
+                        if col is not None:
+                            stmt = stmt.order_by(col.desc() if (dd=='desc') else col.asc())
+            elif default_by and default_by in allowed_order_fields:
+                col = model_cls.__table__.c.get(default_by)
+                if col is not None:
+                    stmt = stmt.order_by(col.desc() if def_dir=='desc' else col.asc())
+        except Exception:
+            pass
+        return stmt
+
+    def apply_pagination(self, stmt, *, limit, offset):
+        if offset is not None:
+            try:
+                o = int(offset)
+            except Exception:
+                raise ValueError("offset must be an integer")
+            if o < 0:
+                raise ValueError("offset must be non-negative")
+            if o:
+                stmt = stmt.offset(o)
+        if limit is not None:
+            try:
+                l = int(limit)
+            except Exception:
+                raise ValueError("limit must be an integer")
+            if l < 0:
+                raise ValueError("limit must be non-negative")
+            stmt = stmt.limit(l)
+        return stmt
