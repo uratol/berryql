@@ -173,17 +173,29 @@ class MSSQLAdapter(BaseAdapter):
         if not parts and ob_str and ob_str in model_cls.__table__.columns:
             dd = od_str
             parts.append(f"[{table_alias}].[{ob_str}] {'DESC' if dd=='desc' else 'ASC'}")
-        if not parts and 'id' in model_cls.__table__.columns:
-            parts.append(f"[{table_alias}].[id] ASC")
+        if not parts:
+            try:
+                pk_col = next(iter(model_cls.__table__.primary_key.columns)).name
+            except Exception:
+                pk_col = None
+            if pk_col:
+                parts.append(f"[{table_alias}].[{pk_col}] ASC")
         return ', '.join(parts) if parts else None
 
-    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, fields: list[str] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None, nested_children: list[dict] | None = None) -> str:
-        n_cols = fields or []
+    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, child_pk_name: str, fields: list[str] | list[tuple[str, str]] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None, nested_children: list[dict] | None = None) -> str:
+        n_cols = list(fields or [])
         if not n_cols:
             for c in grand_model.__table__.columns:
                 n_cols.append(c.name)
-        n_col_select = ', '.join([f"[{grand_model.__tablename__}].[{c}] AS [{c}]" for c in (n_cols or ['id'])])
-        where_parts = [f"[{grand_model.__tablename__}].[{g_fk_col_name}] = [{child_table}].[id]"]
+        select_bits: list[str] = []
+        if n_cols and isinstance(n_cols[0], (list, tuple)):
+            for src, alias2 in (n_cols or []):
+                select_bits.append(f"[{grand_model.__tablename__}].[{src}] AS [{alias2}]")
+        else:
+            for c in (n_cols or []):
+                select_bits.append(f"[{grand_model.__tablename__}].[{c}] AS [{c}]")
+        n_col_select = ', '.join(select_bits) if select_bits else '*'
+        where_parts = [f"[{grand_model.__tablename__}].[{g_fk_col_name}] = [{child_table}].[{child_pk_name}]"]
         # accept both dict and JSON string
         import json as _json
         def _as_dict(maybe):
@@ -206,7 +218,7 @@ class MSSQLAdapter(BaseAdapter):
         if extra_where_sql:
             where_parts.extend([str(x) for x in extra_where_sql if x])
         n_where = ' AND '.join(where_parts)
-        # Handle nested-of-nested arrays: build JSON subqueries correlated to grand_model.id
+        # Handle nested-of-nested arrays: build JSON subqueries correlated to grand_model -> current child
         nested_cols = ''
         if nested_children:
             n_parts: list[str] = []
@@ -223,11 +235,17 @@ class MSSQLAdapter(BaseAdapter):
                     sub_order_multi = nn.get('order_multi')
                     sub_limit = nn.get('limit')
                     sub_offset = nn.get('offset')
+                    # Recurse with PK of current child (grand_model)
+                    try:
+                        child_pk_recur = next(iter(grand_model.__table__.primary_key.columns)).name
+                    except Exception:
+                        child_pk_recur = 'id'
                     sub_sql = self.build_nested_list_sql(
                         alias=sub_alias,
                         grand_model=sub_model,
                         child_table=grand_model.__tablename__,
                         g_fk_col_name=sub_fk,
+                        child_pk_name=child_pk_recur,
                         fields=sub_fields,
                         where_dict=sub_where,
                         default_where=sub_default_where,
@@ -249,8 +267,12 @@ class MSSQLAdapter(BaseAdapter):
         pag_clause = ''
         if limit is not None or offset is not None:
             if not n_order:
-                # Fallback to id asc to satisfy OFFSET/FETCH requirement
-                n_order = self._build_order_clause(grand_model, grand_model.__tablename__, 'id', 'asc', None)
+                # Fallback to PK asc to satisfy OFFSET/FETCH requirement
+                try:
+                    pk_name_fallback = next(iter(grand_model.__table__.primary_key.columns)).name
+                except Exception:
+                    pk_name_fallback = 'id'
+                n_order = self._build_order_clause(grand_model, grand_model.__tablename__, pk_name_fallback, 'asc', None)
             o = self._as_int(offset) or 0
             pag_clause = f" ORDER BY {n_order} OFFSET {o} ROWS"
             if limit is not None:
@@ -259,15 +281,22 @@ class MSSQLAdapter(BaseAdapter):
             pag_clause = f" ORDER BY {n_order}"
         return f"SELECT {n_col_select}{nested_cols} FROM {grand_model.__tablename__} WHERE {n_where}{pag_clause} FOR JSON PATH"
 
-    def build_relation_list_json_full(self, *, parent_table: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, offset: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
+    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, offset: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
         """Assemble full MSSQL JSON aggregation for a to-many relation with optional nested arrays.
 
         nested: list of dicts, each with keys: alias, model, fk_col_name, fields, where, default_where, order_by, order_dir, order_multi, limit
         """
         cols = projected_columns or ['id']
-        select_cols = ', '.join([f"[{child_model.__tablename__}].[{c}] AS [{c}]" for c in cols])
+        select_bits: list[str] = []
+        if cols and isinstance(cols[0], (list, tuple)):
+            for src, alias in cols:  # type: ignore
+                select_bits.append(f"[{child_model.__tablename__}].[{src}] AS [{alias}]")
+        else:
+            for c in cols:  # type: ignore
+                select_bits.append(f"[{child_model.__tablename__}].[{c}] AS [{c}]")
+        select_cols = ', '.join(select_bits)
         # Build where: correlate to parent and apply relation-level JSON where
-        where_parts_rel: list[str] = [f"[{child_model.__tablename__}].[{fk_col_name}] = [{parent_table}].[id]"]
+        where_parts_rel: list[str] = [f"[{child_model.__tablename__}].[{fk_col_name}] = [{parent_table}].[{parent_pk_name}]"]
         import json as _json
         def _as_dict(maybe):
             # Accept dict or JSON string only; ignore callables/expressions
@@ -304,11 +333,17 @@ class MSSQLAdapter(BaseAdapter):
                         n_children.append(nn)
                 except Exception:
                     n_children = []
+                # Determine PK name for current child table (child_model)
+                try:
+                    child_pk_for_nested = next(iter(child_model.__table__.primary_key.columns)).name
+                except Exception:
+                    child_pk_for_nested = 'id'
                 nsql = self.build_nested_list_sql(
                     alias=alias,
                     grand_model=gm,
                     child_table=child_model.__tablename__,
                     g_fk_col_name=gfk,
+                    child_pk_name=child_pk_for_nested,
                     fields=n.get('fields'),
                     where_dict=_as_dict(n.get('where')),
                     default_where=_as_dict(n.get('default_where')),
@@ -327,7 +362,11 @@ class MSSQLAdapter(BaseAdapter):
         if limit is not None or offset is not None:
             # Ensure we have an order clause
             if not order_clause:
-                order_clause = self._build_order_clause(child_model, child_model.__tablename__, 'id', 'asc', None)
+                try:
+                    pk_fallback = next(iter(child_model.__table__.primary_key.columns)).name
+                except Exception:
+                    pk_fallback = 'id'
+                order_clause = self._build_order_clause(child_model, child_model.__tablename__, pk_fallback, 'asc', None)
             o = self._as_int(offset) or 0
             pag_clause = f" ORDER BY {order_clause} OFFSET {o} ROWS"
             if limit is not None:
@@ -349,7 +388,11 @@ class MSSQLAdapter(BaseAdapter):
         Returns a TextClause producing a JSON object string or 'null'.
         """
         cols = projected_columns or ['id']
-        col_list = ', '.join([f"[{child_table}].[{c}]" for c in cols])
+        if cols and isinstance(cols[0], (list, tuple)):
+            # respect aliasing if pairs provided
+            col_list = ', '.join([f"[{child_table}].[{src}] AS [{alias}]" for src, alias in cols])  # type: ignore
+        else:
+            col_list = ', '.join([f"[{child_table}].[{c}]" for c in cols])  # type: ignore
         raw = (
             f"ISNULL((SELECT TOP 1 {col_list} FROM {child_table} WHERE {join_condition} "
             f"FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
@@ -363,7 +406,14 @@ class MSSQLAdapter(BaseAdapter):
         as a scalar column so it becomes a property on each object in the JSON array.
         """
         cols = projected_columns or ['id']
-        select_cols = ', '.join([f"[{child_table}].[{c}] AS [{c}]" for c in cols])
+        select_bits: list[str] = []
+        if cols and isinstance(cols[0], (list, tuple)):
+            for src, alias in cols:  # type: ignore
+                select_bits.append(f"[{child_table}].[{src}] AS [{alias}]")
+        else:
+            for c in cols:  # type: ignore
+                select_bits.append(f"[{child_table}].[{c}] AS [{c}]")
+        select_cols = ', '.join(select_bits)
         nested_cols = ''
         if nested_subqueries:
             # Ensure each nested is wrapped in ISNULL(...) to always return '[]'
@@ -374,7 +424,8 @@ class MSSQLAdapter(BaseAdapter):
         if limit is not None or offset is not None:
             ob = order_by
             if not ob:
-                ob = f"[{child_table}].[id] ASC"
+                # Safety fallback; builders should supply an order when paginating
+                ob = "(SELECT NULL)"
             o = self._as_int(offset) or 0
             pag_clause = f" ORDER BY {ob} OFFSET {o} ROWS"
             if limit is not None:

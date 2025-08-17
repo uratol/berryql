@@ -47,26 +47,34 @@ class FieldDescriptor:
         """
         return FieldDef(name=self.name or '', kind=self.kind, meta=self.meta)
 
-def field(**meta) -> FieldDescriptor:
+def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
     """Declare a scalar field on a Berry type.
 
     Place this as a class attribute inside a ``@berry_schema.type`` class to
     expose a simple column/attribute as a GraphQL field or to reserve a slot for
     a computed scalar resolved by the adapters layer.
 
-    Common metadata keys (interpreted by adapters/registry):
-    - column: Override source column/attribute name on the model.
+        Common metadata keys (interpreted by adapters/registry):
+        - column: Override source column/attribute name on the model. You can pass
+            this as a positional argument too, e.g. ``id = field('user_id')``.
     - description: Optional GraphQL field description.
     - nullable: Hint about nullability for schema generation.
 
-    Example:
+    Examples:
         class PostQL(BerryType):
             id = field()
             title = field(description="Post title")
+            # Map GraphQL 'id' to DB column 'user_id'
+            id_alias = field('user_id', description="Public id")
+            # Or expose DB column with same name directly
+            user_id = field()
 
     Returns:
         FieldDescriptor: A descriptor captured by the registry.
     """
+    if column is not None:
+        meta = dict(meta)
+        meta['column'] = column
     return FieldDescriptor(kind='scalar', **meta)
 
 def relation(target: Any = None, *, single: bool | None = None, **meta) -> FieldDescriptor:

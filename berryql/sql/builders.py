@@ -10,6 +10,113 @@ class RelationSQLBuilders:
         self.registry = registry
 
     # --- helpers -------------------------------------------------------------
+    def _pk_col(self, model_cls):
+        """Get SQLAlchemy primary key column using registry helper."""
+        return self.registry._get_pk_column(model_cls)
+
+    def _pk_name(self, model_cls) -> str:
+        """Get primary key column name using registry helper."""
+        return self.registry._get_pk_name(model_cls)
+
+    def _project_columns(self, model_cls, columns: list[str] | None) -> list:
+        """Map GraphQL scalar names to SQLAlchemy columns with aliasing.
+
+        Rules:
+        - If Berry field has meta.column mapping, project that source column and label as GraphQL name.
+        - Otherwise, project model attribute with same name.
+        - Always ensure the physical PK column is present labeled to its physical name for correlation.
+        - Unknown names are skipped.
+        """
+        cols = list(columns or [])
+        out: list = []
+        seen_labels: set[str] = set()
+        # Fetch Berry field defs if available to consult meta.column
+        btype = None
+        try:
+            # Reverse lookup: model -> btype by scanning registry
+            for _name, _bt in (self.registry.types or {}).items():
+                if getattr(_bt, 'model', None) is model_cls:
+                    btype = _bt
+                    break
+        except Exception:
+            btype = None
+        fdefs = getattr(btype, '__berry_fields__', {}) if btype is not None else {}
+        for name in cols:
+            source_col_name = None
+            try:
+                fd = fdefs.get(name)
+                if fd and getattr(fd, 'kind', None) == 'scalar':
+                    source_col_name = (getattr(fd, 'meta', {}) or {}).get('column')
+            except Exception:
+                source_col_name = None
+            sa_col = None
+            if source_col_name:
+                try:
+                    sa_col = getattr(model_cls.__table__.c, source_col_name, None) or model_cls.__table__.c.get(source_col_name)
+                except Exception:
+                    sa_col = getattr(model_cls, source_col_name, None)
+                if sa_col is not None:
+                    try:
+                        out.append(sa_col.label(name))
+                        seen_labels.add(str(name))
+                    except Exception:
+                        out.append(sa_col)
+                        seen_labels.add(getattr(sa_col, 'name', str(name)))
+                    continue
+            # Fallback: attribute with same name
+            sa_col = getattr(model_cls, name, None)
+            if sa_col is not None:
+                out.append(sa_col)
+                seen_labels.add(str(name))
+        # Ensure the physical PK is available for correlation under its physical name
+        try:
+            pk_name = self._pk_name(model_cls)
+            if pk_name and pk_name not in seen_labels:
+                try:
+                    out.append(self._pk_col(model_cls).label(pk_name))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out
+
+    def _mssql_map_columns_pairs(self, model_cls, columns: list[str] | None) -> list[tuple[str, str]]:
+        """Map GraphQL scalar field names to physical column names for MSSQL adapter.
+
+        Returns a list of (source_column_name, alias_name) pairs. Honors field meta['column']
+        mapping when present; otherwise uses the same name. Unknown names are skipped.
+        """
+        cols = list(columns or [])
+        out: list[tuple[str, str]] = []
+        # lookup btype to access field meta
+        btype = None
+        try:
+            for _name, _bt in (self.registry.types or {}).items():
+                if getattr(_bt, 'model', None) is model_cls:
+                    btype = _bt
+                    break
+        except Exception:
+            btype = None
+        fdefs = getattr(btype, '__berry_fields__', {}) if btype is not None else {}
+        for name in cols:
+            src = None
+            try:
+                fd = fdefs.get(name)
+                if fd and getattr(fd, 'kind', None) == 'scalar':
+                    src = (getattr(fd, 'meta', {}) or {}).get('column')
+            except Exception:
+                src = None
+            if not src:
+                # ensure the column exists on the table
+                try:
+                    if name in model_cls.__table__.columns:
+                        src = name
+                except Exception:
+                    src = name if hasattr(model_cls, name) else None
+            if src:
+                out.append((src, name))
+        return out
+
     def _prepare_requested_scalar_fields(
         self,
         *,
@@ -23,7 +130,6 @@ class RelationSQLBuilders:
         - Honors rel_cfg['fields'] if provided and filters to known scalar fields.
         - Otherwise includes all scalar berry fields on target type.
         - Optionally includes helper FK columns for child's single nested relations that are requested.
-        - Always ensures 'id' is included when available for correlation.
         """
         rel_cfg = rel_cfg or {}
         requested: List[str] = list(rel_cfg.get('fields') or [])
@@ -62,11 +168,7 @@ class RelationSQLBuilders:
                             pass
             except Exception:
                 pass
-        try:
-            if 'id' in child_model_cls.__table__.columns and 'id' not in requested:
-                requested.append('id')
-        except Exception:
-            pass
+        # Don't auto-append a special id alias; PK is handled internally for correlation
         return requested
 
     def _build_single_child_select_sqla(
@@ -86,12 +188,12 @@ class RelationSQLBuilders:
     ):
         """Build a correlated SA select for a single relation (parent has FK to child).
 
-        Applies where/default_where, filter args, ordering fallback to id, and limit 1.
-        """
-        cols = projected_columns or ['id']
-        child_id_col = getattr(child_model_cls, 'id')
+    Applies where/default_where, filter args, ordering fallback to id, and limit 1.
+    """
+        cols = projected_columns or []
+        child_id_col = self._pk_col(child_model_cls)
         parent_fk_col = getattr(parent_model_cls, pfk_col_name)
-        inner_cols = [getattr(child_model_cls, c) for c in cols]
+        inner_cols = self._project_columns(child_model_cls, cols)
         sel = (
             select(*inner_cols)
             .select_from(child_model_cls)
@@ -121,10 +223,9 @@ class RelationSQLBuilders:
         # filter args
         expanded_specs = self._expand_arg_specs(arg_specs or {})
         sel = self._apply_filter_args_sqla(sel, child_model_cls, info, filter_args or {}, expanded_specs)
-        # ensure deterministic ordering when not unique
+        # ensure deterministic ordering when not unique (by PK)
         try:
-            if 'id' in child_model_cls.__table__.columns:
-                sel = sel.order_by(getattr(child_model_cls, 'id').asc())
+            sel = sel.order_by(self._pk_col(child_model_cls).asc())
         except Exception:
             pass
         return sel
@@ -145,11 +246,11 @@ class RelationSQLBuilders:
 
         Applies relation where/default_where, filter args, ordering (order_multi -> order_by -> id), and pagination.
         """
-        inner_cols = [getattr(child_model_cls, c) for c in (projected_columns or ['id'])]
+        inner_cols = self._project_columns(child_model_cls, projected_columns or [])
         sel = (
             select(*inner_cols)
             .select_from(child_model_cls)
-            .where(fk_child_to_parent_col == parent_model_cls.id)
+            .where(fk_child_to_parent_col == self._pk_col(parent_model_cls))
             .correlate(parent_model_cls)
         )
         # where/default_where
@@ -376,14 +477,14 @@ class RelationSQLBuilders:
 
     def _json_row_args_from_subq(self, subq, columns: List[str] | None) -> List[Any]:
         args: List[Any] = []
-        cols = columns or ['id']
+        cols = columns or []
         for c in cols:
             args.extend([_text(f"'{c}'"), getattr(subq.c, c)])
         return args
 
     @staticmethod
     def _ensure_helper_fk_for_single_nested(requested: List[str], child_model_cls, target_b, nested_map: Dict[str, Any]) -> List[str]:
-        out = list(requested or ['id'])
+        out = list(requested or [])
         try:
             for rname, fdef in (getattr(target_b, '__berry_fields__', {}) or {}).items():
                 try:
@@ -438,8 +539,7 @@ class RelationSQLBuilders:
                     ordered = True
         if fallback_id and not ordered:
             try:
-                if 'id' in model_cls.__table__.columns:
-                    sel = sel.order_by(getattr(model_cls, 'id').asc())
+                sel = sel.order_by(self._pk_col(model_cls).asc())
             except Exception:
                 pass
         return sel
@@ -511,7 +611,7 @@ class RelationSQLBuilders:
         # Also skip when rel_name suggests a private/virtual relation used only for computed wrappers.
         if not parent_fk_col_name or (isinstance(rel_name, str) and rel_name.startswith('_')):
             return None
-        cols = projected_columns or ['id']
+        cols = projected_columns or []
         mssql_mode = getattr(adapter, 'name', '') == 'mssql'
         # Determine parent FK name for correlation (parent has FK to child)
         pfk = parent_fk_col_name or f"{rel_name}_id"
@@ -519,8 +619,10 @@ class RelationSQLBuilders:
             # Compose WHERE join + relation filters, then let adapter emit FOR JSON PATH
             child_table = child_model_cls.__tablename__
             parent_table = parent_model_cls.__tablename__
+            # child's PK equals parent's FK
+            child_pk_name = self._pk_name(child_model_cls)
             where_parts: list[str] = [
-                f"[{child_table}].[{pfk}] = [{parent_table}].[id]"
+                f"[{child_table}].[{child_pk_name}] = [{parent_table}].[{pfk}]"
             ]
             # Apply relation where/default_where fragments
             where_parts = self._mssql_where_from_value(
@@ -552,9 +654,11 @@ class RelationSQLBuilders:
                 pass
             where_sql = ' AND '.join(where_parts)
             # Use adapter helper for a single object
+            # On MSSQL, pass (source, alias) pairs so JSON keys remain GraphQL names
+            cols_pairs = self._mssql_map_columns_pairs(child_model_cls, cols)
             return adapter.build_single_relation_json(
                 child_table=child_table,
-                projected_columns=cols,
+                projected_columns=cols_pairs or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                 join_condition=where_sql,
             )
         # Non-MSSQL: correlated select limited to 1, return JSON object or null
@@ -649,11 +753,11 @@ class RelationSQLBuilders:
                                 if sd2.kind == 'scalar':
                                     n_cols.append(sf2)
                         is_single_nested = bool(ncfg.get('single') or False)
-                        # Base select for nested correlated to current_subq.c.id
+                        # Base select for nested correlated to current_subq PK column
                         n_sel = (
-                            select(*[getattr(grand_model, c) for c in (n_cols or ['id'])])
+                            select(*self._project_columns(grand_model, n_cols or []))
                             .select_from(grand_model)
-                            .where(g_fk == getattr(current_subq.c, 'id'))
+                            .where(g_fk == getattr(current_subq.c, self._pk_name(current_model_cls)))
                             .correlate(current_subq)
                         )
                         # Apply nested where/default_where
@@ -711,8 +815,11 @@ class RelationSQLBuilders:
                                 if col2 is not None:
                                     n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
                                     ordered2 = True
-                            if not ordered2 and 'id' in grand_model.__table__.columns:
-                                n_sel = n_sel.order_by(getattr(grand_model, 'id').asc())
+                            if not ordered2:
+                                try:
+                                    n_sel = n_sel.order_by(self._pk_col(grand_model).asc())
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         # Pagination for nested
@@ -728,7 +835,8 @@ class RelationSQLBuilders:
                             n_sel_single = n_sel.limit(1)
                             n_subq = n_sel_single.subquery()
                             n_row_args: List[Any] = []
-                            for sf2 in (n_cols or ['id']):
+                            use_cols = (n_cols or [self._pk_name(grand_model)])
+                            for sf2 in use_cols:
                                 n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
                             # recurse for deeper under this single
                             try:
@@ -753,7 +861,8 @@ class RelationSQLBuilders:
                             # Build JSON array for nested rows, including deeper nested fields
                             n_subq = n_sel.subquery()
                             n_row_args: List[Any] = []
-                            for sf2 in (n_cols or ['id']):
+                            use_cols = (n_cols or [self._pk_name(grand_model)])
+                            for sf2 in use_cols:
                                 n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
                             try:
                                 deeper_args = _build_nested_fields_for_subq(n_subq, grand_model, ncfg.get('nested') or {})
@@ -817,12 +926,10 @@ class RelationSQLBuilders:
                             requested_scalar_i.append(fk2)
             except Exception:
                 pass
-            # Always include child's id for nested correlation if available
-            if 'id' in child_model_cls_i.__table__.columns and 'id' not in requested_scalar_i:
-                requested_scalar_i.append('id')
+            # Do not auto-append logical 'id'; PK will be included internally when needed
             # Base inner select for child rows (correlated to parent)
-            inner_cols_i = [getattr(child_model_cls_i, c) for c in requested_scalar_i] if requested_scalar_i else [getattr(child_model_cls_i, 'id')]
-            inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == parent_model_cls.id).correlate(parent_model_cls)
+            inner_cols_i = self._project_columns(child_model_cls_i, requested_scalar_i) if requested_scalar_i else [self._pk_col(child_model_cls_i)]
+            inner_sel_i = select(*inner_cols_i).select_from(child_model_cls_i).where(fk_col_i == self._pk_col(parent_model_cls)).correlate(parent_model_cls)
             # Filters from filter_args
             try:
                 filter_args = rel_cfg.get('filter_args') or {}
@@ -946,8 +1053,11 @@ class RelationSQLBuilders:
                     if col is not None:
                         inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
                         ordered = True
-                if not ordered and 'id' in child_model_cls_i.__table__.columns:
-                    inner_sel_i = inner_sel_i.order_by(getattr(child_model_cls_i, 'id').asc())
+                if not ordered:
+                    try:
+                        inner_sel_i = inner_sel_i.order_by(self._pk_col(child_model_cls_i).asc())
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Pagination for child
@@ -961,7 +1071,7 @@ class RelationSQLBuilders:
             limited_subq_i = inner_sel_i.subquery()
             # Build per-row JSON object including requested scalars and nested relation JSON (recursive)
             row_json_args_i: List[Any] = []
-            for sf in requested_scalar_i if requested_scalar_i else ['id']:
+            for sf in (requested_scalar_i if requested_scalar_i else [self._pk_name(child_model_cls_i)]):
                 row_json_args_i.extend([_text(f"'{sf}'"), getattr(limited_subq_i.c, sf)])
             try:
                 row_json_args_i.extend(_build_nested_fields_for_subq(limited_subq_i, child_model_cls_i, rel_cfg.get('nested') or {}))
@@ -1012,11 +1122,12 @@ class RelationSQLBuilders:
                     include_helper_fk_for_single_nested=True,
                 )
             else:
-                requested_scalar_local = list(requested_scalar or ['id'])
+                requested_scalar_local = list(requested_scalar or [])
         except Exception:
-            requested_scalar_local = list(requested_scalar or ['id'])
+            requested_scalar_local = list(requested_scalar or [])
         if mssql_mode:
             parent_table = parent_model_cls.__tablename__
+            parent_pk_name = self._pk_name(parent_model_cls)
             # If there are nested relations selected under this list relation, use the
             # MSSQL full nested JSON builder so everything is pushed down in one SELECT.
             nested_cfg_map: Dict[str, Any] = rel_cfg.get('nested') or {}
@@ -1047,20 +1158,41 @@ class RelationSQLBuilders:
                             g_fk_col_name_i = None
                         if not g_fk_col_name_i:
                             continue
-                        # Determine scalar fields
+                        # Determine scalar fields (map to (src, alias) pairs)
                         try:
                             scalars_on_n_i = [sf for sf, sd in (self.registry.types.get(n_target_i).__berry_fields__.items() if n_target_i and self.registry.types.get(n_target_i) else []) if sd.kind == 'scalar']
                         except Exception:
                             scalars_on_n_i = []
-                        n_fields_i: list[str] = []
+                        n_fields_i_names: list[str] = []
                         try:
                             for sf in (ncfg_i.get('fields') or []):
                                 if not scalars_on_n_i or sf in scalars_on_n_i:
-                                    n_fields_i.append(sf)
+                                    n_fields_i_names.append(sf)
+                        except Exception:
+                            n_fields_i_names = []
+                        # map to pairs
+                        try:
+                            n_fields_i: list[tuple[str, str]] = self._mssql_map_columns_pairs(n_model_i, n_fields_i_names) if n_fields_i_names else []
                         except Exception:
                             n_fields_i = []
                         # order_dir default ASC if order_by explicit without dir
                         n_effective_dir_i = self._effective_order_dir(ncfg_i)
+                        # Map order_by and order_multi to physical names
+                        def _map_order_name(model_cls_local, name):
+                            try:
+                                pairs = self._mssql_map_columns_pairs(model_cls_local, [name] if name else [])
+                                return pairs[0][0] if pairs else name
+                            except Exception:
+                                return name
+                        n_order_by_mapped = _map_order_name(n_model_i, ncfg_i.get('order_by'))
+                        n_order_multi_mapped: list[str] = []
+                        try:
+                            for spec in (self.registry._normalize_order_multi_values(ncfg_i.get('order_multi') or []) or []):
+                                cn, _, dd = str(spec).partition(':')
+                                mapped_cn = _map_order_name(n_model_i, cn)
+                                n_order_multi_mapped.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
+                        except Exception:
+                            n_order_multi_mapped = []
                         # Recurse for deeper nests under this node
                         child_specs_i: list[dict] = []
                         try:
@@ -1075,9 +1207,9 @@ class RelationSQLBuilders:
                             'fields': n_fields_i or None,
                             'where': self._resolve_graphql_value(info, ncfg_i.get('where')),
                             'default_where': ncfg_i.get('default_where'),
-                            'order_by': ncfg_i.get('order_by'),
+                            'order_by': n_order_by_mapped,
                             'order_dir': n_effective_dir_i,
-                            'order_multi': self.registry._normalize_order_multi_values(ncfg_i.get('order_multi') or []),
+                            'order_multi': n_order_multi_mapped,
                             'limit': ncfg_i.get('limit'),
                             'offset': ncfg_i.get('offset'),
                             'nested': child_specs_i or None,
@@ -1108,16 +1240,20 @@ class RelationSQLBuilders:
                     if not g_fk_col_name:
                         # can't correlate; skip this nested
                         continue
-                    # Determine fields for nested object: only scalar fields
+                    # Determine fields for nested object: only scalar fields (map to pairs)
                     try:
                         scalars_on_n = [sf for sf, sd in (self.registry.types.get(n_target).__berry_fields__.items() if n_target and self.registry.types.get(n_target) else []) if sd.kind == 'scalar']
                     except Exception:
                         scalars_on_n = []
-                    n_fields = []
+                    n_fields_names: list[str] = []
                     try:
                         for sf in (ncfg.get('fields') or []):
                             if not scalars_on_n or sf in scalars_on_n:
-                                n_fields.append(sf)
+                                n_fields_names.append(sf)
+                    except Exception:
+                        n_fields_names = []
+                    try:
+                        n_fields = self._mssql_map_columns_pairs(n_model, n_fields_names) if n_fields_names else []
                     except Exception:
                         n_fields = []
                     # Determine effective order_dir for nested: ASC when order_by explicit and no explicit dir
@@ -1127,6 +1263,22 @@ class RelationSQLBuilders:
                             n_effective_dir = 'asc'
                     except Exception:
                         pass
+                    # Map order_by/order_multi for this nested level
+                    def _map_order_name2(model_cls_local, name):
+                        try:
+                            pairs = self._mssql_map_columns_pairs(model_cls_local, [name] if name else [])
+                            return pairs[0][0] if pairs else name
+                        except Exception:
+                            return name
+                    n_order_by_mapped2 = _map_order_name2(n_model, ncfg.get('order_by'))
+                    n_order_multi_mapped2: list[str] = []
+                    try:
+                        for spec in (self.registry._normalize_order_multi_values(ncfg.get('order_multi') or []) or []):
+                            cn, _, dd = str(spec).partition(':')
+                            mapped_cn = _map_order_name2(n_model, cn)
+                            n_order_multi_mapped2.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
+                    except Exception:
+                        n_order_multi_mapped2 = []
                     # Build deeper nested children under this nested node
                     nested_children_specs = _mk_nested_specs(n_model, n_target, ncfg.get('nested') or {}) if (ncfg.get('nested') or {}) else []
                     nested_specs.append({
@@ -1136,9 +1288,9 @@ class RelationSQLBuilders:
                         'fields': n_fields or None,
                         'where': self._resolve_graphql_value(info, ncfg.get('where')),
                         'default_where': ncfg.get('default_where'),
-                        'order_by': ncfg.get('order_by'),
+                        'order_by': n_order_by_mapped2,
                         'order_dir': n_effective_dir,
-                        'order_multi': self.registry._normalize_order_multi_values(ncfg.get('order_multi') or []),
+                        'order_multi': n_order_multi_mapped2,
                         'limit': ncfg.get('limit'),
                         'offset': ncfg.get('offset'),
                         'nested': nested_children_specs or None,
@@ -1148,21 +1300,27 @@ class RelationSQLBuilders:
                 effective_order_dir = self._effective_order_dir(rel_cfg)
                 return adapter.build_relation_list_json_full(
                     parent_table=parent_table,
+                    parent_pk_name=parent_pk_name,
                     child_model=child_model_cls,
                     fk_col_name=fk_child_to_parent_col.name,
-                    projected_columns=requested_scalar_local or ['id'],
+                    projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                     rel_where=self._resolve_graphql_value(info, rel_cfg.get('where')),
                     rel_default_where=rel_cfg.get('default_where'),
                     limit=rel_cfg.get('limit'),
                     offset=rel_cfg.get('offset'),
-                    order_by=rel_cfg.get('order_by'),
+                    order_by=(self._mssql_map_columns_pairs(child_model_cls, [rel_cfg.get('order_by')]) or [(rel_cfg.get('order_by'), rel_cfg.get('order_by'))])[0][0] if rel_cfg.get('order_by') else None,
                     order_dir=effective_order_dir,
-                    order_multi=self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
+                    order_multi=[
+                        f"{(self._mssql_map_columns_pairs(child_model_cls, [spec.split(':',1)[0]]) or [(spec.split(':',1)[0], spec.split(':',1)[0])])[0][0]}:{spec.split(':',1)[1]}"
+                        if ':' in spec else (self._mssql_map_columns_pairs(child_model_cls, [spec]) or [(spec, spec)])[0][0]
+                        for spec in (self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []) or [])
+                    ],
                     nested=nested_specs,
                 )
             # No nested relations: use simple JSON list builder with optional filters/order
             # correlate and compose relation-level where
-            where_parts_rel: list[str] = [f"[{child_table}].[{fk_child_to_parent_col.name}] = [{parent_table}].[id]"]
+            parent_pk_name = self._pk_name(parent_model_cls)
+            where_parts_rel: list[str] = [f"[{child_table}].[{fk_child_to_parent_col.name}] = [{parent_table}].[{parent_pk_name}]"]
             where_parts_rel = self._mssql_where_from_value(
                 where_parts_rel,
                 child_model_cls,
@@ -1209,8 +1367,9 @@ class RelationSQLBuilders:
                             continue
                     if gc_model is not None and gc_fk_col is not None:
                         gc_table = gc_model.__tablename__
+                        child_pk_name2 = self._pk_name(child_model_cls)
                         where_parts_rel.append(
-                            f"EXISTS (SELECT 1 FROM {gc_table} WHERE [{gc_table}].[{gc_fk_col}] = [{child_table}].[id])"
+                            f"EXISTS (SELECT 1 FROM {gc_table} WHERE [{gc_table}].[{gc_fk_col}] = [{child_table}].[{child_pk_name2}])"
                         )
             except Exception:
                 pass
@@ -1233,7 +1392,7 @@ class RelationSQLBuilders:
             )
             return adapter.build_list_relation_json(
                 child_table=child_table,
-                projected_columns=requested_scalar_local or ['id'],
+                projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                 where_condition=where_clause,
                 limit=rel_cfg.get('limit'),
                 offset=rel_cfg.get('offset'),
@@ -1245,14 +1404,14 @@ class RelationSQLBuilders:
             parent_model_cls=parent_model_cls,
             child_model_cls=child_model_cls,
             fk_child_to_parent_col=fk_child_to_parent_col,
-            projected_columns=(requested_scalar_local or ['id']),
+            projected_columns=(requested_scalar_local or []),
             rel_cfg=rel_cfg,
             to_where_dict=to_where_dict,
             expr_from_where_dict=expr_from_where_dict,
             info=info,
         )
         limited_subq = inner_sel.subquery()
-        row_json_expr = json_object_fn(*self._json_row_args_from_subq(limited_subq, (requested_scalar_local or ['id'])))
+        row_json_expr = json_object_fn(*self._json_row_args_from_subq(limited_subq, (requested_scalar_local or [self._pk_name(child_model_cls)])))
         agg_inner_expr = json_array_agg_fn(row_json_expr)
         if agg_inner_expr is None:
             return None
@@ -1411,6 +1570,15 @@ class RootSQLBuilders:
     def __init__(self, registry):
         self.registry = registry
 
+    # --- helpers -------------------------------------------------------------
+    def _pk_col(self, model_cls):
+        """Get SQLAlchemy primary key column using registry helper (root scope)."""
+        return self.registry._get_pk_column(model_cls)
+
+    def _pk_name(self, model_cls) -> str:
+        """Get primary key column name using registry helper (root scope)."""
+        return self.registry._get_pk_name(model_cls)
+
     def build_count_aggregates(self, *, model_cls, btype_cls, requested_aggregates: set[str]) -> tuple[list[Any], list[tuple[str, Any]]]:
         cols: list[Any] = []
         meta: list[tuple[str, Any]] = []
@@ -1445,7 +1613,7 @@ class RootSQLBuilders:
                             break
                     if fk_col is None:
                         continue
-                    subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == model_cls.id).scalar_subquery().label(cf_name)
+                    subq_cnt = select(func.count('*')).select_from(child_model_cls).where(fk_col == self._pk_col(model_cls)).scalar_subquery().label(cf_name)
                     cols.append(subq_cnt)
                     meta.append((cf_name, cf_def))
                 except Exception:
@@ -1457,25 +1625,47 @@ class RootSQLBuilders:
     def build_base_root_columns(self, *, model_cls, requested_scalar_root: set[str], requested_relations: Dict[str, Any], required_fk_parent_cols: set[str]) -> list[Any]:
         base_root_cols: list[Any] = []
         effective_root_cols: set[str] = set(requested_scalar_root or set())
-        try:
-            if hasattr(model_cls, 'id') and 'id' not in effective_root_cols:
-                effective_root_cols.add('id')
-        except Exception:
-            pass
-        if requested_relations:
-            effective_root_cols.add('id')
+        # Ensure helper FK columns required for relation correlation are present
         for fk in (required_fk_parent_cols or set()):
             effective_root_cols.add(fk)
+        # Access Berry field defs for column mapping
+        btype = None
+        try:
+            for _name, _bt in (self.registry.types or {}).items():
+                if getattr(_bt, 'model', None) is model_cls:
+                    btype = _bt
+                    break
+        except Exception:
+            btype = None
+        fdefs = getattr(btype, '__berry_fields__', {}) if btype is not None else {}
         for sf in effective_root_cols:
-            if hasattr(model_cls, sf):
-                try:
-                    col_obj = getattr(model_cls, sf)
-                    base_root_cols.append(col_obj.label(sf))
-                except Exception:
+            try:
+                if hasattr(model_cls, sf):
+                    col_obj2 = getattr(model_cls, sf)
                     try:
-                        base_root_cols.append(getattr(model_cls, sf))
+                        base_root_cols.append(col_obj2.label(sf))
                     except Exception:
-                        pass
+                        base_root_cols.append(col_obj2)
+                else:
+                    # Try meta.column mapping
+                    try:
+                        fdef = fdefs.get(sf)
+                        src = (getattr(fdef, 'meta', {}) or {}).get('column') if fdef else None
+                    except Exception:
+                        src = None
+                    if src:
+                        sa_col = None
+                        try:
+                            sa_col = getattr(model_cls.__table__.c, src, None) or model_cls.__table__.c.get(src)
+                        except Exception:
+                            sa_col = getattr(model_cls, src, None)
+                        if sa_col is not None:
+                            try:
+                                base_root_cols.append(sa_col.label(sf))
+                            except Exception:
+                                base_root_cols.append(sa_col)
+            except Exception:
+                pass
         return base_root_cols
 
     def apply_root_filters(self, stmt, *, model_cls, btype_cls, info, raw_where, declared_filters: Dict[str, Any], passed_filter_args: Dict[str, Any]):

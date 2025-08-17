@@ -270,6 +270,48 @@ class BerrySchema:
             pass
         return str
 
+    def _get_pk_name(self, model_cls: Any) -> str:
+        """Return the primary key column name for a SQLAlchemy ORM model.
+
+        Raises ValueError if no primary key column can be determined.
+        """
+        try:
+            if model_cls is not None and hasattr(model_cls, "__table__"):
+                try:
+                    pk_cols = list(getattr(model_cls.__table__, "primary_key").columns)
+                except Exception:
+                    pk_cols = [c for c in model_cls.__table__.columns if getattr(c, "primary_key", False)]
+                if pk_cols:
+                    # Prefer the first PK column (single-column PK expected)
+                    return pk_cols[0].name
+        except Exception:
+            pass
+        raise ValueError(f"Primary key column not found for model: {getattr(model_cls, '__name__', model_cls)}")
+
+    def _get_pk_column(self, model_cls: Any):
+        """Return the SQLAlchemy Column object for the model's primary key.
+
+        Raises ValueError if not found.
+        """
+        pk_name = self._get_pk_name(model_cls)
+        try:
+            # Prefer Column from model.__table__.c to keep compatibility with label()/order_by()
+            col = getattr(model_cls.__table__, 'c', None)
+            if col is not None:
+                cobj = col.get(pk_name)
+                if cobj is not None:
+                    return cobj
+        except Exception:
+            pass
+        try:
+            cobj = getattr(model_cls, pk_name, None)
+            if cobj is not None:
+                return cobj
+        except Exception:
+            pass
+        # If the name resolved but attribute is missing, still raise to fail fast
+        raise ValueError(f"Primary key column object not accessible for model: {getattr(model_cls, '__name__', model_cls)}")
+
     def _build_column_type_map(self, model_cls: Any) -> Dict[str, Any]:
         """Return a mapping of column name -> Python type for the given ORM model."""
         out: Dict[str, Any] = {}
@@ -426,7 +468,12 @@ class BerrySchema:
                     if is_private:
                         # Skip exposing private scalars
                         continue
-                    py_t = column_type_map.get(fname, str)
+                    # Prefer mapped source column for type inference when provided
+                    try:
+                        src_col = (fdef.meta or {}).get('column')
+                    except Exception:
+                        src_col = None
+                    py_t = column_type_map.get(src_col or fname, str)
                     annotations[fname] = Optional[py_t]
                     setattr(st_cls, fname, None)
                 elif fdef.kind == 'relation':
@@ -513,11 +560,19 @@ class BerrySchema:
                                     candidate_fk_val = None
                                 # Record parent id for potential child->parent fallback
                                 try:
-                                    fallback_parent_id = getattr(parent_model, 'id', None) if parent_model is not None else None
+                                    if parent_model is not None:
+                                        try:
+                                            pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
+                                            fallback_parent_id = getattr(parent_model, pk_name_parent, None)
+                                        except Exception:
+                                            fallback_parent_id = None
+                                    else:
+                                        fallback_parent_id = None
                                 except Exception:
                                     fallback_parent_id = None
                                 if fallback_parent_id is None:
                                     try:
+                                        # Fallback to hydrated attribute 'id' when present on the Strawberry instance
                                         fallback_parent_id = getattr(self, 'id', None)
                                     except Exception:
                                         fallback_parent_id = None
@@ -593,8 +648,12 @@ class BerrySchema:
                                                 desc = _dir_value(order_dir) == 'desc' if order_dir is not None else False
                                                 stmt = stmt.order_by(col.desc() if desc else col.asc())
                                                 ordered_any = True
-                                        if not ordered_any and hasattr(child_model_cls, '__table__') and 'id' in child_model_cls.__table__.columns:
-                                            stmt = stmt.order_by(getattr(child_model_cls, 'id').asc())
+                                        if not ordered_any:
+                                            try:
+                                                pk_col_child = self.__berry_registry__._get_pk_column(child_model_cls)
+                                                stmt = stmt.order_by(pk_col_child.asc())
+                                            except Exception:
+                                                pass
                                         result = await session.execute(stmt.limit(1))
                                         row = result.scalar_one_or_none()
                                         if row is None:
@@ -649,7 +708,12 @@ class BerrySchema:
                                             )
                                     except Exception:
                                         pass
-                                    stmt = _select(child_model_cls).where(getattr(child_model_cls, 'id') == candidate_fk_val)
+                                    try:
+                                        pk_col_child = self.__berry_registry__._get_pk_column(child_model_cls)
+                                        stmt = _select(child_model_cls).where(pk_col_child == candidate_fk_val)
+                                    except Exception:
+                                        # If PK not resolvable, fail fast to signal schema/model issue
+                                        raise
                                     # Apply JSON where if provided (argument and schema default)
                                     if related_where is not None or meta_copy.get('where') is not None:
                                         # Strict for user-provided; permissive for schema default
@@ -770,7 +834,14 @@ class BerrySchema:
                                 return []
                             from sqlalchemy import select as _select
                             # Determine parent id value: use ORM model if available; else fallback to hydrated scalar 'id'
-                            parent_id_val = getattr(parent_model, 'id', None) if parent_model is not None else getattr(self, 'id', None)
+                            if parent_model is not None:
+                                try:
+                                    pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
+                                    parent_id_val = getattr(parent_model, pk_name_parent, None)
+                                except Exception:
+                                    parent_id_val = None
+                            else:
+                                parent_id_val = getattr(self, 'id', None)
                             if parent_id_val is None:
                                 return []
                             # Determine requested scalar fields for this relation, prefer extractor meta from root if present
@@ -808,16 +879,14 @@ class BerrySchema:
                                     requested_fields = []
                             # Build minimal column list: always include id for downstream nested resolvers; plus requested scalars if any
                             cols = []
-                            id_expr = None
+                            pk_expr = None
                             try:
-                                id_expr = getattr(child_model_cls, '__table__', None)
-                                id_expr = id_expr.c.get('id') if id_expr is not None else None
-                                if id_expr is None:
-                                    id_expr = getattr(child_model_cls, 'id', None)
+                                pk_expr = self.__berry_registry__._get_pk_column(child_model_cls)
                             except Exception:
-                                id_expr = getattr(child_model_cls, 'id', None)
-                            if id_expr is not None:
-                                cols.append(id_expr.label('id'))
+                                pk_expr = None
+                            if pk_expr is not None:
+                                # Keep label as 'id' for downstream hydration compatibility
+                                cols.append(pk_expr.label('id'))
                             # Filter requested_fields to scalars known on target type
                             try:
                                 scalars_on_target = {sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar'}
@@ -838,7 +907,11 @@ class BerrySchema:
                                 stmt = _select(*cols).select_from(child_model_cls).where(fk_col == parent_id_val)
                             else:
                                 # Fallback to selecting id if nothing resolvable
-                                stmt = _select(id_expr).select_from(child_model_cls).where(fk_col == parent_id_val)
+                                try:
+                                    pk_expr_fallback = self.__berry_registry__._get_pk_column(child_model_cls)
+                                    stmt = _select(pk_expr_fallback).select_from(child_model_cls).where(fk_col == parent_id_val)
+                                except Exception:
+                                    return []
                             # Log potential N+1 for list relation when resolver runs a per-parent query
                             try:
                                 reason = None
@@ -1163,7 +1236,13 @@ class BerrySchema:
                                 return None
                             if is_count_local:
                                 from sqlalchemy import func, select as _select
-                                stmt = _select(func.count()).select_from(child_model_cls).where(fk_col == getattr(parent_model, 'id'))
+                                try:
+                                    pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
+                                    parent_pk_value = getattr(parent_model, pk_name_parent)
+                                except Exception:
+                                    # Fail fast: no PK value on parent
+                                    return 0
+                                stmt = _select(func.count()).select_from(child_model_cls).where(fk_col == parent_pk_value)
                                 result = await session.execute(stmt)
                                 val = result.scalar_one() or 0
                                 key = meta_copy.get('cache_key') or (source + ':count')
@@ -1719,7 +1798,9 @@ class BerrySchema:
                         required_fk_parent_cols=required_fk_parent_cols,
                     )
                     if base_root_cols or select_columns:
-                        stmt = select(*base_root_cols, *select_columns)
+                        # When projecting labeled columns only, we must add an explicit FROM
+                        # so ORDER BY and correlated subselects can reference the parent table.
+                        stmt = select(*base_root_cols, *select_columns).select_from(model_cls)
                     else:
                         stmt = select(model_cls)
                 except Exception:
