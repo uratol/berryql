@@ -26,7 +26,7 @@ async def test_relations_chain_posts_author_post_comments_author_email_shape(db_
 
     posts = res.data["posts"]
     assert isinstance(posts, list)
-    # Basic structural checks
+  # Basic structural checks and ensure nested authors are present even without author_id selected
     for p in posts:
         assert isinstance(p, dict)
         assert "author" in p
@@ -36,9 +36,9 @@ async def test_relations_chain_posts_author_post_comments_author_email_shape(db_
             assert "post_comments" in a and isinstance(a["post_comments"], list)
             for c in a["post_comments"]:
                 assert isinstance(c, dict)
-                # author may be null without explicit author_id projection; if present, email should be a string
-                if c.get("author") is not None:
-                    assert isinstance(c["author"].get("email"), (str, type(None)))
+        # author must be present even without explicit author_id projection
+        assert c.get("author") is not None
+        assert isinstance(c["author"].get("email"), (str, type(None)))
 
 
 @pytest.mark.asyncio

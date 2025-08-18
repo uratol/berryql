@@ -903,6 +903,61 @@ class BerrySchema:
                                     col_obj = None
                                 if col_obj is not None:
                                     cols.append(col_obj.label(fn))
+                            # Also include FK helper columns for any requested nested single relations,
+                            # so their resolvers can work even when the FK wasn't explicitly selected
+                            try:
+                                rel_fields_on_target = {
+                                    rf: rd for rf, rd in self.__berry_registry__.types[target_name_i].__berry_fields__.items()
+                                    if rd.kind == 'relation'
+                                }
+                            except Exception:
+                                rel_fields_on_target = {}
+                            for rf_name, rf_def in rel_fields_on_target.items():
+                                # Only if relation is requested directly under this selection
+                                if rf_name not in requested_fields:
+                                    continue
+                                # Only for single relations (need <rel>_id)
+                                try:
+                                    is_single_rel = bool(rf_def.meta.get('single'))
+                                except Exception:
+                                    is_single_rel = False
+                                if not is_single_rel:
+                                    continue
+                                # Compute target model to find FK direction
+                                try:
+                                    target_rel_name = rf_def.meta.get('target')
+                                    target_rel_btype = self.__berry_registry__.types.get(target_rel_name) if target_rel_name else None
+                                    target_rel_model = target_rel_btype.model if target_rel_btype and target_rel_btype.model else None
+                                except Exception:
+                                    target_rel_model = None
+                                # Prefer explicit '<rel>_id' column when present
+                                fk_col_obj = None
+                                try:
+                                    fk_col_obj = child_model_cls.__table__.c.get(f"{rf_name}_id")
+                                except Exception:
+                                    fk_col_obj = None
+                                if fk_col_obj is None and target_rel_model is not None:
+                                    # Discover FK from child -> target model
+                                    for c in child_model_cls.__table__.columns:
+                                        for fk in getattr(c, 'foreign_keys', []) or []:
+                                            try:
+                                                if fk.column.table.name == target_rel_model.__table__.name:
+                                                    fk_col_obj = c
+                                                    break
+                                            except Exception:
+                                                continue
+                                        if fk_col_obj is not None:
+                                            break
+                                if fk_col_obj is not None:
+                                    # Label as '<rel>_id' so nested single resolvers can pick it up
+                                    try:
+                                        label_name = f"{rf_name}_id"
+                                        # Avoid duplicate additions
+                                        if all(getattr(cl, 'name', None) != label_name for cl in cols):
+                                            cols.append(fk_col_obj.label(label_name))
+                                    except Exception:
+                                        # Best-effort; ignore if labeling fails
+                                        pass
                             if cols:
                                 stmt = _select(*cols).select_from(child_model_cls).where(fk_col == parent_id_val)
                             else:
