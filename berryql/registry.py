@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints, get_origin, get_args
 import asyncio
 import strawberry
 from sqlalchemy import select, func, text as _text
@@ -2274,17 +2274,29 @@ class BerrySchema:
                                 ret_ann = getattr(fval, '__annotations__', {}).get('return')
                             else:
                                 continue
-                            # Map return Berry types to runtime Strawberry types
-                            mapped_type = None
-                            try:
-                                if isinstance(ret_ann, str) and ret_ann in self.types:
-                                    mapped_type = self._st_types.get(ret_ann)
-                                elif ret_ann in self.types.values():
-                                    name = getattr(ret_ann, '__name__', None)
-                                    if name:
-                                        mapped_type = self._st_types.get(name)
-                            except Exception:
-                                mapped_type = None
+                            # Map return Berry types (including Annotated/forward refs) to runtime Strawberry types
+                            def _map_ret(ret_ann_inner):
+                                try:
+                                    # Unwrap typing.Annotated if present
+                                    if get_origin(ret_ann_inner) is not None:
+                                        if str(get_origin(ret_ann_inner)) in (str(get_origin(ret_ann_inner)),):
+                                            pass  # noop to keep mypy quiet
+                                    if get_origin(ret_ann_inner) is getattr(__import__('typing'), 'Annotated', None):
+                                        args = list(get_args(ret_ann_inner) or [])
+                                        if args:
+                                            return _map_ret(args[0])
+                                    # Direct string forward-ref name
+                                    if isinstance(ret_ann_inner, str) and ret_ann_inner in self.types:
+                                        return self._st_types.get(ret_ann_inner)
+                                    # Direct class reference to BerryType subclass
+                                    if ret_ann_inner in self.types.values():
+                                        nm = getattr(ret_ann_inner, '__name__', None)
+                                        if nm:
+                                            return self._st_types.get(nm)
+                                except Exception:
+                                    return None
+                                return None
+                            mapped_type = _map_ret(ret_ann)
                             ann_local[fname] = mapped_type or ret_ann or Any
                         except Exception:
                             pass
@@ -2362,21 +2374,27 @@ class BerrySchema:
                             setattr(MPlain, uf, strawberry.field(resolver=val))
                         except Exception:
                             setattr(MPlain, uf, val)
-                        # Resolve and map return annotation for runtime Berry types
+                        # Resolve and map return annotation for runtime Berry types (supports Annotated)
                         try:
                             ret_ann = getattr(val, '__annotations__', {}).get('return')
                         except Exception:
                             ret_ann = None
-                        mapped_type = None
-                        try:
-                            if isinstance(ret_ann, str) and ret_ann in self.types:
-                                mapped_type = self._st_types.get(ret_ann)
-                            elif ret_ann in self.types.values():
-                                name = getattr(ret_ann, '__name__', None)
-                                if name:
-                                    mapped_type = self._st_types.get(name)
-                        except Exception:
-                            mapped_type = None
+                        def _map_ret_2(ret_ann_inner):
+                            try:
+                                if get_origin(ret_ann_inner) is getattr(__import__('typing'), 'Annotated', None):
+                                    args = list(get_args(ret_ann_inner) or [])
+                                    if args:
+                                        return _map_ret_2(args[0])
+                                if isinstance(ret_ann_inner, str) and ret_ann_inner in self.types:
+                                    return self._st_types.get(ret_ann_inner)
+                                if ret_ann_inner in self.types.values():
+                                    nm = getattr(ret_ann_inner, '__name__', None)
+                                    if nm:
+                                        return self._st_types.get(nm)
+                            except Exception:
+                                return None
+                            return None
+                        mapped_type = _map_ret_2(ret_ann)
                         anns_m[uf] = mapped_type or ret_ann or Any
                 setattr(MPlain, '__annotations__', anns_m)
                 Mutation = strawberry.type(MPlain)  # type: ignore
