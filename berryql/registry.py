@@ -420,6 +420,47 @@ class BerrySchema:
             lock = asyncio.Lock()
         return lock
 
+    # --- Public helpers ---------------------------------------------------
+    def from_model(self, type_ref: Any, model_obj: Any) -> Any:
+        """Instantiate a Strawberry runtime object for the given Berry type and attach a model.
+
+        Usage:
+            instance = berry_schema.from_model('PostQL', post_model)
+            # or
+            instance = berry_schema.from_model(PostQL, post_model)
+
+        The returned instance has:
+          - _model set to the provided SQLAlchemy model instance
+          - scalar fields copied from the model (id, title, ...), when present
+        """
+        try:
+            type_name = type_ref if isinstance(type_ref, str) else getattr(type_ref, '__name__', None)
+        except Exception:
+            type_name = None
+        if not type_name:
+            raise ValueError("from_model requires a BerryType class or its name")
+        st_cls = self._st_types.get(type_name)
+        b_cls = self.types.get(type_name)
+        if st_cls is None or b_cls is None:
+            raise ValueError(f"Unknown Berry type '{type_name}'. Ensure to_strawberry() was called.")
+        inst = st_cls()
+        try:
+            setattr(inst, '_model', model_obj)
+        except Exception:
+            pass
+        # Copy scalar fields directly from model to surface values without extra queries
+        for fname, fdef in (getattr(b_cls, '__berry_fields__', {}) or {}).items():
+            if getattr(fdef, 'kind', None) == 'scalar':
+                try:
+                    val = getattr(model_obj, fname, None)
+                except Exception:
+                    val = None
+                try:
+                    setattr(inst, fname, val)
+                except Exception:
+                    pass
+        return inst
+
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
         # Persist naming behavior for extractor logic
         try:
@@ -2168,33 +2209,39 @@ class BerrySchema:
             if self._user_mutation_cls is not None:
                 MPlain = type('Mutation', (), {'__doc__': 'Auto-generated Berry root mutation.'})
                 setattr(MPlain, '__module__', __name__)
-                # Copy annotated attributes and strawberry-decorated fields as-is
-                try:
-                    anns_m = dict(getattr(self._user_mutation_cls, '__annotations__', {}) or {})
-                except Exception:
-                    anns_m = {}
-                for uf, utype in (anns_m or {}).items():
-                    try:
-                        setattr(MPlain, uf, getattr(self._user_mutation_cls, uf))
-                    except Exception:
-                        pass
-                # Copy methods/attributes decorated by strawberry (mutation/field)
+                # Build fields from user-declared resolvers and map return annotations to runtime types
+                anns_m: Dict[str, Any] = {}
                 for uf, val in vars(self._user_mutation_cls).items():
                     if uf.startswith('__'):
                         continue
-                    if hasattr(MPlain, uf):
-                        continue
-                    try:
-                        looks_strawberry = (
-                            str(getattr(getattr(val, "__class__", object), "module", "") or "").startswith("strawberry")
-                            or hasattr(val, "resolver")
-                            or hasattr(val, "base_resolver")
-                        )
-                        if looks_strawberry:
-                            # Prefer copying the field object as-is to preserve mutation semantics
+                    # Only consider callables (methods) as mutation fields
+                    if callable(val):
+                        # Attach as a strawberry field using the original resolver
+                        try:
+                            setattr(MPlain, uf, strawberry.field(resolver=val))
+                        except Exception:
+                            # Fallback: attach raw callable; Strawberry may still pick it up
                             setattr(MPlain, uf, val)
-                    except Exception:
-                        pass
+                        # Resolve and map return annotation
+                        try:
+                            ret_ann = getattr(val, '__annotations__', {}).get('return')
+                        except Exception:
+                            ret_ann = None
+                        mapped_type = None
+                        try:
+                            # If annotation is a string matching a registered Berry type, map to runtime class
+                            if isinstance(ret_ann, str) and ret_ann in self.types:
+                                mapped_type = self._st_types.get(ret_ann)
+                            # Directly annotated with the BerryType subclass itself
+                            elif ret_ann in self.types.values():
+                                # Map by name
+                                name = getattr(ret_ann, '__name__', None)
+                                if name:
+                                    mapped_type = self._st_types.get(name)
+                        except Exception:
+                            mapped_type = None
+                        # Keep original when not mappable (int, str, etc.)
+                        anns_m[uf] = mapped_type or ret_ann or Any
                 setattr(MPlain, '__annotations__', anns_m)
                 Mutation = strawberry.type(MPlain)  # type: ignore
         except Exception:

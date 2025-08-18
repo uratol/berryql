@@ -2,7 +2,6 @@
 
 Not functionally equivalent yet: purely structural placeholder to evolve tests against.
 """
-from __future__ import annotations
 from typing import Optional, List, Any, AsyncGenerator
 from datetime import datetime
 from sqlalchemy import select, func
@@ -272,8 +271,7 @@ class PostCreatedEvent:
 
 @berry_schema.mutation()
 class Mutation:
-    @strawberry.mutation
-    async def create_post(self, info: Info, title: str, content: str, author_id: int) -> int:
+    async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
         if session is None:
             raise ValueError("No db_session in context")
@@ -291,7 +289,8 @@ class Mutation:
             })
         except Exception:
             pass
-        return int(p.id)
+        # Return full PostQL object
+        return berry_schema.from_model('PostQL', p)
 
 @berry_schema.subscription()
 class Subscription:

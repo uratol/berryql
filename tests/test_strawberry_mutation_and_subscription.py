@@ -13,12 +13,14 @@ async def test_mutation_create_post_and_subscription(db_session, populated_db):
 
     # Run mutation to create a post
     mutation = (
-        "mutation { create_post(title: \"From test\", content: \"Body\", author_id: %d) }"
+        "mutation { create_post(title: \"From test\", content: \"Body\", author_id: %d) { id title author_id } }"
         % populated_db["users"][0].id
     )
     mres = await schema.execute(mutation, context_value={"db_session": db_session})
     assert mres.errors is None, mres.errors
-    new_id = mres.data["create_post"]
+    created = mres.data["create_post"]
+    assert isinstance(created, dict)
+    new_id = int(created["id"]) if created and "id" in created else None
     assert isinstance(new_id, int)
 
     # Pull first subscription event
