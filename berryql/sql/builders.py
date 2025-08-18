@@ -420,30 +420,15 @@ class RelationSQLBuilders:
         if v is None:
             return sel
         if isinstance(v, (dict, str)):
-            if strict:
-                # In strict mode, propagate errors to match previous behavior
-                wdict = to_where_dict(v, strict=True)
-            else:
-                try:
-                    wdict = to_where_dict(v, strict=False)
-                except Exception:
-                    wdict = None
+            # Do not suppress parse errors here; rely on strict flag in helpers to control behavior
+            wdict = to_where_dict(v, strict=strict)
             if wdict:
-                if strict:
-                    expr = expr_from_where_dict(model_cls, wdict, strict=True)
-                else:
-                    try:
-                        expr = expr_from_where_dict(model_cls, wdict, strict=False)
-                    except Exception:
-                        expr = None
+                expr = expr_from_where_dict(model_cls, wdict, strict=strict)
                 if expr is not None:
                     sel = sel.where(expr)
             return sel
         # callable or direct expression
-        try:
-            expr = v(model_cls, info) if callable(v) else v
-        except Exception:
-            expr = None
+        expr = v(model_cls, info) if callable(v) else v
         if expr is not None:
             sel = sel.where(expr)
         return sel
@@ -457,22 +442,14 @@ class RelationSQLBuilders:
         if v is None:
             return where_parts
         if isinstance(v, (dict, str)):
-            if strict:
-                # In strict mode propagate parse errors
-                wdict = to_where_dict(v, strict=True)
-            else:
-                try:
-                    wdict = to_where_dict(v, strict=False)
-                except Exception:
-                    wdict = None
+            # Do not wrap in try/except; helper handles strict behavior
+            wdict = to_where_dict(v, strict=strict)
             if wdict:
                 if strict:
                     # validate to raise on malformed/unknowns
                     _ = expr_from_where_dict(model_cls, wdict, strict=True)
-                try:
-                    where_parts.extend(adapter.where_from_dict(model_cls, wdict))
-                except Exception:
-                    pass
+                # Allow adapter to raise if something unexpected occurs; don't silently drop
+                where_parts.extend(adapter.where_from_dict(model_cls, wdict))
         return where_parts
 
     def _json_row_args_from_subq(self, subq, columns: List[str] | None) -> List[Any]:
@@ -761,67 +738,55 @@ class RelationSQLBuilders:
                             .correlate(current_subq)
                         )
                         # Apply nested where/default_where
-                        try:
-                            rr2 = ncfg.get('where')
-                            if rr2 is not None:
-                                if isinstance(rr2, (dict, str)):
-                                    wdict2 = to_where_dict(rr2, strict=True)
-                                    if wdict2:
-                                        expr2 = expr_from_where_dict(grand_model, wdict2, strict=True)
-                                        if expr2 is not None:
-                                            n_sel = n_sel.where(expr2)
-                                else:
-                                    try:
-                                        expr2 = rr2(grand_model, info) if callable(rr2) else rr2
-                                    except Exception:
-                                        expr2 = None
+                        rr2 = ncfg.get('where')
+                        if rr2 is not None:
+                            if isinstance(rr2, (dict, str)):
+                                wdict2 = to_where_dict(rr2, strict=True)
+                                if wdict2:
+                                    expr2 = expr_from_where_dict(grand_model, wdict2, strict=True)
                                     if expr2 is not None:
                                         n_sel = n_sel.where(expr2)
-                            dr2 = ncfg.get('default_where')
-                            if dr2 is not None:
-                                if isinstance(dr2, (dict, str)):
-                                    wdict2 = to_where_dict(dr2, strict=False)
-                                    if wdict2:
-                                        expr2 = expr_from_where_dict(grand_model, wdict2, strict=False)
-                                        if expr2 is not None:
-                                            n_sel = n_sel.where(expr2)
-                                else:
-                                    try:
-                                        expr2 = dr2(grand_model, info) if callable(dr2) else dr2
-                                    except Exception:
-                                        expr2 = None
+                            else:
+                                expr2 = rr2(grand_model, info) if callable(rr2) else rr2
+                                if expr2 is not None:
+                                    n_sel = n_sel.where(expr2)
+                        dr2 = ncfg.get('default_where')
+                        if dr2 is not None:
+                            if isinstance(dr2, (dict, str)):
+                                wdict2 = to_where_dict(dr2, strict=False)
+                                if wdict2:
+                                    expr2 = expr_from_where_dict(grand_model, wdict2, strict=False)
                                     if expr2 is not None:
                                         n_sel = n_sel.where(expr2)
-                        except Exception:
-                            pass
+                            else:
+                                expr2 = dr2(grand_model, info) if callable(dr2) else dr2
+                                if expr2 is not None:
+                                    n_sel = n_sel.where(expr2)
                         # Ordering for nested
-                        try:
-                            ordered2 = False
-                            n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
-                            nmulti_raw = ncfg.get('order_multi') or []
-                            nmulti: List[str] = self.registry._normalize_order_multi_values(nmulti_raw)
-                            for spec in nmulti:
-                                cn, _, dd = spec.partition(':')
-                                dd = (dd or dir_value_fn(ncfg.get('order_dir'))).lower()
-                                if cn in n_allowed:
-                                    col2 = getattr(grand_model, cn, None)
-                                    if col2 is not None:
-                                        n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
-                                        ordered2 = True
-                            if not ordered2 and ncfg.get('order_by') in n_allowed:
-                                cn = ncfg.get('order_by')
-                                dd = dir_value_fn(ncfg.get('order_dir'))
+                        ordered2 = False
+                        n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
+                        nmulti_raw = ncfg.get('order_multi') or []
+                        nmulti: List[str] = self.registry._normalize_order_multi_values(nmulti_raw)
+                        for spec in nmulti:
+                            cn, _, dd = spec.partition(':')
+                            dd = (dd or dir_value_fn(ncfg.get('order_dir'))).lower()
+                            if cn in n_allowed:
                                 col2 = getattr(grand_model, cn, None)
                                 if col2 is not None:
                                     n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
                                     ordered2 = True
-                            if not ordered2:
-                                try:
-                                    n_sel = n_sel.order_by(self._pk_col(grand_model).asc())
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                        if not ordered2 and ncfg.get('order_by') in n_allowed:
+                            cn = ncfg.get('order_by')
+                            dd = dir_value_fn(ncfg.get('order_dir'))
+                            col2 = getattr(grand_model, cn, None)
+                            if col2 is not None:
+                                n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
+                                ordered2 = True
+                        if not ordered2:
+                            try:
+                                n_sel = n_sel.order_by(self._pk_col(grand_model).asc())
+                            except Exception:
+                                pass
                         # Pagination for nested
                         try:
                             if ncfg.get('offset') is not None:
@@ -1034,32 +999,29 @@ class RelationSQLBuilders:
                     if expr is not None:
                         inner_sel_i = inner_sel_i.where(expr)
             # Ordering for child (order_multi -> order_by -> id)
-            try:
-                ordered = False
-                allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
-                nmulti: List[str] = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or [])
-                for spec in nmulti:
-                    cn, _, dd = spec.partition(':')
-                    dd = (dd or dir_value_fn(rel_cfg.get('order_dir'))).lower()
-                    if cn in allowed_fields:
-                        col = getattr(child_model_cls_i, cn, None)
-                        if col is not None:
-                            inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
-                            ordered = True
-                if not ordered and rel_cfg.get('order_by') in allowed_fields:
-                    cn = rel_cfg.get('order_by')
-                    dd = dir_value_fn(rel_cfg.get('order_dir'))
+            ordered = False
+            allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
+            nmulti: List[str] = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or [])
+            for spec in nmulti:
+                cn, _, dd = spec.partition(':')
+                dd = (dd or dir_value_fn(rel_cfg.get('order_dir'))).lower()
+                if cn in allowed_fields:
                     col = getattr(child_model_cls_i, cn, None)
                     if col is not None:
                         inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
                         ordered = True
-                if not ordered:
-                    try:
-                        inner_sel_i = inner_sel_i.order_by(self._pk_col(child_model_cls_i).asc())
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            if not ordered and rel_cfg.get('order_by') in allowed_fields:
+                cn = rel_cfg.get('order_by')
+                dd = dir_value_fn(rel_cfg.get('order_dir'))
+                col = getattr(child_model_cls_i, cn, None)
+                if col is not None:
+                    inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
+                    ordered = True
+            if not ordered:
+                try:
+                    inner_sel_i = inner_sel_i.order_by(self._pk_col(child_model_cls_i).asc())
+                except Exception:
+                    pass
             # Pagination for child
             try:
                 if rel_cfg.get('offset') is not None:
