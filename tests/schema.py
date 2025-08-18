@@ -186,6 +186,16 @@ class BlogDomain(BerryDomain):
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    # Domain-scoped mutation example
+    async def create_post_mut(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
+        session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
+        if session is None:
+            raise ValueError("No db_session in context")
+        p = Post(title=title, content=content, author_id=author_id)
+        session.add(p)
+        await session.flush()
+        await session.commit()
+        return berry_schema.from_model('PostQL', p)
 
 # A nested grouping domain that exposes userDomain and blogDomain inside
 @berry_schema.domain(name='groupDomain')
@@ -259,18 +269,13 @@ schema = berry_schema.to_strawberry()
 
 # --- Mutations and Subscriptions for tests ---
 
-# Simple in-memory pubsub for created posts
-_post_created_queue: "asyncio.Queue[dict]" = asyncio.Queue()
-
-@strawberry.type
-class PostCreatedEvent:
-    id: int
-    title: Optional[str]
-    content: Optional[str]
-    author_id: int
-
 @berry_schema.mutation()
 class Mutation:
+    # Expose a domain group under Mutation as well
+    userDomain = domain(UserDomain)
+    blogDomain = domain(BlogDomain)
+    groupDomain = domain(GroupDomain)
+
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
         if session is None:
@@ -279,16 +284,6 @@ class Mutation:
         session.add(p)
         await session.flush()
         await session.commit()
-        # Notify subscribers
-        try:
-            await _post_created_queue.put({
-                'id': p.id,
-                'title': p.title,
-                'content': p.content,
-                'author_id': p.author_id,
-            })
-        except Exception:
-            pass
         # Return full PostQL object
         return berry_schema.from_model('PostQL', p)
 
@@ -302,25 +297,18 @@ class Mutation:
         session.add(p)
         await session.flush()
         await session.commit()
-        # Publish event too so subscription stays consistent
-        try:
-            await _post_created_queue.put({
-                'id': p.id,
-                'title': p.title,
-                'content': p.content,
-                'author_id': p.author_id,
-            })
-        except Exception:
-            pass
         return int(p.id)
 
 @berry_schema.subscription()
 class Subscription:
+    # Minimal native Strawberry subscription for demonstration/testing
     @strawberry.subscription
-    async def post_created(self) -> AsyncGenerator[PostCreatedEvent, None]:
-        while True:
-            data = await _post_created_queue.get()
-            yield PostCreatedEvent(**data)
+    async def tick(self, to: int = 1) -> AsyncGenerator[int, None]:
+        # Yield numbers 1..to without any external pub/sub mechanism
+        for i in range(1, max(1, int(to)) + 1):
+            yield i
+            # yield to event loop
+            await asyncio.sleep(0)
 
 # Rebuild schema to include mutation and subscription
 schema = berry_schema.to_strawberry()

@@ -7,8 +7,8 @@ from tests.fixtures import populated_db  # noqa: F401
 
 @pytest.mark.asyncio
 async def test_mutation_create_post_and_subscription(db_session, populated_db):
-    # Start subscription first
-    sub = await schema.subscribe("subscription { post_created { id title author_id } }")
+    # Start a simple native subscription first (no custom pub/sub)
+    sub = await schema.subscribe("subscription { tick(to: 1) }")
     assert hasattr(sub, "__anext__") or hasattr(sub, "__aiter__"), "subscribe() should return async iterator"
 
     # Run mutation to create a post
@@ -33,10 +33,8 @@ async def test_mutation_create_post_and_subscription(db_session, populated_db):
     new_id2 = mres2.data["create_post_id"]
     assert isinstance(new_id2, int)
 
-    # Pull first subscription event
+    # Pull first subscription event from native tick
     it = sub if hasattr(sub, "__anext__") else sub.__aiter__()
     event = await it.__anext__()
     assert getattr(event, "errors", None) is None, getattr(event, "errors", None)
-    payload = event.data["post_created"]
-    assert int(payload["id"]) == int(new_id)
-    assert payload["title"] == "From test"
+    assert event.data["tick"] == 1

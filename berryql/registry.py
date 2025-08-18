@@ -2211,6 +2211,132 @@ class BerrySchema:
                 setattr(MPlain, '__module__', __name__)
                 # Build fields from user-declared resolvers and map return annotations to runtime types
                 anns_m: Dict[str, Any] = {}
+                # Support domain descriptors declared on Mutation
+                try:
+                    from .core.fields import DomainDescriptor as _DomDesc
+                except Exception:
+                    _DomDesc = None  # type: ignore
+                # Cache for mutation domain container types
+                _mut_domain_type_cache: Dict[Type[Any], Any] = {}
+
+                def _ensure_mutation_domain_type(dom_cls: Type[Any]):
+                    # Return cached if already built
+                    try:
+                        if dom_cls in _mut_domain_type_cache:
+                            return _mut_domain_type_cache[dom_cls]
+                    except Exception:
+                        pass
+                    # Create a distinct type name to avoid clashes with query domain types
+                    type_name = f"{getattr(dom_cls, '__name__', 'Domain')}MutType"
+                    if type_name in self._st_types:
+                        DomSt_local = self._st_types[type_name]
+                        _mut_domain_type_cache[dom_cls] = DomSt_local
+                        return DomSt_local
+                    DomSt_local = type(type_name, (), {'__doc__': f'Mutation domain container for {getattr(dom_cls, "__name__", type_name)}'})
+                    DomSt_local.__module__ = __name__
+                    _mut_domain_type_cache[dom_cls] = DomSt_local  # pre-cache
+                    ann_local: Dict[str, Any] = {}
+                    # Attach callable/strawberry mutation fields from the domain class
+                    for fname, fval in list(vars(dom_cls).items()):
+                        # Skip query FieldDescriptors on mutation domains
+                        try:
+                            from .core.fields import FieldDescriptor as _FldDesc  # type: ignore
+                        except Exception:
+                            _FldDesc = None  # type: ignore
+                        if (_FldDesc is not None and isinstance(fval, _FldDesc)) or (_DomDesc is not None and isinstance(fval, _DomDesc)):
+                            # handled separately or skipped
+                            continue
+                        if fname.startswith('__') or fname.startswith('_'):
+                            continue
+                        looks_strawberry = False
+                        try:
+                            mod = getattr(getattr(fval, "__class__", object), "__module__", "") or ""
+                            looks_strawberry = (
+                                mod.startswith("strawberry")
+                                or hasattr(fval, "resolver")
+                                or hasattr(fval, "base_resolver")
+                            )
+                        except Exception:
+                            looks_strawberry = False
+                        try:
+                            if looks_strawberry:
+                                setattr(DomSt_local, fname, fval)
+                                # Try to extract the return annotation to map if possible
+                                fn = getattr(fval, 'resolver', None)
+                                if fn is None:
+                                    br = getattr(fval, 'base_resolver', None)
+                                    fn = getattr(br, 'func', None)
+                                if fn is None:
+                                    fn = getattr(fval, 'func', None)
+                                ret_ann = getattr(fn, '__annotations__', {}).get('return') if callable(fn) else None
+                            elif callable(fval):
+                                setattr(DomSt_local, fname, strawberry.field(resolver=fval))
+                                ret_ann = getattr(fval, '__annotations__', {}).get('return')
+                            else:
+                                continue
+                            # Map return Berry types to runtime Strawberry types
+                            mapped_type = None
+                            try:
+                                if isinstance(ret_ann, str) and ret_ann in self.types:
+                                    mapped_type = self._st_types.get(ret_ann)
+                                elif ret_ann in self.types.values():
+                                    name = getattr(ret_ann, '__name__', None)
+                                    if name:
+                                        mapped_type = self._st_types.get(name)
+                            except Exception:
+                                mapped_type = None
+                            ann_local[fname] = mapped_type or ret_ann or Any
+                        except Exception:
+                            pass
+                    # Handle nested mutation domains
+                    if _DomDesc is not None:
+                        for fname, fval in list(vars(dom_cls).items()):
+                            if isinstance(fval, _DomDesc):
+                                child_cls = fval.domain_cls
+                                child_dom_st = _ensure_mutation_domain_type(child_cls)
+                                if child_dom_st is None:
+                                    continue
+                                ann_local[fname] = child_dom_st  # type: ignore
+                                def _make_nested_resolver(ChildSt):
+                                    async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+                                        inst = ChildSt()
+                                        setattr(inst, '__berry_registry__', getattr(self, '__berry_registry__', self))
+                                        return inst
+                                    return _resolver
+                                setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
+                    # If no fields were added, skip creating this domain type
+                    if not ann_local:
+                        try:
+                            # Remove from cache placeholder
+                            _mut_domain_type_cache.pop(dom_cls, None)
+                        except Exception:
+                            pass
+                        return None
+                    DomSt_local.__annotations__ = ann_local
+                    # Decorate and cache
+                    self._st_types[type_name] = strawberry.type(DomSt_local)  # type: ignore
+                    # Also export into module globals so Strawberry can resolve the type by name
+                    try:
+                        globals()[type_name] = self._st_types[type_name]
+                    except Exception:
+                        pass
+                    return self._st_types[type_name]
+                # First, attach domain fields from the user-declared Mutation class
+                if _DomDesc is not None:
+                    for uf, val in list(vars(self._user_mutation_cls).items()):
+                        if isinstance(val, _DomDesc):
+                            dom_cls = val.domain_cls
+                            DomSt = _ensure_mutation_domain_type(dom_cls)
+                            if DomSt is None:
+                                continue
+                            def _make_domain_resolver(DomSt_local):
+                                async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+                                    inst = DomSt_local()
+                                    setattr(inst, '__berry_registry__', self)
+                                    return inst
+                                return _resolver
+                            anns_m[uf] = DomSt  # type: ignore
+                            setattr(MPlain, uf, strawberry.field(resolver=_make_domain_resolver(DomSt)))
                 for uf, val in vars(self._user_mutation_cls).items():
                     if uf.startswith('__'):
                         continue
