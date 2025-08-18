@@ -2214,33 +2214,43 @@ class BerrySchema:
                 for uf, val in vars(self._user_mutation_cls).items():
                     if uf.startswith('__'):
                         continue
-                    # Only consider callables (methods) as mutation fields
+                    # If this looks like a strawberry field/mutation, copy as-is
+                    looks_strawberry = False
+                    try:
+                        looks_strawberry = (
+                            str(getattr(getattr(val, "__class__", object), "module", "") or "").startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                    except Exception:
+                        looks_strawberry = False
+                    if looks_strawberry:
+                        try:
+                            setattr(MPlain, uf, val)
+                        except Exception:
+                            pass
+                        continue
+                    # Otherwise, treat callables as resolvers and attach them
                     if callable(val):
-                        # Attach as a strawberry field using the original resolver
                         try:
                             setattr(MPlain, uf, strawberry.field(resolver=val))
                         except Exception:
-                            # Fallback: attach raw callable; Strawberry may still pick it up
                             setattr(MPlain, uf, val)
-                        # Resolve and map return annotation
+                        # Resolve and map return annotation for runtime Berry types
                         try:
                             ret_ann = getattr(val, '__annotations__', {}).get('return')
                         except Exception:
                             ret_ann = None
                         mapped_type = None
                         try:
-                            # If annotation is a string matching a registered Berry type, map to runtime class
                             if isinstance(ret_ann, str) and ret_ann in self.types:
                                 mapped_type = self._st_types.get(ret_ann)
-                            # Directly annotated with the BerryType subclass itself
                             elif ret_ann in self.types.values():
-                                # Map by name
                                 name = getattr(ret_ann, '__name__', None)
                                 if name:
                                     mapped_type = self._st_types.get(name)
                         except Exception:
                             mapped_type = None
-                        # Keep original when not mappable (int, str, etc.)
                         anns_m[uf] = mapped_type or ret_ann or Any
                 setattr(MPlain, '__annotations__', anns_m)
                 Mutation = strawberry.type(MPlain)  # type: ignore

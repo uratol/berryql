@@ -23,6 +23,16 @@ async def test_mutation_create_post_and_subscription(db_session, populated_db):
     new_id = int(created["id"]) if created and "id" in created else None
     assert isinstance(new_id, int)
 
+    # Call the id-returning mutation as well
+    mutation2 = (
+        "mutation { create_post_id(title: \"From test 2\", content: \"Body 2\", author_id: %d) }"
+        % populated_db["users"][1].id
+    )
+    mres2 = await schema.execute(mutation2, context_value={"db_session": db_session})
+    assert mres2.errors is None, mres2.errors
+    new_id2 = mres2.data["create_post_id"]
+    assert isinstance(new_id2, int)
+
     # Pull first subscription event
     it = sub if hasattr(sub, "__anext__") else sub.__aiter__()
     event = await it.__anext__()

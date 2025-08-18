@@ -292,6 +292,28 @@ class Mutation:
         # Return full PostQL object
         return berry_schema.from_model('PostQL', p)
 
+    # Also support a classic strawberry-decorated mutation returning just the id
+    @strawberry.mutation
+    async def create_post_id(self, info: Info, title: str, content: str, author_id: int) -> int:
+        session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
+        if session is None:
+            raise ValueError("No db_session in context")
+        p = Post(title=title, content=content, author_id=author_id)
+        session.add(p)
+        await session.flush()
+        await session.commit()
+        # Publish event too so subscription stays consistent
+        try:
+            await _post_created_queue.put({
+                'id': p.id,
+                'title': p.title,
+                'content': p.content,
+                'author_id': p.author_id,
+            })
+        except Exception:
+            pass
+        return int(p.id)
+
 @berry_schema.subscription()
 class Subscription:
     @strawberry.subscription

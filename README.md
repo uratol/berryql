@@ -208,6 +208,56 @@ Testing and development
 - Provide BERRYQL_TEST_DATABASE_URL to run against Postgres/MSSQL; else tests use in-memory SQLite (async) and echo SQL.
 
 
+Mutations
+---------
+
+BerryQL supports two mutation styles inside the class registered with `@berry_schema.mutation()`:
+
+1) Plain Python method (BerryQL maps the return annotation to the runtime Strawberry type):
+
+        - Annotate with the Berry type name (e.g., `-> "PostQL"`) or the Berry class; BerryQL resolves it to the generated Strawberry type.
+        - Return an instance using `berry_schema.from_model('PostQL', orm_instance)` to attach the SQLAlchemy model and seed scalar fields.
+
+2) Classic Strawberry mutation with `@strawberry.mutation`:
+
+        - Best for returning primitives (e.g., integers) or simple payloads.
+
+Example:
+
+```python
+@berry_schema.mutation()
+class Mutation:
+        # Full object mutation
+        async def create_post(self, info: Info, title: str, content: str, author_id: int) -> "PostQL":
+                session: AsyncSession = info.context["db_session"]
+                p = Post(title=title, content=content, author_id=author_id)
+                session.add(p)
+                await session.flush(); await session.commit()
+                return berry_schema.from_model('PostQL', p)
+
+        # ID-only mutation
+        @strawberry.mutation
+        async def create_post_id(self, info: Info, title: str, content: str, author_id: int) -> int:
+                session: AsyncSession = info.context["db_session"]
+                p = Post(title=title, content=content, author_id=author_id)
+                session.add(p)
+                await session.flush(); await session.commit()
+                return int(p.id)
+```
+
+Querying the object mutation:
+
+```graphql
+mutation {
+    create_post(title: "Hello", content: "Body", author_id: 1) {
+        id
+        title
+        author_id
+    }
+}
+```
+
+
 FAQ
 ---
 
