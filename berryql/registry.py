@@ -1229,26 +1229,38 @@ class BerrySchema:
                                 except Exception:
                                     return results_list
                             return results_list
-                        # Build dynamic wrapper to expose filter args
+                        # Build dynamic wrapper; for single relations do not expose limit/offset/order params
                         arg_defs = []
                         for a in target_filters.keys():
                             arg_defs.append(f"{a}=None")
-                        params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None'
-                        if arg_defs:
-                            params += ', ' + ', '.join(arg_defs)
+                        if is_single_value:
+                            params = 'self, info, where=None'
+                            if arg_defs:
+                                params += ', ' + ', '.join(arg_defs)
+                        else:
+                            params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None'
+                            if arg_defs:
+                                params += ', ' + ', '.join(arg_defs)
                         fname_inner = f"_rel_{fname_local}_resolver"
                         src = f"async def {fname_inner}({params}):\n"
                         src += "    _fa={}\n"
                         for a in target_filters.keys():
                             src += f"    _fa['{a}']={a}\n"
-                        src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, where, _fa)\n"
+                        if is_single_value:
+                            # pass None for non-exposed params
+                            src += "    return await _impl(self, info, None, None, None, None, None, where, _fa)\n"
+                        else:
+                            src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, where, _fa)\n"
                         env: Dict[str, Any] = {'_impl': _impl}
                         exec(src, env)
                         fn = env[fname_inner]
                         if not getattr(fn, '__module__', None):  # ensure module for strawberry introspection
                             fn.__module__ = __name__
                         # annotations
-                        anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
+                        if is_single_value:
+                            anns: Dict[str, Any] = {'info': StrawberryInfo, 'where': Optional[str]}
+                        else:
+                            anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
                         # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
                         target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
                         col_type_map: Dict[str, Any] = {}
