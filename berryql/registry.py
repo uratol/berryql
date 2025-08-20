@@ -1981,23 +1981,32 @@ class BerrySchema:
                 arg_defs.append(f"{a}=None")
             args_str = (', '.join(arg_defs)) if arg_defs else ''
             func_name = f"_root_{root_field_name}"
-            # Build parameter list: info, limit, offset, ordering, optional where, order_multi, filter args
-            if args_str:
-                full_params = f"self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None, {args_str}"
+            # Build parameter list: for single roots only expose where + filter args
+            if is_single:
+                if args_str:
+                    full_params = f"self, info, where=None, {args_str}"
+                else:
+                    full_params = "self, info, where=None"
             else:
-                full_params = "self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None"
+                if args_str:
+                    full_params = f"self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None, {args_str}"
+                else:
+                    full_params = "self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None"
             src = f"async def {func_name}({full_params}):\n" \
                   f"    _fa = {{}}\n"
             for a in declared_filters.keys():
                 src += f"    _fa['{a}'] = {a} if '{a}' in locals() else None\n"
             # Apply defaults for declared roots if provided
-            src += "    _ob = order_by if order_by is not None else (_defaults.get('order_by') if _defaults is not None else None)\n"
-            src += "    _od = order_dir if order_dir is not None else (_defaults.get('order_dir') if _defaults is not None else None)\n"
-            src += "    _om = order_multi if order_multi is not None else (_defaults.get('order_multi') if _defaults is not None else None)\n"
             src += "    _rw = where if where is not None else (_defaults.get('where') if _defaults is not None else None)\n"
-            src += "    _lim = limit\n"
-            src += "    if _is_single and _lim is None: _lim = 1\n"
-            src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw)\n"
+            if is_single:
+                # No order/offset/limit args for single roots; enforce limit 1 internally
+                src += "    _rows = await _base_impl(info, 1, None, None, None, None, _fa, _rw)\n"
+            else:
+                src += "    _ob = order_by if order_by is not None else (_defaults.get('order_by') if _defaults is not None else None)\n"
+                src += "    _od = order_dir if order_dir is not None else (_defaults.get('order_dir') if _defaults is not None else None)\n"
+                src += "    _om = order_multi if order_multi is not None else (_defaults.get('order_multi') if _defaults is not None else None)\n"
+                src += "    _lim = limit\n"
+                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw)\n"
             src += "    return (_rows[0] if _rows else None) if _is_single else _rows\n"
             ns: Dict[str, Any] = {'_base_impl': _base_impl, '_defaults': relation_defaults, '_is_single': bool(is_single)}
             ns.update({'Optional': Optional, 'List': List, 'datetime': datetime})
@@ -2005,7 +2014,10 @@ class BerrySchema:
             generated_fn = ns[func_name]
             if not getattr(generated_fn, '__module__', None):
                 generated_fn.__module__ = __name__
-            ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
+            if is_single:
+                ann: Dict[str, Any] = {'info': StrawberryInfo, 'where': Optional[str]}
+            else:
+                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
             ann.update(filter_arg_types)
             generated_fn.__annotations__ = ann
             return generated_fn
