@@ -1656,15 +1656,12 @@ class RootSQLBuilders:
             except Exception:
                 cw_val = None
             if cw_val is not None:
-                try:
-                    if isinstance(cw_val, dict):
-                        expr_obj = _expr_from_where_dict(model_cls, cw_val)
-                    else:
-                        expr_obj = cw_val
-                    if expr_obj is not None:
-                        where_clauses.append(expr_obj)
-                except Exception:
-                    pass
+                if isinstance(cw_val, dict):
+                    expr_obj = _expr_from_where_dict(model_cls, cw_val)
+                else:
+                    expr_obj = cw_val
+                if expr_obj is not None:
+                    where_clauses.append(expr_obj)
         # raw where
         if raw_where is not None:
             wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
@@ -1720,10 +1717,7 @@ class RootSQLBuilders:
             if expr is not None:
                 where_clauses.append(expr)
         for wc in where_clauses:
-            try:
-                stmt = stmt.where(wc)
-            except Exception:
-                pass
+            stmt = stmt.where(wc)
         return stmt
 
     def apply_ordering(self, stmt, *, model_cls, btype_cls, order_by, order_dir, order_multi):
