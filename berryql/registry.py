@@ -1903,7 +1903,7 @@ class BerrySchema:
                     stmt = select(model_cls)
                 else:
                 # ----- Phase 2 filtering (argument-driven) -----
-                    stmt = RootSQLBuilders(self).apply_root_filters(
+                    stmt = await RootSQLBuilders(self).apply_root_filters(
                         stmt,
                         model_cls=model_cls,
                         btype_cls=btype_cls,

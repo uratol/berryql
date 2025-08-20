@@ -1630,8 +1630,9 @@ class RootSQLBuilders:
                 pass
         return base_root_cols
 
-    def apply_root_filters(self, stmt, *, model_cls, btype_cls, info, raw_where, declared_filters: Dict[str, Any], passed_filter_args: Dict[str, Any]):
+    async def apply_root_filters(self, stmt, *, model_cls, btype_cls, info, raw_where, declared_filters: Dict[str, Any], passed_filter_args: Dict[str, Any]):
         from ..core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
+        import inspect
         where_clauses = []
         # gating
         try:
@@ -1653,6 +1654,8 @@ class RootSQLBuilders:
         if custom_where is not None and enforce_gate:
             try:
                 cw_val = custom_where(model_cls, info) if callable(custom_where) else custom_where
+                if inspect.isawaitable(cw_val):
+                    cw_val = await cw_val
             except Exception:
                 cw_val = None
             if cw_val is not None:
@@ -1665,6 +1668,11 @@ class RootSQLBuilders:
         # raw where
         if raw_where is not None:
             wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
+            try:
+                if inspect.isawaitable(wdict):
+                    wdict = await wdict
+            except Exception:
+                pass
             expr2 = None
             try:
                 wdict_parsed = _to_where_dict(wdict, strict=True) if not isinstance(wdict, dict) else wdict
@@ -1697,6 +1705,8 @@ class RootSQLBuilders:
             if getattr(f_spec, 'builder', None):
                 try:
                     expr = f_spec.builder(model_cls, info, value)
+                    if inspect.isawaitable(expr):
+                        expr = await expr
                 except Exception as e:
                     raise ValueError(f"Filter builder failed for {arg_name}: {e}")
             elif getattr(f_spec, 'column', None):

@@ -186,6 +186,13 @@ class BlogDomain(BerryDomain):
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    # Async builder for filter args should be awaited in root filters
+    async def _created_at_gt_async(M, info, v):
+        await asyncio.sleep(0)
+        return M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v)
+    postsAsyncFilter = relation('PostQL', order_by='id', order_dir='asc', arguments={
+        'created_at_gt': _created_at_gt_async,
+    })
     # Domain-scoped mutation example
     async def create_post_mut(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
@@ -247,6 +254,19 @@ class Query:
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    # Async where callable support for roots
+    async def _gate_users_async(model_cls, info: Info):
+        # tiny await to ensure awaitable path is exercised
+        await asyncio.sleep(0)
+        try:
+            ctx = info.context or {}
+        except Exception:
+            ctx = {}
+        # Example filter: gate to users with id > 1 unless overriden
+        if ctx.get('async_gate_return_none'):
+            return None
+        return {'id': {'gt': 1}}
+    usersAsyncGate = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users_async)
     # Example: fetch a single user by id using arguments mapping
     userById = relation('UserQL', single=True, arguments={
         'id': {
