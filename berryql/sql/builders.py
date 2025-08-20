@@ -1682,11 +1682,8 @@ class RootSQLBuilders:
         # raw where
         if raw_where is not None:
             wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
-            try:
-                if inspect.isawaitable(wdict):
-                    wdict = await wdict
-            except Exception:
-                pass
+            if inspect.isawaitable(wdict):
+                wdict = await wdict
             # Apply via common path to preserve identical behavior
             try:
                 tmp = select(model_cls)
