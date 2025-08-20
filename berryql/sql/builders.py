@@ -414,8 +414,11 @@ class RelationSQLBuilders:
                 pass
         return where_parts
 
-    def _apply_where_sqla(self, sel, model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, info):
-        """Apply a where/default_where value (dict/str/callable/expr) to a SQLAlchemy selectable."""
+    def _apply_where_common(self, sel, model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, info):
+        """Common implementation to apply dict/str/callable/expr where to a SA selectable.
+
+        Used by both relation builders and root filters to keep behavior consistent.
+        """
         v = self._resolve_graphql_value(info, value)
         if v is None:
             return sel
@@ -432,6 +435,10 @@ class RelationSQLBuilders:
         if expr is not None:
             sel = sel.where(expr)
         return sel
+
+    def _apply_where_sqla(self, sel, model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, info):
+        """Backwards-compatible shim calling the common where applier."""
+        return self._apply_where_common(sel, model_cls, value, strict=strict, to_where_dict=to_where_dict, expr_from_where_dict=expr_from_where_dict, info=info)
 
     def _mssql_where_from_value(self, where_parts: List[str], model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, adapter, info) -> List[str]:
         """Append MSSQL WHERE fragments for dict/str values. Validates strict=True via SQLAlchemy path.
@@ -1659,12 +1666,19 @@ class RootSQLBuilders:
             except Exception:
                 cw_val = None
             if cw_val is not None:
-                if isinstance(cw_val, dict):
-                    expr_obj = _expr_from_where_dict(model_cls, cw_val)
-                else:
-                    expr_obj = cw_val
-                if expr_obj is not None:
-                    where_clauses.append(expr_obj)
+                # Reuse common where applier on a temporary stmt to keep parity with relations
+                tmp = select(model_cls)
+                tmp = RelationSQLBuilders(self.registry)._apply_where_common(
+                    tmp, model_cls, cw_val, strict=True,
+                    to_where_dict=_to_where_dict,
+                    expr_from_where_dict=_expr_from_where_dict,
+                    info=info,
+                )
+                try:
+                    for _w in getattr(tmp, '_where_criteria', []):  # type: ignore[attr-defined]
+                        where_clauses.append(_w)
+                except Exception:
+                    pass
         # raw where
         if raw_where is not None:
             wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
@@ -1673,21 +1687,26 @@ class RootSQLBuilders:
                     wdict = await wdict
             except Exception:
                 pass
-            expr2 = None
+            # Apply via common path to preserve identical behavior
             try:
-                wdict_parsed = _to_where_dict(wdict, strict=True) if not isinstance(wdict, dict) else wdict
+                tmp = select(model_cls)
+                tmp = RelationSQLBuilders(self.registry)._apply_where_common(
+                    tmp, model_cls, wdict, strict=True,
+                    to_where_dict=_to_where_dict,
+                    expr_from_where_dict=_expr_from_where_dict,
+                    info=info,
+                )
+                # If string was provided but not JSON object, _apply_where_common would attempt parse and may raise.
+                for _w in getattr(tmp, '_where_criteria', []):  # type: ignore[attr-defined]
+                    where_clauses.append(_w)
             except Exception as e:
+                # Match previous error messages for string inputs
                 if isinstance(wdict, str):
+                    msg = str(e)
+                    if 'Unknown where' in msg or 'operator' in msg or 'column' in msg or 'Invalid' in msg:
+                        raise
                     raise ValueError(f"Invalid where JSON: {e}")
-                wdict_parsed = None
-            if isinstance(wdict_parsed, dict):
-                expr2 = _expr_from_where_dict(model_cls, wdict_parsed)
-            else:
-                expr2 = wdict if not isinstance(wdict, str) else None
-            if expr2 is None and isinstance(wdict, str):
-                raise ValueError("where must be a JSON object")
-            if expr2 is not None:
-                where_clauses.append(expr2)
+                raise
         # filter args
         from ..core.filters import OPERATOR_REGISTRY
         for arg_name, value in (passed_filter_args or {}).items():
