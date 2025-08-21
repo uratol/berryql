@@ -28,6 +28,8 @@ async def test_upsert_post_creates_author_first(db_session, populated_db):
     if res.errors:
         # Surface full error for diagnostics
         raise AssertionError(f"GraphQL errors: {res.errors}")
+    if res.data is None:
+        raise AssertionError("No data returned from GraphQL execution.")
     post = res.data["upsert_post"]
     assert post["id"] is not None
     assert post["author_id"] is not None

@@ -1,11 +1,12 @@
 from __future__ import annotations
 import re
 import logging
-from typing import Any, Dict, Optional, Type, List, get_args, get_origin
+from typing import Any, Dict, Optional, Type, List, get_args, get_origin, cast
 import strawberry
 from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
 from sqlalchemy import select
+from sqlalchemy.sql.elements import ColumnElement
 
 if TYPE_CHECKING:  # pragma: no cover
     from .registry import BerrySchema, BerryType, BerryDomain
@@ -104,17 +105,21 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
             if pk_val_local is None:
                 return True  # can't enforce without identity; will re-check after flush
             v = _resolve_scope_value(scope_raw)
-            expr = None
+            expr: Optional[ColumnElement[bool]] = None
             if isinstance(v, (dict, str)):
                 try:
                     wdict = _to_where_dict(v, strict=True)
                     if wdict:
-                        expr = _expr_from_where_dict(model_cls_local, wdict, strict=True)
+                        maybe_expr = _expr_from_where_dict(model_cls_local, wdict, strict=True)
+                        if maybe_expr is not None:
+                            expr = cast(ColumnElement[bool], maybe_expr)
                 except Exception:
                     expr = None
             else:
                 try:
-                    expr = v(model_cls_local, info) if callable(v) else v
+                    res = v(model_cls_local, info) if callable(v) else v
+                    if res is not None:
+                        expr = cast(ColumnElement[bool], res)
                 except Exception:
                     expr = None
             if expr is None:
