@@ -11,6 +11,7 @@ import os
 import sys
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.pool import NullPool
 from urllib.parse import quote_plus, unquote_plus
 
 from tests.models import Base
@@ -66,16 +67,30 @@ async def engine():
                     pool_recycle=-1
                 )
             else:
-                # Other databases 
-                engine = create_async_engine(
-                    test_db_url,
-                    echo=False,
-                    future=True,
-                    pool_size=5,
-                    max_overflow=10,
-                    pool_recycle=3600,
-                    pool_pre_ping=True
-                )
+                # Other databases
+                # For mssql+aioodbc specifically, avoid QueuePool/Pre-Ping to prevent sync contexts touching
+                # async driver methods (which can raise "coroutine ... was never awaited"). Use NullPool.
+                is_mssql_aioodbc = (test_db_url or "").lower().startswith("mssql+aioodbc")
+                if is_mssql_aioodbc:
+                    engine = create_async_engine(
+                        test_db_url,
+                        echo=False,
+                        future=True,
+                        poolclass=NullPool,
+                        pool_pre_ping=False,
+                        pool_recycle=-1,
+                    )
+                else:
+                    # Generic async-friendly defaults
+                    engine = create_async_engine(
+                        test_db_url,
+                        echo=False,
+                        future=True,
+                        pool_size=5,
+                        max_overflow=10,
+                        pool_recycle=3600,
+                        pool_pre_ping=True,
+                    )
             
             # Ensure a clean slate before tests: drop then create all tables
             # This also validates the connection/driver early.
