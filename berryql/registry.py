@@ -164,8 +164,8 @@ class BerrySchema:
         Example:
             @berry_schema.query
             class Query:
-                users = relation('UserQL', where=..., order_by='id')
-                userById = relation('UserQL', single=True, where=...)
+                users = relation('UserQL', scope=..., order_by='id')
+                userById = relation('UserQL', single=True, scope=...)
         """
         def deco(cls: Type[Any]):
             qfields: Dict[str, FieldDef] = {}
@@ -2161,7 +2161,7 @@ class BerrySchema:
                     'order_by': fdef.meta.get('order_by'),
                     'order_dir': fdef.meta.get('order_dir'),
                     'order_multi': fdef.meta.get('order_multi') or [],
-                    'where': fdef.meta.get('where'),
+                    'where': fdef.meta.get('scope'),
                     'arguments': fdef.meta.get('arguments')
                 }
                 is_single_root = bool(fdef.meta.get('single'))
@@ -2217,7 +2217,7 @@ class BerrySchema:
                             'order_by': fdef.meta.get('order_by'),
                             'order_dir': fdef.meta.get('order_dir'),
                             'order_multi': fdef.meta.get('order_multi') or [],
-                            'where': fdef.meta.get('where'),
+                            'where': fdef.meta.get('scope'),
                             'arguments': fdef.meta.get('arguments')
                         }
                         try:

@@ -88,11 +88,11 @@ def relation(target: Any = None, *, single: bool | None = None, mutation: bool =
             (string). When omitted, the registry may infer it from conventions.
         single: When True, the relation returns at most one object (one-to-one).
             When False/None, the relation returns a list.
-        **meta: Extra options interpreted by adapters/registry. Common keys:
+                **meta: Extra options interpreted by adapters/registry. Common keys:
             - order_by: Column name to order by (e.g. "id").
             - order_dir: "asc" or "desc".
-            - where: Callable(model_cls, info) -> SQLAlchemy expression or dict
-              to pre-filter results.
+                        - scope: Callable(model_cls, info) -> SQLAlchemy expression or dict
+                            to pre-filter results (previously named "where").
             - arguments: Mapping of GraphQL argument names to either callables
               ``lambda M, info, v: <SA expression>`` or dict specifications
               {"column": <str>, "op": <str>, "transform": <callable>} to
@@ -129,6 +129,8 @@ def relation(target: Any = None, *, single: bool | None = None, mutation: bool =
         m['single'] = single
     # Flag to enable generating an upsert mutation for this relation under Mutation domains
     m['mutation'] = bool(mutation)
+    # Backward-incompatible rename: parameter 'where' became 'scope'.
+    # If users pass scope=..., keep it under 'scope' key; no implicit aliasing from 'where'.
     return FieldDescriptor(kind='relation', **m)
 
 def aggregate(source: str, **meta) -> FieldDescriptor:

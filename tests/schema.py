@@ -25,13 +25,13 @@ class PostCommentQL(BerryType):
     post = relation('PostQL', single=True)
     author = relation('UserQL', single=True)
     # Force resolver fallback for nested path by using a callable where
-    # (builders mark skip_pushdown when default_where is callable via meta['where']).
-    likes = relation('PostCommentLikeQL', where=lambda M, info: (M.id > 0))
+    # (builders mark skip_pushdown when default_where is callable via meta['scope']).
+    likes = relation('PostCommentLikeQL', scope=lambda M, info: (M.id > 0))
     # Likes made by admin users only
     admin_likes = relation(
         'PostCommentLikeQL',
         # Use JSON where for pushdown-friendly filter: in fixtures, admin user has id=1
-        where='{"user_id": {"eq": 1}}'
+        scope='{"user_id": {"eq": 1}}'
     )
     # Regular strawberry field with its own resolver (preview of comment content)
     @strawberry.field
@@ -117,7 +117,7 @@ class UserQL(BerryType):
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
     # Test-only: default JSON where to verify SQL-level default WHERE pushdown
-    posts_recent = relation('PostQL', where='{"created_at": {"gt": "1900-01-01T00:00:00"}}')
+    posts_recent = relation('PostQL', scope='{"created_at": {"gt": "1900-01-01T00:00:00"}}')
     post_comments = relation('PostCommentQL')
     post_agg = count('posts')
     # Object form of post aggregation (mirrors legacy PostAggType { count })
@@ -134,7 +134,7 @@ class UserQL(BerryType):
         # Applied in non-pushdown path via callable
         from sqlalchemy import exists, select
         return exists(select(PostComment.id).where(PostComment.post_id == model_cls.id))
-    posts_have_comments = relation('PostQL', where=_posts_have_comments_where)
+    posts_have_comments = relation('PostQL', scope=_posts_have_comments_where)
 
 # --- Domains: userDomain and blogDomain ---
 
@@ -171,7 +171,7 @@ class UserDomain(BerryDomain):
             'column': 'is_admin',
             'op': 'eq',
         },
-    }, where=_gate_users)
+    }, scope=_gate_users)
     userById = relation('UserQL', single=True, arguments={
         'id': {
             'column': 'id',
@@ -230,7 +230,7 @@ class Query:
             return {'id': {'eq': -1}}
         except Exception:
             return {'id': {'eq': -1}}
-    users = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users, arguments={
+    users = relation('UserQL', order_by='id', order_dir='asc', scope=_gate_users, arguments={
         'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
         # Use column-based spec to expose proper GraphQL types (List[DateTime])
         'created_at_between': {
@@ -266,7 +266,7 @@ class Query:
         if ctx.get('async_gate_return_none'):
             return None
         return {'id': {'gt': 1}}
-    usersAsyncGate = relation('UserQL', order_by='id', order_dir='asc', where=_gate_users_async)
+    usersAsyncGate = relation('UserQL', order_by='id', order_dir='asc', scope=_gate_users_async)
     # Example: fetch a single user by id using arguments mapping
     userById = relation('UserQL', single=True, arguments={
         'id': {

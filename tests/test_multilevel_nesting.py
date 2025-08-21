@@ -34,7 +34,7 @@ async def test_deep_nesting_with_filters_and_ordering(db_session, populated_db):
 
 @pytest.mark.asyncio
 async def test_mixed_pushdown_and_callable_default_where(db_session, populated_db):
-    # posts_have_comments uses callable where => skip pushdown at that branch
+  # posts_have_comments uses callable scope => skip pushdown at that branch
     q = '''
     query {
       users(limit: 1) {
