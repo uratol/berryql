@@ -283,7 +283,7 @@ class RelationSQLBuilders:
         except Exception:
             allowed = []
         try:
-            from ..core.utils import dir_value as _dir_value
+            from ..core.utils import dir_value
         except Exception:
             def _dir_value(x):
                 return (x or 'asc')
@@ -294,7 +294,7 @@ class RelationSQLBuilders:
             order_by=rel_cfg.get('order_by'),
             order_dir=rel_cfg.get('order_dir'),
             order_multi=self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
-            dir_value_fn=_dir_value,
+            dir_value_fn=dir_value,
             default_dir_for_multi='asc',
             fallback_id=True,
         )
@@ -319,13 +319,14 @@ class RelationSQLBuilders:
             except Exception:
                 continue
             if getattr(spec, 'ops', None) and not getattr(spec, 'op', None):
-                for op_name in spec.ops:
-                    base = spec.alias or key
-                    an = base if str(base).endswith(f"_{op_name}") else f"{base}_{op_name}"
-                    try:
-                        expanded[an] = spec.clone_with(op=op_name, ops=None)
-                    except Exception:
-                        continue
+                if spec.ops is not None:
+                    for op_name in spec.ops:
+                        base = spec.alias or key
+                        an = base if str(base).endswith(f"_{op_name}") else f"{base}_{op_name}"
+                        try:
+                            expanded[an] = spec.clone_with(op=op_name, ops=None)
+                        except Exception:
+                            continue
             else:
                 expanded[spec.alias or key] = spec
         return expanded
