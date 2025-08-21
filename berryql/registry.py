@@ -798,18 +798,16 @@ class BerrySchema:
                                 # If we didn't find a direct FK to child, try fetching the first child where child.parent_id == parent.id
                                 if candidate_fk_val is None and fallback_parent_id is not None:
                                     from sqlalchemy import select as _select
-                                    # Attempt to find an FK from child -> parent (common case)
-                                    child_fk_to_parent = None
-                                    for col in child_model_cls.__table__.columns:
-                                        for fk in col.foreign_keys:
-                                            try:
-                                                if fk.column.table.name == (parent_model.__table__.name if parent_model is not None else None):
-                                                    child_fk_to_parent = col
-                                                    break
-                                            except Exception:
-                                                continue
-                                        if child_fk_to_parent is not None:
-                                            break
+                                    # Attempt to find an FK from child -> parent (common case), honoring explicit override
+                                    try:
+                                        explicit_child_fk_name = meta_copy.get('fk_column_name') or (getattr(self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
+                                    except Exception:
+                                        explicit_child_fk_name = None
+                                    child_fk_to_parent = self.__berry_registry__._find_child_fk_column(
+                                        parent_model.__class__ if parent_model is not None else None,
+                                        child_model_cls,
+                                        explicit_child_fk_name,
+                                    )
                                     if child_fk_to_parent is not None:
                                         # Build a select for the first child row for this parent
                                         stmt = _select(child_model_cls).where(child_fk_to_parent == fallback_parent_id)
@@ -1042,20 +1040,11 @@ class BerrySchema:
                                 explicit_child_fk = meta_copy.get('fk_column_name') or (getattr(self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
                             except Exception:
                                 explicit_child_fk = None
-                            for col in child_model_cls.__table__.columns:
-                                if explicit_child_fk and col.name == explicit_child_fk:
-                                    fk_col = col
-                                    break
-                                for fk in col.foreign_keys:
-                                    try:
-                                        parent_table_name = parent_model_cls.__table__.name if parent_model_cls is not None else (parent_model.__table__.name if parent_model is not None else None)
-                                    except Exception:
-                                        parent_table_name = None
-                                    if parent_table_name and fk.column.table.name == parent_table_name:
-                                        fk_col = col
-                                        break
-                                if fk_col is not None:
-                                    break
+                            fk_col = self.__berry_registry__._find_child_fk_column(
+                                parent_model_cls if parent_model_cls is not None else (parent_model.__class__ if parent_model is not None else None),
+                                child_model_cls,
+                                explicit_child_fk,
+                            )
                             if fk_col is None:
                                 return []
                             from sqlalchemy import select as _select
@@ -1156,24 +1145,23 @@ class BerrySchema:
                                     target_rel_model = target_rel_btype.model if target_rel_btype and target_rel_btype.model else None
                                 except Exception:
                                     target_rel_model = None
-                                # Prefer explicit '<rel>_id' column when present
+                                # Prefer explicit '<rel>_id' column when present; otherwise discover via helper
                                 fk_col_obj = None
                                 try:
                                     fk_col_obj = child_model_cls.__table__.c.get(f"{rf_name}_id")
                                 except Exception:
                                     fk_col_obj = None
                                 if fk_col_obj is None and target_rel_model is not None:
-                                    # Discover FK from child -> target model
-                                    for c in child_model_cls.__table__.columns:
-                                        for fk in getattr(c, 'foreign_keys', []) or []:
-                                            try:
-                                                if fk.column.table.name == target_rel_model.__table__.name:
-                                                    fk_col_obj = c
-                                                    break
-                                            except Exception:
-                                                continue
-                                        if fk_col_obj is not None:
-                                            break
+                                    try:
+                                        # honor any explicit fk configured on the relation definition
+                                        explicit_child_fk_name = None
+                                        try:
+                                            explicit_child_fk_name = (rf_def.meta or {}).get('fk_column_name')
+                                        except Exception:
+                                            explicit_child_fk_name = None
+                                        fk_col_obj = self.__berry_registry__._find_child_fk_column(target_rel_model, child_model_cls, explicit_child_fk_name)
+                                    except Exception:
+                                        fk_col_obj = None
                                 if fk_col_obj is not None:
                                     # Label as '<rel>_id' so nested single resolvers can pick it up
                                     try:
@@ -1516,14 +1504,12 @@ class BerrySchema:
                                     return 0
                                 return None
                             child_model_cls = target_btype.model
-                            fk_col = None
-                            for col in child_model_cls.__table__.columns:
-                                for fk in col.foreign_keys:
-                                    if fk.column.table.name == parent_model.__table__.name:
-                                        fk_col = col
-                                        break
-                                if fk_col is not None:
-                                    break
+                            # honor explicit fk if present on the relation meta
+                            try:
+                                explicit_child_fk_name = (rel_def.meta or {}).get('fk_column_name')
+                            except Exception:
+                                explicit_child_fk_name = None
+                            fk_col = self.__berry_registry__._find_child_fk_column(parent_model.__class__, child_model_cls, explicit_child_fk_name)
                             if fk_col is None:
                                 if is_count_local:
                                     return 0
@@ -1913,21 +1899,11 @@ class BerrySchema:
                         raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     child_model_cls = target_b.model
                     # Determine FK from child->parent, allow explicit override via relation meta
-                    fk_col = None
                     try:
                         explicit_child_fk = rel_cfg.get('fk_column_name')
                     except Exception:
                         explicit_child_fk = None
-                    for col in child_model_cls.__table__.columns:
-                        if explicit_child_fk and col.name == explicit_child_fk:
-                            fk_col = col
-                            break
-                        for fk in col.foreign_keys:
-                            if fk.column.table.name == model_cls.__table__.name:
-                                fk_col = col
-                                break
-                        if fk_col is not None:
-                            break
+                    fk_col = self._find_child_fk_column(model_cls, child_model_cls, explicit_child_fk)
                     if fk_col is None:
                         try:
                             rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
