@@ -715,15 +715,28 @@ class RelationSQLBuilders:
                         if not nb or not nb.model:
                             continue
                         grand_model = nb.model
-                        # FK grandchild -> current_model_cls
+                        # FK grandchild -> current_model_cls (respect explicit fk_column_name when provided)
                         g_fk = None
-                        for c in grand_model.__table__.columns:
-                            for fk in c.foreign_keys:
-                                if fk.column.table.name == current_model_cls.__table__.name:
-                                    g_fk = c
+                        try:
+                            explicit_child_fk = ncfg.get('fk_column_name')
+                        except Exception:
+                            explicit_child_fk = None
+                        try:
+                            if explicit_child_fk and hasattr(grand_model, '__table__'):
+                                for c in grand_model.__table__.columns:
+                                    if c.name == explicit_child_fk:
+                                        g_fk = c
+                                        break
+                        except Exception:
+                            g_fk = None
+                        if g_fk is None:
+                            for c in grand_model.__table__.columns:
+                                for fk in c.foreign_keys:
+                                    if fk.column.table.name == current_model_cls.__table__.name:
+                                        g_fk = c
+                                        break
+                                if g_fk is not None:
                                     break
-                            if g_fk is not None:
-                                break
                         if g_fk is None:
                             continue
                         # Projected scalar fields for nested
@@ -1207,18 +1220,31 @@ class RelationSQLBuilders:
                         n_model = None
                     if not n_model:
                         continue
-                    # Find FK from grandchild (n_model) to child (child_model_cls)
+                    # Find FK from grandchild (n_model) to child (child_model_cls), honoring explicit fk_column_name
                     g_fk_col_name: str | None = None
                     try:
-                        for col in n_model.__table__.columns:
-                            for fk in col.foreign_keys:
-                                if fk.column.table.name == child_model_cls.__table__.name:
+                        explicit_child_fk = ncfg.get('fk_column_name')
+                    except Exception:
+                        explicit_child_fk = None
+                    try:
+                        if explicit_child_fk and hasattr(n_model, '__table__'):
+                            for col in n_model.__table__.columns:
+                                if col.name == explicit_child_fk:
                                     g_fk_col_name = col.name
                                     break
-                            if g_fk_col_name is not None:
-                                break
                     except Exception:
                         g_fk_col_name = None
+                    if g_fk_col_name is None:
+                        try:
+                            for col in n_model.__table__.columns:
+                                for fk in col.foreign_keys:
+                                    if fk.column.table.name == child_model_cls.__table__.name:
+                                        g_fk_col_name = col.name
+                                        break
+                                if g_fk_col_name is not None:
+                                    break
+                        except Exception:
+                            g_fk_col_name = None
                     if not g_fk_col_name:
                         # can't correlate; skip this nested
                         continue

@@ -511,6 +511,37 @@ class BerrySchema:
             pass
         return None
 
+    def _find_child_fk_column(self, parent_model_cls: Any, child_model_cls: Any, explicit_child_fk_name: Optional[str] = None):
+        """Return SQLAlchemy Column on child that references parent via FK.
+
+        Honors explicit_child_fk_name when provided; otherwise scans child's foreign keys
+        to locate a column whose FK target table matches parent's table.
+        Returns None if not found or models lack __table__ metadata.
+        """
+        try:
+            if child_model_cls is None or not hasattr(child_model_cls, '__table__'):
+                return None
+            parent_table_name = None
+            try:
+                parent_table_name = parent_model_cls.__table__.name if hasattr(parent_model_cls, '__table__') else None
+            except Exception:
+                parent_table_name = None
+            for col in child_model_cls.__table__.columns:
+                try:
+                    if explicit_child_fk_name and col.name == explicit_child_fk_name:
+                        return col
+                except Exception:
+                    pass
+                for fk in getattr(col, 'foreign_keys', []) or []:
+                    try:
+                        if parent_table_name and fk.column.table.name == parent_table_name:
+                            return col
+                    except Exception:
+                        continue
+        except Exception:
+            return None
+        return None
+
     def _get_context_lock(self, info: 'StrawberryInfo') -> 'asyncio.Lock':
         """Return a per-request asyncio.Lock stored on info.context to serialize DB access when needed."""
         try:
@@ -1998,14 +2029,11 @@ class BerrySchema:
                                     if sdef.kind == 'scalar':
                                         requested_scalar_i.append(sf)
                             # FK from child to parent
-                            fk_col_i = None
-                            for col in child_model_cls.__table__.columns:
-                                for fk in col.foreign_keys:
-                                    if fk.column.table.name == model_cls.__table__.name:
-                                        fk_col_i = col
-                                        break
-                                if fk_col_i is not None:
-                                    break
+                            try:
+                                explicit_child_fk = rel_cfg.get('fk_column_name')
+                            except Exception:
+                                explicit_child_fk = None
+                            fk_col_i = self._find_child_fk_column(model_cls, child_model_cls, explicit_child_fk)
                             if fk_col_i is not None:
                                 nested_expr = RelationSQLBuilders(self).build_list_relation_json_adapter(
                                     adapter=adapter,
