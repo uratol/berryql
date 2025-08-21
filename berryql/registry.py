@@ -205,6 +205,126 @@ class BerrySchema:
             return cls
         return deco
 
+    # ---------- Input/Mutation helpers ----------
+    def _ensure_input_type(self, btype_cls: Type[BerryType]):
+        """Build (or return cached) Strawberry input type mirroring a BerryType's writable shape.
+
+        Includes scalar fields and relation fields (recursively using corresponding Input types).
+        Aggregates and custom fields are excluded. All fields are optional to support partial updates.
+        """
+        try:
+            tname = getattr(btype_cls, '__name__', None)
+        except Exception:
+            tname = None
+        if not tname:
+            raise ValueError("_ensure_input_type requires a BerryType class")
+        input_name = f"{tname}Input"
+        # Return cached if present
+        if input_name in self._st_types:
+            return self._st_types[input_name]
+        # Create plain class first and cache placeholder to break recursion cycles
+        InPlain = type(input_name, (), {'__doc__': f'Input for upsert of {tname}'})
+        InPlain.__module__ = __name__
+        # Pre-cache placeholder to avoid infinite recursion on self-referential types
+        self._st_types[input_name] = InPlain
+        anns: Dict[str, Any] = {}
+        # Column type map for scalar field type inference
+        try:
+            model_cls = getattr(btype_cls, 'model', None)
+        except Exception:
+            model_cls = None
+        col_type_map: Dict[str, Any] = self._build_column_type_map(model_cls) if model_cls is not None else {}
+        # Scalars
+        for fname, fdef in (getattr(btype_cls, '__berry_fields__', {}) or {}).items():
+            if fdef.kind == 'scalar':
+                # Skip private scalars
+                if isinstance(fname, str) and fname.startswith('_'):
+                    continue
+                src_col = (fdef.meta or {}).get('column') if isinstance(fdef.meta, dict) else None
+                py_t = col_type_map.get(src_col or fname, str)
+                try:
+                    anns[fname] = Optional[py_t]
+                except Exception:
+                    anns[fname] = Optional[str]
+                # default to None to make optional in input
+                try:
+                    setattr(InPlain, fname, None)
+                except Exception:
+                    pass
+            elif fdef.kind == 'relation':
+                # Build nested inputs recursively
+                target_name = fdef.meta.get('target') if isinstance(fdef.meta, dict) else None
+                is_single = bool(fdef.meta.get('single')) if isinstance(fdef.meta, dict) else False
+                if not target_name:
+                    continue
+                target_b = self.types.get(target_name)
+                if not target_b:
+                    continue
+                child_input = self._ensure_input_type(target_b)
+                try:
+                    if is_single:
+                        anns[fname] = Optional[child_input]  # type: ignore[index]
+                        setattr(InPlain, fname, None)
+                    else:
+                        anns[fname] = Optional[List[child_input]]  # type: ignore[index]
+                        # For list relations, default to None (omit) or empty list; choose None to detect intent
+                        setattr(InPlain, fname, None)
+                except Exception:
+                    # Fallback to Optional[str] on annotation failure
+                    anns[fname] = Optional[str]
+                    try:
+                        setattr(InPlain, fname, None)
+                    except Exception:
+                        pass
+        # Attach annotations and decorate as strawberry input
+        setattr(InPlain, '__annotations__', anns)
+        try:
+            # Ensure dataclass mode so defaults are honored without required args
+            InType = strawberry.input(InPlain)  # type: ignore
+        except Exception:
+            # If decoration fails, keep plain class (still usable for annotations)
+            InType = InPlain
+        self._st_types[input_name] = InType
+        # Export globally for forward refs
+        try:
+            globals()[input_name] = InType
+        except Exception:
+            pass
+        return InType
+
+    def _input_to_dict(self, obj: Any) -> Any:
+        """Convert a Strawberry input instance (or nested list/dict) to plain Python dicts/lists.
+
+        Best-effort: handles dataclasses and simple objects with __dict__ or attribute access.
+        """
+        from dataclasses import is_dataclass, asdict
+        # None
+        if obj is None:
+            return None
+        # Primitive
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        # List/tuple
+        if isinstance(obj, (list, tuple)):
+            return [self._input_to_dict(x) for x in obj]
+        # Dict-like
+        if isinstance(obj, dict):
+            return {k: self._input_to_dict(v) for k, v in obj.items()}
+        # Dataclass from strawberry.input
+        try:
+            if is_dataclass(obj):
+                return {k: self._input_to_dict(v) for k, v in asdict(obj).items()}
+        except Exception:
+            pass
+        # Generic object: try __dict__
+        try:
+            d = getattr(obj, '__dict__', None)
+            if isinstance(d, dict):
+                return {k: self._input_to_dict(v) for k, v in d.items() if not k.startswith('_')}
+        except Exception:
+            pass
+        return obj
+
     # ---------- Internal helpers ----------
     def _pluralize(self, name: str) -> str:
         if name.endswith('y') and name[-2:].lower() not in ('ay','ey','iy','oy','uy'):
@@ -2340,6 +2460,34 @@ class BerrySchema:
                                         return inst
                                     return _resolver
                                 setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
+                    # Auto-generate upsert mutations for each relation declared on this domain
+                    try:
+                        for rf, rval in list(vars(dom_cls).items()):
+                            from .core.fields import FieldDescriptor as _FldDesc
+                            if isinstance(rval, _FldDesc):
+                                rdef = rval.build(getattr(dom_cls, '__name__', 'Domain'))
+                                if rdef.kind != 'relation':
+                                    continue
+                                target_name = rdef.meta.get('target') if isinstance(rdef.meta, dict) else None
+                                if not target_name:
+                                    continue
+                                btype_t = self.types.get(target_name)
+                                if not btype_t:
+                                    continue
+                                triplet = None
+                                try:
+                                    triplet = _build_upsert_resolver_for_type(btype_t, field_name=f"upsert_{rf}")
+                                except Exception:
+                                    triplet = None
+                                if triplet is not None:
+                                    fname_u, field_obj, st_ret = triplet
+                                    try:
+                                        setattr(DomSt_local, fname_u, field_obj)
+                                        ann_local[fname_u] = st_ret  # type: ignore
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
                     # If no fields were added, skip creating this domain type
                     if not ann_local:
                         try:
@@ -2357,6 +2505,301 @@ class BerrySchema:
                     except Exception:
                         pass
                     return self._st_types[type_name]
+                # Helper: build a recursive upsert mutation for a BerryType
+                def _build_upsert_resolver_for_type(btype_cls: Type[BerryType], *, field_name: Optional[str] = None):
+                    type_name = getattr(btype_cls, '__name__', 'Type')
+                    st_return = self._st_types.get(type_name)
+                    input_type = self._ensure_input_type(btype_cls)
+                    model_cls = getattr(btype_cls, 'model', None)
+                    if st_return is None or model_cls is None:
+                        return None
+                    pk_name = None
+                    try:
+                        pk_name = self._get_pk_name(model_cls)
+                    except Exception:
+                        pk_name = 'id'
+                    async def _upsert_impl(info: StrawberryInfo, payload):
+                        session = _get_db(info)
+                        if session is None:
+                            raise ValueError("No db_session in context")
+                        data = self._input_to_dict(payload)
+                        # Core recursive function
+                        async def _upsert_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
+                            # Split scalars and relations
+                            scalar_vals: Dict[str, Any] = {}
+                            relation_vals: Dict[str, Any] = {}
+                            for k, v in list((data_local or {}).items()):
+                                fdef = (getattr(btype_local, '__berry_fields__', {}) or {}).get(k)
+                                if fdef is None:
+                                    # allow unknowns to pass through quietly
+                                    scalar_vals[k] = v
+                                elif fdef.kind == 'scalar':
+                                    scalar_vals[k] = v
+                                elif fdef.kind == 'relation':
+                                    relation_vals[k] = v
+                            # If invoked with a parent context (i.e., as a child of a list relation),
+                            # ensure the FK to the parent is present in scalar_vals before insert.
+                            child_rel_to_parent_name: Optional[str] = None
+                            if parent_ctx is not None:
+                                try:
+                                    parent_model_cls = parent_ctx.get('parent_model')
+                                    parent_inst = parent_ctx.get('parent_inst')
+                                except Exception:
+                                    parent_model_cls = None
+                                    parent_inst = None
+                                if parent_model_cls is not None and parent_inst is not None:
+                                    # Determine child->parent FK column name
+                                    child_fk_to_parent = None
+                                    try:
+                                        if hasattr(model_cls_local, '__table__') and hasattr(parent_model_cls, '__table__'):
+                                            for cc in model_cls_local.__table__.columns:
+                                                for fk in cc.foreign_keys:
+                                                    if fk.column.table.name == parent_model_cls.__table__.name:
+                                                        child_fk_to_parent = cc.name
+                                                        break
+                                                if child_fk_to_parent is not None:
+                                                    break
+                                    except Exception:
+                                        child_fk_to_parent = None
+                                    # Also try to find the relationship attribute on the child that targets the parent (e.g., 'post')
+                                    try:
+                                        rel_name_found = None
+                                        mapper = getattr(model_cls_local, '__mapper__', None)
+                                        if mapper is not None:
+                                            for rel in getattr(mapper, 'relationships', []) or []:
+                                                try:
+                                                    target_cls = getattr(rel, 'mapper', None)
+                                                    target_cls = getattr(target_cls, 'class_', None) if target_cls is not None else None
+                                                    if target_cls is parent_model_cls:
+                                                        rel_name_found = getattr(rel, 'key', None)
+                                                        break
+                                                except Exception:
+                                                    continue
+                                        child_rel_to_parent_name = rel_name_found or child_rel_to_parent_name
+                                    except Exception:
+                                        child_rel_to_parent_name = child_rel_to_parent_name or None
+                                    # If missing, try a conventional fallback like '<parent_singular>_id'
+                                    if child_fk_to_parent is None:
+                                        try:
+                                            conv_name = f"{parent_model_cls.__table__.name.rstrip('s')}_id"
+                                            if hasattr(model_cls_local, '__table__') and any(c.name == conv_name for c in model_cls_local.__table__.columns):
+                                                child_fk_to_parent = conv_name
+                                        except Exception:
+                                            pass
+                                    # Set scalar FK if not provided
+                                    if child_fk_to_parent:
+                                        try:
+                                            parent_pk_name_local = self._get_pk_name(parent_model_cls)
+                                        except Exception:
+                                            parent_pk_name_local = 'id'
+                                        try:
+                                            parent_pk_val_local = getattr(parent_inst, parent_pk_name_local)
+                                        except Exception:
+                                            parent_pk_val_local = None
+                                        if parent_pk_val_local is None:
+                                            try:
+                                                await session.flush()
+                                            except Exception:
+                                                pass
+                                            try:
+                                                await session.refresh(parent_inst)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                parent_pk_val_local = getattr(parent_inst, parent_pk_name_local)
+                                            except Exception:
+                                                parent_pk_val_local = None
+                                        try:
+                                            logging.getLogger('berryql').warning(
+                                                "upsert(child): parent=%s pk=%s child_fk_to_parent=%s",
+                                                getattr(parent_model_cls, '__name__', parent_model_cls), parent_pk_val_local, child_fk_to_parent
+                                            )
+                                        except Exception:
+                                            pass
+                                        if scalar_vals.get(child_fk_to_parent) in (None, 0):
+                                            scalar_vals[child_fk_to_parent] = parent_pk_val_local
+                                            try:
+                                                logging.getLogger('berryql').warning(
+                                                    "upsert(child): assign %s=%s in scalar_vals",
+                                                    child_fk_to_parent, parent_pk_val_local
+                                                )
+                                            except Exception:
+                                                pass
+                            # Determine instance (update or create)
+                            instance = None
+                            pk_val = scalar_vals.get(pk_name)
+                            if pk_val is None:
+                                try:
+                                    pk_val = data_local.get(pk_name)
+                                except Exception:
+                                    pk_val = None
+                            if pk_val is not None:
+                                try:
+                                    instance = await session.get(model_cls_local, pk_val)
+                                except Exception:
+                                    instance = None
+                            if instance is None:
+                                instance = model_cls_local()
+                                # If we have pk value, set it to allow natural keys
+                                try:
+                                    if pk_val is not None:
+                                        setattr(instance, pk_name, pk_val)
+                                except Exception:
+                                    pass
+                                session.add(instance)
+                            # Assign scalar fields (ignore None values to support partial updates)
+                            for k, v in list(scalar_vals.items()):
+                                if v is None:
+                                    continue
+                                try:
+                                    setattr(instance, k, v)
+                                except Exception:
+                                    # Honor column mapping when provided
+                                    try:
+                                        src_col = (getattr(btype_local.__berry_fields__.get(k), 'meta', {}) or {}).get('column')
+                                        if src_col:
+                                            setattr(instance, src_col, v)
+                                    except Exception:
+                                        pass
+                            # If we know the relationship attribute from child to parent, set it as well to enforce FK assignment
+                            if parent_ctx is not None and child_rel_to_parent_name and 'parent_inst' in parent_ctx:
+                                try:
+                                    cur_val = getattr(instance, child_rel_to_parent_name, None)
+                                except Exception:
+                                    cur_val = None
+                                try:
+                                    if cur_val is None:
+                                        setattr(instance, child_rel_to_parent_name, parent_ctx.get('parent_inst'))
+                                        logging.getLogger('berryql').warning(
+                                            "upsert(child): set relation %s -> parent instance",
+                                            child_rel_to_parent_name,
+                                        )
+                                except Exception:
+                                    pass
+                            # Ensure pending INSERTs are pushed so identities are available
+                            await session.flush()
+                            # Process relations
+                            for rel_key, rel_value in list(relation_vals.items()):
+                                if rel_value is None:
+                                    continue
+                                rel_def = btype_local.__berry_fields__.get(rel_key)
+                                if rel_def is None or rel_def.kind != 'relation':
+                                    continue
+                                target_name = rel_def.meta.get('target') if isinstance(rel_def.meta, dict) else None
+                                is_single = bool(rel_def.meta.get('single')) if isinstance(rel_def.meta, dict) else False
+                                if not target_name:
+                                    continue
+                                child_btype = self.types.get(target_name)
+                                child_model = getattr(child_btype, 'model', None) if child_btype else None
+                                if not child_btype or not child_model:
+                                    continue
+                                # Determine FK name on child pointing to parent when relation is list,
+                                # or FK on parent pointing to child when single relation stores id on parent.
+                                child_pk_name = None
+                                try:
+                                    child_pk_name = self._get_pk_name(child_model)
+                                except Exception:
+                                    child_pk_name = 'id'
+                                if is_single:
+                                    # Single relation: nested object. Compute child, then assign parent-side FK if exists
+                                    child_data = self._input_to_dict(rel_value)
+                                    # If parent has a '<rel>_id' column, fill it using child's PK
+                                    child_inst = await _upsert_single(child_model, child_btype, child_data, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+                                    try:
+                                        fk_name = self._find_parent_fk_column_name(model_cls_local, child_model, rel_key)
+                                    except Exception:
+                                        fk_name = None
+                                    if fk_name and getattr(instance, fk_name, None) in (None, 0):
+                                        try:
+                                            setattr(instance, fk_name, getattr(child_inst, child_pk_name))
+                                        except Exception:
+                                            pass
+                                else:
+                                    # List relation: array of child inputs
+                                    items = self._input_to_dict(rel_value)
+                                    if not isinstance(items, list):
+                                        items = [items]
+                                    # Ensure FK child->parent is set for each item
+                                    # Determine child fk column referencing parent
+                                    child_fk_col_name = None
+                                    try:
+                                        for cc in child_model.__table__.columns:
+                                            for fk in cc.foreign_keys:
+                                                if fk.column.table.name == model_cls_local.__table__.name:
+                                                    child_fk_col_name = cc.name
+                                                    break
+                                            if child_fk_col_name is not None:
+                                                break
+                                    except Exception:
+                                        child_fk_col_name = None
+                                    # Fallback: try conventional '<parent>_id' when not found
+                                    if child_fk_col_name is None:
+                                        try:
+                                            conv_name = f"{model_cls_local.__table__.name.rstrip('s')}_id"
+                                            if any(c.name == conv_name for c in child_model.__table__.columns):
+                                                child_fk_col_name = conv_name
+                                        except Exception:
+                                            pass
+                                    # Parent id value: compute local parent PK name and ensure it is populated after flush
+                                    parent_pk_val = None
+                                    try:
+                                        parent_pk_name_local = self._get_pk_name(model_cls_local)
+                                    except Exception:
+                                        parent_pk_name_local = 'id'
+                                    # After initial flush above, refresh the parent to guarantee identity is loaded (dialect-safe)
+                                    try:
+                                        parent_pk_val = getattr(instance, parent_pk_name_local)
+                                    except Exception:
+                                        parent_pk_val = None
+                                    if parent_pk_val is None:
+                                        try:
+                                            await session.flush()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            await session.refresh(instance)
+                                        except Exception:
+                                            # Some dialects may not require refresh; ignore failures
+                                            pass
+                                        try:
+                                            parent_pk_val = getattr(instance, parent_pk_name_local)
+                                        except Exception:
+                                            parent_pk_val = None
+                                    try:
+                                        logging.getLogger('berryql').warning(
+                                            "upsert(list): parent=%s pk=%s child_fk_col=%s rel=%s",
+                                            getattr(model_cls_local, '__name__', model_cls_local), parent_pk_val, child_fk_col_name, rel_key
+                                        )
+                                    except Exception:
+                                        pass
+                                    for item in items:
+                                        if child_fk_col_name and parent_pk_val is not None:
+                                            item = dict(item or {})
+                                            if item.get(child_fk_col_name) in (None, 0):
+                                                item[child_fk_col_name] = parent_pk_val
+                                            try:
+                                                logging.getLogger('berryql').warning(
+                                                    "upsert(list): set %s=%s on child payload -> keys=%s",
+                                                    child_fk_col_name, parent_pk_val, list(item.keys())
+                                                )
+                                            except Exception:
+                                                pass
+                                        await _upsert_single(child_model, child_btype, item, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+                            await session.flush()
+                            return instance
+                        inst = await _upsert_single(model_cls, btype_cls, data)
+                        await session.commit()
+                        # Return Strawberry runtime object populated from model
+                        return self.from_model(type_name, inst)
+                    # Build wrapper function with annotations
+                    fname = field_name or f"upsert_{type_name[:-2].lower()}" if type_name.endswith('QL') else f"upsert_{type_name.lower()}"
+                    ann: Dict[str, Any] = {'info': StrawberryInfo, 'payload': input_type, 'return': st_return}
+                    async def _resolver(self, info: StrawberryInfo, payload):  # noqa: D401
+                        return await _upsert_impl(info, payload)
+                    _resolver.__name__ = fname
+                    _resolver.__annotations__ = ann
+                    return fname, strawberry.field(resolver=_resolver), st_return
+
                 # First, attach domain fields from the user-declared Mutation class
                 if _DomDesc is not None:
                     for uf, val in list(vars(self._user_mutation_cls).items()):
@@ -2373,6 +2816,40 @@ class BerrySchema:
                                 return _resolver
                             anns_m[uf] = DomSt  # type: ignore
                             setattr(MPlain, uf, strawberry.field(resolver=_make_domain_resolver(DomSt)))
+                            # Additionally, auto-generate upsert mutations inside the domain for each relation declared on the domain class
+                            try:
+                                # Build a new class that extends the domain container with upsert methods
+                                added_any = False
+                                DomRuntime = self._st_types.get(f"{getattr(dom_cls,'__name__','Domain')}MutType")
+                                if DomRuntime is not None:
+                                    for rf, rval in list(vars(dom_cls).items()):
+                                        if isinstance(rval, FieldDescriptor):
+                                            rdef = rval.build(getattr(dom_cls, '__name__', 'Domain'))
+                                            if rdef.kind != 'relation':
+                                                continue
+                                            target_name = rdef.meta.get('target') if isinstance(rdef.meta, dict) else None
+                                            if not target_name:
+                                                continue
+                                            btype_t = self.types.get(target_name)
+                                            if not btype_t:
+                                                continue
+                                            upsert_triplet = _build_upsert_resolver_for_type(btype_t, field_name=f"upsert_{rf}")
+                                            if upsert_triplet is not None:
+                                                fname_u, field_obj, st_ret = upsert_triplet
+                                                try:
+                                                    setattr(DomRuntime, fname_u, field_obj)
+                                                    # update its annotations dict if exists
+                                                    ann_dom = getattr(DomRuntime, '__annotations__', None)
+                                                    if isinstance(ann_dom, dict):
+                                                        ann_dom[fname_u] = st_ret
+                                                    added_any = True
+                                                except Exception:
+                                                    pass
+                                if added_any:
+                                    # re-register decorated class if needed
+                                    self._st_types[f"{getattr(dom_cls,'__name__','Domain')}MutType"] = DomRuntime
+                            except Exception:
+                                pass
                 for uf, val in vars(self._user_mutation_cls).items():
                     if uf.startswith('__'):
                         continue
@@ -2420,6 +2897,20 @@ class BerrySchema:
                             return None
                         mapped_type = _map_ret_2(ret_ann)
                         anns_m[uf] = mapped_type or ret_ann or Any
+                # Auto-generate top-level upsert mutations for all registered Berry types
+                try:
+                    for tname, btype_cls in list(self.types.items()):
+                        triplet = _build_upsert_resolver_for_type(btype_cls)
+                        if triplet is None:
+                            continue
+                        fname_u, field_obj, st_ret = triplet
+                        # Avoid clobbering user-defined fields
+                        if hasattr(MPlain, fname_u):
+                            continue
+                        setattr(MPlain, fname_u, field_obj)
+                        anns_m[fname_u] = st_ret  # type: ignore
+                except Exception:
+                    pass
                 setattr(MPlain, '__annotations__', anns_m)
                 Mutation = strawberry.type(MPlain)  # type: ignore
         except Exception:
