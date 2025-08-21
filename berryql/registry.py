@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
+import re
 import logging
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints, get_origin, get_args
@@ -2468,6 +2469,9 @@ class BerrySchema:
                                 rdef = rval.build(getattr(dom_cls, '__name__', 'Domain'))
                                 if rdef.kind != 'relation':
                                     continue
+                                # Only project mutation when explicitly enabled on the relation
+                                if not bool((rdef.meta or {}).get('mutation')):
+                                    continue
                                 target_name = rdef.meta.get('target') if isinstance(rdef.meta, dict) else None
                                 if not target_name:
                                     continue
@@ -2476,7 +2480,15 @@ class BerrySchema:
                                     continue
                                 triplet = None
                                 try:
-                                    triplet = _build_upsert_resolver_for_type(btype_t, field_name=f"upsert_{rf}")
+                                    # Compose mutation name based on naming preference
+                                    def _compose_mut_name(rel_attr: str) -> str:
+                                        if getattr(self, '_auto_camel_case', False):
+                                            # upsertQueryName (capitalize the relation attr name)
+                                            return f"upsert{rel_attr[:1].upper()}{rel_attr[1:]}"
+                                        # snake_case: upsert_query_name
+                                        out = re.sub(r"([A-Z])", r"_\1", rel_attr).lower().strip('_')
+                                        return f"upsert_{out}"
+                                    triplet = _build_upsert_resolver_for_type(btype_t, field_name=_compose_mut_name(rf))
                                 except Exception:
                                     triplet = None
                                 if triplet is not None:
@@ -2661,6 +2673,61 @@ class BerrySchema:
                                             setattr(instance, src_col, v)
                                     except Exception:
                                         pass
+                            # As a robust fallback, if this is a child in a parent_ctx, ensure FK to parent is set
+                            if parent_ctx is not None:
+                                try:
+                                    parent_model_cls = parent_ctx.get('parent_model')
+                                    parent_inst = parent_ctx.get('parent_inst')
+                                except Exception:
+                                    parent_model_cls = None
+                                    parent_inst = None
+                                if parent_model_cls is not None and parent_inst is not None:
+                                    # recompute parent PK value if needed
+                                    try:
+                                        parent_pk_name_local = self._get_pk_name(parent_model_cls)
+                                    except Exception:
+                                        parent_pk_name_local = 'id'
+                                    try:
+                                        parent_pk_val_local = getattr(parent_inst, parent_pk_name_local, None)
+                                    except Exception:
+                                        parent_pk_val_local = None
+                                    if parent_pk_val_local is None:
+                                        try:
+                                            await session.flush()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            await session.refresh(parent_inst)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            parent_pk_val_local = getattr(parent_inst, parent_pk_name_local, None)
+                                        except Exception:
+                                            parent_pk_val_local = None
+                                    # Ensure child FK column is set directly on instance when resolvable
+                                    try:
+                                        # Determine child->parent FK column name if we have not already
+                                        _fk_name = None
+                                        if hasattr(model_cls_local, '__table__') and hasattr(parent_model_cls, '__table__'):
+                                            for cc in model_cls_local.__table__.columns:
+                                                for fk in getattr(cc, 'foreign_keys', []) or []:
+                                                    if fk.column.table.name == parent_model_cls.__table__.name:
+                                                        _fk_name = cc.name
+                                                        break
+                                                if _fk_name is not None:
+                                                    break
+                                    except Exception:
+                                        _fk_name = None
+                                    if _fk_name and parent_pk_val_local is not None:
+                                        try:
+                                            cur = getattr(instance, _fk_name, None)
+                                        except Exception:
+                                            cur = None
+                                        if cur in (None, 0):
+                                            try:
+                                                setattr(instance, _fk_name, parent_pk_val_local)
+                                            except Exception:
+                                                pass
                             # If we know the relationship attribute from child to parent, set it as well to enforce FK assignment
                             if parent_ctx is not None and child_rel_to_parent_name and 'parent_inst' in parent_ctx:
                                 try:
@@ -2827,13 +2894,21 @@ class BerrySchema:
                                             rdef = rval.build(getattr(dom_cls, '__name__', 'Domain'))
                                             if rdef.kind != 'relation':
                                                 continue
+                                            # Only project mutation when explicitly enabled on the relation
+                                            if not bool((rdef.meta or {}).get('mutation')):
+                                                continue
                                             target_name = rdef.meta.get('target') if isinstance(rdef.meta, dict) else None
                                             if not target_name:
                                                 continue
                                             btype_t = self.types.get(target_name)
                                             if not btype_t:
                                                 continue
-                                            upsert_triplet = _build_upsert_resolver_for_type(btype_t, field_name=f"upsert_{rf}")
+                                            def _compose_mut_name(rel_attr: str) -> str:
+                                                if getattr(self, '_auto_camel_case', False):
+                                                    return f"upsert{rel_attr[:1].upper()}{rel_attr[1:]}"
+                                                out = re.sub(r"([A-Z])", r"_\1", rel_attr).lower().strip('_')
+                                                return f"upsert_{out}"
+                                            upsert_triplet = _build_upsert_resolver_for_type(btype_t, field_name=_compose_mut_name(rf))
                                             if upsert_triplet is not None:
                                                 fname_u, field_obj, st_ret = upsert_triplet
                                                 try:
@@ -2897,9 +2972,26 @@ class BerrySchema:
                             return None
                         mapped_type = _map_ret_2(ret_ann)
                         anns_m[uf] = mapped_type or ret_ann or Any
-                # Auto-generate top-level upsert mutations for all registered Berry types
+                # Auto-generate top-level upsert mutations, gated by mutation flag on Query relations
                 try:
+                    # Build allow-list of target Berry types from root Query relations with mutation=True
+                    allowed_targets: set[str] | None = None
+                    try:
+                        if isinstance(getattr(self, '_root_query_fields', None), dict):
+                            allowed_targets = set(
+                                fdef.meta.get('target')
+                                for fdef in self._root_query_fields.values()  # type: ignore[attr-defined]
+                                if getattr(fdef, 'kind', None) == 'relation'
+                                and bool((getattr(fdef, 'meta', {}) or {}).get('mutation'))
+                                and fdef.meta.get('target')
+                            )
+                    except Exception:
+                        allowed_targets = None
                     for tname, btype_cls in list(self.types.items()):
+                        # If there is an allow-list computed, only project those
+                        if allowed_targets is not None:
+                            if not tname or tname not in allowed_targets:
+                                continue
                         triplet = _build_upsert_resolver_for_type(btype_cls)
                         if triplet is None:
                             continue

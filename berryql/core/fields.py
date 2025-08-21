@@ -77,7 +77,7 @@ def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
         meta['column'] = column
     return FieldDescriptor(kind='scalar', **meta)
 
-def relation(target: Any = None, *, single: bool | None = None, **meta) -> FieldDescriptor:
+def relation(target: Any = None, *, single: bool | None = None, mutation: bool = False, **meta) -> FieldDescriptor:
     """Declare a relation to another Berry type.
 
     Use on both root Query/Domain classes and nested Berry types to model
@@ -127,6 +127,8 @@ def relation(target: Any = None, *, single: bool | None = None, **meta) -> Field
         m['target'] = target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target
     if single is not None:
         m['single'] = single
+    # Flag to enable generating an upsert mutation for this relation under Mutation domains
+    m['mutation'] = bool(mutation)
     return FieldDescriptor(kind='relation', **m)
 
 def aggregate(source: str, **meta) -> FieldDescriptor:

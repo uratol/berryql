@@ -185,7 +185,7 @@ class BlogDomain(BerryDomain):
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-    })
+    }, mutation=True)
     # Async builder for filter args should be awaited in root filters
     async def _created_at_gt_async(M, info, v):
         await asyncio.sleep(0)
@@ -253,7 +253,7 @@ class Query:
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-    })
+    }, mutation=True)
     # Async where callable support for roots
     async def _gate_users_async(model_cls, info: Info):
         # tiny await to ensure awaitable path is exercised
