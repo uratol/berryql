@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import User, Post, PostComment, PostCommentLike
+from .models import User, Post, PostComment, PostCommentLike, View
 
 
 async def create_sample_users(session: AsyncSession):
@@ -97,19 +97,44 @@ async def seed_populated_db(session: AsyncSession):
     posts = await create_sample_posts(session, users)
     comments = await create_sample_comments(session, users, posts)
     likes = await create_sample_likes(session, users, comments)
+    views = await create_sample_views(session, users, posts, comments)
     return {
         'users': users,
         'posts': posts,
         'post_comments': comments,
         'post_comment_likes': likes,
+        'views': views,
     }
 
 
+async def create_sample_views(session: AsyncSession, users, posts, comments):
+    """Create and commit sample polymorphic views for posts and comments."""
+    user1, user2, user3, _ = users
+    post1, post2, post3, post4, post5 = posts
+    views = [
+        View(entity_type='post', entity_id=post1.id, user_id=user2.id),
+        View(entity_type='post', entity_id=post1.id, user_id=user3.id),
+        View(entity_type='post', entity_id=post2.id, user_id=user3.id),
+        View(entity_type='post_comment', entity_id=comments[0].id, user_id=user1.id),
+        View(entity_type='post_comment', entity_id=comments[1].id, user_id=user1.id),
+    ]
+    session.add_all(views)
+    await session.flush()
+    await session.commit()
+    return views
+
+
 @pytest.fixture(scope="function")
-async def populated_db(sample_users, sample_posts, sample_comments, sample_likes):
+async def sample_views(db_session: AsyncSession, sample_users, sample_posts, sample_comments):
+    return await create_sample_views(db_session, sample_users, sample_posts, sample_comments)
+
+
+@pytest.fixture(scope="function")
+async def populated_db(sample_users, sample_posts, sample_comments, sample_likes, sample_views):
     return {
         'users': sample_users,
         'posts': sample_posts,
-    'post_comments': sample_comments,
-    'post_comment_likes': sample_likes,
+        'post_comments': sample_comments,
+        'post_comment_likes': sample_likes,
+        'views': sample_views,
     }

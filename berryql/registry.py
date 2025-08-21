@@ -715,9 +715,17 @@ class BerrySchema:
                             if is_single_value:
                                 candidate_fk_val = None
                                 fallback_parent_id = None
+                                # Allow explicit FK override on parent -> child
+                                try:
+                                    explicit_fk_name = meta_copy.get('fk_column_name') or (getattr(self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
+                                except Exception:
+                                    explicit_fk_name = None
                                 # Try helper '<relation>_id' on parent instance
                                 try:
-                                    candidate_fk_val = getattr(self, f"{fname_local}_id", None)
+                                    if explicit_fk_name:
+                                        candidate_fk_val = getattr(self, explicit_fk_name, None)
+                                    else:
+                                        candidate_fk_val = getattr(self, f"{fname_local}_id", None)
                                 except Exception:
                                     candidate_fk_val = None
                                 # Record parent id for potential child->parent fallback
@@ -741,6 +749,14 @@ class BerrySchema:
                                 if candidate_fk_val is None and parent_model is not None:
                                     # Derive FK from ORM model instance when available (parent has FK to child)
                                     for col in parent_model.__table__.columns:
+                                        # If explicit FK override provided, use it directly
+                                        if explicit_fk_name and col.name == explicit_fk_name:
+                                            try:
+                                                candidate_fk_val = getattr(parent_model, col.name)
+                                            except Exception:
+                                                candidate_fk_val = None
+                                            if candidate_fk_val is not None:
+                                                break
                                         if col.name.endswith('_id') and col.foreign_keys:
                                             for fk in col.foreign_keys:
                                                 if fk.column.table.name == child_model_cls.__table__.name:
@@ -767,14 +783,17 @@ class BerrySchema:
                                         # Build a select for the first child row for this parent
                                         stmt = _select(child_model_cls).where(child_fk_to_parent == fallback_parent_id)
                                         # Apply where/default_where and filter args similarly to list path
-                                        if related_where is not None or meta_copy.get('where') is not None:
+                                        # Apply relation-level scope (default filter) and argument-provided where
+                                        eff_scope = meta_copy.get('scope')
+                                        if related_where is not None or eff_scope is not None:
                                             if related_where is not None:
                                                 wdict = _to_where_dict(related_where, strict=True)
                                                 if wdict:
                                                     expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
                                                     if expr is not None:
                                                         stmt = stmt.where(expr)
-                                            dwhere = meta_copy.get('where')
+                                            # 'scope' replaces legacy 'where' for schema default filters
+                                            dwhere = eff_scope
                                             if dwhere is not None:
                                                 if isinstance(dwhere, (dict, str)):
                                                     wdict = _to_where_dict(dwhere, strict=False)
@@ -877,18 +896,24 @@ class BerrySchema:
                                         # If PK not resolvable, fail fast to signal schema/model issue
                                         raise
                                     # Apply JSON where if provided (argument and schema default)
-                                    if related_where is not None or meta_copy.get('where') is not None:
+                                    eff_scope = meta_copy.get('scope')
+                                    if related_where is not None or eff_scope is not None:
                                         # Strict for user-provided; permissive for schema default
                                         wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
                                         if wdict_arg:
                                             expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
                                             if expr is not None:
                                                 stmt = stmt.where(expr)
-                                        dwhere = meta_copy.get('where')
+                                        dwhere = eff_scope
                                         if dwhere is not None:
-                                            wdict_def = _to_where_dict(dwhere, strict=False)
-                                            if wdict_def:
-                                                expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=False)
+                                            if isinstance(dwhere, (dict, str)):
+                                                wdict_def = _to_where_dict(dwhere, strict=False)
+                                                if wdict_def:
+                                                    expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=False)
+                                                    if expr is not None:
+                                                        stmt = stmt.where(expr)
+                                            elif callable(dwhere):
+                                                expr = dwhere(child_model_cls, info)
                                                 if expr is not None:
                                                     stmt = stmt.where(expr)
                                     # Add filter where clauses
@@ -981,7 +1006,15 @@ class BerrySchema:
                             # list relation
                             fk_col = None
                             parent_model_cls = getattr(parent_btype_local, 'model', None)
+                            # Allow explicit override for child->parent FK
+                            try:
+                                explicit_child_fk = meta_copy.get('fk_column_name') or (getattr(self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
+                            except Exception:
+                                explicit_child_fk = None
                             for col in child_model_cls.__table__.columns:
+                                if explicit_child_fk and col.name == explicit_child_fk:
+                                    fk_col = col
+                                    break
                                 for fk in col.foreign_keys:
                                     try:
                                         parent_table_name = parent_model_cls.__table__.name if parent_model_cls is not None else (parent_model.__table__.name if parent_model is not None else None)
@@ -1152,7 +1185,8 @@ class BerrySchema:
                             except Exception:
                                 pass
                             # Apply where from args and/or schema default
-                            if related_where is not None or meta_copy.get('where') is not None:
+                            eff_scope = meta_copy.get('scope')
+                            if related_where is not None or eff_scope is not None:
                                 # Strictly validate and apply argument-provided where
                                 if related_where is not None:
                                     wdict = _to_where_dict(related_where, strict=True)
@@ -1161,7 +1195,7 @@ class BerrySchema:
                                         if expr is not None:
                                             stmt = stmt.where(expr)
                                 # Default where from schema meta: keep permissive
-                                dwhere = meta_copy.get('where')
+                                dwhere = eff_scope
                                 if dwhere is not None:
                                     if isinstance(dwhere, (dict, str)):
                                         wdict = _to_where_dict(dwhere, strict=False)
@@ -1847,9 +1881,16 @@ class BerrySchema:
                     if ob_rel and ob_rel not in allowed_fields_rel:
                         raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     child_model_cls = target_b.model
-                    # Determine FK
+                    # Determine FK from child->parent, allow explicit override via relation meta
                     fk_col = None
+                    try:
+                        explicit_child_fk = rel_cfg.get('fk_column_name')
+                    except Exception:
+                        explicit_child_fk = None
                     for col in child_model_cls.__table__.columns:
+                        if explicit_child_fk and col.name == explicit_child_fk:
+                            fk_col = col
+                            break
                         for fk in col.foreign_keys:
                             if fk.column.table.name == model_cls.__table__.name:
                                 fk_col = col
@@ -1884,7 +1925,8 @@ class BerrySchema:
                             if sf in child_model_cls.__table__.columns:
                                 proj_cols.append(sf)
                         # Determine FK helper name for correlation
-                        parent_fk_col_name = self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
+                        # For single relation, allow explicit parent FK override
+                        parent_fk_col_name = rel_cfg.get('fk_column_name') or self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
                         # Delegate to builders
                         rel_expr_core = RelationSQLBuilders(self).build_single_relation_object(
                             adapter=adapter,

@@ -64,7 +64,11 @@ class QueryAnalyzer:
                         child_model_cls = (self.registry.types.get(target_name).model if target_name and self.registry.types.get(target_name) else None)
                     except Exception:
                         child_model_cls = None
-                    parent_fk_col_name = self.registry._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)  # type: ignore[attr-defined]
+                    # Respect explicit fk override for single relations
+                    try:
+                        parent_fk_col_name = rel_cfg.get('fk_column_name') or self.registry._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)  # type: ignore[attr-defined]
+                    except Exception:
+                        parent_fk_col_name = self.registry._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)  # type: ignore[attr-defined]
                     if parent_fk_col_name is not None:
                         required_fk_parent_cols.add(parent_fk_col_name)
         except Exception:

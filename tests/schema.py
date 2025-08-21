@@ -8,7 +8,7 @@ from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
 from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain
-from tests.models import User, Post, PostComment, PostCommentLike  # type: ignore
+from tests.models import User, Post, PostComment, PostCommentLike, View  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
@@ -33,6 +33,8 @@ class PostCommentQL(BerryType):
         # Use JSON where for pushdown-friendly filter: in fixtures, admin user has id=1
         scope='{"user_id": {"eq": 1}}'
     )
+    # Polymorphic views for comments
+    views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post_comment"}}')
     # Regular strawberry field with its own resolver (preview of comment content)
     @strawberry.field
     def content_preview(self) -> str | None:
@@ -55,6 +57,15 @@ class PostCommentLikeQL(BerryType):
     created_at = field()
     user = relation('UserQL', single=True)
     post = relation('PostQL', single=True)
+
+@berry_schema.type(model=View)
+class ViewQL(BerryType):
+    id = field()
+    entity_type = field()
+    entity_id = field()
+    user_id = field()
+    created_at = field()
+    user = relation('UserQL', single=True)
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
@@ -92,6 +103,8 @@ class PostQL(BerryType):
         ),
         returns={'min_created_at': datetime, 'comments_count': int}
     )
+    # Polymorphic views for posts
+    views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}')
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):

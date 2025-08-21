@@ -77,7 +77,7 @@ def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
         meta['column'] = column
     return FieldDescriptor(kind='scalar', **meta)
 
-def relation(target: Any = None, *, single: bool | None = None, mutation: bool = False, **meta) -> FieldDescriptor:
+def relation(target: Any = None, *, single: bool | None = None, mutation: bool = False, fk_column_name: str | None = None, **meta) -> FieldDescriptor:
     """Declare a relation to another Berry type.
 
     Use on both root Query/Domain classes and nested Berry types to model
@@ -129,6 +129,12 @@ def relation(target: Any = None, *, single: bool | None = None, mutation: bool =
         m['single'] = single
     # Flag to enable generating an upsert mutation for this relation under Mutation domains
     m['mutation'] = bool(mutation)
+    # Optional override for foreign key column name.
+    # Semantics:
+    # - For list relations (child -> parent), this is the FK column on the child model referencing the parent (e.g., "entity_id").
+    # - For single relations (parent -> child), this is the FK column on the parent model referencing the child (e.g., "author_id").
+    if fk_column_name is not None:
+        m['fk_column_name'] = fk_column_name
     # Backward-incompatible rename: parameter 'where' became 'scope'.
     # If users pass scope=..., keep it under 'scope' key; no implicit aliasing from 'where'.
     return FieldDescriptor(kind='relation', **m)

@@ -777,7 +777,8 @@ class RelationSQLBuilders:
                         nmulti: List[str] = self.registry._normalize_order_multi_values(nmulti_raw)
                         for spec in nmulti:
                             cn, _, dd = spec.partition(':')
-                            dd = (dd or dir_value_fn(ncfg.get('order_dir'))).lower()
+                            # Default ASC for multi when direction not specified
+                            dd = (dd or 'asc').lower()
                             if cn in n_allowed:
                                 col2 = getattr(grand_model, cn, None)
                                 if col2 is not None:
@@ -785,7 +786,12 @@ class RelationSQLBuilders:
                                     ordered2 = True
                         if not ordered2 and ncfg.get('order_by') in n_allowed:
                             cn = ncfg.get('order_by')
-                            dd = dir_value_fn(ncfg.get('order_dir'))
+                            # When explicit order_by provided without explicit dir, default to ASC
+                            try:
+                                eff_dir = self._effective_order_dir(ncfg)
+                            except Exception:
+                                eff_dir = None
+                            dd = (eff_dir or dir_value_fn(ncfg.get('order_dir'))).lower()
                             col2 = getattr(grand_model, cn, None)
                             if col2 is not None:
                                 n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
@@ -1012,7 +1018,8 @@ class RelationSQLBuilders:
             nmulti: List[str] = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or [])
             for spec in nmulti:
                 cn, _, dd = spec.partition(':')
-                dd = (dd or dir_value_fn(rel_cfg.get('order_dir'))).lower()
+                # Default ASC for multi when direction not specified
+                dd = (dd or 'asc').lower()
                 if cn in allowed_fields:
                     col = getattr(child_model_cls_i, cn, None)
                     if col is not None:
@@ -1020,7 +1027,12 @@ class RelationSQLBuilders:
                         ordered = True
             if not ordered and rel_cfg.get('order_by') in allowed_fields:
                 cn = rel_cfg.get('order_by')
-                dd = dir_value_fn(rel_cfg.get('order_dir'))
+                # When explicit order_by is provided without explicit dir, default to ASC
+                try:
+                    eff_dir_top = self._effective_order_dir(rel_cfg)
+                except Exception:
+                    eff_dir_top = None
+                dd = (eff_dir_top or dir_value_fn(rel_cfg.get('order_dir'))).lower()
                 col = getattr(child_model_cls_i, cn, None)
                 if col is not None:
                     inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())

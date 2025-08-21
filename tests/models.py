@@ -120,3 +120,15 @@ class PostCommentLike(Base):
 
     comment = relationship("PostComment", back_populates="likes")
     user = relationship("User")
+
+
+class View(Base):
+    __tablename__ = 'views'
+
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(50), nullable=False)  # 'post' or 'post_comment'
+    entity_id = Column(Integer, nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+    user = relationship("User")

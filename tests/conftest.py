@@ -126,4 +126,11 @@ async def db_session(engine) -> AsyncGenerator[AsyncSession, None]:
 
 
 # Import fixtures from fixtures module
-from tests.fixtures import sample_users, sample_posts, sample_comments, sample_likes, populated_db
+from tests.fixtures import (
+    sample_users,
+    sample_posts,
+    sample_comments,
+    sample_likes,
+    sample_views,
+    populated_db,
+)
