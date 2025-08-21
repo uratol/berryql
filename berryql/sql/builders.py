@@ -1654,31 +1654,6 @@ class RootSQLBuilders:
                 enforce_gate = bool(getattr(_ctx, 'enforce_user_gate', False))
             except Exception:
                 enforce_gate = False
-        try:
-            custom_where = getattr(btype_cls, '__root_custom_where__', None)
-        except Exception:
-            custom_where = None
-        if custom_where is not None and enforce_gate:
-            try:
-                cw_val = custom_where(model_cls, info) if callable(custom_where) else custom_where
-                if inspect.isawaitable(cw_val):
-                    cw_val = await cw_val
-            except Exception:
-                cw_val = None
-            if cw_val is not None:
-                # Reuse common where applier on a temporary stmt to keep parity with relations
-                tmp = select(model_cls)
-                tmp = RelationSQLBuilders(self.registry)._apply_where_common(
-                    tmp, model_cls, cw_val, strict=True,
-                    to_where_dict=_to_where_dict,
-                    expr_from_where_dict=_expr_from_where_dict,
-                    info=info,
-                )
-                try:
-                    for _w in getattr(tmp, '_where_criteria', []):  # type: ignore[attr-defined]
-                        where_clauses.append(_w)
-                except Exception:
-                    pass
         # raw where
         if raw_where is not None:
             wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
