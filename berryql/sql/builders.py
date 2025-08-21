@@ -602,13 +602,17 @@ class RelationSQLBuilders:
         pfk = parent_fk_col_name or f"{rel_name}_id"
         if mssql_mode:
             # Compose WHERE join + relation filters, then let adapter emit FOR JSON PATH
-            child_table = child_model_cls.__tablename__
-            parent_table = parent_model_cls.__tablename__
+            child_table = child_model_cls  # pass model for schema-aware identifier
+            parent_table = parent_model_cls
             # child's PK equals parent's FK
             child_pk_name = self._pk_name(child_model_cls)
-            where_parts: list[str] = [
-                f"[{child_table}].[{child_pk_name}] = [{parent_table}].[{pfk}]"
-            ]
+            try:
+                ct_ident = adapter.table_ident(child_table)
+                pt_ident = adapter.table_ident(parent_table)
+            except Exception:
+                ct_ident = f"[{getattr(child_model_cls,'__tablename__','')}]"
+                pt_ident = f"[{getattr(parent_model_cls,'__tablename__','')}]"
+            where_parts: list[str] = [f"{ct_ident}.[{child_pk_name}] = {pt_ident}.[{pfk}]"]
             # Apply relation where/default_where fragments
             where_parts = self._mssql_where_from_value(
                 where_parts,
@@ -1121,7 +1125,7 @@ class RelationSQLBuilders:
         except Exception:
             requested_scalar_local = list(requested_scalar or [])
         if mssql_mode:
-            parent_table = parent_model_cls.__tablename__
+            parent_table = parent_model_cls
             parent_pk_name = self._pk_name(parent_model_cls)
             # If there are nested relations selected under this list relation, use the
             # MSSQL full nested JSON builder so everything is pushed down in one SELECT.
@@ -1328,7 +1332,13 @@ class RelationSQLBuilders:
             # No nested relations: use simple JSON list builder with optional filters/order
             # correlate and compose relation-level where
             parent_pk_name = self._pk_name(parent_model_cls)
-            where_parts_rel: list[str] = [f"[{child_table}].[{fk_child_to_parent_col.name}] = [{parent_table}].[{parent_pk_name}]"]
+            try:
+                ct_ident2 = adapter.table_ident(child_model_cls)
+                pt_ident2 = adapter.table_ident(parent_table)
+            except Exception:
+                ct_ident2 = f"[{getattr(child_model_cls,'__tablename__','')}]"
+                pt_ident2 = f"[{getattr(parent_model_cls,'__tablename__','')}]"
+            where_parts_rel: list[str] = [f"{ct_ident2}.[{fk_child_to_parent_col.name}] = {pt_ident2}.[{parent_pk_name}]"]
             where_parts_rel = self._mssql_where_from_value(
                 where_parts_rel,
                 child_model_cls,
@@ -1393,13 +1403,13 @@ class RelationSQLBuilders:
             effective_order_dir2 = self._effective_order_dir(rel_cfg)
             order_clause = adapter.build_order_clause(
                 child_model_cls,
-                child_table,
+                child_model_cls,
                 rel_cfg.get('order_by'),
                 effective_order_dir2,
                 self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
             )
             return adapter.build_list_relation_json(
-                child_table=child_table,
+                child_table=child_model_cls,
                 projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                 where_condition=where_clause,
                 limit=rel_cfg.get('limit'),
