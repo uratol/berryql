@@ -64,6 +64,32 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                 pass
             return v
 
+        def _safe_attrs_dump(model_cls_local, instance_local):
+            """Best-effort dump of model attributes (table columns first, then public __dict__)."""
+            try:
+                out: Dict[str, Any] = {}
+                try:
+                    cols = [c.name for c in getattr(getattr(model_cls_local, '__table__', None), 'columns', [])]
+                except Exception:
+                    cols = []
+                for cn in cols or []:
+                    try:
+                        out[cn] = getattr(instance_local, cn, None)
+                    except Exception:
+                        out[cn] = None
+                if not out:
+                    try:
+                        for k, v in (getattr(instance_local, '__dict__', {}) or {}).items():
+                            if not str(k).startswith('_'):
+                                out[k] = v
+                    except Exception:
+                        pass
+                if not out:
+                    return {'repr': repr(instance_local)}
+                return out
+            except Exception:
+                return {'repr': repr(instance_local)}
+
         async def _enforce_scope(model_cls_local, instance_local, scope_raw: Any | None):
             if scope_raw is None:
                 return True
@@ -243,7 +269,9 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
             if pk_val is not None and instance is not None and eff_scope is not None:
                 ok = await _enforce_scope(model_cls_local, instance, eff_scope)
                 if not ok:
-                    raise PermissionError("Mutation out of scope for update")
+                    _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                    _attrs = _safe_attrs_dump(model_cls_local, instance)
+                    raise PermissionError(f"Mutation out of scope for update; model={_cls}; attrs={_attrs}")
             # Assign scalar fields (ignore None)
             for k, v in list(scalar_vals.items()):
                 if v is None:
@@ -332,7 +360,9 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                         await session.rollback()
                     except Exception:
                         pass
-                    raise PermissionError("Mutation out of scope")
+                    _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                    _attrs = _safe_attrs_dump(model_cls_local, instance)
+                    raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
             # Process relations
             for rel_key, rel_value in list(relation_vals.items()):
                 if rel_value is None:
