@@ -1641,19 +1641,6 @@ class RootSQLBuilders:
         from ..core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
         import inspect
         where_clauses = []
-        # gating
-        try:
-            _ctx = getattr(info, 'context', None)
-        except Exception:
-            _ctx = None
-        enforce_gate = False
-        if isinstance(_ctx, dict):
-            enforce_gate = bool(_ctx.get('enforce_user_gate'))
-        elif _ctx is not None:
-            try:
-                enforce_gate = bool(getattr(_ctx, 'enforce_user_gate', False))
-            except Exception:
-                enforce_gate = False
         # raw where
         if raw_where is not None:
             wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
