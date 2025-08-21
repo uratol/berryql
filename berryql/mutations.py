@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Type, List, get_args, get_origin
 import strawberry
 from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
+from sqlalchemy import select
 
 if TYPE_CHECKING:  # pragma: no cover
     from .registry import BerrySchema, BerryType, BerryDomain
@@ -20,7 +21,7 @@ _logger = logging.getLogger("berryql")
 
 # --- Upsert builder -------------------------------------------------------
 
-def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['BerryType'], *, field_name: Optional[str] = None):
+def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['BerryType'], *, field_name: Optional[str] = None, relation_scope: Any | None = None):
     """Return (fname, strawberry.field, st_return) implementing recursive upsert for a BerryType.
 
     This mirrors the previous inline version in registry, but lives here for clarity.
@@ -41,6 +42,63 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
         if session is None:
             raise ValueError("No db_session in context")
         data = schema._input_to_dict(payload)
+
+        # Helpers to compile and enforce scope for a given model instance
+        from .core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
+
+        def _resolve_scope_value(value):
+            v = value
+            try:
+                # GraphQL VariableNode-like
+                if not isinstance(v, (dict, str)) and hasattr(v, 'name'):
+                    vname = getattr(getattr(v, 'name', None), 'value', None) or getattr(v, 'name', None)
+                    var_vals = getattr(info, 'variable_values', None)
+                    if var_vals is None:
+                        raw_info = getattr(info, '_raw_info', None)
+                        var_vals = getattr(raw_info, 'variable_values', None) if raw_info is not None else None
+                    if isinstance(var_vals, dict) and vname in var_vals:
+                        v = var_vals[vname]
+                if not isinstance(v, (dict, str)) and hasattr(v, 'value'):
+                    v = getattr(v, 'value')
+            except Exception:
+                pass
+            return v
+
+        async def _enforce_scope(model_cls_local, instance_local, scope_raw: Any | None):
+            if scope_raw is None:
+                return True
+            try:
+                pk_name_local = schema._get_pk_name(model_cls_local)
+            except Exception:
+                pk_name_local = 'id'
+            try:
+                pk_val_local = getattr(instance_local, pk_name_local)
+            except Exception:
+                pk_val_local = None
+            if pk_val_local is None:
+                return True  # can't enforce without identity; will re-check after flush
+            v = _resolve_scope_value(scope_raw)
+            expr = None
+            if isinstance(v, (dict, str)):
+                try:
+                    wdict = _to_where_dict(v, strict=True)
+                    if wdict:
+                        expr = _expr_from_where_dict(model_cls_local, wdict, strict=True)
+                except Exception:
+                    expr = None
+            else:
+                try:
+                    expr = v(model_cls_local, info) if callable(v) else v
+                except Exception:
+                    expr = None
+            if expr is None:
+                return True
+            stmt = select(model_cls_local.__table__.c[pk_name_local]).select_from(model_cls_local).where(
+                getattr(model_cls_local.__table__.c, pk_name_local) == pk_val_local
+            ).where(expr)
+            res = await session.execute(stmt)
+            row = res.first()
+            return bool(row)
 
         async def _upsert_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
             # Split scalars and relations
@@ -148,6 +206,31 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     instance = await session.get(model_cls_local, pk_val)
                 except Exception:
                     instance = None
+            # Determine applicable scope for this level
+            eff_scope = None
+            try:
+                if rel_name_from_parent and parent_ctx is not None:
+                    parent_model_cls = parent_ctx.get('parent_model')
+                    # Find parent BerryType to read relation meta
+                    parent_btype = None
+                    try:
+                        for _n, _bt in (schema.types or {}).items():
+                            if getattr(_bt, 'model', None) is parent_model_cls:
+                                parent_btype = _bt
+                                break
+                    except Exception:
+                        parent_btype = None
+                    if parent_btype is not None:
+                        try:
+                            rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
+                            if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
+                                eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
+                        except Exception:
+                            eff_scope = None
+                if eff_scope is None:
+                    eff_scope = relation_scope
+            except Exception:
+                eff_scope = relation_scope
             if instance is None:
                 instance = model_cls_local()
                 if pk_val is not None:
@@ -156,6 +239,11 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     except Exception:
                         pass
                 session.add(instance)
+            # If updating existing row: enforce that it's within scope BEFORE modifying
+            if pk_val is not None and instance is not None and eff_scope is not None:
+                ok = await _enforce_scope(model_cls_local, instance, eff_scope)
+                if not ok:
+                    raise PermissionError("Mutation out of scope for update")
             # Assign scalar fields (ignore None)
             for k, v in list(scalar_vals.items()):
                 if v is None:
@@ -236,6 +324,15 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     pass
             # Flush to materialize identities
             await session.flush()
+            # Enforce scope AFTER changes (covers create and update)
+            if eff_scope is not None:
+                ok2 = await _enforce_scope(model_cls_local, instance, eff_scope)
+                if not ok2:
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        pass
+                    raise PermissionError("Mutation out of scope")
             # Process relations
             for rel_key, rel_value in list(relation_vals.items()):
                 if rel_value is None:
@@ -468,9 +565,17 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 btype_t = schema.types.get(target_name)
                 if not btype_t:
                     continue
+                # Determine effective scope: relation scope or domain guard
+                eff_scope = None
+                try:
+                    eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
+                    if eff_scope is None:
+                        eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                except Exception:
+                    eff_scope = getattr(dom_cls, '__domain_guard__', None)
                 triplet = None
                 try:
-                    triplet = build_upsert_resolver_for_type(schema, btype_t, field_name=_compose_mut_name(schema, rf))
+                    triplet = build_upsert_resolver_for_type(schema, btype_t, field_name=_compose_mut_name(schema, rf), relation_scope=eff_scope)
                 except Exception:
                     triplet = None
                 if triplet is not None:
@@ -560,7 +665,15 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                             btype_t = schema.types.get(target_name)
                             if not btype_t:
                                 continue
-                            triplet = build_upsert_resolver_for_type(schema, btype_t, field_name=_compose_mut_name(schema, rf))
+                            # Determine scope as in builder above
+                            eff_scope = None
+                            try:
+                                eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
+                                if eff_scope is None:
+                                    eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                            except Exception:
+                                eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                            triplet = build_upsert_resolver_for_type(schema, btype_t, field_name=_compose_mut_name(schema, rf), relation_scope=eff_scope)
                             if triplet is None:
                                 continue
                             fname_u, field_obj, st_ret = triplet
@@ -585,21 +698,32 @@ def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str,
     """Attach auto-generated upsert mutations at root, gated by Query relations with mutation=True."""
     # Compute allow-list of target Berry types from root Query relations with mutation=True
     allowed_targets: Optional[set[str]] = None
+    scope_by_target: Dict[str, Any] = {}
     try:
         if isinstance(getattr(schema, '_root_query_fields', None), dict):
-            allowed_targets = set(
-                fdef.meta.get('target')
-                for fdef in schema._root_query_fields.values()  # type: ignore[attr-defined]
-                if getattr(fdef, 'kind', None) == 'relation'
-                and bool((getattr(fdef, 'meta', {}) or {}).get('mutation'))
-                and fdef.meta.get('target')
-            )
+            allowed_targets = set()
+            for fdef in schema._root_query_fields.values():  # type: ignore[attr-defined]
+                try:
+                    if getattr(fdef, 'kind', None) != 'relation':
+                        continue
+                    meta = getattr(fdef, 'meta', {}) or {}
+                    if not bool(meta.get('mutation')):
+                        continue
+                    tgt = meta.get('target')
+                    if not tgt:
+                        continue
+                    allowed_targets.add(tgt)
+                    if tgt not in scope_by_target:
+                        scope_by_target[tgt] = meta.get('scope')
+                except Exception:
+                    continue
     except Exception:
         allowed_targets = None
+        scope_by_target = {}
     for tname, btype_cls in list(schema.types.items()):
         if allowed_targets is not None and (not tname or tname not in allowed_targets):
             continue
-        triplet = build_upsert_resolver_for_type(schema, btype_cls)
+        triplet = build_upsert_resolver_for_type(schema, btype_cls, relation_scope=scope_by_target.get(tname))
         if triplet is None:
             continue
         fname_u, field_obj, st_ret = triplet
