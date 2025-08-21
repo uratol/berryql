@@ -138,6 +138,74 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     scalar_vals[k] = v
                 elif fdef.kind == 'relation':
                     relation_vals[k] = v
+            # Pre-create single child relations when FK is on parent (e.g., Post.author -> users.id via posts.author_id)
+            precreated_children: Dict[str, Any] = {}
+            for rel_key, rel_value in list(relation_vals.items()):
+                try:
+                    rel_def = btype_local.__berry_fields__.get(rel_key)
+                    if rel_def is None or getattr(rel_def, 'kind', None) != 'relation':
+                        continue
+                    meta = getattr(rel_def, 'meta', {}) or {}
+                    is_single = bool(meta.get('single'))
+                    if not is_single:
+                        continue
+                    # Only when user provided a non-empty child payload
+                    if rel_value is None:
+                        continue
+                    target_name = meta.get('target')
+                    if not target_name:
+                        continue
+                    child_btype = schema.types.get(target_name)
+                    child_model = getattr(child_btype, 'model', None) if child_btype else None
+                    if not child_btype or not child_model:
+                        continue
+                    # If parent's FK references child, create child first to have its id
+                    fk_on_parent = None
+                    try:
+                        fk_on_parent = schema._find_parent_fk_column_name(model_cls_local, child_model, rel_key)
+                    except Exception:
+                        fk_on_parent = None
+                    if not fk_on_parent:
+                        continue
+                    child_data = schema._input_to_dict(rel_value)
+                    if not isinstance(child_data, dict):
+                        continue
+                    # Require at least one non-null value for a non-nullable column (excluding pk)
+                    try:
+                        child_pk = schema._get_pk_name(child_model)
+                    except Exception:
+                        child_pk = 'id'
+                    has_substantial = False
+                    try:
+                        for cc in getattr(getattr(child_model, '__table__', None), 'columns', []) or []:
+                            if getattr(cc, 'nullable', True):
+                                continue
+                            if cc.name == child_pk:
+                                continue
+                            if child_data.get(cc.name) is not None:
+                                has_substantial = True
+                                break
+                    except Exception:
+                        # Fallback: any non-None value in payload
+                        has_substantial = any(v is not None for v in child_data.values())
+                    if not has_substantial:
+                        continue
+                    child_inst = await _upsert_single(child_model, child_btype, child_data)
+                    try:
+                        child_pk = schema._get_pk_name(child_model)
+                    except Exception:
+                        child_pk = 'id'
+                    try:
+                        child_id = getattr(child_inst, child_pk, None)
+                    except Exception:
+                        child_id = None
+                    if child_id is not None and scalar_vals.get(fk_on_parent) in (None, 0):
+                        scalar_vals[fk_on_parent] = child_id
+                    precreated_children[rel_key] = child_inst
+                    # Remove from relation_vals so it's not processed again later
+                    del relation_vals[rel_key]
+                except Exception:
+                    continue
             # Parent context: ensure child FK to parent is set on payload
             child_rel_to_parent_name: Optional[str] = None
             if parent_ctx is not None:
@@ -348,6 +416,13 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     if cur_val is None:
                         setattr(instance, child_rel_to_parent_name, parent_ctx.get('parent_inst'))
                         _logger.warning("upsert(child): set relation %s -> parent instance", child_rel_to_parent_name)
+                except Exception:
+                    pass
+            # If we pre-created a single child whose FK is on parent, also set relationship attribute when possible
+            for _rk, _child in list(precreated_children.items()):
+                try:
+                    if getattr(instance, _rk, None) is None:
+                        setattr(instance, _rk, _child)
                 except Exception:
                     pass
             # Flush to materialize identities
