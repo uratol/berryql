@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 import logging
+import uuid
 from typing import Any, Dict, Optional, Type, List, get_args, get_origin, cast
 import strawberry
 from typing import TYPE_CHECKING
@@ -143,6 +144,43 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     scalar_vals[k] = v
                 elif fdef.kind == 'relation':
                     relation_vals[k] = v
+            # Helper: detect MSSQL dialect and GUID PK to pre-seed id to avoid OUTPUT with triggers
+            def _is_mssql(session_local) -> bool:
+                try:
+                    bind = getattr(session_local, 'bind', None)
+                    if bind is None:
+                        bind = session_local.get_bind()  # type: ignore[attr-defined]
+                    # AsyncEngine exposes sync_engine
+                    dialect = getattr(bind, 'dialect', None) or getattr(getattr(bind, 'sync_engine', None), 'dialect', None)
+                    name = getattr(dialect, 'name', '')
+                    return str(name).lower() == 'mssql'
+                except Exception:
+                    return False
+            def _has_guid_pk(model_cls_inner, pk_name_inner: str) -> bool:
+                try:
+                    col = getattr(getattr(model_cls_inner, '__table__', None), 'c', {}).get(pk_name_inner)  # type: ignore[attr-defined]
+                except Exception:
+                    col = None
+                if col is None:
+                    try:
+                        col = getattr(getattr(model_cls_inner, '__table__', None).c, pk_name_inner)  # type: ignore[attr-defined]
+                    except Exception:
+                        col = None
+                try:
+                    if col is not None:
+                        # Detect our custom GUID TypeDecorator or MSSQL UNIQUEIDENTIFIER
+                        t = getattr(col, 'type', None)
+                        tname = getattr(getattr(t, '__class__', object), '__name__', '')
+                        if 'GUID' in str(tname):
+                            return True
+                        impl = getattr(t, 'impl', None)
+                        if impl and 'UNIQUEIDENTIFIER' in str(getattr(getattr(impl, '__class__', object), '__name__', '')).upper():
+                            return True
+                        if 'UNIQUEIDENTIFIER' in str(t).upper():
+                            return True
+                except Exception:
+                    pass
+                return False
             # Pre-create single child relations when FK is on parent (e.g., Post.author -> users.id via posts.author_id)
             precreated_children: Dict[str, Any] = {}
             for rel_key, rel_value in list(relation_vals.items()):
@@ -337,6 +375,17 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                         setattr(instance, pk_name, pk_val)
                     except Exception:
                         pass
+                # For MSSQL tables with GUID PKs that normally rely on server_default (e.g., newsequentialid()),
+                # pre-generate a UUID to avoid implicit RETURNING/OUTPUT, which fails when triggers exist.
+                try:
+                    current_pk = getattr(instance, pk_name, None)
+                except Exception:
+                    current_pk = None
+                try:
+                    if current_pk in (None, '') and _is_mssql(session) and _has_guid_pk(model_cls_local, pk_name):
+                        setattr(instance, pk_name, uuid.uuid4())
+                except Exception:
+                    pass
                 session.add(instance)
             # If updating existing row: enforce that it's within scope BEFORE modifying
             if pk_val is not None and instance is not None and eff_scope is not None:
