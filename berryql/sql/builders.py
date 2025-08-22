@@ -215,7 +215,7 @@ class RelationSQLBuilders:
             sel,
             child_model_cls,
             rel_default_where,
-            strict=False,
+            strict=True,
             to_where_dict=to_where_dict,
             expr_from_where_dict=expr_from_where_dict,
             info=info,
@@ -267,7 +267,7 @@ class RelationSQLBuilders:
             sel,
             child_model_cls,
             rel_cfg.get('default_where'),
-            strict=False,
+            strict=True,
             to_where_dict=to_where_dict,
             expr_from_where_dict=expr_from_where_dict,
             info=info,
@@ -628,7 +628,7 @@ class RelationSQLBuilders:
                 where_parts,
                 child_model_cls,
                 rel_default_where,
-                strict=False,
+                strict=True,
                 to_where_dict=to_where_dict,
                 expr_from_where_dict=expr_from_where_dict,
                 adapter=adapter,
@@ -778,9 +778,9 @@ class RelationSQLBuilders:
                         dr2 = ncfg.get('default_where')
                         if dr2 is not None:
                             if isinstance(dr2, (dict, str)):
-                                wdict2 = to_where_dict(dr2, strict=False)
+                                wdict2 = to_where_dict(dr2, strict=True)
                                 if wdict2:
-                                    expr2 = expr_from_where_dict(grand_model, wdict2, strict=False)
+                                    expr2 = expr_from_where_dict(grand_model, wdict2, strict=True)
                                     if expr2 is not None:
                                         n_sel = n_sel.where(expr2)
                             else:
@@ -1017,9 +1017,9 @@ class RelationSQLBuilders:
             dr = rel_cfg.get('default_where')
             if dr is not None:
                 if isinstance(dr, (dict, str)):
-                    wdict = to_where_dict(dr, strict=False)
+                    wdict = to_where_dict(dr, strict=True)
                     if wdict:
-                        expr = expr_from_where_dict(child_model_cls_i, wdict, strict=False)
+                        expr = expr_from_where_dict(child_model_cls_i, wdict, strict=True)
                         if expr is not None:
                             inner_sel_i = inner_sel_i.where(expr)
                 else:
@@ -1143,20 +1143,43 @@ class RelationSQLBuilders:
                             n_model_i = None
                         if not n_model_i:
                             continue
-                        # Find FK from n_model_i (grandchild) to parent child_model (parent_model_cls_local)
+                        # Determine whether nested is single or list
+                        is_single_i = bool(ncfg_i.get('single'))
                         g_fk_col_name_i: str | None = None
-                        try:
-                            for col in n_model_i.__table__.columns:
-                                for fk in col.foreign_keys:
-                                    if fk.column.table.name == parent_model_cls_local.__table__.name:
-                                        g_fk_col_name_i = col.name
+                        child_fk_to_nested_i: str | None = None
+                        if is_single_i:
+                            # For single nested, we need FK from parent child_model -> nested model
+                            try:
+                                # Try to infer from naming or metadata
+                                rel_name_local = nname_i
+                                fk_name_guess = f"{rel_name_local}_id"
+                                # Use registry helper to find parent FK column name on parent_model_cls_local
+                                pfk_name = self.registry._find_parent_fk_column_name(parent_model_cls_local, n_model_i, rel_name_local)
+                                child_fk_to_nested_i = pfk_name or fk_name_guess
+                                # Validate that such a column exists on parent_model_cls_local
+                                if hasattr(parent_model_cls_local, '__table__'):
+                                    if not any(c.name == child_fk_to_nested_i for c in parent_model_cls_local.__table__.columns):
+                                        # If not found, skip this nested spec
+                                        child_fk_to_nested_i = None
+                            except Exception:
+                                child_fk_to_nested_i = None
+                            if not child_fk_to_nested_i:
+                                # can't correlate this single nested; skip it
+                                continue
+                        else:
+                            # For list nested, find FK from nested model -> parent child model
+                            try:
+                                for col in n_model_i.__table__.columns:
+                                    for fk in col.foreign_keys:
+                                        if fk.column.table.name == parent_model_cls_local.__table__.name:
+                                            g_fk_col_name_i = col.name
+                                            break
+                                    if g_fk_col_name_i is not None:
                                         break
-                                if g_fk_col_name_i is not None:
-                                    break
-                        except Exception:
-                            g_fk_col_name_i = None
-                        if not g_fk_col_name_i:
-                            continue
+                            except Exception:
+                                g_fk_col_name_i = None
+                            if not g_fk_col_name_i:
+                                continue
                         # Determine scalar fields (map to (src, alias) pairs)
                         try:
                             scalars_on_n_i = [sf for sf, sd in (self.registry.types.get(n_target_i).__berry_fields__.items() if n_target_i and self.registry.types.get(n_target_i) else []) if sd.kind == 'scalar']
@@ -1199,10 +1222,9 @@ class RelationSQLBuilders:
                                 child_specs_i = _mk_nested_specs(n_model_i, n_target_i, ncfg_i.get('nested') or {})
                         except Exception:
                             child_specs_i = []
-                        specs.append({
+                        spec_obj = {
                             'alias': nname_i,
                             'model': n_model_i,
-                            'fk_col_name': g_fk_col_name_i,
                             'fields': n_fields_i or None,
                             'where': self._resolve_graphql_value(info, ncfg_i.get('where')),
                             'default_where': ncfg_i.get('default_where'),
@@ -1212,7 +1234,14 @@ class RelationSQLBuilders:
                             'limit': ncfg_i.get('limit'),
                             'offset': ncfg_i.get('offset'),
                             'nested': child_specs_i or None,
-                        })
+                        }
+                        if is_single_i:
+                            spec_obj['mode'] = 'single'
+                            spec_obj['child_fk_name'] = child_fk_to_nested_i
+                        else:
+                            spec_obj['mode'] = 'list'
+                            spec_obj['fk_col_name'] = g_fk_col_name_i
+                        specs.append(spec_obj)
                     return specs
                 # Build nested specs from the immediate nested map
                 for nname, ncfg in nested_cfg_map.items():
@@ -1224,34 +1253,50 @@ class RelationSQLBuilders:
                         n_model = None
                     if not n_model:
                         continue
-                    # Find FK from grandchild (n_model) to child (child_model_cls), honoring explicit fk_column_name
+                    # Determine correlation for nested
+                    is_single_nested = bool(ncfg.get('single'))
                     g_fk_col_name: str | None = None
-                    try:
-                        explicit_child_fk = ncfg.get('fk_column_name')
-                    except Exception:
-                        explicit_child_fk = None
-                    try:
-                        if explicit_child_fk and hasattr(n_model, '__table__'):
-                            for col in n_model.__table__.columns:
-                                if col.name == explicit_child_fk:
-                                    g_fk_col_name = col.name
-                                    break
-                    except Exception:
-                        g_fk_col_name = None
-                    if g_fk_col_name is None:
+                    child_fk_to_nested: str | None = None
+                    if is_single_nested:
+                        # Need FK on child -> nested model
                         try:
-                            for col in n_model.__table__.columns:
-                                for fk in col.foreign_keys:
-                                    if fk.column.table.name == child_model_cls.__table__.name:
+                            rel_name_local2 = nname
+                            pfk_name2 = self.registry._find_parent_fk_column_name(child_model_cls, n_model, rel_name_local2)
+                            child_fk_to_nested = pfk_name2 or f"{rel_name_local2}_id"
+                            if hasattr(child_model_cls, '__table__') and not any(c.name == child_fk_to_nested for c in child_model_cls.__table__.columns):
+                                child_fk_to_nested = None
+                        except Exception:
+                            child_fk_to_nested = None
+                        if not child_fk_to_nested:
+                            continue
+                    else:
+                        # Find FK from grandchild (n_model) to child (child_model_cls), honoring explicit fk_column_name
+                        try:
+                            explicit_child_fk = ncfg.get('fk_column_name')
+                        except Exception:
+                            explicit_child_fk = None
+                        try:
+                            if explicit_child_fk and hasattr(n_model, '__table__'):
+                                for col in n_model.__table__.columns:
+                                    if col.name == explicit_child_fk:
                                         g_fk_col_name = col.name
                                         break
-                                if g_fk_col_name is not None:
-                                    break
                         except Exception:
                             g_fk_col_name = None
-                    if not g_fk_col_name:
-                        # can't correlate; skip this nested
-                        continue
+                        if g_fk_col_name is None:
+                            try:
+                                for col in n_model.__table__.columns:
+                                    for fk in col.foreign_keys:
+                                        if fk.column.table.name == child_model_cls.__table__.name:
+                                            g_fk_col_name = col.name
+                                            break
+                                    if g_fk_col_name is not None:
+                                        break
+                            except Exception:
+                                g_fk_col_name = None
+                        if not g_fk_col_name:
+                            # can't correlate; skip this nested
+                            continue
                     # Determine fields for nested object: only scalar fields (map to pairs)
                     try:
                         scalars_on_n = [sf for sf, sd in (self.registry.types.get(n_target).__berry_fields__.items() if n_target and self.registry.types.get(n_target) else []) if sd.kind == 'scalar']
@@ -1293,10 +1338,9 @@ class RelationSQLBuilders:
                         n_order_multi_mapped2 = []
                     # Build deeper nested children under this nested node
                     nested_children_specs = _mk_nested_specs(n_model, n_target, ncfg.get('nested') or {}) if (ncfg.get('nested') or {}) else []
-                    nested_specs.append({
+                    spec_obj2 = {
                         'alias': nname,
                         'model': n_model,
-                        'fk_col_name': g_fk_col_name,
                         'fields': n_fields or None,
                         'where': self._resolve_graphql_value(info, ncfg.get('where')),
                         'default_where': ncfg.get('default_where'),
@@ -1306,7 +1350,14 @@ class RelationSQLBuilders:
                         'limit': ncfg.get('limit'),
                         'offset': ncfg.get('offset'),
                         'nested': nested_children_specs or None,
-                    })
+                    }
+                    if is_single_nested:
+                        spec_obj2['mode'] = 'single'
+                        spec_obj2['child_fk_name'] = child_fk_to_nested
+                    else:
+                        spec_obj2['mode'] = 'list'
+                        spec_obj2['fk_col_name'] = g_fk_col_name
+                    nested_specs.append(spec_obj2)
                 # Build full JSON for the list relation, including nested arrays
                 # Compute effective top-level order_dir: ASC when order_by explicit without explicit dir
                 effective_order_dir = self._effective_order_dir(rel_cfg)
@@ -1353,7 +1404,7 @@ class RelationSQLBuilders:
                 where_parts_rel,
                 child_model_cls,
                 rel_cfg.get('default_where'),
-                strict=False,
+                strict=True,
                 to_where_dict=to_where_dict,
                 expr_from_where_dict=expr_from_where_dict,
                 adapter=adapter,

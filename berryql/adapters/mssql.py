@@ -248,7 +248,7 @@ class MSSQLAdapter(BaseAdapter):
         if extra_where_sql:
             where_parts.extend([str(x) for x in extra_where_sql if x])
         n_where = ' AND '.join(where_parts)
-        # Handle nested-of-nested arrays: build JSON subqueries correlated to grand_model -> current child
+        # Handle nested-of-nested arrays and singles: build JSON subqueries correlated to grand_model -> current child
         nested_cols = ''
         if nested_children:
             n_parts: list[str] = []
@@ -256,38 +256,149 @@ class MSSQLAdapter(BaseAdapter):
                 try:
                     sub_alias = nn.get('alias')
                     sub_model = nn.get('model')
-                    sub_fk = nn.get('fk_col_name')
-                    sub_fields = nn.get('fields')
-                    sub_where = nn.get('where')
-                    sub_default_where = nn.get('default_where')
-                    sub_order_by = nn.get('order_by')
-                    sub_order_dir = nn.get('order_dir')
-                    sub_order_multi = nn.get('order_multi')
-                    sub_limit = nn.get('limit')
-                    sub_offset = nn.get('offset')
-                    # Recurse with PK of current child (grand_model)
-                    try:
-                        child_pk_recur = next(iter(grand_model.__table__.primary_key.columns)).name
-                    except Exception:
-                        child_pk_recur = 'id'
-                    sub_sql = self.build_nested_list_sql(
-                        alias=sub_alias,
-                        grand_model=sub_model,
-                        child_table=grand_model,
-                        g_fk_col_name=sub_fk,
-                        child_pk_name=child_pk_recur,
-                        fields=sub_fields,
-                        where_dict=sub_where,
-                        default_where=sub_default_where,
-                        order_by=sub_order_by,
-                        order_dir=sub_order_dir,
-                        order_multi=sub_order_multi,
-                        limit=sub_limit,
-                        offset=sub_offset,
-                        extra_where_sql=None,
-                        nested_children=None,
-                    )
-                    n_parts.append(f"ISNULL(({sub_sql}), '[]') AS [{sub_alias}]")
+                    sub_mode = nn.get('mode') or 'list'
+                    if sub_mode == 'single':
+                        # Single nested object off each grand_model row: join grand_model.child_fk = sub_model.pk
+                        child_fk_name = nn.get('child_fk_name')
+                        if not child_fk_name:
+                            continue
+                        try:
+                            sub_pk_name = next(iter(sub_model.__table__.primary_key.columns)).name
+                        except Exception:
+                            sub_pk_name = 'id'
+                        # Build where (join + where/default_where)
+                        where_parts_s: list[str] = [
+                            f"{self.table_ident(grand_model)}.[{child_fk_name}] = {self.table_ident(sub_model)}.[{sub_pk_name}]"
+                        ]
+                        def _as_dict2(maybe):
+                            import json as _json
+                            if isinstance(maybe, dict):
+                                return maybe
+                            if isinstance(maybe, str):
+                                try:
+                                    v = _json.loads(maybe)
+                                    return v if isinstance(v, dict) else None
+                                except Exception:
+                                    return None
+                            return None
+                        wdict_s = _as_dict2(nn.get('where'))
+                        if wdict_s:
+                            where_parts_s.extend(self.where_from_dict(sub_model, wdict_s))
+                        dwdict_s = _as_dict2(nn.get('default_where'))
+                        if dwdict_s:
+                            where_parts_s.extend(self.where_from_dict(sub_model, dwdict_s))
+                        join_cond = ' AND '.join(where_parts_s)
+                        # Base columns for sub_model
+                        cols_pairs = nn.get('fields') or [(c.name, c.name) for c in sub_model.__table__.columns]
+                        sub_cols = ', '.join([f"{self.table_ident(sub_model)}.[{src}] AS [{alias}]" for src, alias in cols_pairs])
+                        # Include nested under this single (one recursive level: singles and lists)
+                        extra_cols = ''
+                        sub_children = nn.get('nested') or []
+                        if sub_children:
+                            sub_parts: list[str] = []
+                            for sn in sub_children:
+                                s_alias = sn.get('alias')
+                                s_model = sn.get('model')
+                                s_mode = sn.get('mode') or 'list'
+                                if s_mode == 'single':
+                                    s_child_fk = sn.get('child_fk_name')
+                                    if not s_child_fk:
+                                        continue
+                                    try:
+                                        s_pk = next(iter(s_model.__table__.primary_key.columns)).name
+                                    except Exception:
+                                        s_pk = 'id'
+                                    s_where = [f"{self.table_ident(sub_model)}.[{s_child_fk}] = {self.table_ident(s_model)}.[{s_pk}]"]
+                                    wdict_ss = _as_dict2(sn.get('where'))
+                                    if wdict_ss:
+                                        s_where.extend(self.where_from_dict(s_model, wdict_ss))
+                                    dwdict_ss = _as_dict2(sn.get('default_where'))
+                                    if dwdict_ss:
+                                        s_where.extend(self.where_from_dict(s_model, dwdict_ss))
+                                    s_join = ' AND '.join(s_where)
+                                    s_cols_pairs = sn.get('fields') or [(c.name, c.name) for c in s_model.__table__.columns]
+                                    s_json = self.build_single_relation_json(
+                                        child_table=s_model,
+                                        projected_columns=s_cols_pairs,
+                                        join_condition=s_join,
+                                    )
+                                    sub_parts.append(f"ISNULL(({str(s_json).strip()}), 'null') AS [{s_alias}]")
+                                else:
+                                    # list under the single: s_model.fk_to_sub_model = sub_model.pk
+                                    s_fk = sn.get('fk_col_name')
+                                    if not s_fk:
+                                        # Try to infer FK from s_model to sub_model
+                                        try:
+                                            for c in s_model.__table__.columns:
+                                                for fk in c.foreign_keys:
+                                                    if fk.column.table.name == sub_model.__table__.name:
+                                                        s_fk = c.name
+                                                        break
+                                                if s_fk:
+                                                    break
+                                        except Exception:
+                                            s_fk = None
+                                    if not s_fk:
+                                        continue
+                                    try:
+                                        sub_pk_for_nested = next(iter(sub_model.__table__.primary_key.columns)).name
+                                    except Exception:
+                                        sub_pk_for_nested = 'id'
+                                    nsql2 = self.build_nested_list_sql(
+                                        alias=s_alias,
+                                        grand_model=s_model,
+                                        child_table=sub_model,
+                                        g_fk_col_name=s_fk,
+                                        child_pk_name=sub_pk_for_nested,
+                                        fields=sn.get('fields'),
+                                        where_dict=_as_dict2(sn.get('where')),
+                                        default_where=_as_dict2(sn.get('default_where')),
+                                        order_by=sn.get('order_by'),
+                                        order_dir=sn.get('order_dir'),
+                                        order_multi=sn.get('order_multi'),
+                                        limit=sn.get('limit'),
+                                        offset=sn.get('offset'),
+                                        extra_where_sql=None,
+                                        nested_children=sn.get('nested') or None,
+                                    )
+                                    sub_parts.append(f"ISNULL(({nsql2}), '[]') AS [{s_alias}]")
+                            if sub_parts:
+                                extra_cols = ', ' + ', '.join(sub_parts)
+                        single_sql = f"ISNULL((SELECT TOP 1 {sub_cols}{extra_cols} FROM {self.table_ident(sub_model)} WHERE {join_cond} FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
+                        n_parts.append(f"{single_sql} AS [{sub_alias}]")
+                    else:
+                        sub_fk = nn.get('fk_col_name')
+                        sub_fields = nn.get('fields')
+                        sub_where = nn.get('where')
+                        sub_default_where = nn.get('default_where')
+                        sub_order_by = nn.get('order_by')
+                        sub_order_dir = nn.get('order_dir')
+                        sub_order_multi = nn.get('order_multi')
+                        sub_limit = nn.get('limit')
+                        sub_offset = nn.get('offset')
+                        # Recurse with PK of current child (grand_model)
+                        try:
+                            child_pk_recur = next(iter(grand_model.__table__.primary_key.columns)).name
+                        except Exception:
+                            child_pk_recur = 'id'
+                        sub_sql = self.build_nested_list_sql(
+                            alias=sub_alias,
+                            grand_model=sub_model,
+                            child_table=grand_model,
+                            g_fk_col_name=sub_fk,
+                            child_pk_name=child_pk_recur,
+                            fields=sub_fields,
+                            where_dict=sub_where,
+                            default_where=sub_default_where,
+                            order_by=sub_order_by,
+                            order_dir=sub_order_dir,
+                            order_multi=sub_order_multi,
+                            limit=sub_limit,
+                            offset=sub_offset,
+                            extra_where_sql=None,
+                            nested_children=None,
+                        )
+                        n_parts.append(f"ISNULL(({sub_sql}), '[]') AS [{sub_alias}]")
                 except Exception:
                     continue
             if n_parts:
@@ -357,7 +468,96 @@ class MSSQLAdapter(BaseAdapter):
             for n in nested:
                 alias = n.get('alias')
                 gm = n.get('model')
+                mode = n.get('mode') or 'list'
+                if mode == 'single':
+                    # Single nested object: join condition is child_model.child_fk_name = gm.pk
+                    child_fk_name = n.get('child_fk_name')
+                    if not child_fk_name:
+                        continue
+                    try:
+                        gm_pk = next(iter(gm.__table__.primary_key.columns)).name
+                    except Exception:
+                        gm_pk = 'id'
+                    join_cond = f"{self.table_ident(child_model)}.[{child_fk_name}] = {self.table_ident(gm)}.[{gm_pk}]"
+                    cols_pairs = n.get('fields') or []
+                    # When no explicit fields provided, select all columns from gm
+                    if not cols_pairs:
+                        cols_pairs = [(c.name, c.name) for c in gm.__table__.columns]
+                    # Build column list including nested-of-single projections
+                    gm_cols = ', '.join([f"{self.table_ident(gm)}.[{src}] AS [{alias}]" for src, alias in cols_pairs])
+                    extra_nested_cols = ''
+                    # Process nested children under this single node (if any)
+                    sub_nests = n.get('nested') or []
+                    if sub_nests:
+                        sub_parts = []
+                        for sn in sub_nests:
+                            s_alias = sn.get('alias')
+                            s_model = sn.get('model')
+                            s_mode = sn.get('mode') or 'list'
+                            if s_mode == 'single':
+                                # Correlate gm -> s_model via gm.child_fk_name = s_model.pk
+                                s_child_fk = sn.get('child_fk_name')
+                                if not s_child_fk:
+                                    continue
+                                try:
+                                    s_pk = next(iter(s_model.__table__.primary_key.columns)).name
+                                except Exception:
+                                    s_pk = 'id'
+                                s_join = f"{self.table_ident(gm)}.[{s_child_fk}] = {self.table_ident(s_model)}.[{s_pk}]"
+                                s_cols_pairs = sn.get('fields') or [(c.name, c.name) for c in s_model.__table__.columns]
+                                s_sub = self.build_single_relation_json(
+                                    child_table=s_model,
+                                    projected_columns=s_cols_pairs,
+                                    join_condition=s_join,
+                                )
+                                sub_parts.append(f"ISNULL(({str(s_sub).strip()}), 'null') AS [{s_alias}]")
+                            else:
+                                # List under gm: s_model.fk_to_gm = gm.pk
+                                s_fk = sn.get('fk_col_name')
+                                if not s_fk:
+                                    continue
+                                try:
+                                    child_pk_for_nested = gm_pk
+                                except Exception:
+                                    child_pk_for_nested = 'id'
+                                nsql = self.build_nested_list_sql(
+                                    alias=s_alias,
+                                    grand_model=s_model,
+                                    child_table=gm,
+                                    g_fk_col_name=s_fk,
+                                    child_pk_name=child_pk_for_nested,
+                                    fields=sn.get('fields'),
+                                    where_dict=_as_dict(sn.get('where')),
+                                    default_where=_as_dict(sn.get('default_where')),
+                                    order_by=sn.get('order_by'),
+                                    order_dir=sn.get('order_dir'),
+                                    order_multi=sn.get('order_multi'),
+                                    limit=sn.get('limit'),
+                                    offset=sn.get('offset'),
+                                    extra_where_sql=None,
+                                    nested_children=sn.get('nested') or None,
+                                )
+                                sub_parts.append(f"ISNULL(({nsql}), '[]') AS [{s_alias}]")
+                        if sub_parts:
+                            extra_nested_cols = ', ' + ', '.join(sub_parts)
+                    # Compose final single object with nested columns
+                    inner = f"ISNULL((SELECT TOP 1 {gm_cols}{extra_nested_cols} FROM {self.table_ident(gm)} WHERE {join_cond} FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
+                    nested_parts.append(f"{inner} AS [{alias}]")
+                    continue
+                # List nested branch (existing behavior)
                 gfk = n.get('fk_col_name')
+                if not gfk:
+                    # Fallback: find FK on nested model (gm) referencing child_model
+                    try:
+                        for col in gm.__table__.columns:
+                            for fk in col.foreign_keys:
+                                if fk.column.table.name == child_model.__table__.name:
+                                    gfk = col.name
+                                    break
+                            if gfk:
+                                break
+                    except Exception:
+                        gfk = None
                 # Prepare nested-of-nested specs if any
                 n_children = []
                 try:
