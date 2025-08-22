@@ -143,6 +143,8 @@ class PostQL(BerryType):
     created_at = field()
     # Base64-encoded single binary blob across dialects
     binary_blob = field()
+    # Read-only computed scalar mirroring SQLAlchemy column_property on Post
+    content_length = field(returns=int, read_only=True)
     author = relation('UserQL', single=True, arguments={
         'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
         'created_at_between': lambda M, info, v: (M.created_at.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None),
@@ -170,8 +172,8 @@ class PostQL(BerryType):
         ),
         returns={'min_created_at': datetime, 'comments_count': int}
     )
-    # Polymorphic views for posts
-    views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}')
+    # Polymorphic views for posts + mutation
+    views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}', mutation=True)
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):

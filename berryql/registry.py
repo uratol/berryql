@@ -242,8 +242,19 @@ class BerrySchema:
                 # Skip private scalars
                 if isinstance(fname, str) and fname.startswith('_'):
                     continue
+                # Skip computed/read-only scalars from mutation input types
+                try:
+                    _meta = (getattr(fdef, 'meta', {}) or {})
+                    if _meta.get('read_only') or _meta.get('computed'):
+                        continue
+                except Exception:
+                    pass
                 src_col = (fdef.meta or {}).get('column') if isinstance(fdef.meta, dict) else None
-                py_t = col_type_map.get(src_col or fname, str)
+                # Allow explicit override of Python type via meta.returns
+                try:
+                    py_t = (fdef.meta or {}).get('returns') or col_type_map.get(src_col or fname, str)
+                except Exception:
+                    py_t = col_type_map.get(src_col or fname, str)
                 try:
                     anns[fname] = Optional[py_t]
                 except Exception:

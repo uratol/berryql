@@ -1,8 +1,8 @@
 """Database models for BerryQL tests (shared)."""
 
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, JSON
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, JSON, func
+from sqlalchemy.orm import DeclarativeBase, relationship, column_property
 from sqlalchemy.types import TypeDecorator, LargeBinary
 from sqlalchemy.dialects import postgresql, mssql
 
@@ -90,6 +90,8 @@ class Post(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     # New: single binary blob (base64 in GraphQL)
     binary_blob = Column(BinaryBlob(), nullable=True)
+    # Computed (read-only) column: length of content; uses SQL function for cross-dialect support
+    content_length = column_property(func.length(content))
     
     author = relationship("User", back_populates="posts")
     post_comments = relationship("PostComment", back_populates="post")
