@@ -183,38 +183,32 @@ def build_merge_resolver_for_type(
                 return True
             # Resolve potential GraphQL variables/literals
             v = _resolve_scope_value(scope_raw)
+            # Match query path: resolve async callables (like apply_root_filters does)
+            if callable(v):
+                try:
+                    v_res = v(model_cls_local, info)
+                    import inspect as _ins
+                    if _ins.isawaitable(v_res):
+                        v_res = await v_res  # type: ignore
+                    v = v_res
+                except Exception:
+                    # Do not suppress scope resolution errors
+                    raise
             # Base statement: select PK for this instance
             stmt = select(getattr(model_cls_local.__table__.c, pk_name_local)).select_from(model_cls_local).where(
                 getattr(model_cls_local.__table__.c, pk_name_local) == pk_val_local
             )
-            # Reuse common builder to apply where regardless of type (dict/str/callable/expr)
-            try:
-                builder = RelationSQLBuilders(schema)
-                stmt = builder._apply_where_common(
-                    stmt,
-                    model_cls_local,
-                    v,
-                    strict=True,
-                    to_where_dict=_to_where_dict,
-                    expr_from_where_dict=_expr_from_where_dict,
-                    info=info,
-                )
-            except Exception:
-                # Fallback: try to coerce dict/str via helpers directly
-                try:
-                    if isinstance(v, (dict, str)):
-                        wdict = _to_where_dict(v, strict=True)
-                        if wdict:
-                            expr = cast(ColumnElement[bool], _expr_from_where_dict(model_cls_local, wdict, strict=True))
-                            if expr is not None:
-                                stmt = stmt.where(expr)
-                    else:
-                        expr2 = v(model_cls_local, info) if callable(v) else v
-                        if expr2 is not None:
-                            stmt = stmt.where(cast(ColumnElement[bool], expr2))
-                except Exception:
-                    # If scope can't be applied, do not block the mutation here; treat as no scope.
-                    pass
+            # Reuse common builder to apply where regardless of type (dict/str/expr)
+            builder = RelationSQLBuilders(schema)
+            stmt = builder._apply_where_common(
+                stmt,
+                model_cls_local,
+                v,
+                strict=True,
+                to_where_dict=_to_where_dict,
+                expr_from_where_dict=_expr_from_where_dict,
+                info=info,
+            )
             res = await session.execute(stmt)
             row = res.first()
             return bool(row)
