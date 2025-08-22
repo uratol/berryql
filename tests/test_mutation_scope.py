@@ -11,8 +11,8 @@ async def test_nested_mutation_scope_rejects_out_of_scope_like(db_session, popul
 
     m = (
         """
-        mutation Upsert($payload: PostQLInput!) {
-          upsert_post(payload: $payload) { id title }
+                mutation Upsert($payload: PostQLInput!) {
+                    merge_post(payload: $payload) { id title }
         }
         """
     )
@@ -47,8 +47,8 @@ async def test_nested_mutation_scope_allows_in_scope_like(db_session, populated_
 
     m = (
         """
-        mutation Upsert($payload: PostQLInput!) {
-          upsert_post(payload: $payload) {
+                mutation Upsert($payload: PostQLInput!) {
+                    merge_post(payload: $payload) {
             id
             post_comments { id content admin_likes { id user_id } }
           }
@@ -74,7 +74,7 @@ async def test_nested_mutation_scope_allows_in_scope_like(db_session, populated_
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
     assert res.data is not None, "No data returned from mutation"
-    post = res.data["upsert_post"]
+    post = res.data["merge_post"]
     pcs = post["post_comments"]
     assert isinstance(pcs, list) and len(pcs) == 1
     likes = pcs[0]["admin_likes"]
@@ -91,8 +91,8 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
     # First create a post with one comment and one admin_like (user_id=1)
     create_m = (
         """
-        mutation Upsert($payload: PostQLInput!) {
-          upsert_post(payload: $payload) {
+                mutation Upsert($payload: PostQLInput!) {
+                    merge_post(payload: $payload) {
             id
             post_comments { id content admin_likes { id user_id } }
           }
@@ -118,15 +118,15 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
     res1 = await schema.execute(create_m, variable_values=create_vars, context_value={"db_session": db_session})
     assert res1.errors is None, res1.errors
     assert res1.data is not None, "No data returned from mutation"
-    post = res1.data["upsert_post"]
+    post = res1.data["merge_post"]
     pc = post["post_comments"][0]
     like_id = int(pc["admin_likes"][0]["id"])
 
     # Now attempt to update that like out of scope
     upd_m = (
         """
-        mutation Upsert($payload: PostQLInput!) {
-          upsert_post(payload: $payload) { id }
+                mutation Upsert($payload: PostQLInput!) {
+                    merge_post(payload: $payload) { id }
         }
         """
     )

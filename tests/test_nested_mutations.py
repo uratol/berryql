@@ -5,7 +5,7 @@ from tests.schema import schema
 
 @pytest.mark.asyncio
 async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_db):
-    # Use top-level auto-generated mutation upsert_post with nested relations
+    # Use top-level auto-generated mutation merge_post with nested relations
     u1 = populated_db['users'][0]
     u2 = populated_db['users'][1]
     u3 = populated_db['users'][2]
@@ -13,7 +13,7 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
     mutation = (
         """
         mutation Upsert($payload: PostQLInput!) {
-          upsert_post(payload: $payload) {
+          merge_post(payload: $payload) {
             id
             title
             author_id
@@ -48,7 +48,7 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
     }
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    post = res.data["upsert_post"]
+    post = res.data["merge_post"]
     assert post["title"] == "Nested Create"
     assert int(post["author_id"]) == int(u1.id)
     pcs = post["post_comments"]
@@ -87,7 +87,7 @@ async def test_mutation_domain_upsert_posts(db_session, populated_db):
         """
         mutation($payload: PostQLInput!) {
           blogDomain { 
-            upsert_posts(payload: $payload) {
+            merge_posts(payload: $payload) {
               id
               title
             }
@@ -104,5 +104,5 @@ async def test_mutation_domain_upsert_posts(db_session, populated_db):
     }
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    data = res.data["blogDomain"]["upsert_posts"]
+    data = res.data["blogDomain"]["merge_posts"]
     assert data["title"] == "Domain Upsert"

@@ -61,6 +61,31 @@ from .core.hydration import Hydrator
 
 __all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
 
+# --- GraphQL variables normalization helper ---
+def _normalize_variables(v: Any):
+    """Recursively normalize incoming variable values to match our schema.
+
+    Currently maps legacy '__delete' flags to GraphQL-safe '_Delete'.
+    """
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, list):
+            return [_normalize_variables(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(_normalize_variables(x) for x in v)
+        if isinstance(v, dict):
+            out = {}
+            for k, val in v.items():
+                kk = '_Delete' if k == '__delete' else k
+                out[kk] = _normalize_variables(val)
+            return out
+    except Exception:
+        return v
+    return v
+
 # --- Helper: Relation selection extraction (moved out of resolver closure) ---
 ## RelationSelectionExtractor imported from core.selection
 
@@ -278,6 +303,17 @@ class BerrySchema:
                     except Exception:
                         pass
         # Attach annotations and decorate as strawberry input
+        # Special control flag: allow delete semantics in mutation payloads
+        # Control flag: delete semantics. Use GraphQL-safe name while accepting python '__delete'.
+        try:
+            from dataclasses import field as _dc_field
+            anns['_Delete'] = Optional[bool]
+            # Expose as _Delete in GraphQL but allow '__delete' from Python dicts by aliasing in input_to_dict
+            setattr(InPlain, '_Delete', None)
+        except Exception:
+            pass
+        
+        # Now attach annotations and decorate as strawberry input
         setattr(InPlain, '__annotations__', anns)
         try:
             # Ensure dataclass mode so defaults are honored without required args
@@ -310,7 +346,14 @@ class BerrySchema:
             return [self._input_to_dict(x) for x in obj]
         # Dict-like
         if isinstance(obj, dict):
-            return {k: self._input_to_dict(v) for k, v in obj.items()}
+            out = {}
+            for k, v in obj.items():
+                kk = k
+                # Normalize control flag alias
+                if k == '__delete':
+                    kk = '_Delete'
+                out[kk] = self._input_to_dict(v)
+            return out
         # Dataclass from strawberry.input
         try:
             if is_dataclass(obj):
@@ -321,7 +364,15 @@ class BerrySchema:
         try:
             d = getattr(obj, '__dict__', None)
             if isinstance(d, dict):
-                return {k: self._input_to_dict(v) for k, v in d.items() if not k.startswith('_')}
+                out = {}
+                for k, v in d.items():
+                    if k.startswith('_'):
+                        # Honor our control flag when present on dataclass objects
+                        if k == '_Delete':
+                            out['_Delete'] = self._input_to_dict(v)
+                        continue
+                    out[k] = self._input_to_dict(v)
+                return out
         except Exception:
             pass
         return obj
@@ -614,6 +665,26 @@ class BerrySchema:
         return inst
 
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
+        # Local helper: normalize variable values before GraphQL coercion (e.g., map legacy '__delete' -> '_Delete').
+        def _normalize_variables(v: Any):
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, (str, int, float, bool)):
+                    return v
+                if isinstance(v, list):
+                    return [_normalize_variables(x) for x in v]
+                if isinstance(v, tuple):
+                    return tuple(_normalize_variables(x) for x in v)
+                if isinstance(v, dict):
+                    out = {}
+                    for k, val in v.items():
+                        kk = '_Delete' if k == '__delete' else k
+                        out[kk] = _normalize_variables(val)
+                    return out
+            except Exception:
+                return v
+            return v
         # Persist naming behavior for extractor logic
         try:
             # Prefer explicit name_converter when available
@@ -2526,61 +2597,45 @@ class BerrySchema:
                     continue
         except Exception:
             pass
-        # Build the Schema honoring provided strawberry_config; keep backward compatibility.
-        # Precedence: explicit strawberry_config -> default False (legacy behavior)
-        if strawberry_config is not None:
-            # First, try older Strawberry signature using auto_camel_case kwarg
-            try:
-                ac = getattr(strawberry_config, 'auto_camel_case', None)
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
-                    if Mutation is not None and Subscription is not None:
-                        return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, auto_camel_case=ac)  # type: ignore[arg-type]
-                    if Mutation is not None:
-                        return strawberry.Schema(Query, mutation=Mutation, auto_camel_case=ac)  # type: ignore[arg-type]
-                    return strawberry.Schema(Query, auto_camel_case=ac)  # type: ignore[arg-type]
-            except TypeError:
-                # If unsupported, try newer signature with config kwarg
+        # Build the Schema using StrawberryConfig exclusively (modern API).
+        # If caller provided a config, honor it; otherwise default to snake_case globally.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
+            if strawberry_config is None:
                 try:
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
-                        if Mutation is not None and Subscription is not None:
-                            return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, config=strawberry_config)  # type: ignore[arg-type]
-                        if Mutation is not None:
-                            return strawberry.Schema(Query, mutation=Mutation, config=strawberry_config)  # type: ignore[arg-type]
-                        return strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
-                except TypeError:
-                    # Last resort: build without config
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
-                        if Mutation is not None and Subscription is not None:
-                            return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription)
-                        if Mutation is not None:
-                            return strawberry.Schema(Query, mutation=Mutation)
-                        return strawberry.Schema(Query)
-        # Default: preserve previous library behavior (auto_camel_case=False)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
-                if Mutation is not None and Subscription is not None:
-                    return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, auto_camel_case=False)  # type: ignore[arg-type]
-                if Mutation is not None:
-                    return strawberry.Schema(Query, mutation=Mutation, auto_camel_case=False)  # type: ignore[arg-type]
-                return strawberry.Schema(Query, auto_camel_case=False)  # type: ignore[arg-type]
-        except TypeError:  # pragma: no cover
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
-                    if Mutation is not None and Subscription is not None:
-                        return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
-                    if Mutation is not None:
-                        return strawberry.Schema(Query, mutation=Mutation, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
-                    return strawberry.Schema(Query, config=StrawberryConfig(auto_camel_case=False))  # type: ignore[arg-type]
-            except Exception:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=DeprecationWarning, message=r"LazyType is deprecated.*")
-                    if Mutation is not None and Subscription is not None:
-                        return strawberry.Schema(Query, mutation=Mutation, subscription=Subscription)
-                    if Mutation is not None:
-                        return strawberry.Schema(Query, mutation=Mutation)
-                    return strawberry.Schema(Query)
+                    from strawberry.schema.name_converter import NameConverter as _NC  # type: ignore
+                    class _IdentityNameConverter(_NC):  # type: ignore[misc]
+                        def __init__(self):
+                            super().__init__(auto_camel_case=False)
+                            self.auto_camel_case = False
+                        def apply_naming_config(self, name: str) -> str:  # type: ignore[override]
+                            return name
+                    _nc = _IdentityNameConverter()
+                    strawberry_config = StrawberryConfig(name_converter=_nc, auto_camel_case=False)  # type: ignore[arg-type]
+                except Exception:
+                    strawberry_config = StrawberryConfig(auto_camel_case=False)  # type: ignore[arg-type]
+            # Finally, construct schema with config
+            # Build base schema
+            if Mutation is not None and Subscription is not None:
+                _inner_schema = strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, config=strawberry_config)  # type: ignore[arg-type]
+            elif Mutation is not None:
+                _inner_schema = strawberry.Schema(Query, mutation=Mutation, config=strawberry_config)  # type: ignore[arg-type]
+            else:
+                _inner_schema = strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
+            # Wrap schema to normalize variables before validation/execution
+            registry_self = self
+            class _SchemaProxy:
+                def __init__(self, inner):
+                    self._inner = inner
+                async def execute(self, query: str, *, variable_values: Optional[dict] = None, context_value: Optional[dict] = None, operation_name: Optional[str] = None):
+                    vv = _normalize_variables(variable_values)
+                    return await self._inner.execute(query, variable_values=vv, context_value=context_value, operation_name=operation_name)
+                def __getattr__(self, name: str):
+                    return getattr(self._inner, name)
+                # Provide access to underlying strawberry schema if ever needed
+                @property
+                def _strawberry_schema(self):
+                    return self._inner
+                def __repr__(self) -> str:  # pragma: no cover - debugging convenience
+                    return f"SchemaProxy({self._inner!r})"
+            return _SchemaProxy(_inner_schema)

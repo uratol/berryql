@@ -9,7 +9,7 @@ async def test_upsert_post_creates_author_first(db_session, populated_db):
     # Create a post with nested author (single relation). No author_id is provided.
     mutation = (
         "mutation Upsert($payload: PostQLInput!) {"
-        "  upsert_post(payload: $payload) { id title author_id author { id name } }"
+        "  merge_post(payload: $payload) { id title author_id author { id name } }"
         "}"
     )
     variables = {
@@ -30,7 +30,7 @@ async def test_upsert_post_creates_author_first(db_session, populated_db):
         raise AssertionError(f"GraphQL errors: {res.errors}")
     if res.data is None:
         raise AssertionError("No data returned from GraphQL execution.")
-    post = res.data["upsert_post"]
+    post = res.data["merge_post"]
     assert post["id"] is not None
     assert post["author_id"] is not None
     assert post["author"] is not None

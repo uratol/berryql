@@ -21,9 +21,9 @@ else:
 
 _logger = logging.getLogger("berryql")
 
-# --- Upsert builder -------------------------------------------------------
+# --- Merge builder -------------------------------------------------------
 
-def build_upsert_resolver_for_type(
+def build_merge_resolver_for_type(
     schema: 'BerrySchema',
     btype_cls: Type['BerryType'],
     *,
@@ -32,7 +32,7 @@ def build_upsert_resolver_for_type(
     pre_callback: Any | None = None,
     post_callback: Any | None = None,
 ):
-    """Return (fname, strawberry.field, st_return) implementing recursive upsert for a BerryType.
+    """Return (fname, strawberry.field, st_return) implementing recursive merge for a BerryType.
 
     This mirrors the previous inline version in registry, but lives here for clarity.
     """
@@ -47,7 +47,7 @@ def build_upsert_resolver_for_type(
     except Exception:
         pk_name = 'id'
 
-    async def _upsert_impl(info: StrawberryInfo, payload):
+    async def _merge_impl(info: StrawberryInfo, payload):
         session = _get_db(info)
         if session is None:
             raise ValueError("No db_session in context")
@@ -57,18 +57,18 @@ def build_upsert_resolver_for_type(
         from .core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
 
         # --- Callback helpers -------------------------------------------------
-        import inspect, asyncio as _asyncio
+        import inspect
 
         def _norm_callable(cb):
             return cb if callable(cb) else None
 
         # Type-level hooks on BerryType, best-effort
         try:
-            type_pre_cb = _norm_callable(getattr(btype_cls, 'pre_upsert', None) or getattr(btype_cls, '__pre_upsert__', None))
+            type_pre_cb = _norm_callable(getattr(btype_cls, 'pre_merge', None) or getattr(btype_cls, 'pre_upsert', None) or getattr(btype_cls, '__pre_upsert__', None))
         except Exception:
             type_pre_cb = None
         try:
-            type_post_cb = _norm_callable(getattr(btype_cls, 'post_upsert', None) or getattr(btype_cls, '__post_upsert__', None))
+            type_post_cb = _norm_callable(getattr(btype_cls, 'post_merge', None) or getattr(btype_cls, 'post_upsert', None) or getattr(btype_cls, '__post_upsert__', None))
         except Exception:
             type_post_cb = None
 
@@ -90,10 +90,9 @@ def build_upsert_resolver_for_type(
                 else:
                     res = cb(data_local)
                 if inspect.isawaitable(res):
-                    res = await res  # type: ignore[func-returns-value]
+                    res = await res  # type: ignore
                 return schema._input_to_dict(res) if res is not None else data_local
             except Exception:
-                # propagate callback exceptions to abort mutation
                 raise
 
         async def _maybe_call_post(cb, model_cls_local, info_local, instance_local, created_local, context_local):
@@ -118,7 +117,6 @@ def build_upsert_resolver_for_type(
                 if inspect.isawaitable(res):
                     await res
             except Exception:
-                # Let exceptions bubble up to caller
                 raise
 
         def _resolve_scope_value(value):
@@ -140,7 +138,6 @@ def build_upsert_resolver_for_type(
             return v
 
         def _safe_attrs_dump(model_cls_local, instance_local):
-            """Best-effort dump of model attributes (table columns first, then public __dict__)."""
             try:
                 out: Dict[str, Any] = {}
                 try:
@@ -177,7 +174,7 @@ def build_upsert_resolver_for_type(
             except Exception:
                 pk_val_local = None
             if pk_val_local is None:
-                return True  # can't enforce without identity; will re-check after flush
+                return True
             v = _resolve_scope_value(scope_raw)
             expr: Optional[ColumnElement[bool]] = None
             if isinstance(v, (dict, str)):
@@ -205,14 +202,13 @@ def build_upsert_resolver_for_type(
             row = res.first()
             return bool(row)
 
-        async def _upsert_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
+        async def _merge_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
             # Compute effective relation-level callbacks (from parent relation meta or top-level builder args)
             eff_pre_cb = None
             eff_post_cb = None
             try:
                 if rel_name_from_parent and parent_ctx is not None:
                     parent_model_cls = parent_ctx.get('parent_model')
-                    # Find parent BerryType to read relation meta
                     parent_btype = None
                     try:
                         for _n, _bt in (schema.types or {}).items():
@@ -226,8 +222,8 @@ def build_upsert_resolver_for_type(
                             rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
                             if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
                                 meta = (getattr(rdef, 'meta', {}) or {})
-                                eff_pre_cb = _norm_callable(meta.get('pre') or meta.get('pre_upsert'))
-                                eff_post_cb = _norm_callable(meta.get('post') or meta.get('post_upsert'))
+                                eff_pre_cb = _norm_callable(meta.get('pre') or meta.get('pre_merge') or meta.get('pre_upsert'))
+                                eff_post_cb = _norm_callable(meta.get('post') or meta.get('post_merge') or meta.get('post_upsert'))
                         except Exception:
                             eff_pre_cb = eff_pre_cb or None
                             eff_post_cb = eff_post_cb or None
@@ -239,11 +235,94 @@ def build_upsert_resolver_for_type(
                 eff_pre_cb = _norm_callable(pre_callback)
                 eff_post_cb = _norm_callable(post_callback)
 
-            # Call pre-callbacks before any processing (relation-level then type-level)
+            # Determine applicable scope for this level (needed early for delete path)
+            eff_scope = None
+            try:
+                if rel_name_from_parent and parent_ctx is not None:
+                    parent_model_cls = parent_ctx.get('parent_model')
+                    parent_btype = None
+                    try:
+                        for _n, _bt in (schema.types or {}).items():
+                            if getattr(_bt, 'model', None) is parent_model_cls:
+                                parent_btype = _bt
+                                break
+                    except Exception:
+                        parent_btype = None
+                    if parent_btype is not None:
+                        try:
+                            rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
+                            if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
+                                eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
+                        except Exception:
+                            eff_scope = None
+                if eff_scope is None:
+                    eff_scope = relation_scope
+            except Exception:
+                eff_scope = relation_scope
+
+            # Early delete handling
+            try:
+                if isinstance(data_local, dict):
+                    # Accept either legacy '__delete' (pre-normalization) or GraphQL-safe '_Delete'
+                    delete_flag = bool(data_local.get('__delete') or data_local.get('_Delete'))
+                else:
+                    delete_flag = False
+            except Exception:
+                delete_flag = False
+            if delete_flag:
+                try:
+                    pk_name_local = schema._get_pk_name(model_cls_local)
+                except Exception:
+                    pk_name_local = 'id'
+                pk_val_local = None
+                try:
+                    if isinstance(data_local, dict):
+                        pk_val_local = data_local.get(pk_name_local)
+                except Exception:
+                    pk_val_local = None
+                if pk_val_local in (None, 0, ''):
+                    raise ValueError(f"Missing primary key for delete on {getattr(model_cls_local,'__name__',model_cls_local)}")
+                instance_for_delete = await session.get(model_cls_local, pk_val_local)
+                if instance_for_delete is None:
+                    raise ValueError(f"Instance not found for delete; {getattr(model_cls_local,'__name__',model_cls_local)}.{pk_name_local}={pk_val_local}")
+                if eff_scope is not None:
+                    ok = await _enforce_scope(model_cls_local, instance_for_delete, eff_scope)
+                    if not ok:
+                        _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                        _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
+                        raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
+                if eff_pre_cb is not None:
+                    await _maybe_call_pre(eff_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                if type_pre_cb is not None:
+                    await _maybe_call_pre(type_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                # Use bulk DELETE to avoid ORM trying to NULL-out child FKs (which may be NOT NULL)
+                try:
+                    from sqlalchemy import delete as _sa_delete
+                    try:
+                        pk_col = getattr(getattr(model_cls_local, '__table__', None).c, pk_name_local)
+                    except Exception:
+                        pk_col = None
+                    if pk_col is not None:
+                        await session.execute(_sa_delete(model_cls_local).where(pk_col == pk_val_local))
+                    else:
+                        # Fallback to ORM delete if we can't access column object
+                        await session.delete(instance_for_delete)
+                except Exception:
+                    # As a last resort, perform ORM delete
+                    await session.delete(instance_for_delete)
+                await session.flush()
+                if eff_post_cb is not None:
+                    await _maybe_call_post(eff_post_cb, model_cls_local, info, instance_for_delete, False, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                if type_post_cb is not None:
+                    await _maybe_call_post(type_post_cb, model_cls_local, info, instance_for_delete, False, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                return instance_for_delete
+
+            # Call pre-callbacks before any processing
             if eff_pre_cb is not None:
                 data_local = await _maybe_call_pre(eff_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             if type_pre_cb is not None:
                 data_local = await _maybe_call_pre(type_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+
             # Split scalars and relations
             scalar_vals: Dict[str, Any] = {}
             relation_vals: Dict[str, Any] = {}
@@ -255,44 +334,35 @@ def build_upsert_resolver_for_type(
                     scalar_vals[k] = v
                 elif fdef.kind == 'relation':
                     relation_vals[k] = v
-            # Helper: detect MSSQL dialect and GUID PK to pre-seed id to avoid OUTPUT with triggers
+
+            # Helper: MSSQL/GUID
             def _is_mssql(session_local) -> bool:
                 try:
-                    bind = getattr(session_local, 'bind', None)
-                    if bind is None:
-                        bind = session_local.get_bind()  # type: ignore[attr-defined]
-                    # AsyncEngine exposes sync_engine
+                    bind = getattr(session_local, 'bind', None) or session_local.get_bind()
                     dialect = getattr(bind, 'dialect', None) or getattr(getattr(bind, 'sync_engine', None), 'dialect', None)
                     name = getattr(dialect, 'name', '')
                     return str(name).lower() == 'mssql'
                 except Exception:
                     return False
+
             def _has_guid_pk(model_cls_inner, pk_name_inner: str) -> bool:
                 try:
-                    col = getattr(getattr(model_cls_inner, '__table__', None), 'c', {}).get(pk_name_inner)  # type: ignore[attr-defined]
+                    col = getattr(getattr(model_cls_inner, '__table__', None).c, pk_name_inner)
                 except Exception:
                     col = None
-                if col is None:
-                    try:
-                        col = getattr(getattr(model_cls_inner, '__table__', None).c, pk_name_inner)  # type: ignore[attr-defined]
-                    except Exception:
-                        col = None
                 try:
                     if col is not None:
-                        # Detect our custom GUID TypeDecorator or MSSQL UNIQUEIDENTIFIER
                         t = getattr(col, 'type', None)
                         tname = getattr(getattr(t, '__class__', object), '__name__', '')
                         if 'GUID' in str(tname):
-                            return True
-                        impl = getattr(t, 'impl', None)
-                        if impl and 'UNIQUEIDENTIFIER' in str(getattr(getattr(impl, '__class__', object), '__name__', '')).upper():
                             return True
                         if 'UNIQUEIDENTIFIER' in str(t).upper():
                             return True
                 except Exception:
                     pass
                 return False
-            # Pre-create single child relations when FK is on parent (e.g., Post.author -> users.id via posts.author_id)
+
+            # Pre-create single child relations when FK is on parent
             precreated_children: Dict[str, Any] = {}
             for rel_key, rel_value in list(relation_vals.items()):
                 try:
@@ -303,7 +373,6 @@ def build_upsert_resolver_for_type(
                     is_single = bool(meta.get('single'))
                     if not is_single:
                         continue
-                    # Only when user provided a non-empty child payload
                     if rel_value is None:
                         continue
                     target_name = meta.get('target')
@@ -313,7 +382,6 @@ def build_upsert_resolver_for_type(
                     child_model = getattr(child_btype, 'model', None) if child_btype else None
                     if not child_btype or not child_model:
                         continue
-                    # If parent's FK references child, create child first to have its id
                     fk_on_parent = None
                     try:
                         fk_on_parent = schema._find_parent_fk_column_name(model_cls_local, child_model, rel_key)
@@ -324,7 +392,6 @@ def build_upsert_resolver_for_type(
                     child_data = schema._input_to_dict(rel_value)
                     if not isinstance(child_data, dict):
                         continue
-                    # Require at least one non-null value for a non-nullable column (excluding pk)
                     try:
                         child_pk = schema._get_pk_name(child_model)
                     except Exception:
@@ -340,11 +407,10 @@ def build_upsert_resolver_for_type(
                                 has_substantial = True
                                 break
                     except Exception:
-                        # Fallback: any non-None value in payload
                         has_substantial = any(v is not None for v in child_data.values())
                     if not has_substantial:
                         continue
-                    child_inst = await _upsert_single(child_model, child_btype, child_data)
+                    child_inst = await _merge_single(child_model, child_btype, child_data)
                     try:
                         child_pk = schema._get_pk_name(child_model)
                     except Exception:
@@ -356,10 +422,10 @@ def build_upsert_resolver_for_type(
                     if child_id is not None and scalar_vals.get(fk_on_parent) in (None, 0):
                         scalar_vals[fk_on_parent] = child_id
                     precreated_children[rel_key] = child_inst
-                    # Remove from relation_vals so it's not processed again later
                     del relation_vals[rel_key]
                 except Exception:
                     continue
+
             # Parent context: ensure child FK to parent is set on payload
             child_rel_to_parent_name: Optional[str] = None
             if parent_ctx is not None:
@@ -383,7 +449,7 @@ def build_upsert_resolver_for_type(
                                     break
                     except Exception:
                         child_fk_to_parent = None
-                    # Also relationship attribute on child targeting parent (e.g., 'post')
+                    # Also relationship attribute on child targeting parent
                     try:
                         rel_name_found = None
                         mapper = getattr(model_cls_local, '__mapper__', None)
@@ -430,22 +496,9 @@ def build_upsert_resolver_for_type(
                                 parent_pk_val_local = getattr(parent_inst, parent_pk_name_local)
                             except Exception:
                                 parent_pk_val_local = None
-                        try:
-                            _logger.warning(
-                                "upsert(child): parent=%s pk=%s child_fk_to_parent=%s",
-                                getattr(parent_model_cls, '__name__', parent_model_cls), parent_pk_val_local, child_fk_to_parent
-                            )
-                        except Exception:
-                            pass
                         if scalar_vals.get(child_fk_to_parent) in (None, 0):
                             scalar_vals[child_fk_to_parent] = parent_pk_val_local
-                            try:
-                                _logger.warning(
-                                    "upsert(child): assign %s=%s in scalar_vals",
-                                    child_fk_to_parent, parent_pk_val_local
-                                )
-                            except Exception:
-                                pass
+
             # Determine instance (update or create)
             instance = None
             pk_val = scalar_vals.get(pk_name) or (data_local.get(pk_name) if isinstance(data_local, dict) else None)
@@ -454,31 +507,15 @@ def build_upsert_resolver_for_type(
                     instance = await session.get(model_cls_local, pk_val)
                 except Exception:
                     instance = None
-            # Determine applicable scope for this level
-            eff_scope = None
-            try:
-                if rel_name_from_parent and parent_ctx is not None:
-                    parent_model_cls = parent_ctx.get('parent_model')
-                    # Find parent BerryType to read relation meta
-                    parent_btype = None
-                    try:
-                        for _n, _bt in (schema.types or {}).items():
-                            if getattr(_bt, 'model', None) is parent_model_cls:
-                                parent_btype = _bt
-                                break
-                    except Exception:
-                        parent_btype = None
-                    if parent_btype is not None:
-                        try:
-                            rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
-                            if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
-                                eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
-                        except Exception:
-                            eff_scope = None
-                if eff_scope is None:
-                    eff_scope = relation_scope
-            except Exception:
-                eff_scope = relation_scope
+
+            # Enforce scope before update
+            if pk_val is not None and instance is not None and eff_scope is not None:
+                ok = await _enforce_scope(model_cls_local, instance, eff_scope)
+                if not ok:
+                    _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                    _attrs = _safe_attrs_dump(model_cls_local, instance)
+                    raise PermissionError(f"Mutation out of scope for update; model={_cls}; attrs={_attrs}")
+
             created_now = False
             if instance is None:
                 instance = model_cls_local()
@@ -488,8 +525,6 @@ def build_upsert_resolver_for_type(
                     except Exception:
                         pass
                 created_now = True
-                # For MSSQL tables with GUID PKs that normally rely on server_default (e.g., newsequentialid()),
-                # pre-generate a UUID to avoid implicit RETURNING/OUTPUT, which fails when triggers exist.
                 try:
                     current_pk = getattr(instance, pk_name, None)
                 except Exception:
@@ -500,13 +535,7 @@ def build_upsert_resolver_for_type(
                 except Exception:
                     pass
                 session.add(instance)
-            # If updating existing row: enforce that it's within scope BEFORE modifying
-            if pk_val is not None and instance is not None and eff_scope is not None:
-                ok = await _enforce_scope(model_cls_local, instance, eff_scope)
-                if not ok:
-                    _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                    _attrs = _safe_attrs_dump(model_cls_local, instance)
-                    raise PermissionError(f"Mutation out of scope for update; model={_cls}; attrs={_attrs}")
+
             # Assign scalar fields (ignore None)
             for k, v in list(scalar_vals.items()):
                 if v is None:
@@ -520,6 +549,7 @@ def build_upsert_resolver_for_type(
                             setattr(instance, src_col, v)
                     except Exception:
                         pass
+
             # Robust fallback for MSSQL: ensure child FK set directly on instance
             if parent_ctx is not None:
                 try:
@@ -573,6 +603,7 @@ def build_upsert_resolver_for_type(
                                 setattr(instance, _fk_name, parent_pk_val_local)
                             except Exception:
                                 pass
+
             # Also set relationship attribute to parent instance if available
             if parent_ctx is not None and child_rel_to_parent_name and 'parent_inst' in parent_ctx:
                 try:
@@ -582,9 +613,9 @@ def build_upsert_resolver_for_type(
                 try:
                     if cur_val is None:
                         setattr(instance, child_rel_to_parent_name, parent_ctx.get('parent_inst'))
-                        _logger.warning("upsert(child): set relation %s -> parent instance", child_rel_to_parent_name)
                 except Exception:
                     pass
+
             # If we pre-created a single child whose FK is on parent, also set relationship attribute when possible
             for _rk, _child in list(precreated_children.items()):
                 try:
@@ -592,9 +623,11 @@ def build_upsert_resolver_for_type(
                         setattr(instance, _rk, _child)
                 except Exception:
                     pass
+
             # Flush to materialize identities
             await session.flush()
-            # Enforce scope AFTER changes (covers create and update)
+
+            # Enforce scope AFTER changes
             if eff_scope is not None:
                 ok2 = await _enforce_scope(model_cls_local, instance, eff_scope)
                 if not ok2:
@@ -605,6 +638,7 @@ def build_upsert_resolver_for_type(
                     _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
                     _attrs = _safe_attrs_dump(model_cls_local, instance)
                     raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
+
             # Process relations
             for rel_key, rel_value in list(relation_vals.items()):
                 if rel_value is None:
@@ -620,14 +654,13 @@ def build_upsert_resolver_for_type(
                 child_model = getattr(child_btype, 'model', None) if child_btype else None
                 if not child_btype or not child_model:
                     continue
-                # Determine child pk name
                 try:
                     child_pk_name = schema._get_pk_name(child_model)
                 except Exception:
                     child_pk_name = 'id'
                 if is_single:
                     child_data = schema._input_to_dict(rel_value)
-                    child_inst = await _upsert_single(child_model, child_btype, child_data, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+                    child_inst = await _merge_single(child_model, child_btype, child_data, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
                     try:
                         fk_name = schema._find_parent_fk_column_name(model_cls_local, child_model, rel_key)
                     except Exception:
@@ -641,7 +674,6 @@ def build_upsert_resolver_for_type(
                     items = schema._input_to_dict(rel_value)
                     if not isinstance(items, list):
                         items = [items]
-                    # Determine child fk column referencing parent
                     child_fk_col_name = None
                     try:
                         for cc in child_model.__table__.columns:
@@ -660,7 +692,6 @@ def build_upsert_resolver_for_type(
                                 child_fk_col_name = conv_name
                         except Exception:
                             pass
-                    # Ensure parent id value is available
                     try:
                         parent_pk_name_local = schema._get_pk_name(model_cls_local)
                     except Exception:
@@ -682,43 +713,30 @@ def build_upsert_resolver_for_type(
                             parent_pk_val = getattr(instance, parent_pk_name_local)
                         except Exception:
                             parent_pk_val = None
-                    try:
-                        _logger.warning(
-                            "upsert(list): parent=%s pk=%s child_fk_col=%s rel=%s",
-                            getattr(model_cls_local, '__name__', model_cls_local), parent_pk_val, child_fk_col_name, rel_key
-                        )
-                    except Exception:
-                        pass
                     for item in items:
                         if child_fk_col_name and parent_pk_val is not None:
                             item = dict(item or {})
                             if item.get(child_fk_col_name) in (None, 0):
                                 item[child_fk_col_name] = parent_pk_val
-                            try:
-                                _logger.warning(
-                                    "upsert(list): set %s=%s on child payload -> keys=%s",
-                                    child_fk_col_name, parent_pk_val, list(item.keys())
-                                )
-                            except Exception:
-                                pass
-                        await _upsert_single(child_model, child_btype, item, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+                        await _merge_single(child_model, child_btype, item, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+
             await session.flush()
-            # Fire post-callbacks (type-level first or relation-level first? choose relation-level then type-level for symmetry with pre)
+            # Fire post-callbacks
             if eff_post_cb is not None:
                 await _maybe_call_post(eff_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             if type_post_cb is not None:
                 await _maybe_call_post(type_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             return instance
 
-        inst = await _upsert_single(model_cls, btype_cls, data)
+        inst = await _merge_single(model_cls, btype_cls, data)
         await session.commit()
         return schema.from_model(type_name, inst)
 
-    fname = field_name or (f"upsert_{type_name[:-2].lower()}" if type_name.endswith('QL') else f"upsert_{type_name.lower()}")
+    fname = field_name or (f"merge_{type_name[:-2].lower()}" if type_name.endswith('QL') else f"merge_{type_name.lower()}")
     ann: Dict[str, Any] = {'info': StrawberryInfo, 'payload': input_type, 'return': st_return}
 
     async def _resolver(self, info: StrawberryInfo, payload):  # noqa: D401
-        return await _upsert_impl(info, payload)
+        return await _merge_impl(info, payload)
 
     _resolver.__name__ = fname
     _resolver.__annotations__ = ann
@@ -728,15 +746,22 @@ def build_upsert_resolver_for_type(
 
 def _compose_mut_name(schema: 'BerrySchema', rel_attr: str) -> str:
     if getattr(schema, '_auto_camel_case', False):
-        return f"upsert{rel_attr[:1].upper()}{rel_attr[1:]}"
+        return f"merge{rel_attr[:1].upper()}{rel_attr[1:]}"
     out = re.sub(r"([A-Z])", r"_\1", rel_attr).lower().strip('_')
-    return f"upsert_{out}"
+    return f"merge_{out}"
+
+# Backward-compatibility aliases (no cover)
+def build_upsert_resolver_for_type(*args, **kwargs):  # pragma: no cover
+    return build_merge_resolver_for_type(*args, **kwargs)
+
+def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:  # pragma: no cover
+    return add_top_level_merges(schema, MPlain, anns_m)
 
 
 def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomain']):
     """Build or return a Strawberry type for domain-scoped mutation container.
 
-    Adds auto-generated upsert_* fields for relations on the domain with meta['mutation'] True.
+    Adds auto-generated merge_* fields for relations on the domain with meta['mutation'] True.
     """
     # Cache key/type name
     type_name = f"{getattr(dom_cls, '__name__', 'Domain')}MutType"
@@ -827,7 +852,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                     return inst
                 return _resolver
             setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
-    # Auto-generate upsert mutations for relations on domain with mutation=True
+    # Auto-generate merge mutations for relations on domain with mutation=True
     try:
         for rf, rval in list(vars(dom_cls).items()):
             if isinstance(rval, _FldDesc):
@@ -848,8 +873,8 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 eff_post_cb = None
                 try:
                     eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
-                    eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
-                    eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
+                    eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_merge') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
+                    eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_merge') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
                     if eff_scope is None:
                         eff_scope = getattr(dom_cls, '__domain_guard__', None)
                 except Exception:
@@ -858,7 +883,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                     eff_post_cb = None
                 triplet = None
                 try:
-                    triplet = build_upsert_resolver_for_type(
+                    triplet = build_merge_resolver_for_type(
                         schema,
                         btype_t,
                         field_name=_compose_mut_name(schema, rf),
@@ -918,7 +943,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
 
 
 def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
-    """Attach domain fields declared on user Mutation, using mutation domain types, and add upserts inside them."""
+    """Attach domain fields declared on user Mutation, using mutation domain types, and add merges inside them."""
     from .core.fields import DomainDescriptor as _DomDesc
     if getattr(schema, '_user_mutation_cls', None) is None:
         return
@@ -936,7 +961,7 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                 return _resolver
             anns_m[uf] = DomSt  # type: ignore
             setattr(MPlain, uf, strawberry.field(resolver=_make_domain_resolver(DomSt)))
-            # Best-effort: ensure upsert_* are present on the decorated runtime type too
+            # Best-effort: ensure merge_* are present on the decorated runtime type too
             try:
                 DomRuntime = schema._st_types.get(f"{getattr(dom_cls,'__name__','Domain')}MutType")
                 if DomRuntime is not None:
@@ -961,15 +986,15 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                             eff_post_cb = None
                             try:
                                 eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
-                                eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
-                                eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
+                                eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_merge') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
+                                eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_merge') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
                                 if eff_scope is None:
                                     eff_scope = getattr(dom_cls, '__domain_guard__', None)
                             except Exception:
                                 eff_scope = getattr(dom_cls, '__domain_guard__', None)
                                 eff_pre_cb = None
                                 eff_post_cb = None
-                            triplet = build_upsert_resolver_for_type(
+                            triplet = build_merge_resolver_for_type(
                                 schema,
                                 btype_t,
                                 field_name=_compose_mut_name(schema, rf),
@@ -995,10 +1020,10 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                 pass
 
 
-# --- Top-level upserts ----------------------------------------------------
+# --- Top-level merges ----------------------------------------------------
 
-def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
-    """Attach auto-generated upsert mutations at root, gated by Query relations with mutation=True."""
+def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
+    """Attach auto-generated merge mutations at root, gated by Query relations with mutation=True."""
     # Compute allow-list of target Berry types from root Query relations with mutation=True
     allowed_targets: Optional[set[str]] = None
     scope_by_target: Dict[str, Any] = {}
@@ -1020,8 +1045,8 @@ def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str,
                         scope_by_target[tgt] = meta.get('scope')
                     # Also stash callbacks per target when declared on root
                     try:
-                        _pre = meta.get('pre') or meta.get('pre_upsert')
-                        _post = meta.get('post') or meta.get('post_upsert')
+                        _pre = meta.get('pre') or meta.get('pre_merge') or meta.get('pre_upsert')
+                        _post = meta.get('post') or meta.get('post_merge') or meta.get('post_upsert')
                     except Exception:
                         _pre = None
                         _post = None
@@ -1037,7 +1062,7 @@ def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str,
     for tname, btype_cls in list(schema.types.items()):
         if allowed_targets is not None and (not tname or tname not in allowed_targets):
             continue
-        triplet = build_upsert_resolver_for_type(
+        triplet = build_merge_resolver_for_type(
             schema,
             btype_cls,
             relation_scope=scope_by_target.get(tname),

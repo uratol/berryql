@@ -10,7 +10,7 @@ async def test_upsert_callbacks_async(db_session, populated_db):
     uid = populated_db["users"][0].id
     # Invoke async callbacks via domain field under Mutation
     mutation = (
-        "mutation($p: PostQLInput!) { asyncDomain { upsert_posts(payload: $p) { id title author_id } } }"
+        "mutation($p: PostQLInput!) { asyncDomain { merge_posts(payload: $p) { id title author_id } } }"
     )
     variables = {
         "p": {"title": "Async", "content": "Body", "author_id": uid}
@@ -23,7 +23,7 @@ async def test_upsert_callbacks_async(db_session, populated_db):
     assert res.errors is None, res.errors
     edge = res.data.get("asyncDomain")
     assert isinstance(edge, dict)
-    post = edge["upsert_posts"]
+    post = edge["merge_posts"]
     # Title should have async pre and post markers
     assert post["title"].startswith("[apre]Async")
     assert post["title"].endswith("[apost]")
