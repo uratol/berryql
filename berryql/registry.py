@@ -236,6 +236,11 @@ class BerrySchema:
         except Exception:
             model_cls = None
         col_type_map: Dict[str, Any] = self._build_column_type_map(model_cls) if model_cls is not None else {}
+        # Set of physical table columns for read-only/computed detection
+        try:
+            table_cols = set(c.name for c in getattr(getattr(model_cls, '__table__', None), 'columns', []) or []) if model_cls is not None else set()
+        except Exception:
+            table_cols = set()
         # Scalars
         for fname, fdef in (getattr(btype_cls, '__berry_fields__', {}) or {}).items():
             if fdef.kind == 'scalar':
@@ -250,6 +255,14 @@ class BerrySchema:
                 except Exception:
                     pass
                 src_col = (fdef.meta or {}).get('column') if isinstance(fdef.meta, dict) else None
+                # If the source is not a real table column, treat as read-only (computed) and skip
+                try:
+                    source_name = src_col or fname
+                    if source_name not in table_cols:
+                        # do not include in input
+                        continue
+                except Exception:
+                    pass
                 # Allow explicit override of Python type via meta.returns
                 try:
                     py_t = (fdef.meta or {}).get('returns') or col_type_map.get(src_col or fname, str)
@@ -695,7 +708,28 @@ class BerrySchema:
                         src_col = (fdef.meta or {}).get('column')
                     except Exception:
                         src_col = None
-                    py_t = column_type_map.get(src_col or fname, str)
+                    py_t = column_type_map.get(src_col or fname)
+                    if py_t is None:
+                        # Try to infer from SQLAlchemy mapped attr (column_property / hybrid)
+                        try:
+                            model_attr = getattr(getattr(bcls, 'model', None), src_col or fname, None)
+                            # Column-like has .type; column_property.expression has type too
+                            t = getattr(getattr(model_attr, 'property', None), 'columns', None)
+                            if t:
+                                col0 = t[0]
+                                py_t = self._sa_python_type(getattr(col0, 'type', None))
+                            else:
+                                sa_type = getattr(model_attr, 'type', None) or getattr(getattr(model_attr, 'expression', None), 'type', None)
+                                if sa_type is not None:
+                                    py_t = self._sa_python_type(sa_type)
+                        except Exception:
+                            py_t = None
+                    if py_t is None:
+                        # Allow explicit override via meta.returns or default to str
+                        try:
+                            py_t = (fdef.meta or {}).get('returns') or str
+                        except Exception:
+                            py_t = str
                     annotations[fname] = Optional[py_t]
                     setattr(st_cls, fname, None)
                 elif fdef.kind == 'relation':
