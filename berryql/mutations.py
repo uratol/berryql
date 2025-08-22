@@ -1190,12 +1190,15 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
 def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
     """Attach auto-generated merge mutations at root, gated by Query relations with mutation=True."""
     # Compute allow-list of target Berry types from root Query relations with mutation=True
+    # and collect relation-specific metadata to expose alias fields named by Query attribute.
     allowed_targets: Optional[set[str]] = None
     scope_by_target: Dict[str, Any] = {}
+    # Only attribute-based merges will be exposed at root (no per-type legacy names)
+    relations_info: list[dict] = []
     try:
         if isinstance(getattr(schema, '_root_query_fields', None), dict):
             allowed_targets = set()
-            for fdef in schema._root_query_fields.values():  # type: ignore[attr-defined]
+            for rf, fdef in schema._root_query_fields.items():  # type: ignore[attr-defined]
                 try:
                     if getattr(fdef, 'kind', None) != 'relation':
                         continue
@@ -1219,25 +1222,50 @@ def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                         scope_by_target[f"__pre__::{tgt}"] = _pre
                     if _post is not None:
                         scope_by_target[f"__post__::{tgt}"] = _post
+                    # Collect relation-specific info for alias building based on Query attribute name
+                    try:
+                        relations_info.append({
+                            'attr': rf,
+                            'target': tgt,
+                            'scope': meta.get('scope'),
+                            'pre': _pre,
+                            'post': _post,
+                        })
+                    except Exception:
+                        pass
                 except Exception:
                     continue
     except Exception:
         allowed_targets = None
         scope_by_target = {}
-    for tname, btype_cls in list(schema.types.items()):
-        if allowed_targets is not None and (not tname or tname not in allowed_targets):
+        relations_info = []
+    # Expose alias names derived from Query attribute names for better ergonomics only.
+    # Example: Query.posts (mutation=True) -> merge_posts at root, with relation-specific scope/callbacks.
+    for info in relations_info:
+        try:
+            rf = info.get('attr')
+            tgt = info.get('target')
+            if not rf or not tgt:
+                continue
+            btype_cls = schema.types.get(tgt)
+            if not btype_cls:
+                continue
+            alias_name = _compose_mut_name(schema, rf)
+            if hasattr(MPlain, alias_name):
+                continue
+            triplet_alias = build_merge_resolver_for_type(
+                schema,
+                btype_cls,
+                field_name=alias_name,
+                relation_scope=info.get('scope'),
+                pre_callback=info.get('pre'),
+                post_callback=info.get('post'),
+            )
+            if triplet_alias is None:
+                continue
+            an, field_obj_alias, st_ret_alias = triplet_alias
+            setattr(MPlain, an, field_obj_alias)
+            anns_m[an] = st_ret_alias  # type: ignore
+        except Exception:
+            # Non-fatal: skip alias if anything goes wrong
             continue
-        triplet = build_merge_resolver_for_type(
-            schema,
-            btype_cls,
-            relation_scope=scope_by_target.get(tname),
-            pre_callback=scope_by_target.get(f"__pre__::{tname}"),
-            post_callback=scope_by_target.get(f"__post__::{tname}"),
-        )
-        if triplet is None:
-            continue
-        fname_u, field_obj, st_ret = triplet
-        if hasattr(MPlain, fname_u):
-            continue
-        setattr(MPlain, fname_u, field_obj)
-        anns_m[fname_u] = st_ret  # type: ignore

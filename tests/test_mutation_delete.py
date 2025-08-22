@@ -13,7 +13,7 @@ async def test_merge_delete_invokes_callbacks(db_session, populated_db):
 
     # Delete existing post via _Delete flag; callbacks set on root Query.posts
     mutation = (
-        "mutation($p: PostQLInput!) { merge_post(payload: $p) { id title author_id } }"
+    "mutation($p: PostQLInput!) { merge_posts(payload: $p) { id title author_id } }"
     )
     variables = {"p": {"id": pid, "_Delete": True}}
     res = await schema.execute(
@@ -23,7 +23,7 @@ async def test_merge_delete_invokes_callbacks(db_session, populated_db):
     )
     assert res.errors is None, res.errors
     # We return the deleted instance snapshot; id should match
-    out = res.data["merge_post"]
+    out = res.data["merge_posts"]
     assert int(out["id"]) == pid
 
     # Pre and post should both have been logged with created=False
