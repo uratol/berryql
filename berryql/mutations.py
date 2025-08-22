@@ -291,6 +291,66 @@ def build_merge_resolver_for_type(
                         _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
                         _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
                         raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
+                # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints)
+                from sqlalchemy import select as _sa_select, delete as _sa_delete
+                async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
+                    try:
+                        bfields = getattr(parent_btype_cls, '__berry_fields__', {}) or {}
+                    except Exception:
+                        bfields = {}
+                    for rname, rdef in bfields.items():
+                        try:
+                            if getattr(rdef, 'kind', None) != 'relation':
+                                continue
+                            meta_r = getattr(rdef, 'meta', {}) or {}
+                            target_name = meta_r.get('target')
+                            if not target_name:
+                                continue
+                            child_btype = schema.types.get(target_name)
+                            child_model_cls = getattr(child_btype, 'model', None) if child_btype is not None else None
+                            if child_model_cls is None:
+                                continue
+                            explicit_child_fk_name = meta_r.get('fk_column_name')
+                            # Find FK on child referencing parent
+                            try:
+                                fk_col = schema._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)  # type: ignore[attr-defined]
+                            except Exception:
+                                fk_col = None
+                            if fk_col is None:
+                                continue
+                            # Recurse to grandchildren first by selecting child PKs
+                            try:
+                                child_pk_name = schema._get_pk_name(child_model_cls)
+                            except Exception:
+                                child_pk_name = 'id'
+                            try:
+                                child_pk_col = getattr(getattr(child_model_cls, '__table__', None).c, child_pk_name)
+                            except Exception:
+                                child_pk_col = None
+                            # Fetch child ids to recurse
+                            try:
+                                if child_pk_col is not None:
+                                    ids_res = await session.execute(_sa_select(child_pk_col).where(fk_col == parent_pk_val))
+                                    child_ids = [row[0] for row in ids_res.fetchall()]
+                                else:
+                                    ids_res = await session.execute(_sa_select(getattr(child_model_cls, child_pk_name)).where(fk_col == parent_pk_val))
+                                    child_ids = [row[0] for row in ids_res.fetchall()]
+                            except Exception:
+                                child_ids = []
+                            for cid in child_ids:
+                                await _cascade_delete_children(child_model_cls, child_btype, cid)
+                            # Delete children referencing the parent
+                            try:
+                                await session.execute(_sa_delete(child_model_cls).where(fk_col == parent_pk_val))
+                            except Exception:
+                                # Fall back to ORM delete one-by-one
+                                for cid in child_ids:
+                                    inst_c = await session.get(child_model_cls, cid)
+                                    if inst_c is not None:
+                                        await session.delete(inst_c)
+                        except Exception:
+                            continue
+                await _cascade_delete_children(model_cls_local, btype_local, pk_val_local)
                 if eff_pre_cb is not None:
                     await _maybe_call_pre(eff_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
                 if type_pre_cb is not None:

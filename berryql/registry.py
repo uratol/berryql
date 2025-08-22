@@ -666,25 +666,6 @@ class BerrySchema:
 
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
         # Local helper: normalize variable values before GraphQL coercion (e.g., map legacy '__delete' -> '_Delete').
-        def _normalize_variables(v: Any):
-            try:
-                if v is None:
-                    return None
-                if isinstance(v, (str, int, float, bool)):
-                    return v
-                if isinstance(v, list):
-                    return [_normalize_variables(x) for x in v]
-                if isinstance(v, tuple):
-                    return tuple(_normalize_variables(x) for x in v)
-                if isinstance(v, dict):
-                    out = {}
-                    for k, val in v.items():
-                        kk = '_Delete' if k == '__delete' else k
-                        out[kk] = _normalize_variables(val)
-                    return out
-            except Exception:
-                return v
-            return v
         # Persist naming behavior for extractor logic
         try:
             # Prefer explicit name_converter when available
@@ -2627,9 +2608,11 @@ class BerrySchema:
             class _SchemaProxy:
                 def __init__(self, inner):
                     self._inner = inner
-                async def execute(self, query: str, *, variable_values: Optional[dict] = None, context_value: Optional[dict] = None, operation_name: Optional[str] = None):
-                    vv = _normalize_variables(variable_values)
-                    return await self._inner.execute(query, variable_values=vv, context_value=context_value, operation_name=operation_name)
+                async def execute(self, query: str, *args, **kwargs):
+                    # Normalize variables while preserving full Strawberry API (root_value, extensions, etc.)
+                    if 'variable_values' in kwargs:
+                        kwargs['variable_values'] = _normalize_variables(kwargs.get('variable_values'))
+                    return await self._inner.execute(query, *args, **kwargs)
                 def __getattr__(self, name: str):
                     return getattr(self._inner, name)
                 # Provide access to underlying strawberry schema if ever needed
