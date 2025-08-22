@@ -61,30 +61,6 @@ from .core.hydration import Hydrator
 
 __all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
 
-# --- GraphQL variables normalization helper ---
-def _normalize_variables(v: Any):
-    """Recursively normalize incoming variable values to match our schema.
-
-    Currently maps legacy '__delete' flags to GraphQL-safe '_Delete'.
-    """
-    try:
-        if v is None:
-            return None
-        if isinstance(v, (str, int, float, bool)):
-            return v
-        if isinstance(v, list):
-            return [_normalize_variables(x) for x in v]
-        if isinstance(v, tuple):
-            return tuple(_normalize_variables(x) for x in v)
-        if isinstance(v, dict):
-            out = {}
-            for k, val in v.items():
-                kk = '_Delete' if k == '__delete' else k
-                out[kk] = _normalize_variables(val)
-            return out
-    except Exception:
-        return v
-    return v
 
 # --- Helper: Relation selection extraction (moved out of resolver closure) ---
 ## RelationSelectionExtractor imported from core.selection
@@ -304,11 +280,9 @@ class BerrySchema:
                         pass
         # Attach annotations and decorate as strawberry input
         # Special control flag: allow delete semantics in mutation payloads
-        # Control flag: delete semantics. Use GraphQL-safe name while accepting python '__delete'.
         try:
             from dataclasses import field as _dc_field
             anns['_Delete'] = Optional[bool]
-            # Expose as _Delete in GraphQL but allow '__delete' from Python dicts by aliasing in input_to_dict
             setattr(InPlain, '_Delete', None)
         except Exception:
             pass
@@ -348,11 +322,7 @@ class BerrySchema:
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                kk = k
-                # Normalize control flag alias
-                if k == '__delete':
-                    kk = '_Delete'
-                out[kk] = self._input_to_dict(v)
+                out[k] = self._input_to_dict(v)
             return out
         # Dataclass from strawberry.input
         try:
@@ -367,9 +337,6 @@ class BerrySchema:
                 out = {}
                 for k, v in d.items():
                     if k.startswith('_'):
-                        # Honor our control flag when present on dataclass objects
-                        if k == '_Delete':
-                            out['_Delete'] = self._input_to_dict(v)
                         continue
                     out[k] = self._input_to_dict(v)
                 return out
@@ -665,7 +632,6 @@ class BerrySchema:
         return inst
 
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
-        # Local helper: normalize variable values before GraphQL coercion (e.g., map legacy '__delete' -> '_Delete').
         # Persist naming behavior for extractor logic
         try:
             # Prefer explicit name_converter when available
@@ -2603,22 +2569,4 @@ class BerrySchema:
                 _inner_schema = strawberry.Schema(Query, mutation=Mutation, config=strawberry_config)  # type: ignore[arg-type]
             else:
                 _inner_schema = strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
-            # Wrap schema to normalize variables before validation/execution
-            registry_self = self
-            class _SchemaProxy:
-                def __init__(self, inner):
-                    self._inner = inner
-                async def execute(self, query: str, *args, **kwargs):
-                    # Normalize variables while preserving full Strawberry API (root_value, extensions, etc.)
-                    if 'variable_values' in kwargs:
-                        kwargs['variable_values'] = _normalize_variables(kwargs.get('variable_values'))
-                    return await self._inner.execute(query, *args, **kwargs)
-                def __getattr__(self, name: str):
-                    return getattr(self._inner, name)
-                # Provide access to underlying strawberry schema if ever needed
-                @property
-                def _strawberry_schema(self):
-                    return self._inner
-                def __repr__(self) -> str:  # pragma: no cover - debugging convenience
-                    return f"SchemaProxy({self._inner!r})"
-            return _SchemaProxy(_inner_schema)
+            return _inner_schema

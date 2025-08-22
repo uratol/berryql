@@ -263,8 +263,7 @@ def build_merge_resolver_for_type(
             # Early delete handling
             try:
                 if isinstance(data_local, dict):
-                    # Accept either legacy '__delete' (pre-normalization) or GraphQL-safe '_Delete'
-                    delete_flag = bool(data_local.get('__delete') or data_local.get('_Delete'))
+                    delete_flag = bool(data_local.get('_Delete'))
                 else:
                     delete_flag = False
             except Exception:

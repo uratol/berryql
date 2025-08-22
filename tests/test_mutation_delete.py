@@ -11,11 +11,11 @@ async def test_merge_delete_invokes_callbacks(db_session, populated_db):
     post = populated_db["posts"][0]
     pid = int(post.id)
 
-    # Delete existing post via __delete flag; callbacks set on root Query.posts
+    # Delete existing post via _Delete flag; callbacks set on root Query.posts
     mutation = (
         "mutation($p: PostQLInput!) { merge_post(payload: $p) { id title author_id } }"
     )
-    variables = {"p": {"id": pid, "__delete": True}}
+    variables = {"p": {"id": pid, "_Delete": True}}
     res = await schema.execute(
         mutation,
         variable_values=variables,
