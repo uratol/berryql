@@ -14,6 +14,73 @@ import asyncio
 
 berry_schema = BerrySchema()
 
+# --- Test-only: pre/post callback hooks & log ---
+CALLBACK_EVENTS: list[dict] = []
+
+def _test_pre_upsert(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+    try:
+        if not (getattr(info, 'context', None) or {}).get('test_callbacks'):
+            return data
+    except Exception:
+        return data
+    d = dict(data or {})
+    d['title'] = f"[pre]{d.get('title','')}"
+    try:
+        CALLBACK_EVENTS.append({'event': 'pre', 'model': getattr(model_cls, '__name__', str(model_cls))})
+    except Exception:
+        pass
+    return d
+
+def _test_post_upsert(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
+    try:
+        if (getattr(info, 'context', None) or {}).get('test_callbacks'):
+            # mutate title to mark post-callback effect
+            try:
+                t = getattr(instance, 'title', None)
+                if t is not None:
+                    setattr(instance, 'title', f"{t}[post]")
+            except Exception:
+                pass
+            try:
+                CALLBACK_EVENTS.append({'event': 'post', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+            except Exception:
+                pass
+    except Exception:
+        return
+
+# Async variants for callback testing
+async def _test_pre_upsert_async(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+    await asyncio.sleep(0)
+    try:
+        if not (getattr(info, 'context', None) or {}).get('test_callbacks_async'):
+            return data
+    except Exception:
+        return data
+    d = dict(data or {})
+    d['title'] = f"[apre]{d.get('title','')}"
+    try:
+        CALLBACK_EVENTS.append({'event': 'apre', 'model': getattr(model_cls, '__name__', str(model_cls))})
+    except Exception:
+        pass
+    return d
+
+async def _test_post_upsert_async(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
+    await asyncio.sleep(0)
+    try:
+        if (getattr(info, 'context', None) or {}).get('test_callbacks_async'):
+            try:
+                t = getattr(instance, 'title', None)
+                if t is not None:
+                    setattr(instance, 'title', f"{t}[apost]")
+            except Exception:
+                pass
+            try:
+                CALLBACK_EVENTS.append({'event': 'apost', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+            except Exception:
+                pass
+    except Exception:
+        return
+
 @berry_schema.type(model=PostComment)
 class PostCommentQL(BerryType):
     id = field()
@@ -198,7 +265,7 @@ class BlogDomain(BerryDomain):
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-    }, mutation=True)
+    }, mutation=True, pre=_test_pre_upsert, post=_test_post_upsert)
     # Async builder for filter args should be awaited in root filters
     async def _created_at_gt_async(M, info, v):
         await asyncio.sleep(0)
@@ -223,6 +290,11 @@ class GroupDomain(BerryDomain):
     # Nest other domains inside this domain
     userDomain = domain(UserDomain)
     blogDomain = domain(BlogDomain)
+
+# Domain solely for async callback tests
+@berry_schema.domain(name='asyncDomain')
+class AsyncDomain(BerryDomain):
+    posts = relation('PostQL', mutation=True, pre=_test_pre_upsert_async, post=_test_post_upsert_async)
 
 # Declare Query with explicit roots and grouped domains
 @berry_schema.query()
@@ -266,7 +338,7 @@ class Query:
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-    }, mutation=True)
+    }, mutation=True, pre=_test_pre_upsert, post=_test_post_upsert)
     # Async where callable support for roots
     async def _gate_users_async(model_cls, info: Info):
         # tiny await to ensure awaitable path is exercised
@@ -308,6 +380,8 @@ class Mutation:
     userDomain = domain(UserDomain)
     blogDomain = domain(BlogDomain)
     groupDomain = domain(GroupDomain)
+    # Expose async callback domain under Mutation
+    asyncDomain = domain(AsyncDomain)
 
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None

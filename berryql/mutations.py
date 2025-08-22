@@ -23,7 +23,15 @@ _logger = logging.getLogger("berryql")
 
 # --- Upsert builder -------------------------------------------------------
 
-def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['BerryType'], *, field_name: Optional[str] = None, relation_scope: Any | None = None):
+def build_upsert_resolver_for_type(
+    schema: 'BerrySchema',
+    btype_cls: Type['BerryType'],
+    *,
+    field_name: Optional[str] = None,
+    relation_scope: Any | None = None,
+    pre_callback: Any | None = None,
+    post_callback: Any | None = None,
+):
     """Return (fname, strawberry.field, st_return) implementing recursive upsert for a BerryType.
 
     This mirrors the previous inline version in registry, but lives here for clarity.
@@ -47,6 +55,71 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
 
         # Helpers to compile and enforce scope for a given model instance
         from .core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
+
+        # --- Callback helpers -------------------------------------------------
+        import inspect, asyncio as _asyncio
+
+        def _norm_callable(cb):
+            return cb if callable(cb) else None
+
+        # Type-level hooks on BerryType, best-effort
+        try:
+            type_pre_cb = _norm_callable(getattr(btype_cls, 'pre_upsert', None) or getattr(btype_cls, '__pre_upsert__', None))
+        except Exception:
+            type_pre_cb = None
+        try:
+            type_post_cb = _norm_callable(getattr(btype_cls, 'post_upsert', None) or getattr(btype_cls, '__post_upsert__', None))
+        except Exception:
+            type_post_cb = None
+
+        async def _maybe_call_pre(cb, model_cls_local, info_local, data_local, context_local):
+            if not callable(cb):
+                return data_local
+            try:
+                sig = inspect.signature(cb)
+                params = list(sig.parameters.keys())
+            except Exception:
+                params = []
+            try:
+                if len(params) >= 4:
+                    res = cb(model_cls_local, info_local, data_local, context_local)
+                elif len(params) == 3:
+                    res = cb(model_cls_local, info_local, data_local)
+                elif len(params) == 2:
+                    res = cb(data_local, info_local)
+                else:
+                    res = cb(data_local)
+                if inspect.isawaitable(res):
+                    res = await res  # type: ignore[func-returns-value]
+                return schema._input_to_dict(res) if res is not None else data_local
+            except Exception:
+                # propagate callback exceptions to abort mutation
+                raise
+
+        async def _maybe_call_post(cb, model_cls_local, info_local, instance_local, created_local, context_local):
+            if not callable(cb):
+                return None
+            try:
+                sig = inspect.signature(cb)
+                params = list(sig.parameters.keys())
+            except Exception:
+                params = []
+            try:
+                if len(params) >= 5:
+                    res = cb(model_cls_local, info_local, instance_local, created_local, context_local)
+                elif len(params) == 4:
+                    res = cb(model_cls_local, info_local, instance_local, created_local)
+                elif len(params) == 3:
+                    res = cb(instance_local, info_local, created_local)
+                elif len(params) == 2:
+                    res = cb(instance_local, info_local)
+                else:
+                    res = cb(instance_local)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                # Let exceptions bubble up to caller
+                raise
 
         def _resolve_scope_value(value):
             v = value
@@ -133,6 +206,44 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
             return bool(row)
 
         async def _upsert_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
+            # Compute effective relation-level callbacks (from parent relation meta or top-level builder args)
+            eff_pre_cb = None
+            eff_post_cb = None
+            try:
+                if rel_name_from_parent and parent_ctx is not None:
+                    parent_model_cls = parent_ctx.get('parent_model')
+                    # Find parent BerryType to read relation meta
+                    parent_btype = None
+                    try:
+                        for _n, _bt in (schema.types or {}).items():
+                            if getattr(_bt, 'model', None) is parent_model_cls:
+                                parent_btype = _bt
+                                break
+                    except Exception:
+                        parent_btype = None
+                    if parent_btype is not None:
+                        try:
+                            rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
+                            if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
+                                meta = (getattr(rdef, 'meta', {}) or {})
+                                eff_pre_cb = _norm_callable(meta.get('pre') or meta.get('pre_upsert'))
+                                eff_post_cb = _norm_callable(meta.get('post') or meta.get('post_upsert'))
+                        except Exception:
+                            eff_pre_cb = eff_pre_cb or None
+                            eff_post_cb = eff_post_cb or None
+                if eff_pre_cb is None:
+                    eff_pre_cb = _norm_callable(pre_callback)
+                if eff_post_cb is None:
+                    eff_post_cb = _norm_callable(post_callback)
+            except Exception:
+                eff_pre_cb = _norm_callable(pre_callback)
+                eff_post_cb = _norm_callable(post_callback)
+
+            # Call pre-callbacks before any processing (relation-level then type-level)
+            if eff_pre_cb is not None:
+                data_local = await _maybe_call_pre(eff_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            if type_pre_cb is not None:
+                data_local = await _maybe_call_pre(type_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             # Split scalars and relations
             scalar_vals: Dict[str, Any] = {}
             relation_vals: Dict[str, Any] = {}
@@ -368,6 +479,7 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                     eff_scope = relation_scope
             except Exception:
                 eff_scope = relation_scope
+            created_now = False
             if instance is None:
                 instance = model_cls_local()
                 if pk_val is not None:
@@ -375,6 +487,7 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                         setattr(instance, pk_name, pk_val)
                     except Exception:
                         pass
+                created_now = True
                 # For MSSQL tables with GUID PKs that normally rely on server_default (e.g., newsequentialid()),
                 # pre-generate a UUID to avoid implicit RETURNING/OUTPUT, which fails when triggers exist.
                 try:
@@ -590,6 +703,11 @@ def build_upsert_resolver_for_type(schema: 'BerrySchema', btype_cls: Type['Berry
                                 pass
                         await _upsert_single(child_model, child_btype, item, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
             await session.flush()
+            # Fire post-callbacks (type-level first or relation-level first? choose relation-level then type-level for symmetry with pre)
+            if eff_post_cb is not None:
+                await _maybe_call_post(eff_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            if type_post_cb is not None:
+                await _maybe_call_post(type_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             return instance
 
         inst = await _upsert_single(model_cls, btype_cls, data)
@@ -726,15 +844,28 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                     continue
                 # Determine effective scope: relation scope or domain guard
                 eff_scope = None
+                eff_pre_cb = None
+                eff_post_cb = None
                 try:
                     eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
+                    eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
+                    eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
                     if eff_scope is None:
                         eff_scope = getattr(dom_cls, '__domain_guard__', None)
                 except Exception:
                     eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                    eff_pre_cb = None
+                    eff_post_cb = None
                 triplet = None
                 try:
-                    triplet = build_upsert_resolver_for_type(schema, btype_t, field_name=_compose_mut_name(schema, rf), relation_scope=eff_scope)
+                    triplet = build_upsert_resolver_for_type(
+                        schema,
+                        btype_t,
+                        field_name=_compose_mut_name(schema, rf),
+                        relation_scope=eff_scope,
+                        pre_callback=eff_pre_cb,
+                        post_callback=eff_post_cb,
+                    )
                 except Exception:
                     triplet = None
                 if triplet is not None:
@@ -826,13 +957,26 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                                 continue
                             # Determine scope as in builder above
                             eff_scope = None
+                            eff_pre_cb = None
+                            eff_post_cb = None
                             try:
                                 eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
+                                eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
+                                eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
                                 if eff_scope is None:
                                     eff_scope = getattr(dom_cls, '__domain_guard__', None)
                             except Exception:
                                 eff_scope = getattr(dom_cls, '__domain_guard__', None)
-                            triplet = build_upsert_resolver_for_type(schema, btype_t, field_name=_compose_mut_name(schema, rf), relation_scope=eff_scope)
+                                eff_pre_cb = None
+                                eff_post_cb = None
+                            triplet = build_upsert_resolver_for_type(
+                                schema,
+                                btype_t,
+                                field_name=_compose_mut_name(schema, rf),
+                                relation_scope=eff_scope,
+                                pre_callback=eff_pre_cb,
+                                post_callback=eff_post_cb,
+                            )
                             if triplet is None:
                                 continue
                             fname_u, field_obj, st_ret = triplet
@@ -874,6 +1018,17 @@ def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str,
                     allowed_targets.add(tgt)
                     if tgt not in scope_by_target:
                         scope_by_target[tgt] = meta.get('scope')
+                    # Also stash callbacks per target when declared on root
+                    try:
+                        _pre = meta.get('pre') or meta.get('pre_upsert')
+                        _post = meta.get('post') or meta.get('post_upsert')
+                    except Exception:
+                        _pre = None
+                        _post = None
+                    if _pre is not None:
+                        scope_by_target[f"__pre__::{tgt}"] = _pre
+                    if _post is not None:
+                        scope_by_target[f"__post__::{tgt}"] = _post
                 except Exception:
                     continue
     except Exception:
@@ -882,7 +1037,13 @@ def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str,
     for tname, btype_cls in list(schema.types.items()):
         if allowed_targets is not None and (not tname or tname not in allowed_targets):
             continue
-        triplet = build_upsert_resolver_for_type(schema, btype_cls, relation_scope=scope_by_target.get(tname))
+        triplet = build_upsert_resolver_for_type(
+            schema,
+            btype_cls,
+            relation_scope=scope_by_target.get(tname),
+            pre_callback=scope_by_target.get(f"__pre__::{tname}"),
+            post_callback=scope_by_target.get(f"__post__::{tname}"),
+        )
         if triplet is None:
             continue
         fname_u, field_obj, st_ret = triplet
