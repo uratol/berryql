@@ -1,6 +1,55 @@
 import pytest
 
 from tests.schema import schema
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_domain_mutation_scope_async_guard(db_session, populated_db):
+    # Set an async domain guard on BlogDomain to allow only author_id == 1
+    from tests.schema import BlogDomain, schema as berry_schema
+    orig_guard = getattr(BlogDomain, "__domain_guard__", None)
+
+    async def _guard(model_cls, info):
+        await asyncio.sleep(0)
+        return {"author_id": {"eq": 1}}
+
+    try:
+        setattr(BlogDomain, "__domain_guard__", _guard)
+        m = (
+            """
+            mutation($p: PostQLInput!) {
+              blogDomain { merge_posts(payload: $p) { id title author_id } }
+            }
+            """
+        )
+        # Out-of-scope: author_id = 2
+        res1 = await berry_schema.execute(
+            m,
+            variable_values={"p": {"title": "A", "content": "B", "author_id": 2}},
+            context_value={"db_session": db_session},
+        )
+        assert res1.errors is not None, "expected scope violation error for async guard"
+        assert "out of scope" in str(res1.errors[0]).lower()
+
+        # In-scope: author_id = 1
+        res2 = await berry_schema.execute(
+            m,
+            variable_values={"p": {"title": "C", "content": "D", "author_id": 1}},
+            context_value={"db_session": db_session},
+        )
+        assert res2.errors is None, res2.errors
+        data = res2.data["blogDomain"]["merge_posts"]
+        assert int(data["author_id"]) == 1
+    finally:
+        # Restore guard
+        if orig_guard is None:
+            try:
+                delattr(BlogDomain, "__domain_guard__")
+            except Exception:
+                pass
+        else:
+            setattr(BlogDomain, "__domain_guard__", orig_guard)
 
 
 @pytest.mark.asyncio

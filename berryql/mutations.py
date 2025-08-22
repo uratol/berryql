@@ -1003,10 +1003,30 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                     eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
                     eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_merge') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
                     eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_merge') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
-                    if eff_scope is None:
-                        eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                    # Build a runtime scope resolver that prefers relation meta scope when present,
+                    # otherwise evaluates the current domain guard at call time.
+                    def _make_runtime_scope_callable(dom_cls_local, meta_scope_local):
+                        async def _runtime_scope(model_cls_local, info_local):
+                            inner = meta_scope_local if meta_scope_local is not None else getattr(dom_cls_local, '__domain_guard__', None)
+                            if callable(inner):
+                                try:
+                                    res = inner(model_cls_local, info_local)
+                                    import inspect as _ins
+                                    if _ins.isawaitable(res):
+                                        res = await res  # type: ignore
+                                    return res
+                                except Exception:
+                                    # Propagate guard errors
+                                    raise
+                            return inner
+                        return _runtime_scope
+                    eff_scope = _make_runtime_scope_callable(dom_cls, eff_scope)
                 except Exception:
-                    eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                    # Fallback to runtime domain guard
+                    def _scope_fallback(model_cls_local, info_local):
+                        inner = getattr(dom_cls, '__domain_guard__', None)
+                        return inner(model_cls_local, info_local) if callable(inner) else inner
+                    eff_scope = _scope_fallback
                     eff_pre_cb = None
                     eff_post_cb = None
                 triplet = None
@@ -1116,10 +1136,27 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                                 eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
                                 eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_merge') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
                                 eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_merge') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
-                                if eff_scope is None:
-                                    eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                                # Use a runtime scope callable to always consult current __domain_guard__ when needed
+                                def _make_runtime_scope_callable(dom_cls_local, meta_scope_local):
+                                    async def _runtime_scope(model_cls_local, info_local):
+                                        inner = meta_scope_local if meta_scope_local is not None else getattr(dom_cls_local, '__domain_guard__', None)
+                                        if callable(inner):
+                                            try:
+                                                res = inner(model_cls_local, info_local)
+                                                import inspect as _ins
+                                                if _ins.isawaitable(res):
+                                                    res = await res  # type: ignore
+                                                return res
+                                            except Exception:
+                                                raise
+                                        return inner
+                                    return _runtime_scope
+                                eff_scope = _make_runtime_scope_callable(dom_cls, eff_scope)
                             except Exception:
-                                eff_scope = getattr(dom_cls, '__domain_guard__', None)
+                                def _scope_fallback(model_cls_local, info_local):
+                                    inner = getattr(dom_cls, '__domain_guard__', None)
+                                    return inner(model_cls_local, info_local) if callable(inner) else inner
+                                eff_scope = _scope_fallback
                                 eff_pre_cb = None
                                 eff_post_cb = None
                             triplet = build_merge_resolver_for_type(
