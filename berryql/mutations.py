@@ -411,6 +411,38 @@ def build_merge_resolver_for_type(
                 elif fdef.kind == 'relation':
                     relation_vals[k] = v
 
+            # If relation/domain scope provides fixed equality constraints, use them as defaults
+            # for missing scalar fields on this level (exclude primary key).
+            try:
+                pk_name_local = schema._get_pk_name(model_cls_local)
+            except Exception:
+                pk_name_local = 'id'
+            if eff_scope is not None:
+                try:
+                    v_scope = _resolve_scope_value(eff_scope)
+                    # Only handle dict/JSON forms for defaults; callables/expressions enforced below
+                    from .core.utils import to_where_dict as _to_where_dict
+                    wdict = _to_where_dict(v_scope, strict=False) if not isinstance(v_scope, dict) else v_scope
+                except Exception:
+                    wdict = None
+                if isinstance(wdict, dict):
+                    try:
+                        # Iterate simple equality constraints and apply missing defaults
+                        for _col, _ops in (wdict or {}).items():
+                            try:
+                                if _col == pk_name_local:
+                                    continue
+                                if not isinstance(_ops, dict):
+                                    continue
+                                if 'eq' not in _ops:
+                                    continue
+                                if scalar_vals.get(_col) is None:
+                                    scalar_vals[_col] = _ops.get('eq')
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
             # Helper: MSSQL/GUID
             def _is_mssql(session_local) -> bool:
                 try:
@@ -525,6 +557,22 @@ def build_merge_resolver_for_type(
                                     break
                     except Exception:
                         child_fk_to_parent = None
+                    # Check relation meta for explicit fk_column_name override
+                    if child_fk_to_parent is None and rel_name_from_parent is not None:
+                        try:
+                            parent_btype = None
+                            for _n, _bt in (schema.types or {}).items():
+                                if getattr(_bt, 'model', None) is parent_model_cls:
+                                    parent_btype = _bt
+                                    break
+                            if parent_btype is not None:
+                                rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
+                                if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
+                                    _fk_override = (getattr(rdef, 'meta', {}) or {}).get('fk_column_name')
+                                    if _fk_override:
+                                        child_fk_to_parent = _fk_override
+                        except Exception:
+                            pass
                     # Also relationship attribute on child targeting parent
                     try:
                         rel_name_found = None
@@ -750,17 +798,27 @@ def build_merge_resolver_for_type(
                     items = schema._input_to_dict(rel_value)
                     if not isinstance(items, list):
                         items = [items]
+                    # Determine child FK column name for list relations. Prefer explicit override from relation meta.
                     child_fk_col_name = None
                     try:
-                        for cc in child_model.__table__.columns:
-                            for fk in cc.foreign_keys:
-                                if fk.column.table.name == model_cls_local.__table__.name:
-                                    child_fk_col_name = cc.name
-                                    break
-                            if child_fk_col_name is not None:
-                                break
+                        _meta = getattr(rel_def, 'meta', {}) or {}
+                        _fk_override = _meta.get('fk_column_name')
+                        if _fk_override:
+                            child_fk_col_name = _fk_override
                     except Exception:
                         child_fk_col_name = None
+                    # Fallback: inspect actual FKs from child to parent table
+                    if child_fk_col_name is None:
+                        try:
+                            for cc in child_model.__table__.columns:
+                                for fk in cc.foreign_keys:
+                                    if fk.column.table.name == model_cls_local.__table__.name:
+                                        child_fk_col_name = cc.name
+                                        break
+                                if child_fk_col_name is not None:
+                                    break
+                        except Exception:
+                            child_fk_col_name = None
                     if child_fk_col_name is None:
                         try:
                             conv_name = f"{model_cls_local.__table__.name.rstrip('s')}_id"
