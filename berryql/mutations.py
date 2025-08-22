@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
 from sqlalchemy import select
 from sqlalchemy.sql.elements import ColumnElement
+from .sql.builders import RelationSQLBuilders
 
 if TYPE_CHECKING:  # pragma: no cover
     from .registry import BerrySchema, BerryType, BerryDomain
@@ -163,6 +164,11 @@ def build_merge_resolver_for_type(
                 return {'repr': repr(instance_local)}
 
         async def _enforce_scope(model_cls_local, instance_local, scope_raw: Any | None):
+            """Enforce mutation scope using the same where builder as queries.
+
+            Accepts dict/JSON string/callable/SQLA expression. Callable may return any of those.
+            Supports ScalarSelect inside where dicts (e.g., {'id': {'in': select(...).scalar_subquery()}}).
+            """
             if scope_raw is None:
                 return True
             try:
@@ -175,29 +181,40 @@ def build_merge_resolver_for_type(
                 pk_val_local = None
             if pk_val_local is None:
                 return True
+            # Resolve potential GraphQL variables/literals
             v = _resolve_scope_value(scope_raw)
-            expr: Optional[ColumnElement[bool]] = None
-            if isinstance(v, (dict, str)):
-                try:
-                    wdict = _to_where_dict(v, strict=True)
-                    if wdict:
-                        maybe_expr = _expr_from_where_dict(model_cls_local, wdict, strict=True)
-                        if maybe_expr is not None:
-                            expr = cast(ColumnElement[bool], maybe_expr)
-                except Exception:
-                    expr = None
-            else:
-                try:
-                    res = v(model_cls_local, info) if callable(v) else v
-                    if res is not None:
-                        expr = cast(ColumnElement[bool], res)
-                except Exception:
-                    expr = None
-            if expr is None:
-                return True
-            stmt = select(model_cls_local.__table__.c[pk_name_local]).select_from(model_cls_local).where(
+            # Base statement: select PK for this instance
+            stmt = select(getattr(model_cls_local.__table__.c, pk_name_local)).select_from(model_cls_local).where(
                 getattr(model_cls_local.__table__.c, pk_name_local) == pk_val_local
-            ).where(expr)
+            )
+            # Reuse common builder to apply where regardless of type (dict/str/callable/expr)
+            try:
+                builder = RelationSQLBuilders(schema)
+                stmt = builder._apply_where_common(
+                    stmt,
+                    model_cls_local,
+                    v,
+                    strict=True,
+                    to_where_dict=_to_where_dict,
+                    expr_from_where_dict=_expr_from_where_dict,
+                    info=info,
+                )
+            except Exception:
+                # Fallback: try to coerce dict/str via helpers directly
+                try:
+                    if isinstance(v, (dict, str)):
+                        wdict = _to_where_dict(v, strict=True)
+                        if wdict:
+                            expr = cast(ColumnElement[bool], _expr_from_where_dict(model_cls_local, wdict, strict=True))
+                            if expr is not None:
+                                stmt = stmt.where(expr)
+                    else:
+                        expr2 = v(model_cls_local, info) if callable(v) else v
+                        if expr2 is not None:
+                            stmt = stmt.where(cast(ColumnElement[bool], expr2))
+                except Exception:
+                    # If scope can't be applied, do not block the mutation here; treat as no scope.
+                    pass
             res = await session.execute(stmt)
             row = res.first()
             return bool(row)
