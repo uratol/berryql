@@ -61,6 +61,7 @@ from .core.hydration import Hydrator
 
 __all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
 
+UNSET = getattr(strawberry, 'UNSET')
 
 # --- Helper: Relation selection extraction (moved out of resolver closure) ---
 ## RelationSelectionExtractor imported from core.selection
@@ -223,6 +224,7 @@ class BerrySchema:
         Includes scalar fields and relation fields (recursively using corresponding Input types).
         Aggregates and custom fields are excluded. All fields are optional to support partial updates.
         """
+        # Resolve target type name
         try:
             tname = getattr(btype_cls, '__name__', None)
         except Exception:
@@ -239,6 +241,7 @@ class BerrySchema:
         # Pre-cache placeholder to avoid infinite recursion on self-referential types
         self._st_types[input_name] = InPlain
         anns: Dict[str, Any] = {}
+
         # Column type map for scalar field type inference
         try:
             model_cls = getattr(btype_cls, 'model', None)
@@ -250,7 +253,8 @@ class BerrySchema:
             table_cols = set(c.name for c in getattr(getattr(model_cls, '__table__', None), 'columns', []) or []) if model_cls is not None else set()
         except Exception:
             table_cols = set()
-        # Scalars
+
+        # Scalars and relations
         for fname, fdef in (getattr(btype_cls, '__berry_fields__', {}) or {}).items():
             if fdef.kind == 'scalar':
                 # Skip private scalars
@@ -268,7 +272,6 @@ class BerrySchema:
                 try:
                     source_name = src_col or fname
                     if source_name not in table_cols:
-                        # do not include in input
                         continue
                 except Exception:
                     pass
@@ -281,11 +284,11 @@ class BerrySchema:
                     anns[fname] = Optional[py_t]
                 except Exception:
                     anns[fname] = Optional[str]
-                # default to None to make optional in input
+                # Use strawberry.UNSET to distinguish omitted vs explicit null
                 try:
-                    setattr(InPlain, fname, None)
+                    setattr(InPlain, fname, UNSET)
                 except Exception:
-                    pass
+                    setattr(InPlain, fname, None)
             elif fdef.kind == 'relation':
                 # Build nested inputs recursively
                 target_name = fdef.meta.get('target') if isinstance(fdef.meta, dict) else None
@@ -299,37 +302,34 @@ class BerrySchema:
                 try:
                     if is_single:
                         anns[fname] = Optional[child_input]  # type: ignore[index]
-                        setattr(InPlain, fname, None)
+                        setattr(InPlain, fname, UNSET)
                     else:
                         anns[fname] = Optional[List[child_input]]  # type: ignore[index]
-                        # For list relations, default to None (omit) or empty list; choose None to detect intent
-                        setattr(InPlain, fname, None)
+                        setattr(InPlain, fname, UNSET)
                 except Exception:
-                    # Fallback to Optional[str] on annotation failure
                     anns[fname] = Optional[str]
                     try:
                         setattr(InPlain, fname, None)
                     except Exception:
                         pass
-        # Attach annotations and decorate as strawberry input
+
         # Special control flag: allow delete semantics in mutation payloads
         try:
-            from dataclasses import field as _dc_field
             anns['_Delete'] = Optional[bool]
-            setattr(InPlain, '_Delete', None)
+            setattr(InPlain, '_Delete', UNSET)
         except Exception:
-            pass
-        
+            try:
+                setattr(InPlain, '_Delete', None)
+            except Exception:
+                pass
+
         # Now attach annotations and decorate as strawberry input
         setattr(InPlain, '__annotations__', anns)
         try:
-            # Ensure dataclass mode so defaults are honored without required args
             InType = strawberry.input(InPlain)  # type: ignore
         except Exception:
-            # If decoration fails, keep plain class (still usable for annotations)
             InType = InPlain
         self._st_types[input_name] = InType
-        # Export globally for forward refs
         try:
             globals()[input_name] = InType
         except Exception:
@@ -341,7 +341,7 @@ class BerrySchema:
 
         Best-effort: handles dataclasses and simple objects with __dict__ or attribute access.
         """
-        from dataclasses import is_dataclass, asdict
+        from dataclasses import is_dataclass, fields as _dc_fields
         # None
         if obj is None:
             return None
@@ -360,7 +360,20 @@ class BerrySchema:
         # Dataclass from strawberry.input
         try:
             if is_dataclass(obj):
-                return {k: self._input_to_dict(v) for k, v in asdict(obj).items()}
+                out: Dict[str, Any] = {}
+                for f in _dc_fields(obj):
+                    try:
+                        v = getattr(obj, f.name)
+                    except Exception:
+                        continue
+                    # Skip UNSET (omitted) fields; keep None as explicit null
+                    try:
+                        if v is UNSET:
+                            continue
+                    except Exception:
+                        pass
+                    out[f.name] = self._input_to_dict(v)
+                return out
         except Exception:
             pass
         # Generic object: try __dict__

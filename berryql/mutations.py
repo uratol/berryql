@@ -742,11 +742,12 @@ def build_merge_resolver_for_type(
                     pass
                 session.add(instance)
 
-            # Assign scalar fields (ignore None)
+            # Assign scalar fields; allow explicit None to clear nullable fields.
+            # Do not overwrite primary key with None/empty.
             for k, v in list(scalar_vals.items()):
-                if v is None:
-                    continue
                 try:
+                    if k == pk_name and (v is None or v == ''):
+                        continue
                     setattr(instance, k, v)
                 except Exception:
                     try:
