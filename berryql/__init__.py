@@ -10,7 +10,7 @@ directly (avoiding circular imports).
 """
 from typing import Optional
 from .registry import BerrySchema, BerryType, BerryDomain, StrawberryConfig
-from .core.fields import field, relation, aggregate, count, custom, custom_object, domain
+from .core.fields import field, relation, aggregate, count, custom, custom_object, domain, mutation
 
 _ACTIVE_SCHEMA: Optional[BerrySchema] = None
 
@@ -25,6 +25,6 @@ def get_active_schema() -> BerrySchema:
 
 __all__ = [
     'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig',
-    'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain',
+    'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation',
     'get_active_schema', 'set_active_schema'
 ]

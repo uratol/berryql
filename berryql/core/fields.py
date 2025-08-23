@@ -77,7 +77,7 @@ def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
         meta['column'] = column
     return FieldDescriptor(kind='scalar', **meta)
 
-def relation(target: Any = None, *, single: bool | None = None, mutation: bool = False, fk_column_name: str | None = None, **meta) -> FieldDescriptor:
+def relation(target: Any = None, *, single: bool | None = None, fk_column_name: str | None = None, **meta) -> FieldDescriptor:
     """Declare a relation to another Berry type.
 
     Use on both root Query/Domain classes and nested Berry types to model
@@ -127,8 +127,6 @@ def relation(target: Any = None, *, single: bool | None = None, mutation: bool =
         m['target'] = target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target
     if single is not None:
         m['single'] = single
-    # Flag to enable generating an upsert mutation for this relation under Mutation domains
-    m['mutation'] = bool(mutation)
     # Optional override for foreign key column name.
     # Semantics:
     # - For list relations (child -> parent), this is the FK column on the child model referencing the parent (e.g., "entity_id").
@@ -138,6 +136,53 @@ def relation(target: Any = None, *, single: bool | None = None, mutation: bool =
     # Backward-incompatible rename: parameter 'where' became 'scope'.
     # If users pass scope=..., keep it under 'scope' key; no implicit aliasing from 'where'.
     return FieldDescriptor(kind='relation', **m)
+
+
+# --- Mutations (write registration) ---
+
+class MutationDescriptor:
+    """Descriptor placed on Query/Domain/Mutation classes to register merge mutations.
+
+    Use with the :func:`mutation` factory. The attribute name where this
+    descriptor is assigned will be used as the GraphQL mutation field name.
+
+    Example:
+        class Mutation:
+            merge_posts = mutation('PostQL', pre=pre_cb, post=post_cb)
+
+        @berry_schema.domain(name='blogDomain')
+        class BlogDomain(BerryDomain):
+            posts = relation('PostQL')
+            merge_posts = mutation('PostQL')
+    """
+    def __init__(self, *, target: Any, single: Optional[bool] = None, pre: Any | None = None, post: Any | None = None):
+        self.meta: Dict[str, Any] = {
+            'target': target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target,
+            'single': single,
+            'pre': pre,
+            'post': post,
+        }
+        self.name: str | None = None
+
+    def __set_name__(self, owner, name):  # pragma: no cover - trivial
+        self.name = name
+
+    def build(self, parent_name: str) -> FieldDef:
+        return FieldDef(name=self.name or '', kind='mutation', meta=self.meta)
+
+
+def mutation(target: Any, *, single: Optional[bool] = None, pre: Any | None = None, post: Any | None = None) -> MutationDescriptor:
+    """Declare a merge mutation for a Berry type.
+
+    Args:
+        target: Berry type (class or its name string) to merge.
+        single: When True, the payload is a single object; when False/None, payload is a list.
+        pre: Optional callback invoked before merge of an item. May be sync or async.
+        post: Optional callback invoked after merge of an item. May be sync or async.
+
+    The attribute name is the GraphQL mutation field name. Example: ``merge_posts``.
+    """
+    return MutationDescriptor(target=target, single=single, pre=pre, post=post)
 
 def aggregate(source: str, **meta) -> FieldDescriptor:
     """Declare an aggregate derived from a relation.

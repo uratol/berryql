@@ -10,10 +10,10 @@ async def test_upsert_callbacks_async(db_session, populated_db):
     uid = populated_db["users"][0].id
     # Invoke async callbacks via domain field under Mutation
     mutation = (
-        "mutation($p: PostQLInput!) { asyncDomain { merge_posts(payload: $p) { id title author_id } } }"
+        "mutation($p: [PostQLInput!]!) { asyncDomain { merge_posts(payload: $p) { id title author_id } } }"
     )
     variables = {
-        "p": {"title": "Async", "content": "Body", "author_id": uid}
+        "p": [{"title": "Async", "content": "Body", "author_id": uid}]
     }
     res = await schema.execute(
         mutation,

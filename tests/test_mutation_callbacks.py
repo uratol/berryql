@@ -11,10 +11,10 @@ async def test_upsert_callbacks_create(db_session, populated_db):
     uid = populated_db["users"][0].id
     # Use root-level upsert with callbacks
     mutation = (
-    "mutation($payload: PostQLInput!) { merge_posts(payload: $payload) { id title author_id } }"
+    "mutation($payload: [PostQLInput!]!) { merge_posts(payload: $payload) { id title author_id } }"
     )
     variables = {
-        "payload": {"title": "New", "content": "Body", "author_id": uid}
+        "payload": [{"title": "New", "content": "Body", "author_id": uid}]
     }
     res = await schema.execute(
         mutation,
@@ -35,8 +35,8 @@ async def test_upsert_callbacks_update(db_session, populated_db):
     CALLBACK_EVENTS.clear()
     uid = populated_db["users"][1].id
     # First create
-    create = "mutation($p: PostQLInput!) { merge_posts(payload: $p) { id title } }"
-    payload = {"title": "Once", "content": "B", "author_id": uid}
+    create = "mutation($p: [PostQLInput!]!) { merge_posts(payload: $p) { id title } }"
+    payload = [{"title": "Once", "content": "B", "author_id": uid}]
     res1 = await schema.execute(
         create,
         variable_values={"p": payload},
@@ -46,8 +46,8 @@ async def test_upsert_callbacks_update(db_session, populated_db):
     pid = int(res1.data["merge_posts"]["id"])
 
     # Update: title change only
-    upd = "mutation($p: PostQLInput!) { merge_posts(payload: $p) { id title } }"
-    payload2 = {"id": pid, "title": "Twice"}
+    upd = "mutation($p: [PostQLInput!]!) { merge_posts(payload: $p) { id title } }"
+    payload2 = [{"id": pid, "title": "Twice"}]
     res2 = await schema.execute(
         upd,
         variable_values={"p": payload2},

@@ -32,6 +32,8 @@ def build_merge_resolver_for_type(
     relation_scope: Any | None = None,
     pre_callback: Any | None = None,
     post_callback: Any | None = None,
+    payload_is_list: bool | None = None,
+    return_is_list: bool | None = None,
 ):
     """Return (fname, strawberry.field, st_return) implementing recursive merge for a BerryType.
 
@@ -856,12 +858,37 @@ def build_merge_resolver_for_type(
                 await _maybe_call_post(type_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             return instance
 
-        inst = await _merge_single(model_cls, btype_cls, data)
-        await session.commit()
-        return schema.from_model(type_name, inst)
+        # Support list payloads when configured by caller
+        pl_is_list = bool(payload_is_list)
+        rt_is_list = bool(return_is_list)
+        if pl_is_list:
+            items = data if isinstance(data, list) else ([data] if data is not None else [])
+            out_models = []
+            for item in items:
+                inst = await _merge_single(model_cls, btype_cls, item)
+                out_models.append(inst)
+            await session.commit()
+            if rt_is_list:
+                return [schema.from_model(type_name, m) for m in out_models]
+            # Fallback: return last item if single return requested
+            last = out_models[-1] if out_models else None
+            return schema.from_model(type_name, last) if last is not None else None
+        else:
+            inst = await _merge_single(model_cls, btype_cls, data)
+            await session.commit()
+            return schema.from_model(type_name, inst)
 
     fname = field_name or (f"merge_{type_name[:-2].lower()}" if type_name.endswith('QL') else f"merge_{type_name.lower()}")
-    ann: Dict[str, Any] = {'info': StrawberryInfo, 'payload': input_type, 'return': st_return}
+    # Decide arg/return annotations (list vs single)
+    ann_payload = input_type
+    ann_return = st_return
+    if bool(payload_is_list):
+        from typing import List as _ListType  # avoid shadowing
+        ann_payload = _ListType[input_type]  # type: ignore[index]
+    if bool(return_is_list):
+        from typing import List as _ListType  # avoid shadowing
+        ann_return = _ListType[st_return]  # type: ignore[index]
+    ann: Dict[str, Any] = {'info': StrawberryInfo, 'payload': ann_payload, 'return': ann_return}
 
     async def _resolver(self, info: StrawberryInfo, payload):  # noqa: D401
         return await _merge_impl(info, payload)
@@ -980,74 +1007,54 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                     return inst
                 return _resolver
             setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
-    # Auto-generate merge mutations for relations on domain with mutation=True
+    # Auto-generate merge mutations declared explicitly via MutationDescriptor on the domain
     try:
-        for rf, rval in list(vars(dom_cls).items()):
-            if isinstance(rval, _FldDesc):
-                rdef = rval.build(getattr(dom_cls, '__name__', 'Domain'))
-                if rdef.kind != 'relation':
-                    continue
-                if not bool((rdef.meta or {}).get('mutation')):
-                    continue
-                target_name = rdef.meta.get('target') if isinstance(rdef.meta, dict) else None
-                if not target_name:
-                    continue
-                btype_t = schema.types.get(target_name)
-                if not btype_t:
-                    continue
-                # Determine effective scope: relation scope or domain guard
-                eff_scope = None
-                eff_pre_cb = None
-                eff_post_cb = None
-                try:
-                    eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
-                    eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_merge') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
-                    eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_merge') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
-                    # Build a runtime scope resolver that prefers relation meta scope when present,
-                    # otherwise evaluates the current domain guard at call time.
-                    def _make_runtime_scope_callable(dom_cls_local, meta_scope_local):
-                        async def _runtime_scope(model_cls_local, info_local):
-                            inner = meta_scope_local if meta_scope_local is not None else getattr(dom_cls_local, '__domain_guard__', None)
-                            if callable(inner):
-                                try:
-                                    res = inner(model_cls_local, info_local)
-                                    import inspect as _ins
-                                    if _ins.isawaitable(res):
-                                        res = await res  # type: ignore
-                                    return res
-                                except Exception:
-                                    # Propagate guard errors
-                                    raise
-                            return inner
-                        return _runtime_scope
-                    eff_scope = _make_runtime_scope_callable(dom_cls, eff_scope)
-                except Exception:
-                    # Fallback to runtime domain guard
-                    def _scope_fallback(model_cls_local, info_local):
-                        inner = getattr(dom_cls, '__domain_guard__', None)
-                        return inner(model_cls_local, info_local) if callable(inner) else inner
-                    eff_scope = _scope_fallback
-                    eff_pre_cb = None
-                    eff_post_cb = None
-                triplet = None
-                try:
-                    triplet = build_merge_resolver_for_type(
-                        schema,
-                        btype_t,
-                        field_name=_compose_mut_name(schema, rf),
-                        relation_scope=eff_scope,
-                        pre_callback=eff_pre_cb,
-                        post_callback=eff_post_cb,
-                    )
-                except Exception:
-                    triplet = None
-                if triplet is not None:
-                    fname_u, field_obj, st_ret = triplet
-                    try:
-                        setattr(DomSt_local, fname_u, field_obj)
-                        ann_local[fname_u] = st_ret  # type: ignore
-                    except Exception:
-                        pass
+        from .core.fields import MutationDescriptor as _MutDesc
+        for attr_name, desc in list(vars(dom_cls).items()):
+            if not isinstance(desc, _MutDesc):
+                continue
+            meta = getattr(desc, 'meta', {}) or {}
+            target_name = meta.get('target')
+            if not target_name:
+                continue
+            btype_t = schema.types.get(target_name)
+            if not btype_t:
+                continue
+            # Domain-level scope is the domain guard (runtime evaluated)
+            def _runtime_scope(dom_cls_local):
+                async def _inner(model_cls_local, info_local):
+                    inner = getattr(dom_cls_local, '__domain_guard__', None)
+                    if callable(inner):
+                        res = inner(model_cls_local, info_local)
+                        import inspect as _ins
+                        if _ins.isawaitable(res):
+                            res = await res  # type: ignore
+                        return res
+                    return inner
+                return _inner
+            eff_scope = _runtime_scope(dom_cls)
+            is_single = bool(meta.get('single'))
+            pre_cb = meta.get('pre')
+            post_cb = meta.get('post')
+            # Use attribute name as GraphQL mutation field name directly
+            triplet = build_merge_resolver_for_type(
+                schema,
+                btype_t,
+                field_name=attr_name,
+                relation_scope=eff_scope,
+                pre_callback=pre_cb,
+                post_callback=post_cb,
+                payload_is_list=(not is_single),
+                return_is_list=False,
+            )
+            if triplet is None:
+                continue
+            fname_u, field_obj, st_ret = triplet
+            try:
+                setattr(DomSt_local, fname_u, field_obj)
+                ann_local[fname_u] = st_ret  # type: ignore
+            except Exception:
+                pass
     except Exception:
         pass
     # If no fields were collected, or DomSt_local ended up without any strawberry field/mutation attrs, skip creating the type entirely
@@ -1113,72 +1120,50 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
             try:
                 DomRuntime = schema._st_types.get(f"{getattr(dom_cls,'__name__','Domain')}MutType")
                 if DomRuntime is not None:
-                    from .core.fields import FieldDescriptor as _FldDesc
+                    from .core.fields import MutationDescriptor as _MutDesc
                     updated = False
-                    for rf, rval in list(vars(dom_cls).items()):
-                        if isinstance(rval, _FldDesc):
-                            rdef = rval.build(getattr(dom_cls, '__name__', 'Domain'))
-                            if rdef.kind != 'relation':
-                                continue
-                            if not bool((rdef.meta or {}).get('mutation')):
-                                continue
-                            target_name = rdef.meta.get('target') if isinstance(rdef.meta, dict) else None
-                            if not target_name:
-                                continue
-                            btype_t = schema.types.get(target_name)
-                            if not btype_t:
-                                continue
-                            # Determine scope as in builder above
-                            eff_scope = None
-                            eff_pre_cb = None
-                            eff_post_cb = None
+                    for attr_name, desc in list(vars(dom_cls).items()):
+                        if not isinstance(desc, _MutDesc):
+                            continue
+                        meta = getattr(desc, 'meta', {}) or {}
+                        target_name = meta.get('target')
+                        if not target_name:
+                            continue
+                        btype_t = schema.types.get(target_name)
+                        if not btype_t:
+                            continue
+                        # Runtime scope = domain guard
+                        async def _runtime_scope(model_cls_local, info_local):
+                            inner = getattr(dom_cls, '__domain_guard__', None)
+                            if callable(inner):
+                                res = inner(model_cls_local, info_local)
+                                import inspect as _ins
+                                if _ins.isawaitable(res):
+                                    res = await res  # type: ignore
+                                return res
+                            return inner
+                        triplet = build_merge_resolver_for_type(
+                            schema,
+                            btype_t,
+                            field_name=attr_name,
+                            relation_scope=_runtime_scope,
+                            pre_callback=meta.get('pre'),
+                            post_callback=meta.get('post'),
+                            payload_is_list=(not bool(meta.get('single'))),
+                            return_is_list=False,
+                        )
+                        if triplet is None:
+                            continue
+                        fname_u, field_obj, st_ret = triplet
+                        if not hasattr(DomRuntime, fname_u):
                             try:
-                                eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
-                                eff_pre_cb = (getattr(rdef, 'meta', {}) or {}).get('pre') or (getattr(rdef, 'meta', {}) or {}).get('pre_merge') or (getattr(rdef, 'meta', {}) or {}).get('pre_upsert')
-                                eff_post_cb = (getattr(rdef, 'meta', {}) or {}).get('post') or (getattr(rdef, 'meta', {}) or {}).get('post_merge') or (getattr(rdef, 'meta', {}) or {}).get('post_upsert')
-                                # Use a runtime scope callable to always consult current __domain_guard__ when needed
-                                def _make_runtime_scope_callable(dom_cls_local, meta_scope_local):
-                                    async def _runtime_scope(model_cls_local, info_local):
-                                        inner = meta_scope_local if meta_scope_local is not None else getattr(dom_cls_local, '__domain_guard__', None)
-                                        if callable(inner):
-                                            try:
-                                                res = inner(model_cls_local, info_local)
-                                                import inspect as _ins
-                                                if _ins.isawaitable(res):
-                                                    res = await res  # type: ignore
-                                                return res
-                                            except Exception:
-                                                raise
-                                        return inner
-                                    return _runtime_scope
-                                eff_scope = _make_runtime_scope_callable(dom_cls, eff_scope)
+                                setattr(DomRuntime, fname_u, field_obj)
+                                ann_dom = getattr(DomRuntime, '__annotations__', None)
+                                if isinstance(ann_dom, dict):
+                                    ann_dom[fname_u] = st_ret
+                                updated = True
                             except Exception:
-                                def _scope_fallback(model_cls_local, info_local):
-                                    inner = getattr(dom_cls, '__domain_guard__', None)
-                                    return inner(model_cls_local, info_local) if callable(inner) else inner
-                                eff_scope = _scope_fallback
-                                eff_pre_cb = None
-                                eff_post_cb = None
-                            triplet = build_merge_resolver_for_type(
-                                schema,
-                                btype_t,
-                                field_name=_compose_mut_name(schema, rf),
-                                relation_scope=eff_scope,
-                                pre_callback=eff_pre_cb,
-                                post_callback=eff_post_cb,
-                            )
-                            if triplet is None:
-                                continue
-                            fname_u, field_obj, st_ret = triplet
-                            if not hasattr(DomRuntime, fname_u):
-                                try:
-                                    setattr(DomRuntime, fname_u, field_obj)
-                                    ann_dom = getattr(DomRuntime, '__annotations__', None)
-                                    if isinstance(ann_dom, dict):
-                                        ann_dom[fname_u] = st_ret
-                                    updated = True
-                                except Exception:
-                                    pass
+                                pass
                     if updated:
                         schema._st_types[f"{getattr(dom_cls,'__name__','Domain')}MutType"] = DomRuntime
             except Exception:
@@ -1188,84 +1173,40 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
 # --- Top-level merges ----------------------------------------------------
 
 def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
-    """Attach auto-generated merge mutations at root, gated by Query relations with mutation=True."""
-    # Compute allow-list of target Berry types from root Query relations with mutation=True
-    # and collect relation-specific metadata to expose alias fields named by Query attribute.
-    allowed_targets: Optional[set[str]] = None
-    scope_by_target: Dict[str, Any] = {}
-    # Only attribute-based merges will be exposed at root (no per-type legacy names)
-    relations_info: list[dict] = []
+    """Attach explicitly declared merge mutations at the root Mutation class.
+
+    Uses MutationDescriptor entries on the user-declared Mutation class.
+    """
+    user_mut = getattr(schema, '_user_mutation_cls', None)
+    if user_mut is None:
+        return
     try:
-        if isinstance(getattr(schema, '_root_query_fields', None), dict):
-            allowed_targets = set()
-            for rf, fdef in schema._root_query_fields.items():  # type: ignore[attr-defined]
-                try:
-                    if getattr(fdef, 'kind', None) != 'relation':
-                        continue
-                    meta = getattr(fdef, 'meta', {}) or {}
-                    if not bool(meta.get('mutation')):
-                        continue
-                    tgt = meta.get('target')
-                    if not tgt:
-                        continue
-                    allowed_targets.add(tgt)
-                    if tgt not in scope_by_target:
-                        scope_by_target[tgt] = meta.get('scope')
-                    # Also stash callbacks per target when declared on root
-                    try:
-                        _pre = meta.get('pre') or meta.get('pre_merge') or meta.get('pre_upsert')
-                        _post = meta.get('post') or meta.get('post_merge') or meta.get('post_upsert')
-                    except Exception:
-                        _pre = None
-                        _post = None
-                    if _pre is not None:
-                        scope_by_target[f"__pre__::{tgt}"] = _pre
-                    if _post is not None:
-                        scope_by_target[f"__post__::{tgt}"] = _post
-                    # Collect relation-specific info for alias building based on Query attribute name
-                    try:
-                        relations_info.append({
-                            'attr': rf,
-                            'target': tgt,
-                            'scope': meta.get('scope'),
-                            'pre': _pre,
-                            'post': _post,
-                        })
-                    except Exception:
-                        pass
-                except Exception:
-                    continue
-    except Exception:
-        allowed_targets = None
-        scope_by_target = {}
-        relations_info = []
-    # Expose alias names derived from Query attribute names for better ergonomics only.
-    # Example: Query.posts (mutation=True) -> merge_posts at root, with relation-specific scope/callbacks.
-    for info in relations_info:
-        try:
-            rf = info.get('attr')
-            tgt = info.get('target')
-            if not rf or not tgt:
+        from .core.fields import MutationDescriptor as _MutDesc
+        for attr_name, desc in list(vars(user_mut).items()):
+            if not isinstance(desc, _MutDesc):
                 continue
-            btype_cls = schema.types.get(tgt)
+            meta = getattr(desc, 'meta', {}) or {}
+            target_name = meta.get('target')
+            if not target_name:
+                continue
+            btype_cls = schema.types.get(target_name)
             if not btype_cls:
                 continue
-            alias_name = _compose_mut_name(schema, rf)
-            if hasattr(MPlain, alias_name):
-                continue
-            triplet_alias = build_merge_resolver_for_type(
+            is_single = bool(meta.get('single'))
+            triplet = build_merge_resolver_for_type(
                 schema,
                 btype_cls,
-                field_name=alias_name,
-                relation_scope=info.get('scope'),
-                pre_callback=info.get('pre'),
-                post_callback=info.get('post'),
+                field_name=attr_name,
+                relation_scope=None,
+                pre_callback=meta.get('pre'),
+                post_callback=meta.get('post'),
+                payload_is_list=(not is_single),
+                return_is_list=False,
             )
-            if triplet_alias is None:
+            if triplet is None:
                 continue
-            an, field_obj_alias, st_ret_alias = triplet_alias
-            setattr(MPlain, an, field_obj_alias)
-            anns_m[an] = st_ret_alias  # type: ignore
-        except Exception:
-            # Non-fatal: skip alias if anything goes wrong
-            continue
+            an, field_obj, st_ret = triplet
+            setattr(MPlain, an, field_obj)
+            anns_m[an] = st_ret  # type: ignore
+    except Exception:
+        return

@@ -18,7 +18,7 @@ async def test_domain_mutation_scope_async_guard(db_session, populated_db):
         setattr(BlogDomain, "__domain_guard__", _guard)
         m = (
             """
-            mutation($p: PostQLInput!) {
+            mutation($p: [PostQLInput!]!) {
               blogDomain { merge_posts(payload: $p) { id title author_id } }
             }
             """
@@ -26,7 +26,7 @@ async def test_domain_mutation_scope_async_guard(db_session, populated_db):
         # Out-of-scope: author_id = 2
         res1 = await berry_schema.execute(
             m,
-            variable_values={"p": {"title": "A", "content": "B", "author_id": 2}},
+            variable_values={"p": [{"title": "A", "content": "B", "author_id": 2}]},
             context_value={"db_session": db_session},
         )
         assert res1.errors is not None, "expected scope violation error for async guard"
@@ -35,7 +35,7 @@ async def test_domain_mutation_scope_async_guard(db_session, populated_db):
         # In-scope: author_id = 1
         res2 = await berry_schema.execute(
             m,
-            variable_values={"p": {"title": "C", "content": "D", "author_id": 1}},
+            variable_values={"p": [{"title": "C", "content": "D", "author_id": 1}]},
             context_value={"db_session": db_session},
         )
         assert res2.errors is None, res2.errors
@@ -60,13 +60,13 @@ async def test_nested_mutation_scope_rejects_out_of_scope_like(db_session, popul
 
     m = (
         """
-                mutation Upsert($payload: PostQLInput!) {
+                mutation Upsert($payload: [PostQLInput!]!) {
                     merge_posts(payload: $payload) { id title }
         }
         """
     )
     variables = {
-        "payload": {
+        "payload": [{
             "title": "Scoped Create",
             "content": "Body",
             "author_id": int(u1.id),
@@ -80,7 +80,7 @@ async def test_nested_mutation_scope_rejects_out_of_scope_like(db_session, popul
                     ]
                 }
             ],
-        }
+        }]
     }
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is not None, "expected scope violation error"
@@ -96,7 +96,7 @@ async def test_nested_mutation_scope_allows_in_scope_like(db_session, populated_
 
     m = (
         """
-                mutation Upsert($payload: PostQLInput!) {
+                mutation Upsert($payload: [PostQLInput!]!) {
                     merge_posts(payload: $payload) {
             id
             post_comments { id content admin_likes { id user_id } }
@@ -105,7 +105,7 @@ async def test_nested_mutation_scope_allows_in_scope_like(db_session, populated_
         """
     )
     variables = {
-        "payload": {
+        "payload": [{
             "title": "Scoped OK",
             "content": "Body",
             "author_id": int(u1.id),
@@ -118,7 +118,7 @@ async def test_nested_mutation_scope_allows_in_scope_like(db_session, populated_
                     ]
                 }
             ],
-        }
+        }]
     }
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
@@ -140,7 +140,7 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
     # First create a post with one comment and one admin_like (user_id=1)
     create_m = (
         """
-                mutation Upsert($payload: PostQLInput!) {
+                mutation Upsert($payload: [PostQLInput!]!) {
                     merge_posts(payload: $payload) {
             id
             post_comments { id content admin_likes { id user_id } }
@@ -149,7 +149,7 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
         """
     )
     create_vars = {
-        "payload": {
+        "payload": [{
             "title": "Scoped Update Base",
             "content": "Body",
             "author_id": int(u1.id),
@@ -162,7 +162,7 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
                     ]
                 }
             ],
-        }
+        }]
     }
     res1 = await schema.execute(create_m, variable_values=create_vars, context_value={"db_session": db_session})
     assert res1.errors is None, res1.errors
@@ -174,13 +174,13 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
     # Now attempt to update that like out of scope
     upd_m = (
         """
-                mutation Upsert($payload: PostQLInput!) {
+                mutation Upsert($payload: [PostQLInput!]!) {
                     merge_posts(payload: $payload) { id }
         }
         """
     )
     upd_vars = {
-        "payload": {
+        "payload": [{
             "id": int(post["id"]),
             "post_comments": [
                 {
@@ -190,7 +190,7 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
                     ]
                 }
             ],
-        }
+        }]
     }
     res2 = await schema.execute(upd_m, variable_values=upd_vars, context_value={"db_session": db_session})
     assert res2.errors is not None, "expected scope violation on update"

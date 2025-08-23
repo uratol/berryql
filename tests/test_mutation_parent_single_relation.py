@@ -8,12 +8,12 @@ pytestmark = pytest.mark.asyncio
 async def test_upsert_post_creates_author_first(db_session, populated_db):
     # Create a post with nested author (single relation). No author_id is provided.
     mutation = (
-        "mutation Upsert($payload: PostQLInput!) {"
+        "mutation Upsert($payload: [PostQLInput!]!) {"
     "  merge_posts(payload: $payload) { id title author_id author { id name } }"
         "}"
     )
     variables = {
-        "payload": {
+        "payload": [{
             "title": "Post with new author",
             "content": "Body",
             # Nested single relation: author
@@ -22,7 +22,7 @@ async def test_upsert_post_creates_author_first(db_session, populated_db):
                 "email": "nested_author@example.com",
                 "is_admin": False
             }
-        }
+        }]
     }
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     if res.errors:

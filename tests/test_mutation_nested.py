@@ -12,7 +12,7 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
 
     mutation = (
         """
-        mutation Upsert($payload: PostQLInput!) {
+  mutation Upsert($payload: [PostQLInput!]!) {
           merge_posts(payload: $payload) {
             id
             title
@@ -28,7 +28,7 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
         """
     )
     variables = {
-        "payload": {
+    "payload": [{
             "title": "Nested Create",
             "content": "Body",
             "author_id": int(u1.id),
@@ -44,7 +44,7 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
                     ]
                 },
             ],
-        }
+    }]
     }
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
@@ -85,7 +85,7 @@ async def test_mutation_domain_upsert_posts(db_session, populated_db):
     u1 = populated_db['users'][0]
     m = (
         """
-        mutation($payload: PostQLInput!) {
+    mutation($payload: [PostQLInput!]!) {
           blogDomain { 
             merge_posts(payload: $payload) {
               id
@@ -96,11 +96,11 @@ async def test_mutation_domain_upsert_posts(db_session, populated_db):
         """
     )
     variables = {
-        "payload": {
+    "payload": [{
             "title": "Domain Upsert",
             "content": "From domain",
             "author_id": int(u1.id),
-        }
+    }]
     }
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors

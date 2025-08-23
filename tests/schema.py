@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
-from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain
+from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain, mutation
 from tests.models import User, Post, PostComment, PostCommentLike, View  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
@@ -172,8 +172,8 @@ class PostQL(BerryType):
         ),
         returns={'min_created_at': datetime, 'comments_count': int}
     )
-    # Polymorphic views for posts + mutation
-    views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}', mutation=True)
+    # Polymorphic views for posts
+    views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}')
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
@@ -267,7 +267,9 @@ class BlogDomain(BerryDomain):
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-    }, mutation=True, pre=_test_pre_upsert, post=_test_post_upsert)
+    })
+    # Declare merge mutation for posts within the domain)
+    merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
     # Async builder for filter args should be awaited in root filters
     async def _created_at_gt_async(M, info, v):
         await asyncio.sleep(0)
@@ -296,7 +298,8 @@ class GroupDomain(BerryDomain):
 # Domain solely for async callback tests
 @berry_schema.domain(name='asyncDomain')
 class AsyncDomain(BerryDomain):
-    posts = relation('PostQL', mutation=True, pre=_test_pre_upsert_async, post=_test_post_upsert_async)
+    # Explicit async callbacks for merge
+    merge_posts = mutation('PostQL', pre=_test_pre_upsert_async, post=_test_post_upsert_async)
 
 # Declare Query with explicit roots and grouped domains
 @berry_schema.query()
@@ -340,7 +343,7 @@ class Query:
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-    }, mutation=True, pre=_test_pre_upsert, post=_test_post_upsert)
+    })
     # Async where callable support for roots
     async def _gate_users_async(model_cls, info: Info):
         # tiny await to ensure awaitable path is exercised
@@ -385,6 +388,9 @@ class Mutation:
     # Expose async callback domain under Mutation
     asyncDomain = domain(AsyncDomain)
 
+    # Top-level merge for posts at Query level)
+    merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
+
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
         if session is None:
@@ -419,5 +425,5 @@ class Subscription:
             # yield to event loop
             await asyncio.sleep(0)
 
-# Rebuild schema to include mutation and subscription
+# Rebuild schema to include query, mutation and subscription
 schema = berry_schema.to_strawberry()

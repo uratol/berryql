@@ -118,6 +118,9 @@ class BerrySchema:
         self._user_subscription_cls = None
         # Domain registry: name -> (domain class, options)
         self._domains = {}
+        # Names of domains explicitly attached to Query via DomainDescriptor
+        # This ensures we expose only intended domains on Query (and not mutation-only domains)
+        self._domains_exposed_on_query = set()
 
     def register(self, cls: Type[BerryType]):
         self.types[cls.__name__] = cls
@@ -180,7 +183,13 @@ class BerrySchema:
                     dom_cls = v.domain_cls
                     dom_name = v.name or v.attr_name or getattr(dom_cls, '__domain_name__', None) or k
                     # Persist the chosen field name and class for build time
-                    self._domains.setdefault(dom_name, {'class': dom_cls, 'expose': True, 'options': dict(v.meta)})
+                    # Always overwrite to mark this domain exposed on Query
+                    self._domains[dom_name] = {'class': dom_cls, 'expose': True, 'options': dict(v.meta)}
+                    # Track explicit exposure on Query
+                    try:
+                        self._domains_exposed_on_query.add(dom_name)
+                    except Exception:
+                        pass
             self._root_query_fields = qfields
             # Save user-declared class for copying strawberry fields later
             self._user_query_cls = cls
@@ -2399,7 +2408,9 @@ class BerrySchema:
                     pass
                 return self._st_types[type_name]
 
-            for dom_name, cfg in list(self._domains.items()):
+            # Only expose domains explicitly declared on Query
+            for dom_name in list(self._domains_exposed_on_query):
+                cfg = self._domains.get(dom_name) or {}
                 dom_cls = cfg.get('class')
                 if not dom_cls:
                     continue
@@ -2519,11 +2530,11 @@ class BerrySchema:
                             return None
                         mapped_type = _map_ret_2(ret_ann)
                         anns_m[uf] = mapped_type or ret_ann or Any
-                # Auto-generate top-level upsert mutations via mutations module (gated by Query relations' mutation=True)
+                # Attach explicitly declared top-level merge mutations via mutations module
                 try:
                     if '_mut' not in locals():
                         from . import mutations as _mut  # type: ignore
-                    _mut.add_top_level_upserts(self, MPlain, anns_m)
+                    _mut.add_top_level_merges(self, MPlain, anns_m)
                 except Exception:
                     pass
                 setattr(MPlain, '__annotations__', anns_m)
