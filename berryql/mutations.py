@@ -22,6 +22,34 @@ else:
 
 _logger = logging.getLogger("berryql")
 
+# --- Shared helpers (module-level) ---------------------------------------
+
+def compose_scope_with_guard(dom_cls: Any, desc_scope: Any):
+    """Compose descriptor-level scope with domain guard into a single async callable.
+
+    Returns an async function (model_cls, info) -> scope_value suitable for _apply_where_common.
+    """
+    async def _inner(model_cls_local, info_local):
+        import inspect as _ins
+        ds_val = desc_scope
+        if callable(ds_val):
+            ds_val = ds_val(model_cls_local, info_local)
+            if _ins.isawaitable(ds_val):
+                ds_val = await ds_val  # type: ignore
+        guard = getattr(dom_cls, '__domain_guard__', None)
+        if callable(guard):
+            g_val = guard(model_cls_local, info_local)
+            if _ins.isawaitable(g_val):
+                g_val = await g_val  # type: ignore
+        else:
+            g_val = guard
+        if ds_val is None:
+            return g_val
+        if g_val is None:
+            return ds_val
+        return (ds_val, g_val)
+    return _inner
+
 # --- Merge builder -------------------------------------------------------
 
 def build_merge_resolver_for_type(
@@ -165,6 +193,80 @@ def build_merge_resolver_for_type(
             except Exception:
                 return {'repr': repr(instance_local)}
 
+        # Local DRY helpers
+        def _get_pk_name_safe(model_cls_local) -> str:
+            try:
+                return schema._get_pk_name(model_cls_local)
+            except Exception:
+                return 'id'
+
+        async def _get_pk_value(instance_local, model_cls_local):
+            pk_name_local = _get_pk_name_safe(model_cls_local)
+            try:
+                val = getattr(instance_local, pk_name_local, None)
+            except Exception:
+                val = None
+            if val not in (None, ''):
+                return val
+            try:
+                await session.flush()
+            except Exception:
+                pass
+            try:
+                await session.refresh(instance_local)
+            except Exception:
+                pass
+            try:
+                return getattr(instance_local, pk_name_local, None)
+            except Exception:
+                return None
+
+        def _get_parent_btype_for_model(parent_model_cls):
+            try:
+                for _n, _bt in (schema.types or {}).items():
+                    if getattr(_bt, 'model', None) is parent_model_cls:
+                        return _bt
+            except Exception:
+                return None
+            return None
+
+        def _get_parent_relation_meta(parent_ctx_local, rel_name_local):
+            if not parent_ctx_local or not rel_name_local:
+                return {}
+            try:
+                parent_model_cls = parent_ctx_local.get('parent_model')
+                parent_btype = _get_parent_btype_for_model(parent_model_cls)
+                if parent_btype is None:
+                    return {}
+                rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_local)
+                if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
+                    return getattr(rdef, 'meta', {}) or {}
+            except Exception:
+                return {}
+            return {}
+
+        def _detect_child_fk_column(parent_model_cls, child_model_cls, override: Optional[str] = None) -> Optional[str]:
+            if override:
+                return override
+            try:
+                if hasattr(child_model_cls, '__table__') and hasattr(parent_model_cls, '__table__'):
+                    for cc in child_model_cls.__table__.columns:
+                        for fk in getattr(cc, 'foreign_keys', []) or []:
+                            try:
+                                if fk.column.table.name == parent_model_cls.__table__.name:
+                                    return cc.name
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+            try:
+                conv_name = f"{parent_model_cls.__table__.name.rstrip('s')}_id"
+                if hasattr(child_model_cls, '__table__') and any(c.name == conv_name for c in child_model_cls.__table__.columns):
+                    return conv_name
+            except Exception:
+                pass
+            return None
+
         async def _enforce_scope(model_cls_local, instance_local, scope_raw: Any | None):
             """Enforce mutation scope using the same where builder as queries.
 
@@ -173,10 +275,7 @@ def build_merge_resolver_for_type(
             """
             if scope_raw is None:
                 return True
-            try:
-                pk_name_local = schema._get_pk_name(model_cls_local)
-            except Exception:
-                pk_name_local = 'id'
+            pk_name_local = _get_pk_name_safe(model_cls_local)
             try:
                 pk_val_local = getattr(instance_local, pk_name_local)
             except Exception:
@@ -220,26 +319,10 @@ def build_merge_resolver_for_type(
             eff_pre_cb = None
             eff_post_cb = None
             try:
-                if rel_name_from_parent and parent_ctx is not None:
-                    parent_model_cls = parent_ctx.get('parent_model')
-                    parent_btype = None
-                    try:
-                        for _n, _bt in (schema.types or {}).items():
-                            if getattr(_bt, 'model', None) is parent_model_cls:
-                                parent_btype = _bt
-                                break
-                    except Exception:
-                        parent_btype = None
-                    if parent_btype is not None:
-                        try:
-                            rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
-                            if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
-                                meta = (getattr(rdef, 'meta', {}) or {})
-                                eff_pre_cb = _norm_callable(meta.get('pre') or meta.get('pre_merge') or meta.get('pre_upsert'))
-                                eff_post_cb = _norm_callable(meta.get('post') or meta.get('post_merge') or meta.get('post_upsert'))
-                        except Exception:
-                            eff_pre_cb = eff_pre_cb or None
-                            eff_post_cb = eff_post_cb or None
+                meta = _get_parent_relation_meta(parent_ctx, rel_name_from_parent)
+                if meta:
+                    eff_pre_cb = _norm_callable(meta.get('pre') or meta.get('pre_merge') or meta.get('pre_upsert'))
+                    eff_post_cb = _norm_callable(meta.get('post') or meta.get('post_merge') or meta.get('post_upsert'))
                 if eff_pre_cb is None:
                     eff_pre_cb = _norm_callable(pre_callback)
                 if eff_post_cb is None:
@@ -251,23 +334,8 @@ def build_merge_resolver_for_type(
             # Determine applicable scope for this level (needed early for delete path)
             eff_scope = None
             try:
-                if rel_name_from_parent and parent_ctx is not None:
-                    parent_model_cls = parent_ctx.get('parent_model')
-                    parent_btype = None
-                    try:
-                        for _n, _bt in (schema.types or {}).items():
-                            if getattr(_bt, 'model', None) is parent_model_cls:
-                                parent_btype = _bt
-                                break
-                    except Exception:
-                        parent_btype = None
-                    if parent_btype is not None:
-                        try:
-                            rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
-                            if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
-                                eff_scope = (getattr(rdef, 'meta', {}) or {}).get('scope')
-                        except Exception:
-                            eff_scope = None
+                meta = _get_parent_relation_meta(parent_ctx, rel_name_from_parent)
+                eff_scope = meta.get('scope') if isinstance(meta, dict) else None
                 if eff_scope is None:
                     eff_scope = relation_scope
             except Exception:
@@ -297,6 +365,45 @@ def build_merge_resolver_for_type(
                 instance_for_delete = await session.get(model_cls_local, pk_val_local)
                 if instance_for_delete is None:
                     raise ValueError(f"Instance not found for delete; {getattr(model_cls_local,'__name__',model_cls_local)}.{pk_name_local}={pk_val_local}")
+                # If this delete is occurring as a child operation under a parent instance,
+                # validate that the child belongs to the parent (by FK) and prepare data for parent scope enforcement.
+                _fk_name_ctx = (parent_ctx or {}).get('child_fk_col_name')
+                _parent_scope = (parent_ctx or {}).get('parent_scope')
+                _parent_inst = (parent_ctx or {}).get('parent_inst')
+                _child_fk_val = None
+                try:
+                    if _fk_name_ctx and _parent_inst is not None:
+                        try:
+                            _parent_pk_name = schema._get_pk_name(parent_ctx.get('parent_model')) if parent_ctx else 'id'
+                        except Exception:
+                            _parent_pk_name = 'id'
+                        try:
+                            _parent_pk_val = getattr(_parent_inst, _parent_pk_name, None)
+                        except Exception:
+                            _parent_pk_val = None
+                        try:
+                            _child_fk_val = getattr(instance_for_delete, _fk_name_ctx, None)
+                        except Exception:
+                            _child_fk_val = None
+                        if _parent_pk_val is not None and _child_fk_val is not None and str(_child_fk_val) != str(_parent_pk_val):
+                            raise PermissionError("Mutation out of scope for delete; child does not belong to parent")
+                except PermissionError:
+                    raise
+                except Exception:
+                    # Non-fatal validation issues shouldn't prevent subsequent scope enforcement
+                    pass
+                # Enforce the parent scope against the actual parent row id from the child FK.
+                if _parent_scope is not None and _fk_name_ctx:
+                    # If we can map back to a parent model, check that parent id under scope exists.
+                    parent_model_cls_local = (parent_ctx or {}).get('parent_model') if parent_ctx else None
+                    parent_pk_name_scope = schema._get_pk_name(parent_model_cls_local) if parent_model_cls_local else 'id'
+                    class _StubParent:
+                        pass
+                    _stub = _StubParent()
+                    setattr(_stub, parent_pk_name_scope, _child_fk_val)
+                    ok_parent = await _enforce_scope(parent_model_cls_local, _stub, _parent_scope)
+                    if not ok_parent:
+                        raise PermissionError("Mutation out of scope for delete; parent not within scope")
                 if eff_scope is not None:
                     ok = await _enforce_scope(model_cls_local, instance_for_delete, eff_scope)
                     if not ok:
@@ -409,10 +516,7 @@ def build_merge_resolver_for_type(
 
             # If relation/domain scope provides fixed equality constraints, use them as defaults
             # for missing scalar fields on this level (exclude primary key).
-            try:
-                pk_name_local = schema._get_pk_name(model_cls_local)
-            except Exception:
-                pk_name_local = 'id'
+            pk_name_local = _get_pk_name_safe(model_cls_local)
             if eff_scope is not None:
                 try:
                     v_scope = _resolve_scope_value(eff_scope)
@@ -540,35 +644,9 @@ def build_merge_resolver_for_type(
                     parent_model_cls = None
                     parent_inst = None
                 if parent_model_cls is not None and parent_inst is not None:
-                    # Determine child->parent FK column name
-                    child_fk_to_parent = None
-                    try:
-                        if hasattr(model_cls_local, '__table__') and hasattr(parent_model_cls, '__table__'):
-                            for cc in model_cls_local.__table__.columns:
-                                for fk in getattr(cc, 'foreign_keys', []) or []:
-                                    if fk.column.table.name == parent_model_cls.__table__.name:
-                                        child_fk_to_parent = cc.name
-                                        break
-                                if child_fk_to_parent is not None:
-                                    break
-                    except Exception:
-                        child_fk_to_parent = None
-                    # Check relation meta for explicit fk_column_name override
-                    if child_fk_to_parent is None and rel_name_from_parent is not None:
-                        try:
-                            parent_btype = None
-                            for _n, _bt in (schema.types or {}).items():
-                                if getattr(_bt, 'model', None) is parent_model_cls:
-                                    parent_btype = _bt
-                                    break
-                            if parent_btype is not None:
-                                rdef = getattr(parent_btype, '__berry_fields__', {}).get(rel_name_from_parent)
-                                if rdef is not None and getattr(rdef, 'kind', None) == 'relation':
-                                    _fk_override = (getattr(rdef, 'meta', {}) or {}).get('fk_column_name')
-                                    if _fk_override:
-                                        child_fk_to_parent = _fk_override
-                        except Exception:
-                            pass
+                    # Determine child->parent FK column name (meta override > inspection > conventional)
+                    meta = _get_parent_relation_meta(parent_ctx, rel_name_from_parent)
+                    child_fk_to_parent = _detect_child_fk_column(parent_model_cls, model_cls_local, (meta or {}).get('fk_column_name'))
                     # Also relationship attribute on child targeting parent
                     try:
                         rel_name_found = None
@@ -586,36 +664,9 @@ def build_merge_resolver_for_type(
                         child_rel_to_parent_name = rel_name_found or child_rel_to_parent_name
                     except Exception:
                         child_rel_to_parent_name = child_rel_to_parent_name or None
-                    # Conventional fallback for fk name
-                    if child_fk_to_parent is None:
-                        try:
-                            conv_name = f"{parent_model_cls.__table__.name.rstrip('s')}_id"
-                            if hasattr(model_cls_local, '__table__') and any(c.name == conv_name for c in model_cls_local.__table__.columns):
-                                child_fk_to_parent = conv_name
-                        except Exception:
-                            pass
+                    # child_fk_to_parent already includes conventional fallback
                     if child_fk_to_parent:
-                        try:
-                            parent_pk_name_local = schema._get_pk_name(parent_model_cls)
-                        except Exception:
-                            parent_pk_name_local = 'id'
-                        try:
-                            parent_pk_val_local = getattr(parent_inst, parent_pk_name_local)
-                        except Exception:
-                            parent_pk_val_local = None
-                        if parent_pk_val_local is None:
-                            try:
-                                await session.flush()
-                            except Exception:
-                                pass
-                            try:
-                                await session.refresh(parent_inst)
-                            except Exception:
-                                pass
-                            try:
-                                parent_pk_val_local = getattr(parent_inst, parent_pk_name_local)
-                            except Exception:
-                                parent_pk_val_local = None
+                        parent_pk_val_local = await _get_pk_value(parent_inst, parent_model_cls)
                         if scalar_vals.get(child_fk_to_parent) in (None, 0):
                             scalar_vals[child_fk_to_parent] = parent_pk_val_local
 
@@ -628,7 +679,26 @@ def build_merge_resolver_for_type(
                 except Exception:
                     instance = None
 
-            # Enforce scope before update
+            # Enforce parent ownership constraint for child update when invoked under a parent
+            if pk_val is not None and instance is not None and parent_ctx is not None:
+                _fk_name_ctx = parent_ctx.get('child_fk_col_name')
+                _parent_inst_ctx = parent_ctx.get('parent_inst')
+                if _fk_name_ctx and _parent_inst_ctx is not None:
+                    try:
+                        _parent_pk_name_ctx = schema._get_pk_name(parent_ctx.get('parent_model')) if parent_ctx.get('parent_model') else 'id'
+                    except Exception:
+                        _parent_pk_name_ctx = 'id'
+                    try:
+                        _parent_pk_val_ctx = getattr(_parent_inst_ctx, _parent_pk_name_ctx, None)
+                    except Exception:
+                        _parent_pk_val_ctx = None
+                    try:
+                        _child_fk_val_ctx = getattr(instance, _fk_name_ctx, None)
+                    except Exception:
+                        _child_fk_val_ctx = None
+                    if _parent_pk_val_ctx is not None and _child_fk_val_ctx is not None and str(_child_fk_val_ctx) != str(_parent_pk_val_ctx):
+                        raise PermissionError("Mutation out of scope for update; child does not belong to parent")
+            # Enforce relation scope before update
             if pk_val is not None and instance is not None and eff_scope is not None:
                 ok = await _enforce_scope(model_cls_local, instance, eff_scope)
                 if not ok:
@@ -645,6 +715,22 @@ def build_merge_resolver_for_type(
                     except Exception:
                         pass
                 created_now = True
+                # If invoked as child under a parent and child FK is present in scalar_vals but mismatched, reject
+                if parent_ctx is not None:
+                    _fk_name_ctx = parent_ctx.get('child_fk_col_name')
+                    _parent_inst_ctx = parent_ctx.get('parent_inst')
+                    if _fk_name_ctx and _parent_inst_ctx is not None:
+                        try:
+                            _parent_pk_name_ctx = schema._get_pk_name(parent_ctx.get('parent_model')) if parent_ctx.get('parent_model') else 'id'
+                        except Exception:
+                            _parent_pk_name_ctx = 'id'
+                        try:
+                            _parent_pk_val_ctx = getattr(_parent_inst_ctx, _parent_pk_name_ctx, None)
+                        except Exception:
+                            _parent_pk_val_ctx = None
+                        if _parent_pk_val_ctx is not None and scalar_vals.get(_fk_name_ctx) not in (None, 0):
+                            if str(scalar_vals.get(_fk_name_ctx)) != str(_parent_pk_val_ctx):
+                                raise PermissionError("Mutation out of scope for create; child does not belong to parent")
                 try:
                     current_pk = getattr(instance, pk_name, None)
                 except Exception:
@@ -700,19 +786,8 @@ def build_merge_resolver_for_type(
                             parent_pk_val_local = getattr(parent_inst, parent_pk_name_local, None)
                         except Exception:
                             parent_pk_val_local = None
-                    # Determine fk name
-                    try:
-                        _fk_name = None
-                        if hasattr(model_cls_local, '__table__') and hasattr(parent_model_cls, '__table__'):
-                            for cc in model_cls_local.__table__.columns:
-                                for fk in getattr(cc, 'foreign_keys', []) or []:
-                                    if fk.column.table.name == parent_model_cls.__table__.name:
-                                        _fk_name = cc.name
-                                        break
-                                if _fk_name is not None:
-                                    break
-                    except Exception:
-                        _fk_name = None
+                    # Determine fk name using helper
+                    _fk_name = _detect_child_fk_column(parent_model_cls, model_cls_local)
                     if _fk_name and parent_pk_val_local is not None:
                         try:
                             cur = getattr(instance, _fk_name, None)
@@ -794,34 +869,9 @@ def build_merge_resolver_for_type(
                     items = schema._input_to_dict(rel_value)
                     if not isinstance(items, list):
                         items = [items]
-                    # Determine child FK column name for list relations. Prefer explicit override from relation meta.
-                    child_fk_col_name = None
-                    try:
-                        _meta = getattr(rel_def, 'meta', {}) or {}
-                        _fk_override = _meta.get('fk_column_name')
-                        if _fk_override:
-                            child_fk_col_name = _fk_override
-                    except Exception:
-                        child_fk_col_name = None
-                    # Fallback: inspect actual FKs from child to parent table
-                    if child_fk_col_name is None:
-                        try:
-                            for cc in child_model.__table__.columns:
-                                for fk in cc.foreign_keys:
-                                    if fk.column.table.name == model_cls_local.__table__.name:
-                                        child_fk_col_name = cc.name
-                                        break
-                                if child_fk_col_name is not None:
-                                    break
-                        except Exception:
-                            child_fk_col_name = None
-                    if child_fk_col_name is None:
-                        try:
-                            conv_name = f"{model_cls_local.__table__.name.rstrip('s')}_id"
-                            if any(c.name == conv_name for c in child_model.__table__.columns):
-                                child_fk_col_name = conv_name
-                        except Exception:
-                            pass
+                    # Determine child FK column name for list relations using helper (override > inspection > conventional)
+                    _meta = getattr(rel_def, 'meta', {}) or {}
+                    child_fk_col_name = _detect_child_fk_column(model_cls_local, child_model, _meta.get('fk_column_name'))
                     try:
                         parent_pk_name_local = schema._get_pk_name(model_cls_local)
                     except Exception:
@@ -831,24 +881,24 @@ def build_merge_resolver_for_type(
                     except Exception:
                         parent_pk_val = None
                     if parent_pk_val is None:
-                        try:
-                            await session.flush()
-                        except Exception:
-                            pass
-                        try:
-                            await session.refresh(instance)
-                        except Exception:
-                            pass
-                        try:
-                            parent_pk_val = getattr(instance, parent_pk_name_local)
-                        except Exception:
-                            parent_pk_val = None
+                        parent_pk_val = await _get_pk_value(instance, model_cls_local)
                     for item in items:
                         if child_fk_col_name and parent_pk_val is not None:
                             item = dict(item or {})
                             if item.get(child_fk_col_name) in (None, 0):
                                 item[child_fk_col_name] = parent_pk_val
-                        await _merge_single(child_model, child_btype, item, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+                        await _merge_single(
+                            child_model,
+                            child_btype,
+                            item,
+                            parent_ctx={
+                                'parent_model': model_cls_local,
+                                'parent_inst': instance,
+                                'child_fk_col_name': child_fk_col_name,
+                                'parent_scope': eff_scope,
+                            },
+                            rel_name_from_parent=rel_key,
+                        )
 
             await session.flush()
             # Fire post-callbacks
@@ -1021,32 +1071,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             if not btype_t:
                 continue
             # Build effective scope: optional descriptor scope AND domain guard
-            def _compose_scope(dom_cls_local, desc_scope):
-                async def _inner(model_cls_local, info_local):
-                    import inspect as _ins
-                    # Resolve descriptor-level scope first (may be value or callable)
-                    ds_val = desc_scope
-                    if callable(ds_val):
-                        ds_val = ds_val(model_cls_local, info_local)
-                        if _ins.isawaitable(ds_val):
-                            ds_val = await ds_val  # type: ignore
-                    # Resolve domain guard next
-                    guard = getattr(dom_cls_local, '__domain_guard__', None)
-                    if callable(guard):
-                        g_val = guard(model_cls_local, info_local)
-                        if _ins.isawaitable(g_val):
-                            g_val = await g_val  # type: ignore
-                    else:
-                        g_val = guard
-                    # If both present, AND them via builder by returning a tuple understood by _apply_where_common
-                    # We'll return a tuple (ds_val, g_val) and let builder combine; if one is None, return the other.
-                    if ds_val is None:
-                        return g_val
-                    if g_val is None:
-                        return ds_val
-                    return (ds_val, g_val)
-                return _inner
-            eff_scope = _compose_scope(dom_cls, meta.get('scope'))
+            eff_scope = compose_scope_with_guard(dom_cls, meta.get('scope'))
             is_single = bool(meta.get('single'))
             pre_cb = meta.get('pre')
             post_cb = meta.get('post')
@@ -1146,37 +1171,8 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                         btype_t = schema.types.get(target_name)
                         if not btype_t:
                             continue
-                        # Runtime scope = domain guard
-                        async def _runtime_scope(model_cls_local, info_local):
-                            inner = getattr(dom_cls, '__domain_guard__', None)
-                            if callable(inner):
-                                res = inner(model_cls_local, info_local)
-                                import inspect as _ins
-                                if _ins.isawaitable(res):
-                                    res = await res  # type: ignore
-                                return res
-                            return inner
                         # Compose descriptor-level scope with domain guard at runtime
-                        async def _runtime_scope(model_cls_local, info_local):
-                            import inspect as _ins
-                            # Descriptor scope from meta
-                            ds_val = meta.get('scope')
-                            if callable(ds_val):
-                                ds_val = ds_val(model_cls_local, info_local)
-                                if _ins.isawaitable(ds_val):
-                                    ds_val = await ds_val  # type: ignore
-                            inner = getattr(dom_cls, '__domain_guard__', None)
-                            if callable(inner):
-                                g_val = inner(model_cls_local, info_local)
-                                if _ins.isawaitable(g_val):
-                                    g_val = await g_val  # type: ignore
-                            else:
-                                g_val = inner
-                            if ds_val is None:
-                                return g_val
-                            if g_val is None:
-                                return ds_val
-                            return (ds_val, g_val)
+                        _runtime_scope = compose_scope_with_guard(dom_cls, meta.get('scope'))
                         triplet = build_merge_resolver_for_type(
                             schema,
                             btype_t,
