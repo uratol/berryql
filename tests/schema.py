@@ -390,6 +390,8 @@ class Mutation:
 
     # Top-level merge for posts at Query level)
     merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
+    # Single-payload variant: accepts a single PostQLInput instead of a list
+    merge_post = mutation('PostQL', single=True, pre=_test_pre_upsert, post=_test_post_upsert)
 
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
