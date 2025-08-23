@@ -270,6 +270,8 @@ class BlogDomain(BerryDomain):
     })
     # Declare merge mutation for posts within the domain)
     merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
+    # Scoped domain-level mutation: only author_id == 1 allowed
+    merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}')
     # Async builder for filter args should be awaited in root filters
     async def _created_at_gt_async(M, info, v):
         await asyncio.sleep(0)
@@ -392,6 +394,8 @@ class Mutation:
     merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
     # Single-payload variant: accepts a single PostQLInput instead of a list
     merge_post = mutation('PostQL', single=True, pre=_test_pre_upsert, post=_test_post_upsert)
+    # Scoped root-level mutation: only author_id == 1 allowed
+    merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}')
 
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None

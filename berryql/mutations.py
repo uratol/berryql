@@ -1020,19 +1020,33 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             btype_t = schema.types.get(target_name)
             if not btype_t:
                 continue
-            # Domain-level scope is the domain guard (runtime evaluated)
-            def _runtime_scope(dom_cls_local):
+            # Build effective scope: optional descriptor scope AND domain guard
+            def _compose_scope(dom_cls_local, desc_scope):
                 async def _inner(model_cls_local, info_local):
-                    inner = getattr(dom_cls_local, '__domain_guard__', None)
-                    if callable(inner):
-                        res = inner(model_cls_local, info_local)
-                        import inspect as _ins
-                        if _ins.isawaitable(res):
-                            res = await res  # type: ignore
-                        return res
-                    return inner
+                    import inspect as _ins
+                    # Resolve descriptor-level scope first (may be value or callable)
+                    ds_val = desc_scope
+                    if callable(ds_val):
+                        ds_val = ds_val(model_cls_local, info_local)
+                        if _ins.isawaitable(ds_val):
+                            ds_val = await ds_val  # type: ignore
+                    # Resolve domain guard next
+                    guard = getattr(dom_cls_local, '__domain_guard__', None)
+                    if callable(guard):
+                        g_val = guard(model_cls_local, info_local)
+                        if _ins.isawaitable(g_val):
+                            g_val = await g_val  # type: ignore
+                    else:
+                        g_val = guard
+                    # If both present, AND them via builder by returning a tuple understood by _apply_where_common
+                    # We'll return a tuple (ds_val, g_val) and let builder combine; if one is None, return the other.
+                    if ds_val is None:
+                        return g_val
+                    if g_val is None:
+                        return ds_val
+                    return (ds_val, g_val)
                 return _inner
-            eff_scope = _runtime_scope(dom_cls)
+            eff_scope = _compose_scope(dom_cls, meta.get('scope'))
             is_single = bool(meta.get('single'))
             pre_cb = meta.get('pre')
             post_cb = meta.get('post')
@@ -1142,6 +1156,27 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                                     res = await res  # type: ignore
                                 return res
                             return inner
+                        # Compose descriptor-level scope with domain guard at runtime
+                        async def _runtime_scope(model_cls_local, info_local):
+                            import inspect as _ins
+                            # Descriptor scope from meta
+                            ds_val = meta.get('scope')
+                            if callable(ds_val):
+                                ds_val = ds_val(model_cls_local, info_local)
+                                if _ins.isawaitable(ds_val):
+                                    ds_val = await ds_val  # type: ignore
+                            inner = getattr(dom_cls, '__domain_guard__', None)
+                            if callable(inner):
+                                g_val = inner(model_cls_local, info_local)
+                                if _ins.isawaitable(g_val):
+                                    g_val = await g_val  # type: ignore
+                            else:
+                                g_val = inner
+                            if ds_val is None:
+                                return g_val
+                            if g_val is None:
+                                return ds_val
+                            return (ds_val, g_val)
                         triplet = build_merge_resolver_for_type(
                             schema,
                             btype_t,
@@ -1193,11 +1228,12 @@ def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
             if not btype_cls:
                 continue
             is_single = bool(meta.get('single'))
+            eff_scope = meta.get('scope')
             triplet = build_merge_resolver_for_type(
                 schema,
                 btype_cls,
                 field_name=attr_name,
-                relation_scope=None,
+                relation_scope=eff_scope,
                 pre_callback=meta.get('pre'),
                 post_callback=meta.get('post'),
                 payload_is_list=(not is_single),
