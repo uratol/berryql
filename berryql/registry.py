@@ -11,7 +11,7 @@ from sqlalchemy import and_ as _and
 from .adapters import get_adapter  # adapter abstraction
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import load_only
-from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
+from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, Numeric as SANumeric
 from sqlalchemy.types import TypeDecorator as _SATypeDecorator
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
 import uuid as _py_uuid
@@ -90,6 +90,24 @@ class BerryTypeMeta(type):
                 v.__set_name__(None, k)
                 fdefs[k] = v.build(name)
         namespace['__berry_fields__'] = fdefs
+        # Pick methods tagged via decorators
+        try:
+            pre_list = []
+            post_list = []
+            for k, v in list(namespace.items()):
+                try:
+                    if getattr(v, '__berry_merge_pre__', False):
+                        pre_list.append(v)
+                    if getattr(v, '__berry_merge_post__', False):
+                        post_list.append(v)
+                except Exception:
+                    continue
+            if pre_list:
+                namespace['__merge_pre_cbs__'] = tuple(pre_list)
+            if post_list:
+                namespace['__merge_post_cbs__'] = tuple(post_list)
+        except Exception:
+            pass
         return super().__new__(mcls, name, bases, namespace)
 
 class BerryType(metaclass=BerryTypeMeta):
@@ -123,9 +141,13 @@ class BerrySchema:
         # This ensures we expose only intended domains on Query (and not mutation-only domains)
         self._domains_exposed_on_query = set()
 
+    # No external registration of callbacks; only type decorators are supported.
+
     def register(self, cls: Type[BerryType]):
         self.types[cls.__name__] = cls
         return cls
+
+    # No external registration method; use @berry_schema.pre/@berry_schema.post on the type.
 
     def type(self, *, model: Optional[Type] = None):
         def deco(cls: Type[BerryType]):
@@ -216,6 +238,27 @@ class BerrySchema:
             self._domains.setdefault(dom_name, {'class': cls, 'expose': False, 'options': {}})
             return cls
         return deco
+
+    # ---- Decorators for type-level mutation callbacks (single names) ---
+    def pre(self, fn: Optional[Callable[..., Any]] = None):
+        """Decorator to mark a method as the pre-merge callback."""
+        def _deco(f):
+            try:
+                setattr(f, '__berry_merge_pre__', True)
+            except Exception:
+                pass
+            return f
+        return _deco(fn) if callable(fn) else _deco
+
+    def post(self, fn: Optional[Callable[..., Any]] = None):
+        """Decorator to mark a method as the post-merge callback."""
+        def _deco(f):
+            try:
+                setattr(f, '__berry_merge_post__', True)
+            except Exception:
+                pass
+            return f
+        return _deco(fn) if callable(fn) else _deco
 
     # ---------- Input/Mutation helpers ----------
     def _ensure_input_type(self, btype_cls: Type[BerryType]):
@@ -439,6 +482,12 @@ class BerrySchema:
                 return bool
             if isinstance(sqlatype, DateTime):
                 return datetime
+            # Treat DECIMAL/NUMERIC as float for GraphQL scalar purposes
+            try:
+                if isinstance(sqlatype, SANumeric):
+                    return float
+            except Exception:
+                pass
             if isinstance(sqlatype, PG_UUID):
                 return _py_uuid.UUID
             if isinstance(sqlatype, PG_ARRAY):
@@ -824,6 +873,8 @@ class BerrySchema:
                             session = _get_db(info)
                             if session is None:
                                 return None if is_single_value else []
+                            # Acquire per-request lock for DB I/O in relation resolvers as well
+                            lock = self.__berry_registry__._get_context_lock(info)
                             target_btype = self.__berry_registry__.types.get(target_name_i)
                             if not target_btype or not target_btype.model:
                                 return None if is_single_value else []
@@ -949,7 +1000,8 @@ class BerrySchema:
                                                 stmt = stmt.order_by(pk_col_child.asc())
                                             except Exception:
                                                 pass
-                                        result = await session.execute(stmt.limit(1))
+                                        async with lock:
+                                            result = await session.execute(stmt.limit(1))
                                         row = result.scalar_one_or_none()
                                         if row is None:
                                             return None
@@ -1066,7 +1118,8 @@ class BerrySchema:
                                                 raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                         if expr is not None:
                                             stmt = stmt.where(expr)
-                                    result = await session.execute(stmt.limit(1))
+                                    async with lock:
+                                        result = await session.execute(stmt.limit(1))
                                     row = result.scalar_one_or_none()
                                 else:
                                     # Log potential N+1 when doing a direct get per parent
@@ -1091,7 +1144,8 @@ class BerrySchema:
                                             )
                                     except Exception:
                                         pass
-                                    row = await session.get(child_model_cls, candidate_fk_val)
+                                    async with lock:
+                                        row = await session.get(child_model_cls, candidate_fk_val)
                                 if not row:
                                     return None
                                 inst = target_cls_i()
@@ -1422,7 +1476,8 @@ class BerrySchema:
                                 if l < 0:
                                     raise ValueError("limit must be non-negative")
                                 stmt = stmt.limit(l)
-                            result = await session.execute(stmt)
+                            async with lock:
+                                result = await session.execute(stmt)
                             rows = []
                             try:
                                 rows = result.mappings().all()  # type: ignore[attr-defined]

@@ -175,6 +175,24 @@ class PostQL(BerryType):
     # Polymorphic views for posts
     views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}')
 
+    # Type-level mutation callbacks (moved from mutation() pre/post params)
+    @berry_schema.pre
+    def _merge_pre(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+        return _test_pre_upsert(model_cls, info, data, ctx)
+
+    @berry_schema.post
+    def _merge_post(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
+        return _test_post_upsert(model_cls, info, instance, created, ctx)
+
+    # Async variants for callback testing
+    @berry_schema.pre
+    async def _merge_pre_async(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+        return await _test_pre_upsert_async(model_cls, info, data, ctx)
+
+    @berry_schema.post
+    async def _merge_post_async(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
+        return await _test_post_upsert_async(model_cls, info, instance, created, ctx)
+
 @berry_schema.type(model=User)
 class UserQL(BerryType):
     id = field()
@@ -269,7 +287,7 @@ class BlogDomain(BerryDomain):
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
     # Declare merge mutation for posts within the domain)
-    merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
+    merge_posts = mutation('PostQL')
     # Scoped domain-level mutation: only author_id == 1 allowed
     merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}')
     # Async builder for filter args should be awaited in root filters
@@ -301,7 +319,7 @@ class GroupDomain(BerryDomain):
 @berry_schema.domain(name='asyncDomain')
 class AsyncDomain(BerryDomain):
     # Explicit async callbacks for merge
-    merge_posts = mutation('PostQL', pre=_test_pre_upsert_async, post=_test_post_upsert_async)
+    merge_posts = mutation('PostQL')
 
 # Declare Query with explicit roots and grouped domains
 @berry_schema.query()
@@ -391,9 +409,9 @@ class Mutation:
     asyncDomain = domain(AsyncDomain)
 
     # Top-level merge for posts at Query level)
-    merge_posts = mutation('PostQL', pre=_test_pre_upsert, post=_test_post_upsert)
+    merge_posts = mutation('PostQL')
     # Single-payload variant: accepts a single PostQLInput instead of a list
-    merge_post = mutation('PostQL', single=True, pre=_test_pre_upsert, post=_test_post_upsert)
+    merge_post = mutation('PostQL', single=True)
     # Scoped root-level mutation: only author_id == 1 allowed
     merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}')
 

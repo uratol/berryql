@@ -93,15 +93,6 @@ def build_merge_resolver_for_type(
         def _norm_callable(cb):
             return cb if callable(cb) else None
 
-        # Type-level hooks on BerryType, best-effort
-        try:
-            type_pre_cb = _norm_callable(getattr(btype_cls, 'pre_merge', None) or getattr(btype_cls, 'pre_upsert', None) or getattr(btype_cls, '__pre_upsert__', None))
-        except Exception:
-            type_pre_cb = None
-        try:
-            type_post_cb = _norm_callable(getattr(btype_cls, 'post_merge', None) or getattr(btype_cls, 'post_upsert', None) or getattr(btype_cls, '__post_upsert__', None))
-        except Exception:
-            type_post_cb = None
 
         async def _maybe_call_pre(cb, model_cls_local, info_local, data_local, context_local):
             if not callable(cb):
@@ -111,20 +102,17 @@ def build_merge_resolver_for_type(
                 params = list(sig.parameters.keys())
             except Exception:
                 params = []
-            try:
-                if len(params) >= 4:
-                    res = cb(model_cls_local, info_local, data_local, context_local)
-                elif len(params) == 3:
-                    res = cb(model_cls_local, info_local, data_local)
-                elif len(params) == 2:
-                    res = cb(data_local, info_local)
-                else:
-                    res = cb(data_local)
-                if inspect.isawaitable(res):
-                    res = await res  # type: ignore
-                return schema._input_to_dict(res) if res is not None else data_local
-            except Exception:
-                raise
+            if len(params) >= 4:
+                res = cb(model_cls_local, info_local, data_local, context_local)
+            elif len(params) == 3:
+                res = cb(model_cls_local, info_local, data_local)
+            elif len(params) == 2:
+                res = cb(data_local, info_local)
+            else:
+                res = cb(data_local)
+            if inspect.isawaitable(res):
+                res = await res  # type: ignore
+            return schema._input_to_dict(res) if res is not None else data_local
 
         async def _maybe_call_post(cb, model_cls_local, info_local, instance_local, created_local, context_local):
             if not callable(cb):
@@ -134,21 +122,45 @@ def build_merge_resolver_for_type(
                 params = list(sig.parameters.keys())
             except Exception:
                 params = []
+            if len(params) >= 5:
+                res = cb(model_cls_local, info_local, instance_local, created_local, context_local)
+            elif len(params) == 4:
+                res = cb(model_cls_local, info_local, instance_local, created_local)
+            elif len(params) == 3:
+                res = cb(instance_local, info_local, created_local)
+            elif len(params) == 2:
+                res = cb(instance_local, info_local)
+            else:
+                res = cb(instance_local)
+            if inspect.isawaitable(res):
+                await res
+
+        # Multi-callback helpers
+        def _collect_cbs(cbs_or_one):
+            out: List[Any] = []
             try:
-                if len(params) >= 5:
-                    res = cb(model_cls_local, info_local, instance_local, created_local, context_local)
-                elif len(params) == 4:
-                    res = cb(model_cls_local, info_local, instance_local, created_local)
-                elif len(params) == 3:
-                    res = cb(instance_local, info_local, created_local)
-                elif len(params) == 2:
-                    res = cb(instance_local, info_local)
-                else:
-                    res = cb(instance_local)
-                if inspect.isawaitable(res):
-                    await res
+                if cbs_or_one is None:
+                    return out
+                if isinstance(cbs_or_one, (list, tuple)):
+                    for it in cbs_or_one:
+                        if callable(it):
+                            out.append(it)
+                    return out
+                if callable(cbs_or_one):
+                    return [cbs_or_one]
             except Exception:
-                raise
+                return out
+            return out
+
+        async def _maybe_call_pre_many(cbs, model_cls_local, info_local, data_local, context_local):
+            current = data_local
+            for cb in _collect_cbs(cbs):
+                current = await _maybe_call_pre(cb, model_cls_local, info_local, current, context_local)
+            return current
+
+        async def _maybe_call_post_many(cbs, model_cls_local, info_local, instance_local, created_local, context_local):
+            for cb in _collect_cbs(cbs):
+                await _maybe_call_post(cb, model_cls_local, info_local, instance_local, created_local, context_local)
 
         def _resolve_scope_value(value):
             v = value
@@ -315,31 +327,58 @@ def build_merge_resolver_for_type(
             return bool(row)
 
         async def _merge_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
-            # Compute effective relation-level callbacks (from parent relation meta or top-level builder args)
-            eff_pre_cb = None
-            eff_post_cb = None
+            # Compute effective callbacks: combine optional explicit ones with type-level decorators
+            eff_pre_cbs: List[Any] = []
+            eff_post_cbs: List[Any] = []
             try:
                 meta = _get_parent_relation_meta(parent_ctx, rel_name_from_parent)
                 if meta:
-                    eff_pre_cb = _norm_callable(meta.get('pre') or meta.get('pre_merge') or meta.get('pre_upsert'))
-                    eff_post_cb = _norm_callable(meta.get('post') or meta.get('post_merge') or meta.get('post_upsert'))
-                if eff_pre_cb is None:
-                    eff_pre_cb = _norm_callable(pre_callback)
-                if eff_post_cb is None:
-                    eff_post_cb = _norm_callable(post_callback)
+                    # Only support type-level decorators now; relation meta pre/post removed.
+                    pass
             except Exception:
-                eff_pre_cb = _norm_callable(pre_callback)
-                eff_post_cb = _norm_callable(post_callback)
+                pass
+
+            # Resolve type-level callbacks for the current (possibly nested) BerryType
+            local_type_pre_cbs = list(getattr(btype_local, '__merge_pre_cbs__', ()) or ())
+            local_type_post_cbs = list(getattr(btype_local, '__merge_post_cbs__', ()) or ())
+            # Prepend/append explicit callbacks if provided at builder time
+            if pre_callback is not None:
+                try:
+                    if isinstance(pre_callback, (list, tuple)):
+                        eff_pre_cbs.extend([cb for cb in pre_callback if callable(cb)])
+                    elif callable(pre_callback):
+                        eff_pre_cbs.append(pre_callback)
+                except Exception:
+                    pass
+            if post_callback is not None:
+                try:
+                    if isinstance(post_callback, (list, tuple)):
+                        eff_post_cbs.extend([cb for cb in post_callback if callable(cb)])
+                    elif callable(post_callback):
+                        eff_post_cbs.append(post_callback)
+                except Exception:
+                    pass
+            # Final effective callback lists
+            eff_pre_cbs.extend(local_type_pre_cbs)
+            eff_post_cbs.extend(local_type_post_cbs)
 
             # Determine applicable scope for this level (needed early for delete path)
             eff_scope = None
+            eff_scope_inherited_from_parent = False  # when True, enforce on parent model, not on child
             try:
                 meta = _get_parent_relation_meta(parent_ctx, rel_name_from_parent)
                 eff_scope = meta.get('scope') if isinstance(meta, dict) else None
                 if eff_scope is None:
                     eff_scope = relation_scope
+                    # If we're nested under a parent and there's no relation-specific scope,
+                    # the effective scope comes from the domain. In that case enforce it
+                    # against the parent instance rather than the child rows.
+                    if parent_ctx is not None and relation_scope is not None:
+                        eff_scope_inherited_from_parent = True
             except Exception:
                 eff_scope = relation_scope
+                if parent_ctx is not None and relation_scope is not None:
+                    eff_scope_inherited_from_parent = True
 
             # Early delete handling
             try:
@@ -470,10 +509,8 @@ def build_merge_resolver_for_type(
                         except Exception:
                             continue
                 await _cascade_delete_children(model_cls_local, btype_local, pk_val_local)
-                if eff_pre_cb is not None:
-                    await _maybe_call_pre(eff_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
-                if type_pre_cb is not None:
-                    await _maybe_call_pre(type_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                # Type-level pre callbacks
+                data_local = await _maybe_call_pre_many(local_type_pre_cbs, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
                 # Use bulk DELETE to avoid ORM trying to NULL-out child FKs (which may be NOT NULL)
                 try:
                     from sqlalchemy import delete as _sa_delete
@@ -490,17 +527,11 @@ def build_merge_resolver_for_type(
                     # As a last resort, perform ORM delete
                     await session.delete(instance_for_delete)
                 await session.flush()
-                if eff_post_cb is not None:
-                    await _maybe_call_post(eff_post_cb, model_cls_local, info, instance_for_delete, False, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
-                if type_post_cb is not None:
-                    await _maybe_call_post(type_post_cb, model_cls_local, info, instance_for_delete, False, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                await _maybe_call_post_many(local_type_post_cbs, model_cls_local, info, instance_for_delete, False, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
                 return instance_for_delete
 
             # Call pre-callbacks before any processing
-            if eff_pre_cb is not None:
-                data_local = await _maybe_call_pre(eff_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
-            if type_pre_cb is not None:
-                data_local = await _maybe_call_pre(type_pre_cb, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            data_local = await _maybe_call_pre_many(local_type_pre_cbs, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
 
             # Split scalars and relations
             scalar_vals: Dict[str, Any] = {}
@@ -700,11 +731,20 @@ def build_merge_resolver_for_type(
                         raise PermissionError("Mutation out of scope for update; child does not belong to parent")
             # Enforce relation scope before update
             if pk_val is not None and instance is not None and eff_scope is not None:
-                ok = await _enforce_scope(model_cls_local, instance, eff_scope)
-                if not ok:
-                    _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                    _attrs = _safe_attrs_dump(model_cls_local, instance)
-                    raise PermissionError(f"Mutation out of scope for update; model={_cls}; attrs={_attrs}")
+                if parent_ctx is not None and eff_scope_inherited_from_parent:
+                    # Enforce the inherited domain scope on the parent instance instead of the child
+                    parent_model_cls_local = parent_ctx.get('parent_model') if isinstance(parent_ctx, dict) else None
+                    parent_inst_local = parent_ctx.get('parent_inst') if isinstance(parent_ctx, dict) else None
+                    if parent_model_cls_local is not None and parent_inst_local is not None:
+                        ok_parent = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'))
+                        if not ok_parent:
+                            raise PermissionError("Mutation out of scope for update; parent not within scope")
+                else:
+                    ok = await _enforce_scope(model_cls_local, instance, eff_scope)
+                    if not ok:
+                        _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                        _attrs = _safe_attrs_dump(model_cls_local, instance)
+                        raise PermissionError(f"Mutation out of scope for update; model={_cls}; attrs={_attrs}")
 
             created_now = False
             if instance is None:
@@ -825,15 +865,27 @@ def build_merge_resolver_for_type(
 
             # Enforce scope AFTER changes
             if eff_scope is not None:
-                ok2 = await _enforce_scope(model_cls_local, instance, eff_scope)
-                if not ok2:
-                    try:
-                        await session.rollback()
-                    except Exception:
-                        pass
-                    _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                    _attrs = _safe_attrs_dump(model_cls_local, instance)
-                    raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
+                if parent_ctx is not None and eff_scope_inherited_from_parent:
+                    parent_model_cls_local = parent_ctx.get('parent_model') if isinstance(parent_ctx, dict) else None
+                    parent_inst_local = parent_ctx.get('parent_inst') if isinstance(parent_ctx, dict) else None
+                    if parent_model_cls_local is not None and parent_inst_local is not None:
+                        ok2p = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'))
+                        if not ok2p:
+                            try:
+                                await session.rollback()
+                            except Exception:
+                                pass
+                            raise PermissionError("Mutation out of scope; parent not within scope")
+                else:
+                    ok2 = await _enforce_scope(model_cls_local, instance, eff_scope)
+                    if not ok2:
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            pass
+                        _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                        _attrs = _safe_attrs_dump(model_cls_local, instance)
+                        raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
 
             # Process relations
             for rel_key, rel_value in list(relation_vals.items()):
@@ -903,10 +955,7 @@ def build_merge_resolver_for_type(
 
             await session.flush()
             # Fire post-callbacks
-            if eff_post_cb is not None:
-                await _maybe_call_post(eff_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
-            if type_post_cb is not None:
-                await _maybe_call_post(type_post_cb, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            await _maybe_call_post_many(eff_post_cbs, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             return instance
 
         # Support list payloads when configured by caller
@@ -1074,16 +1123,12 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             # Build effective scope: optional descriptor scope AND domain guard
             eff_scope = compose_scope_with_guard(dom_cls, meta.get('scope'))
             is_single = bool(meta.get('single'))
-            pre_cb = meta.get('pre')
-            post_cb = meta.get('post')
             # Use attribute name as GraphQL mutation field name directly
             triplet = build_merge_resolver_for_type(
                 schema,
                 btype_t,
                 field_name=attr_name,
                 relation_scope=eff_scope,
-                pre_callback=pre_cb,
-                post_callback=post_cb,
                 payload_is_list=(not is_single),
                 return_is_list=False,
             )

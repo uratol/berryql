@@ -148,19 +148,17 @@ class MutationDescriptor:
 
     Example:
         class Mutation:
-            merge_posts = mutation('PostQL', pre=pre_cb, post=post_cb)
+            merge_posts = mutation('PostQL')
 
         @berry_schema.domain(name='blogDomain')
         class BlogDomain(BerryDomain):
             posts = relation('PostQL')
             merge_posts = mutation('PostQL')
     """
-    def __init__(self, *, target: Any, single: Optional[bool] = None, pre: Any | None = None, post: Any | None = None, scope: Any | None = None):
+    def __init__(self, *, target: Any, single: Optional[bool] = None, scope: Any | None = None):
         self.meta: Dict[str, Any] = {
             'target': target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target,
             'single': single,
-            'pre': pre,
-            'post': post,
             'scope': scope,
         }
         self.name: str | None = None
@@ -172,14 +170,12 @@ class MutationDescriptor:
         return FieldDef(name=self.name or '', kind='mutation', meta=self.meta)
 
 
-def mutation(target: Any, *, single: Optional[bool] = None, pre: Any | None = None, post: Any | None = None, scope: Any | None = None) -> MutationDescriptor:
+def mutation(target: Any, *, single: Optional[bool] = None, scope: Any | None = None) -> MutationDescriptor:
     """Declare a merge mutation for a Berry type.
 
     Args:
         target: Berry type (class or its name string) to merge.
         single: When True, the payload is a single object; when False/None, payload is a list.
-        pre: Optional callback invoked before merge of an item. May be sync or async.
-        post: Optional callback invoked after merge of an item. May be sync or async.
     scope: Optional where-like guard to restrict which rows can be mutated. Accepts
         a dict/JSON string/SQLAlchemy expression or a callable ``fn(model_cls, info)``
         returning any of those. When provided on a domain mutation, it will be applied
@@ -187,7 +183,7 @@ def mutation(target: Any, *, single: Optional[bool] = None, pre: Any | None = No
 
     The attribute name is the GraphQL mutation field name. Example: ``merge_posts``.
     """
-    return MutationDescriptor(target=target, single=single, pre=pre, post=post, scope=scope)
+    return MutationDescriptor(target=target, single=single, scope=scope)
 
 def aggregate(source: str, **meta) -> FieldDescriptor:
     """Declare an aggregate derived from a relation.
