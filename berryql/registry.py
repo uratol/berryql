@@ -1979,6 +1979,23 @@ class BerrySchema:
                     self._st_types[name] = strawberry.type(cls, description=desc)  # type: ignore
                 else:
                     self._st_types[name] = strawberry.type(cls)  # type: ignore
+        # Post-decoration safety net: directly set the description on the Strawberry definition
+        try:
+            for _tname, _tcls in list(self._st_types.items()):
+                try:
+                    desc = getattr(_tcls, '__berry_description__', None)
+                except Exception:
+                    desc = None
+                if not desc:
+                    continue
+                try:
+                    defn = getattr(_tcls, '__strawberry_definition__', None)
+                    if defn is not None and getattr(defn, 'description', None) in (None, ''):
+                        setattr(defn, 'description', str(desc))
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Expose generated Strawberry types in this module's globals to satisfy LazyType lookups
         try:
             for _tname, _tcls in self._st_types.items():
