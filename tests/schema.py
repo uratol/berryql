@@ -143,6 +143,8 @@ class PostQL(BerryType):
     created_at = field()
     # Base64-encoded single binary blob across dialects
     binary_blob = field()
+    # New enum field projected from SQLAlchemy Enum
+    status = field()
     # Read-only computed scalar mirroring SQLAlchemy column_property on Post
     content_length = field()
     author = relation('UserQL', single=True, arguments={

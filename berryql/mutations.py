@@ -784,10 +784,42 @@ def build_merge_resolver_for_type(
 
             # Assign scalar fields; allow explicit None to clear nullable fields.
             # Do not overwrite primary key with None/empty.
+            # Enum-aware coercion: if model column declares Column.info['python_enum'],
+            # accept GraphQL enum NAME strings and coerce to enum.value before assignment.
             for k, v in list(scalar_vals.items()):
                 try:
+                    # Primary key guard
                     if k == pk_name and (v is None or v == ''):
                         continue
+                    # Coerce enum NAME -> value when applicable
+                    try:
+                        col = getattr(getattr(model_cls_local, '__table__', None).c, k)
+                    except Exception:
+                        col = None
+                    if col is not None:
+                        try:
+                            col_info = getattr(col, 'info', {}) or {}
+                            enum_cls = col_info.get('python_enum')
+                        except Exception:
+                            enum_cls = None
+                        if enum_cls is not None:
+                            try:
+                                from enum import Enum as _PyEnum
+                                # If we already got an Enum instance, read its value
+                                if isinstance(v, _PyEnum):
+                                    v = getattr(v, 'value', getattr(v, 'name', v))
+                                elif isinstance(v, str):
+                                    # Try by NAME first (GraphQL variables pass NAME), fallback to value
+                                    try:
+                                        v = enum_cls[v].value
+                                    except Exception:
+                                        try:
+                                            v = enum_cls(v).value
+                                        except Exception:
+                                            # leave as-is if it doesn't match
+                                            pass
+                            except Exception:
+                                pass
                     setattr(instance, k, v)
                 except Exception:
                     try:
@@ -861,6 +893,37 @@ def build_merge_resolver_for_type(
                     pass
 
             # Flush to materialize identities
+            # Final coercion pass for enum fields: convert Enum or NAME strings to stored values
+            try:
+                for _col in getattr(getattr(model_cls_local, '__table__', None), 'columns', []) or []:
+                    try:
+                        col_info = getattr(_col, 'info', {}) or {}
+                        enum_cls = col_info.get('python_enum')
+                    except Exception:
+                        enum_cls = None
+                    if enum_cls is None:
+                        continue
+                    try:
+                        cur = getattr(instance, _col.name, None)
+                    except Exception:
+                        cur = None
+                    try:
+                        from enum import Enum as _PyEnum
+                        if isinstance(cur, _PyEnum):
+                            setattr(instance, _col.name, getattr(cur, 'value', getattr(cur, 'name', cur)))
+                        elif isinstance(cur, str):
+                            try:
+                                setattr(instance, _col.name, enum_cls[cur].value)
+                            except Exception:
+                                try:
+                                    setattr(instance, _col.name, enum_cls(cur).value)
+                                except Exception:
+                                    # leave as-is
+                                    pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             await session.flush()
 
             # Enforce scope AFTER changes

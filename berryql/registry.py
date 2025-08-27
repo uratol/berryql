@@ -11,7 +11,7 @@ from sqlalchemy import and_ as _and
 from .adapters import get_adapter  # adapter abstraction
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import load_only
-from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, Numeric as SANumeric
+from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, Numeric as SANumeric, Enum as SAEnumType
 from sqlalchemy.types import TypeDecorator as _SATypeDecorator
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
 import uuid as _py_uuid
@@ -324,7 +324,20 @@ class BerrySchema:
                 except Exception:
                     py_t = col_type_map.get(src_col or fname, str)
                 try:
-                    anns[fname] = Optional[py_t]
+                    if isinstance(py_t, type) and issubclass(py_t, Enum):
+                        # Mirror output: wrap Python Enum into a Strawberry enum for input as well
+                        st_enum_name = getattr(py_t, '__name__', 'Enum')
+                        st_enum = self._st_types.get(st_enum_name)
+                        if st_enum is None:
+                            st_enum = strawberry.enum(py_t, name=st_enum_name)  # type: ignore
+                            self._st_types[st_enum_name] = st_enum
+                            try:
+                                globals()[st_enum_name] = st_enum
+                            except Exception:
+                                pass
+                        anns[fname] = Optional[st_enum]  # type: ignore[index]
+                    else:
+                        anns[fname] = Optional[py_t]
                 except Exception:
                     anns[fname] = Optional[str]
                 # Use strawberry.UNSET to distinguish omitted vs explicit null
@@ -385,12 +398,19 @@ class BerrySchema:
         Best-effort: handles dataclasses and simple objects with __dict__ or attribute access.
         """
         from dataclasses import is_dataclass, fields as _dc_fields
+        from enum import Enum as _PyEnum
         # None
         if obj is None:
             return None
         # Primitive
         if isinstance(obj, (str, int, float, bool)):
             return obj
+        # Enum -> coerce to its value for DB storage
+        try:
+            if isinstance(obj, _PyEnum):
+                return getattr(obj, 'value', obj.name)
+        except Exception:
+            pass
         # List/tuple
         if isinstance(obj, (list, tuple)):
             return [self._input_to_dict(x) for x in obj]
@@ -451,6 +471,15 @@ class BerrySchema:
         Defaults to str for unknown types (safe GraphQL scalar mapping).
         """
         try:
+            # Allow passing a SQLAlchemy Column; if so, unwrap to its .type but keep a ref
+            col_obj = None
+            try:
+                # A Column-like will have both 'type' and 'info' attributes
+                if hasattr(sqlatype, 'type') and hasattr(sqlatype, 'info'):
+                    col_obj = sqlatype
+                    sqlatype = getattr(sqlatype, 'type', sqlatype)
+            except Exception:
+                col_obj = None
             # Unwrap TypeDecorator when possible and special-case BinaryBlob/BinaryArray
             if isinstance(sqlatype, _SATypeDecorator):
                 # Special-case our BinaryArray -> List[str]
@@ -474,14 +503,33 @@ class BerrySchema:
                             return t
                 except Exception:
                     pass
+            # Important: check SQLAlchemy Enum BEFORE String, since Enum is a subclass of String
+            # SQLAlchemy Enum -> underlying Python Enum class when available
+            try:
+                if isinstance(sqlatype, SAEnumType):
+                    enum_cls = getattr(sqlatype, 'enum_class', None)
+                    if enum_cls is not None:
+                        return enum_cls
+            except Exception:
+                pass
+            # Fallback for non-SAEnum columns: allow Column.info to declare the corresponding Python Enum
+            try:
+                if col_obj is not None:
+                    info = getattr(col_obj, 'info', {}) or {}
+                    pe = info.get('python_enum')
+                    from enum import Enum as _PyEnum
+                    if isinstance(pe, type) and issubclass(pe, _PyEnum):
+                        return pe
+            except Exception:
+                pass
             if isinstance(sqlatype, Integer):
                 return int
-            if isinstance(sqlatype, String):
-                return str
             if isinstance(sqlatype, Boolean):
                 return bool
             if isinstance(sqlatype, DateTime):
                 return datetime
+            if isinstance(sqlatype, String):
+                return str
             # Treat DECIMAL/NUMERIC as float for GraphQL scalar purposes
             try:
                 if isinstance(sqlatype, SANumeric):
@@ -552,7 +600,8 @@ class BerrySchema:
         try:
             if model_cls is not None and hasattr(model_cls, '__table__'):
                 for col in model_cls.__table__.columns:
-                    out[col.name] = self._sa_python_type(getattr(col, 'type', None))
+                    # Pass the Column itself so _sa_python_type can inspect Column.info for enum hints
+                    out[col.name] = self._sa_python_type(col)
         except Exception:
             pass
         return out
@@ -721,6 +770,25 @@ class BerrySchema:
                 except Exception:
                     val = None
                 try:
+                    # If column is annotated with a Python Enum and DB stored a raw string, map back to Enum
+                    py_t = None
+                    try:
+                        col = getattr(getattr(b_cls, 'model', None).__table__.c, fname)
+                        info = getattr(col, 'info', {}) or {}
+                        py_t = info.get('python_enum')
+                    except Exception:
+                        py_t = None
+                    from enum import Enum as _PyEnum
+                    if isinstance(py_t, type) and issubclass(py_t, _PyEnum) and isinstance(val, str):
+                        try:
+                            # Prefer value-based lookup
+                            val = py_t(val)
+                        except Exception:
+                            # Fallback: accept enum NAME if stored
+                            try:
+                                val = py_t[val]
+                            except Exception:
+                                pass
                     setattr(inst, fname, val)
                 except Exception:
                     pass
@@ -801,7 +869,24 @@ class BerrySchema:
                             py_t = (fdef.meta or {}).get('returns') or str
                         except Exception:
                             py_t = str
-                    annotations[fname] = Optional[py_t]
+                    # Convert Python Enum classes to Strawberry enums on the fly
+                    try:
+                        if isinstance(py_t, type) and issubclass(py_t, Enum):
+                            # Cache by name to reuse across types
+                            st_enum_name = getattr(py_t, '__name__', 'Enum')
+                            st_enum = self._st_types.get(st_enum_name)
+                            if st_enum is None:
+                                st_enum = strawberry.enum(py_t, name=st_enum_name)  # type: ignore
+                                self._st_types[st_enum_name] = st_enum
+                                try:
+                                    globals()[st_enum_name] = st_enum
+                                except Exception:
+                                    pass
+                            annotations[fname] = Optional[st_enum]  # type: ignore[index]
+                        else:
+                            annotations[fname] = Optional[py_t]
+                    except Exception:
+                        annotations[fname] = Optional[py_t]
                     setattr(st_cls, fname, None)
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')

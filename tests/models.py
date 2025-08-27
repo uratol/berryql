@@ -1,7 +1,9 @@
 """Database models for BerryQL tests (shared)."""
 
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, JSON, func
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, JSON, func, CheckConstraint
+from sqlalchemy import Enum as SAEnum
+import enum
 from sqlalchemy.orm import DeclarativeBase, relationship, column_property
 from sqlalchemy.types import TypeDecorator, LargeBinary
 from sqlalchemy.dialects import postgresql, mssql
@@ -80,8 +82,18 @@ class User(Base):
     post_comments = relationship("PostComment", back_populates="author")
 
 
+class PostStatus(enum.StrEnum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
 class Post(Base):
     __tablename__ = 'posts'
+    __table_args__ = (
+        # Enforce allowed status values at the DB level (portable)
+        CheckConstraint("status IN ('draft','published','archived')", name='ck_post_status'),
+    )
     
     id = Column(Integer, primary_key=True)
     title = Column(String(200), nullable=False)
@@ -90,6 +102,7 @@ class Post(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     # New: single binary blob (base64 in GraphQL)
     binary_blob = Column(BinaryBlob(), nullable=True)
+    status = Column(String(20), nullable=False, default=PostStatus.DRAFT, info={'python_enum': PostStatus})
     # Computed (read-only) column: length of content; uses SQL function for cross-dialect support
     content_length = column_property(func.length(content))
     

@@ -40,7 +40,72 @@ class Hydrator:
 
     @staticmethod
     def copy_mapping_fields(inst: Any, mapping: Dict[str, Any]) -> None:
-        """Best-effort copy of mapping keys as attributes on the instance."""
+        """Best-effort copy of mapping keys as attributes on the instance.
+
+        Enum-aware: if a mapped field corresponds to a model column annotated with
+        Column.info['python_enum'] and the value is a raw string (DB value or NAME),
+        convert it to the Python Enum instance to let Strawberry serialize it as ENUM.
+        """
+        # Infer the Berry type and model class from the runtime instance
+        btype = None
+        model_cls = None
+        try:
+            registry = getattr(inst, '__berry_registry__', None)
+            if registry is None:
+                # Some call sites construct the hydrator with a registry; fall back via self when available
+                registry = getattr(getattr(inst, '__class__', object), '__berry_registry__', None)
+        except Exception:
+            registry = None
+        try:
+            if registry is None:
+                # Hydrator always has a registry; access it via closure variable
+                registry = getattr(Hydrator, 'registry', None)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            if registry is not None:
+                type_name = getattr(getattr(inst, '__class__', None), '__name__', None)
+                btype = registry.types.get(type_name) if type_name else None
+                model_cls = getattr(btype, 'model', None) if btype is not None else None
+        except Exception:
+            btype = None
+            model_cls = None
+        def _coerce_enum(model_cls_local, key: str, value: Any) -> Any:
+            if model_cls_local is None:
+                return value
+            try:
+                col = getattr(getattr(model_cls_local, '__table__', None).c, key)
+            except Exception:
+                col = None
+            if col is None:
+                return value
+            try:
+                info = getattr(col, 'info', {}) or {}
+                enum_cls = info.get('python_enum')
+            except Exception:
+                enum_cls = None
+            if enum_cls is None:
+                return value
+            try:
+                from enum import Enum as _PyEnum
+                if isinstance(value, enum_cls):
+                    return value
+                if isinstance(value, _PyEnum):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        # Prefer value-based lookup (DB stores value)
+                        return enum_cls(value)
+                    except Exception:
+                        try:
+                            # Fallback: interpret as NAME
+                            return enum_cls[value]
+                        except Exception:
+                            return value
+            except Exception:
+                return value
+            return value
+        # Iterate and set attributes
         try:
             items_iter = mapping.items()
         except Exception:
@@ -50,9 +115,13 @@ class Hydrator:
                 items_iter = []  # type: ignore
         for k, v in items_iter:
             try:
-                setattr(inst, str(k), v)
+                v2 = _coerce_enum(model_cls, str(k), v)
+                setattr(inst, str(k), v2)
             except Exception:
-                pass
+                try:
+                    setattr(inst, str(k), v)
+                except Exception:
+                    pass
 
     def hydrate_base_scalars(
         self,
@@ -63,11 +132,55 @@ class Hydrator:
         requested_relations: Dict[str, Any] | None,
         required_fk_parent_cols: set[str] | None,
     ) -> None:
+        # Resolve model class for enum/date coercions
+        btype = None
+        model_cls = None
+        try:
+            type_name = getattr(getattr(inst, '__class__', None), '__name__', None)
+            btype = self.registry.types.get(type_name) if type_name else None
+            model_cls = getattr(btype, 'model', None) if btype is not None else None
+        except Exception:
+            btype = None
+            model_cls = None
+        def _coerce_enum_for_model(key: str, value: Any) -> Any:
+            if model_cls is None:
+                return value
+            try:
+                col = getattr(getattr(model_cls, '__table__', None).c, key)
+            except Exception:
+                col = None
+            if col is None:
+                return value
+            try:
+                enum_cls = (getattr(col, 'info', {}) or {}).get('python_enum')
+            except Exception:
+                enum_cls = None
+            if enum_cls is None:
+                return value
+            try:
+                from enum import Enum as _PyEnum
+                if isinstance(value, enum_cls) or isinstance(value, _PyEnum):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        return enum_cls(value)
+                    except Exception:
+                        try:
+                            return enum_cls[value]
+                        except Exception:
+                            return value
+            except Exception:
+                return value
+            return value
         # Only assign requested scalar root fields when specified
         if requested_scalar_root:
             for sf in requested_scalar_root:
                 try:
-                    setattr(inst, sf, mapping.get(sf, None))
+                    v = mapping.get(sf, None)
+                    # Coerce datetime and enum when needed
+                    v = self._coerce_datetime_scalar(model_cls, sf, v)
+                    v = _coerce_enum_for_model(sf, v)
+                    setattr(inst, sf, v)
                 except Exception:
                     pass
         # Ensure helper cols present (id for relation resolvers + FK helpers)
@@ -80,7 +193,10 @@ class Hydrator:
             for name in needed:
                 if getattr(inst, name, None) is None and (name in mapping):
                     try:
-                        setattr(inst, name, mapping.get(name))
+                        v2 = mapping.get(name)
+                        v2 = self._coerce_datetime_scalar(model_cls, name, v2)
+                        v2 = _coerce_enum_for_model(name, v2)
+                        setattr(inst, name, v2)
                     except Exception:
                         pass
         except Exception:
@@ -219,6 +335,38 @@ class Hydrator:
         rel_push_status: Dict[str, Dict[str, Any]] | None = None,
     ) -> None:
         import json as _json
+        # Helper to coerce enum scalars for target model class
+        def _coerce_enum_scalar(target_model_cls: Any, key: str, value: Any) -> Any:
+            try:
+                col = getattr(getattr(target_model_cls, '__table__', None).c, key)
+            except Exception:
+                col = None
+            if col is None:
+                return value
+            try:
+                info = getattr(col, 'info', {}) or {}
+                enum_cls = info.get('python_enum')
+            except Exception:
+                enum_cls = None
+            if enum_cls is None:
+                return value
+            try:
+                from enum import Enum as _PyEnum
+                if isinstance(value, enum_cls):
+                    return value
+                if isinstance(value, _PyEnum):
+                    return value
+                if isinstance(value, str):
+                    try:
+                        return enum_cls(value)
+                    except Exception:
+                        try:
+                            return enum_cls[value]
+                        except Exception:
+                            return value
+            except Exception:
+                return value
+            return value
         for rel_name, rel_meta in (requested_relations or {}).items():
             key = f"_pushrel_{rel_name}"
             if key in mapping:
@@ -242,6 +390,7 @@ class Hydrator:
                             for sf, sdef in target_b.__berry_fields__.items():
                                 if sdef.kind == 'scalar':
                                     val = self._coerce_datetime_scalar(target_b.model, sf, parsed_value.get(sf))
+                                    val = _coerce_enum_scalar(target_b.model, sf, val)
                                     setattr(child_inst, sf, val)
                             setattr(child_inst, '_model', None)
                             built_value = child_inst
@@ -257,6 +406,7 @@ class Hydrator:
                                 for sf, sdef in target_b.__berry_fields__.items():
                                     if sdef.kind == 'scalar':
                                         val = self._coerce_datetime_scalar(target_b.model, sf, item.get(sf))
+                                        val = _coerce_enum_scalar(target_b.model, sf, val)
                                         setattr(child_inst, sf, val)
                                 setattr(child_inst, '_model', None)
                                 # hydrate nested relations recursively if present in item
@@ -337,6 +487,20 @@ class Hydrator:
                     for nsf, nsdef in n_target_b.__berry_fields__.items():
                         if nsdef.kind == 'scalar':
                             val = self._coerce_datetime_scalar(n_target_b.model, nsf, parsed_nested_i.get(nsf))
+                            # Enum coercion for nested single relation
+                            try:
+                                col = getattr(getattr(n_target_b.model, '__table__', None).c, nsf)
+                                enum_cls = (getattr(col, 'info', {}) or {}).get('python_enum') if col is not None else None
+                            except Exception:
+                                enum_cls = None
+                            if enum_cls is not None and isinstance(val, str):
+                                try:
+                                    val = enum_cls(val)
+                                except Exception:
+                                    try:
+                                        val = enum_cls[val]
+                                    except Exception:
+                                        pass
                             setattr(ni, nsf, val)
                     setattr(ni, '_model', None)
                     setattr(parent_inst, nname_i, ni)
@@ -354,6 +518,20 @@ class Hydrator:
                         for nsf, nsdef in n_target_b.__berry_fields__.items():
                             if nsdef.kind == 'scalar':
                                 val = self._coerce_datetime_scalar(n_target_b.model, nsf, nv_i.get(nsf))
+                                # Enum coercion for nested list relation
+                                try:
+                                    col = getattr(getattr(n_target_b.model, '__table__', None).c, nsf)
+                                    enum_cls = (getattr(col, 'info', {}) or {}).get('python_enum') if col is not None else None
+                                except Exception:
+                                    enum_cls = None
+                                if enum_cls is not None and isinstance(val, str):
+                                    try:
+                                        val = enum_cls(val)
+                                    except Exception:
+                                        try:
+                                            val = enum_cls[val]
+                                        except Exception:
+                                            pass
                                 setattr(ni, nsf, val)
                         setattr(ni, '_model', None)
                         # recurse deeper if any

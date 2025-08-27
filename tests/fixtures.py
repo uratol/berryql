@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import User, Post, PostComment, PostCommentLike, View
+from .models import User, Post, PostComment, PostCommentLike, View, PostStatus
 
 
 async def create_sample_users(session: AsyncSession):
@@ -31,11 +31,11 @@ async def create_sample_posts(session: AsyncSession, users):
     user1, user2, user3, _ = users
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     posts = [
-        Post(title="First Post", content="Hello world!", author_id=user1.id, created_at=now - timedelta(minutes=60), binary_blob=b"a"),
-        Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id, created_at=now - timedelta(minutes=45), binary_blob=b"x"),
-        Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id, created_at=now - timedelta(minutes=30), binary_blob=None),
-        Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id, created_at=now - timedelta(minutes=15), binary_blob=b"\x00\x01\x02"),
-        Post(title="Getting Started", content="A beginner's guide", author_id=user3.id, created_at=now - timedelta(minutes=5), binary_blob=None),
+    Post(title="First Post", content="Hello world!", author_id=user1.id, created_at=now - timedelta(minutes=60), binary_blob=b"a", status=PostStatus.PUBLISHED),
+    Post(title="GraphQL is Great", content="I love GraphQL!", author_id=user1.id, created_at=now - timedelta(minutes=45), binary_blob=b"x", status=PostStatus.PUBLISHED),
+    Post(title="SQLAlchemy Tips", content="Some useful tips...", author_id=user2.id, created_at=now - timedelta(minutes=30), binary_blob=None, status=PostStatus.DRAFT),
+    Post(title="Python Best Practices", content="Here are some tips...", author_id=user2.id, created_at=now - timedelta(minutes=15), binary_blob=b"\x00\x01\x02", status=PostStatus.PUBLISHED),
+    Post(title="Getting Started", content="A beginner's guide", author_id=user3.id, created_at=now - timedelta(minutes=5), binary_blob=None, status=PostStatus.ARCHIVED),
     ]
     session.add_all(posts)
     await session.flush()
