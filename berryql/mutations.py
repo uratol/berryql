@@ -9,6 +9,7 @@ from .core.utils import get_db_session as _get_db
 from sqlalchemy import select
 from sqlalchemy.sql.elements import ColumnElement
 from .sql.builders import RelationSQLBuilders
+from .core.enum_utils import get_model_enum_cls, coerce_input_to_storage_value, normalize_instance_enums
 
 if TYPE_CHECKING:  # pragma: no cover
     from .registry import BerrySchema, BerryType, BerryDomain
@@ -797,29 +798,9 @@ def build_merge_resolver_for_type(
                     except Exception:
                         col = None
                     if col is not None:
-                        try:
-                            col_info = getattr(col, 'info', {}) or {}
-                            enum_cls = col_info.get('python_enum')
-                        except Exception:
-                            enum_cls = None
+                        enum_cls = get_model_enum_cls(model_cls_local, k)
                         if enum_cls is not None:
-                            try:
-                                from enum import Enum as _PyEnum
-                                # If we already got an Enum instance, read its value
-                                if isinstance(v, _PyEnum):
-                                    v = getattr(v, 'value', getattr(v, 'name', v))
-                                elif isinstance(v, str):
-                                    # Try by NAME first (GraphQL variables pass NAME), fallback to value
-                                    try:
-                                        v = enum_cls[v].value
-                                    except Exception:
-                                        try:
-                                            v = enum_cls(v).value
-                                        except Exception:
-                                            # leave as-is if it doesn't match
-                                            pass
-                            except Exception:
-                                pass
+                            v = coerce_input_to_storage_value(enum_cls, v)
                     setattr(instance, k, v)
                 except Exception:
                     try:
@@ -892,36 +873,9 @@ def build_merge_resolver_for_type(
                 except Exception:
                     pass
 
-            # Flush to materialize identities
-            # Final coercion pass for enum fields: convert Enum or NAME strings to stored values
+            # Flush to materialize identities; ensure enum fields are normalized
             try:
-                for _col in getattr(getattr(model_cls_local, '__table__', None), 'columns', []) or []:
-                    try:
-                        col_info = getattr(_col, 'info', {}) or {}
-                        enum_cls = col_info.get('python_enum')
-                    except Exception:
-                        enum_cls = None
-                    if enum_cls is None:
-                        continue
-                    try:
-                        cur = getattr(instance, _col.name, None)
-                    except Exception:
-                        cur = None
-                    try:
-                        from enum import Enum as _PyEnum
-                        if isinstance(cur, _PyEnum):
-                            setattr(instance, _col.name, getattr(cur, 'value', getattr(cur, 'name', cur)))
-                        elif isinstance(cur, str):
-                            try:
-                                setattr(instance, _col.name, enum_cls[cur].value)
-                            except Exception:
-                                try:
-                                    setattr(instance, _col.name, enum_cls(cur).value)
-                                except Exception:
-                                    # leave as-is
-                                    pass
-                    except Exception:
-                        pass
+                normalize_instance_enums(model_cls_local, instance)
             except Exception:
                 pass
             await session.flush()

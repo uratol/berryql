@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+from .enum_utils import get_model_enum_cls, coerce_mapping_to_enum
 from datetime import datetime
 
 # SQLAlchemy DateTime for value coercion
@@ -71,40 +72,8 @@ class Hydrator:
             btype = None
             model_cls = None
         def _coerce_enum(model_cls_local, key: str, value: Any) -> Any:
-            if model_cls_local is None:
-                return value
-            try:
-                col = getattr(getattr(model_cls_local, '__table__', None).c, key)
-            except Exception:
-                col = None
-            if col is None:
-                return value
-            try:
-                info = getattr(col, 'info', {}) or {}
-                enum_cls = info.get('python_enum')
-            except Exception:
-                enum_cls = None
-            if enum_cls is None:
-                return value
-            try:
-                from enum import Enum as _PyEnum
-                if isinstance(value, enum_cls):
-                    return value
-                if isinstance(value, _PyEnum):
-                    return value
-                if isinstance(value, str):
-                    try:
-                        # Prefer value-based lookup (DB stores value)
-                        return enum_cls(value)
-                    except Exception:
-                        try:
-                            # Fallback: interpret as NAME
-                            return enum_cls[value]
-                        except Exception:
-                            return value
-            except Exception:
-                return value
-            return value
+            enum_cls = get_model_enum_cls(model_cls_local, key)
+            return coerce_mapping_to_enum(enum_cls, value)
         # Iterate and set attributes
         try:
             items_iter = mapping.items()
@@ -143,35 +112,8 @@ class Hydrator:
             btype = None
             model_cls = None
         def _coerce_enum_for_model(key: str, value: Any) -> Any:
-            if model_cls is None:
-                return value
-            try:
-                col = getattr(getattr(model_cls, '__table__', None).c, key)
-            except Exception:
-                col = None
-            if col is None:
-                return value
-            try:
-                enum_cls = (getattr(col, 'info', {}) or {}).get('python_enum')
-            except Exception:
-                enum_cls = None
-            if enum_cls is None:
-                return value
-            try:
-                from enum import Enum as _PyEnum
-                if isinstance(value, enum_cls) or isinstance(value, _PyEnum):
-                    return value
-                if isinstance(value, str):
-                    try:
-                        return enum_cls(value)
-                    except Exception:
-                        try:
-                            return enum_cls[value]
-                        except Exception:
-                            return value
-            except Exception:
-                return value
-            return value
+            enum_cls = get_model_enum_cls(model_cls, key)
+            return coerce_mapping_to_enum(enum_cls, value)
         # Only assign requested scalar root fields when specified
         if requested_scalar_root:
             for sf in requested_scalar_root:
