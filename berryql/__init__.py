@@ -1,32 +1,49 @@
-"""Next-gen declarative Berry layer (clean-slate).
+"""BerryQL public API and lightweight lazy exports.
 
-Public API:
-- BerrySchema, BerryType, BerryDomain, StrawberryConfig
-- field, relation, aggregate, count, custom, custom_object, domain
+This __init__ avoids importing heavy submodules at import time to prevent
+circular imports when foundational layers (like database models) import
+BerryQL utilities (e.g., enum helpers).
 
-Additionally exposes get_active_schema/set_active_schema so resolvers can access
-the single schema instance configured in app.graphql.schema without importing it
-directly (avoiding circular imports).
+Exposes:
+- get_active_schema, set_active_schema (without importing registry eagerly)
+- Lazy attributes: BerrySchema, BerryType, BerryDomain, StrawberryConfig
+- Lazy functions: field, relation, aggregate, count, custom, custom_object, domain, mutation
+- enum_column (resolved lazily from .sql.enum_helpers)
 """
-from typing import Optional
-from .registry import BerrySchema, BerryType, BerryDomain, StrawberryConfig
-from .core.fields import field, relation, aggregate, count, custom, custom_object, domain, mutation
-from .sql.enum_helpers import enum_column
+from __future__ import annotations
 
-_ACTIVE_SCHEMA: Optional[BerrySchema] = None
+from typing import Any
 
-def set_active_schema(schema: BerrySchema) -> None:
+_ACTIVE_SCHEMA: Any = None
+
+
+def set_active_schema(schema: Any) -> None:
     global _ACTIVE_SCHEMA
     _ACTIVE_SCHEMA = schema
 
-def get_active_schema() -> BerrySchema:
+
+def get_active_schema() -> Any:
     if _ACTIVE_SCHEMA is None:
         raise RuntimeError("Active Berry schema not set. Ensure schema.py initialized it.")
     return _ACTIVE_SCHEMA
+
+
+def __getattr__(name: str):  # PEP 562 lazy exports
+    if name in {'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig'}:
+        from . import registry as _registry
+        return getattr(_registry, name)
+    if name in {'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation'}:
+        from .core import fields as _fields
+        return getattr(_fields, name)
+    if name == 'enum_column':
+        from .sql.enum_helpers import enum_column as _enum_column
+        return _enum_column
+    raise AttributeError(name)
+
 
 __all__ = [
     'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig',
     'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation',
     'enum_column',
-    'get_active_schema', 'set_active_schema'
+    'get_active_schema', 'set_active_schema',
 ]
