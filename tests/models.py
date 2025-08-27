@@ -92,7 +92,10 @@ class Post(Base):
     __tablename__ = 'posts'
     __table_args__ = (
         # Enforce allowed status values at the DB level (portable)
-        CheckConstraint("status IN ('draft','published','archived')", name='ck_post_status'),
+        CheckConstraint(
+            f"status IN ({','.join([repr(e.value) for e in PostStatus])})",
+            name='ck_post_status'
+        ),
     )
     
     id = Column(Integer, primary_key=True)
