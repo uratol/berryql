@@ -72,12 +72,13 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = 'users'
+    __table_args__ = {'comment': 'Application users'}
     
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(255), unique=True, nullable=False)
-    is_admin = Column(Boolean, default=False, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    id = Column(Integer, primary_key=True, comment='User primary key')
+    name = Column(String(100), nullable=False, comment='Public display name')
+    email = Column(String(255), unique=True, nullable=False, comment='Unique login email')
+    is_admin = Column(Boolean, default=False, nullable=False, comment='Administrative flag')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
     
     posts = relationship("Post", back_populates="author")
     post_comments = relationship("PostComment", back_populates="author")
@@ -92,13 +93,13 @@ class PostStatus(enum.Enum):
 class Post(Base):
     __tablename__ = 'posts'
     # SQLAlchemy Enum with explicit CHECK constraint name for all dialects
-    __table_args__ = ()
+    __table_args__ = {'comment': 'Blog posts'}
     
-    id = Column(Integer, primary_key=True)
-    title = Column(String(200), nullable=False)
-    content = Column(String(5000))
-    author_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    id = Column(Integer, primary_key=True, comment='Post primary key')
+    title = Column(String(200), nullable=False, comment='Post title')
+    content = Column(String(5000), comment='Post body text')
+    author_id = Column(Integer, ForeignKey('users.id'), nullable=False, comment='Author FK to users.id')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
     # New: single binary blob (base64 in GraphQL)
     binary_blob = Column(BinaryBlob(), nullable=True)
     # Enum with helper: ensures hashability and consistent storage; emits named CHECK
@@ -117,13 +118,14 @@ class Post(Base):
 
 class PostComment(Base):
     __tablename__ = 'post_comments'
+    __table_args__ = {'comment': 'User comments on posts'}
     
-    id = Column(Integer, primary_key=True)
-    content = Column(String(1000), nullable=False)
-    rate = Column(Integer, nullable=False, default=0)
-    post_id = Column(Integer, ForeignKey('posts.id'), nullable=False)
-    author_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    id = Column(Integer, primary_key=True, comment='Comment primary key')
+    content = Column(String(1000), nullable=False, comment='Comment text')
+    rate = Column(Integer, nullable=False, default=0, comment='Simple rating value')
+    post_id = Column(Integer, ForeignKey('posts.id'), nullable=False, comment='FK to posts.id')
+    author_id = Column(Integer, ForeignKey('users.id'), nullable=False, comment='FK to users.id')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
     
     post = relationship("Post", back_populates="post_comments")
     author = relationship("User", back_populates="post_comments")
@@ -132,11 +134,12 @@ class PostComment(Base):
 
 class PostCommentLike(Base):
     __tablename__ = 'post_comment_likes'
+    __table_args__ = {'comment': 'Likes for comments'}
     
-    id = Column(Integer, primary_key=True)
-    post_comment_id = Column(Integer, ForeignKey('post_comments.id'), nullable=False)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    id = Column(Integer, primary_key=True, comment='Like primary key')
+    post_comment_id = Column(Integer, ForeignKey('post_comments.id'), nullable=False, comment='FK to post_comments.id')
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, comment='FK to users.id')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
 
     comment = relationship("PostComment", back_populates="likes")
     user = relationship("User")
@@ -144,11 +147,12 @@ class PostCommentLike(Base):
 
 class View(Base):
     __tablename__ = 'views'
+    __table_args__ = {'comment': 'Polymorphic views on posts and comments'}
 
-    id = Column(Integer, primary_key=True)
-    entity_type = Column(String(50), nullable=False)  # 'post' or 'post_comment'
-    entity_id = Column(Integer, nullable=False)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    id = Column(Integer, primary_key=True, comment='View primary key')
+    entity_type = Column(String(50), nullable=False, comment="Entity type: 'post' or 'post_comment'")
+    entity_id = Column(Integer, nullable=False, comment='Polymorphic entity id')
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False, comment='FK to users.id')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
 
     user = relationship("User")

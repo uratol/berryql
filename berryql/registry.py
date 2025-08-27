@@ -813,6 +813,23 @@ class BerrySchema:
         for name, bcls in self.types.items():
             st_cls = self._st_types[name]
             annotations: Dict[str, Any] = getattr(st_cls, '__annotations__', {}) or {}
+            # Prefer SQLAlchemy table comment or model docstring for type description
+            try:
+                model_cls_doc = None
+                model_cls = getattr(bcls, 'model', None)
+                if hasattr(getattr(model_cls, '__table__', None), 'comment'):
+                    model_cls_doc = getattr(model_cls.__table__, 'comment')  # type: ignore[attr-defined]
+                if not model_cls_doc:
+                    model_cls_doc = getattr(model_cls, '__doc__', None)
+                if model_cls_doc:
+                    # Set both __doc__ (best-effort) and a stable attribute consumed at decoration time
+                    setattr(st_cls, '__doc__', model_cls_doc)
+                    try:
+                        setattr(st_cls, '__berry_description__', str(model_cls_doc))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             # Also capture user-declared annotations on the BerryType subclass itself so we can
             # expose regular strawberry fields (with their own resolvers) alongside Berry fields.
             try:
@@ -857,6 +874,28 @@ class BerrySchema:
                             py_t = (fdef.meta or {}).get('returns') or str
                         except Exception:
                             py_t = str
+                    # Optional: discover column description from SQLAlchemy Column.info/comment
+                    field_description = None
+                    try:
+                        model_cls_local = getattr(bcls, 'model', None)
+                        col_name = src_col or fname
+                        col_obj = None
+                        if hasattr(getattr(model_cls_local, '__table__', None), 'c'):
+                            try:
+                                col_obj = getattr(model_cls_local.__table__.c, col_name)
+                            except Exception:
+                                try:
+                                    col_obj = model_cls_local.__table__.c.get(col_name)
+                                except Exception:
+                                    col_obj = None
+                        if col_obj is not None:
+                            # Column.comment is preferred; fallback to Column.info["description"|"doc"]
+                            field_description = getattr(col_obj, 'comment', None)
+                            if not field_description:
+                                info_dict = getattr(col_obj, 'info', {}) or {}
+                                field_description = info_dict.get('description') or info_dict.get('doc')
+                    except Exception:
+                        field_description = None
                     # Convert Python Enum classes to Strawberry enums on the fly
                     try:
                         if isinstance(py_t, type) and issubclass(py_t, Enum):
@@ -875,7 +914,14 @@ class BerrySchema:
                             annotations[fname] = Optional[py_t]
                     except Exception:
                         annotations[fname] = Optional[py_t]
-                    setattr(st_cls, fname, None)
+                    # Attach Strawberry field with description when available so GraphQL introspection shows it
+                    try:
+                        if field_description:
+                            setattr(st_cls, fname, strawberry.field(default=None, description=str(field_description)))
+                        else:
+                            setattr(st_cls, fname, None)
+                    except Exception:
+                        setattr(st_cls, fname, None)
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
@@ -1923,7 +1969,16 @@ class BerrySchema:
                 # Ensure typing symbols available for forward refs
                 mod_globals = globals()
                 mod_globals.update({'Optional': Optional, 'List': List})
-                self._st_types[name] = strawberry.type(cls)  # type: ignore
+                # Prefer explicit description when available to ensure introspection shows it
+                desc = None
+                try:
+                    desc = getattr(cls, '__berry_description__', None)
+                except Exception:
+                    desc = None
+                if desc:
+                    self._st_types[name] = strawberry.type(cls, description=desc)  # type: ignore
+                else:
+                    self._st_types[name] = strawberry.type(cls)  # type: ignore
         # Expose generated Strawberry types in this module's globals to satisfy LazyType lookups
         try:
             for _tname, _tcls in self._st_types.items():
