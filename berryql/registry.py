@@ -512,16 +512,6 @@ class BerrySchema:
                         return enum_cls
             except Exception:
                 pass
-            # Fallback for non-SAEnum columns: allow Column.info to declare the corresponding Python Enum
-            try:
-                if col_obj is not None:
-                    info = getattr(col_obj, 'info', {}) or {}
-                    pe = info.get('python_enum')
-                    from enum import Enum as _PyEnum
-                    if isinstance(pe, type) and issubclass(pe, _PyEnum):
-                        return pe
-            except Exception:
-                pass
             if isinstance(sqlatype, Integer):
                 return int
             if isinstance(sqlatype, Boolean):
@@ -770,23 +760,21 @@ class BerrySchema:
                 except Exception:
                     val = None
                 try:
-                    # If column is annotated with a Python Enum and DB stored a raw string, map back to Enum
-                    py_t = None
+                    # If column is SAEnum and DB stored a raw string, map back to Python Enum
+                    enum_cls = None
                     try:
                         col = getattr(getattr(b_cls, 'model', None).__table__.c, fname)
-                        info = getattr(col, 'info', {}) or {}
-                        py_t = info.get('python_enum')
+                        sa_type = getattr(col, 'type', None)
+                        if isinstance(sa_type, SAEnumType):
+                            enum_cls = getattr(sa_type, 'enum_class', None)
                     except Exception:
-                        py_t = None
-                    from enum import Enum as _PyEnum
-                    if isinstance(py_t, type) and issubclass(py_t, _PyEnum) and isinstance(val, str):
+                        enum_cls = None
+                    if enum_cls is not None and isinstance(val, str):
                         try:
-                            # Prefer value-based lookup
-                            val = py_t(val)
+                            val = enum_cls(val)
                         except Exception:
-                            # Fallback: accept enum NAME if stored
                             try:
-                                val = py_t[val]
+                                val = enum_cls[val]
                             except Exception:
                                 pass
                     setattr(inst, fname, val)

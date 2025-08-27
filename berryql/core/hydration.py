@@ -43,9 +43,9 @@ class Hydrator:
     def copy_mapping_fields(inst: Any, mapping: Dict[str, Any]) -> None:
         """Best-effort copy of mapping keys as attributes on the instance.
 
-        Enum-aware: if a mapped field corresponds to a model column annotated with
-        Column.info['python_enum'] and the value is a raw string (DB value or NAME),
-        convert it to the Python Enum instance to let Strawberry serialize it as ENUM.
+    Enum-aware: when a mapped field corresponds to a model column of SAEnum type
+    and the value is a raw string (DB value or NAME), it is converted to the
+    Python Enum instance so Strawberry serializes it as ENUM.
         """
         # Infer the Berry type and model class from the runtime instance
         btype = None
@@ -279,36 +279,8 @@ class Hydrator:
         import json as _json
         # Helper to coerce enum scalars for target model class
         def _coerce_enum_scalar(target_model_cls: Any, key: str, value: Any) -> Any:
-            try:
-                col = getattr(getattr(target_model_cls, '__table__', None).c, key)
-            except Exception:
-                col = None
-            if col is None:
-                return value
-            try:
-                info = getattr(col, 'info', {}) or {}
-                enum_cls = info.get('python_enum')
-            except Exception:
-                enum_cls = None
-            if enum_cls is None:
-                return value
-            try:
-                from enum import Enum as _PyEnum
-                if isinstance(value, enum_cls):
-                    return value
-                if isinstance(value, _PyEnum):
-                    return value
-                if isinstance(value, str):
-                    try:
-                        return enum_cls(value)
-                    except Exception:
-                        try:
-                            return enum_cls[value]
-                        except Exception:
-                            return value
-            except Exception:
-                return value
-            return value
+            enum_cls = get_model_enum_cls(target_model_cls, key)
+            return coerce_mapping_to_enum(enum_cls, value)
         for rel_name, rel_meta in (requested_relations or {}).items():
             key = f"_pushrel_{rel_name}"
             if key in mapping:
@@ -430,19 +402,8 @@ class Hydrator:
                         if nsdef.kind == 'scalar':
                             val = self._coerce_datetime_scalar(n_target_b.model, nsf, parsed_nested_i.get(nsf))
                             # Enum coercion for nested single relation
-                            try:
-                                col = getattr(getattr(n_target_b.model, '__table__', None).c, nsf)
-                                enum_cls = (getattr(col, 'info', {}) or {}).get('python_enum') if col is not None else None
-                            except Exception:
-                                enum_cls = None
-                            if enum_cls is not None and isinstance(val, str):
-                                try:
-                                    val = enum_cls(val)
-                                except Exception:
-                                    try:
-                                        val = enum_cls[val]
-                                    except Exception:
-                                        pass
+                            enum_cls = get_model_enum_cls(n_target_b.model, nsf)
+                            val = coerce_mapping_to_enum(enum_cls, val)
                             setattr(ni, nsf, val)
                     setattr(ni, '_model', None)
                     setattr(parent_inst, nname_i, ni)
@@ -461,19 +422,8 @@ class Hydrator:
                             if nsdef.kind == 'scalar':
                                 val = self._coerce_datetime_scalar(n_target_b.model, nsf, nv_i.get(nsf))
                                 # Enum coercion for nested list relation
-                                try:
-                                    col = getattr(getattr(n_target_b.model, '__table__', None).c, nsf)
-                                    enum_cls = (getattr(col, 'info', {}) or {}).get('python_enum') if col is not None else None
-                                except Exception:
-                                    enum_cls = None
-                                if enum_cls is not None and isinstance(val, str):
-                                    try:
-                                        val = enum_cls(val)
-                                    except Exception:
-                                        try:
-                                            val = enum_cls[val]
-                                        except Exception:
-                                            pass
+                                enum_cls = get_model_enum_cls(n_target_b.model, nsf)
+                                val = coerce_mapping_to_enum(enum_cls, val)
                                 setattr(ni, nsf, val)
                         setattr(ni, '_model', None)
                         # recurse deeper if any

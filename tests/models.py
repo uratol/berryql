@@ -82,7 +82,7 @@ class User(Base):
     post_comments = relationship("PostComment", back_populates="author")
 
 
-class PostStatus(enum.StrEnum):
+class PostStatus(enum.Enum):
     DRAFT = "draft"
     PUBLISHED = "published"
     ARCHIVED = "archived"
@@ -90,13 +90,8 @@ class PostStatus(enum.StrEnum):
 
 class Post(Base):
     __tablename__ = 'posts'
-    __table_args__ = (
-        # Enforce allowed status values at the DB level (portable)
-        CheckConstraint(
-            f"status IN ({','.join([repr(e.value) for e in PostStatus])})",
-            name='ck_post_status'
-        ),
-    )
+    # SQLAlchemy Enum with explicit CHECK constraint name for all dialects
+    __table_args__ = ()
     
     id = Column(Integer, primary_key=True)
     title = Column(String(200), nullable=False)
@@ -105,7 +100,14 @@ class Post(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     # New: single binary blob (base64 in GraphQL)
     binary_blob = Column(BinaryBlob(), nullable=True)
-    status = Column(String(20), nullable=False, default=PostStatus.DRAFT, info={'python_enum': PostStatus})
+    # Enum with helper: ensures hashability and consistent storage; emits named CHECK
+    from berryql.sql.enum_helpers import enum_column
+    status = enum_column(
+        PostStatus,
+        nullable=False,
+        default=PostStatus.DRAFT,
+        constraint_name="ck_post_status",
+    )
     # Computed (read-only) column: length of content; uses SQL function for cross-dialect support
     content_length = column_property(func.length(content))
     

@@ -785,8 +785,7 @@ def build_merge_resolver_for_type(
 
             # Assign scalar fields; allow explicit None to clear nullable fields.
             # Do not overwrite primary key with None/empty.
-            # Enum-aware coercion: if model column declares Column.info['python_enum'],
-            # accept GraphQL enum NAME strings and coerce to enum.value before assignment.
+            # Enum-aware coercion via SAEnum: accept NAME strings and coerce to enum.value before assignment.
             for k, v in list(scalar_vals.items()):
                 try:
                     # Primary key guard
