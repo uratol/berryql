@@ -910,7 +910,25 @@ class BerrySchema:
                         field_description = None
                     # Convert Python Enum classes to Strawberry enums on the fly
                     try:
-                        if isinstance(py_t, type) and issubclass(py_t, Enum):
+                        is_enum_type = isinstance(py_t, type) and issubclass(py_t, Enum)
+                        if is_enum_type:
+                            # Build enum values list for description augmentation
+                            try:
+                                members = list(py_t)  # type: ignore[arg-type]
+                                vals = []
+                                for m in members:
+                                    try:
+                                        v = getattr(m, 'value', None)
+                                        vals.append(str(v if v is not None else getattr(m, 'name', str(m))))
+                                    except Exception:
+                                        vals.append(str(getattr(m, 'name', str(m))))
+                                values_str = ", ".join(vals)
+                                enum_values_desc = f"Values: {values_str}" if values_str else None
+                            except Exception:
+                                enum_values_desc = None
+                        else:
+                            enum_values_desc = None
+                        if is_enum_type:
                             # Cache by name to reuse across types
                             st_enum_name = getattr(py_t, '__name__', 'Enum')
                             st_enum = self._st_types.get(st_enum_name)
@@ -928,6 +946,15 @@ class BerrySchema:
                         annotations[fname] = Optional[py_t]
                     # Attach Strawberry field with description when available so GraphQL introspection shows it
                     try:
+                        # If enum, append values list to description or set it when absent
+                        try:
+                            if enum_values_desc:
+                                if field_description:
+                                    field_description = f"{field_description} | {enum_values_desc}"
+                                else:
+                                    field_description = enum_values_desc
+                        except Exception:
+                            pass
                         if field_description:
                             setattr(st_cls, fname, strawberry.field(default=None, description=str(field_description)))
                         else:

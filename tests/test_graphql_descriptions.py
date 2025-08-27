@@ -52,6 +52,9 @@ async def test_postql_descriptions_from_comments():
     assert f.get("author") == "Application users"
     assert f.get("post_comments") == "User comments on posts"
     assert f.get("views") == "Polymorphic views on posts and comments"
+    # Enum field should include a values list in its description
+    status_desc = f.get("status") or ""
+    assert "Values: draft, published, archived" in status_desc
 
 
 @pytest.mark.asyncio
