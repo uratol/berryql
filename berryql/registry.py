@@ -803,13 +803,15 @@ class BerrySchema:
         # Always rebuild Strawberry runtime classes fresh per call to honor config changes
         # and avoid stale definitions across multiple to_strawberry invocations.
         self._st_types = {}
+        # Keep a mapping of type name -> description to enforce on the final Strawberry definitions
+        type_descriptions: Dict[str, str] = {}
         # Two-pass: create plain classes first
         for name, bcls in self.types.items():
             base_namespace = {'__berry_registry__': self, '__doc__': f'Berry runtime type {name}'}
             cls = type(name, (), base_namespace)
             cls.__module__ = __name__
             self._st_types[name] = cls
-    # Second pass: add fields & annotations before decoration
+        # Second pass: add fields & annotations before decoration
         for name, bcls in self.types.items():
             st_cls = self._st_types[name]
             annotations: Dict[str, Any] = getattr(st_cls, '__annotations__', {}) or {}
@@ -826,6 +828,8 @@ class BerrySchema:
                     setattr(st_cls, '__doc__', model_cls_doc)
                     try:
                         setattr(st_cls, '__berry_description__', str(model_cls_doc))
+                        # Also cache on the local map to enforce after decoration (works across Strawberry versions)
+                        type_descriptions[name] = str(model_cls_doc)
                     except Exception:
                         pass
             except Exception:
@@ -1979,19 +1983,20 @@ class BerrySchema:
                     self._st_types[name] = strawberry.type(cls, description=desc)  # type: ignore
                 else:
                     self._st_types[name] = strawberry.type(cls)  # type: ignore
-        # Post-decoration safety net: directly set the description on the Strawberry definition
+        # Post-decoration safety net: directly set the description on the Strawberry definitions
+        # using the cached map (more reliable than reading attributes from the decorated class).
         try:
-            for _tname, _tcls in list(self._st_types.items()):
+            for _tname, _desc in list(type_descriptions.items()):
                 try:
-                    desc = getattr(_tcls, '__berry_description__', None)
+                    _tcls = self._st_types.get(_tname)
                 except Exception:
-                    desc = None
-                if not desc:
+                    _tcls = None
+                if _tcls is None:
                     continue
                 try:
                     defn = getattr(_tcls, '__strawberry_definition__', None)
                     if defn is not None and getattr(defn, 'description', None) in (None, ''):
-                        setattr(defn, 'description', str(desc))
+                        setattr(defn, 'description', str(_desc))
                 except Exception:
                     pass
         except Exception:
