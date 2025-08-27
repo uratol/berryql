@@ -289,7 +289,7 @@ class BlogDomain(BerryDomain):
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
     # Declare merge mutation for posts within the domain)
-    merge_posts = mutation('PostQL')
+    merge_posts = mutation('PostQL', comment="Create or update posts (domain)")
     # Scoped domain-level mutation: only author_id == 1 allowed
     merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}')
     # Async builder for filter args should be awaited in root filters
@@ -321,7 +321,7 @@ class GroupDomain(BerryDomain):
 @berry_schema.domain(name='asyncDomain')
 class AsyncDomain(BerryDomain):
     # Explicit async callbacks for merge
-    merge_posts = mutation('PostQL')
+    merge_posts = mutation('PostQL', comment="Create or update posts (async domain)")
 
 # Declare Query with explicit roots and grouped domains
 @berry_schema.query()
@@ -411,11 +411,11 @@ class Mutation:
     asyncDomain = domain(AsyncDomain)
 
     # Top-level merge for posts at Query level)
-    merge_posts = mutation('PostQL')
+    merge_posts = mutation('PostQL', comment="Create or update posts")
     # Single-payload variant: accepts a single PostQLInput instead of a list
-    merge_post = mutation('PostQL', single=True)
+    merge_post = mutation('PostQL', single=True, comment="Create or update a single post")
     # Scoped root-level mutation: only author_id == 1 allowed
-    merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}')
+    merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}', comment="Create or update posts (only author_id==1)")
 
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None

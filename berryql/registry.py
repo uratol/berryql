@@ -851,6 +851,11 @@ class BerrySchema:
                     if is_private:
                         # Skip exposing private scalars
                         continue
+                    # Optional explicit field comment override
+                    try:
+                        explicit_field_comment = (fdef.meta or {}).get('comment')
+                    except Exception:
+                        explicit_field_comment = None
                     # Prefer mapped source column for type inference when provided
                     try:
                         src_col = (fdef.meta or {}).get('column')
@@ -881,23 +886,26 @@ class BerrySchema:
                     # Optional: discover column description from SQLAlchemy Column.info/comment
                     field_description = None
                     try:
-                        model_cls_local = getattr(bcls, 'model', None)
-                        col_name = src_col or fname
-                        col_obj = None
-                        if hasattr(getattr(model_cls_local, '__table__', None), 'c'):
-                            try:
-                                col_obj = getattr(model_cls_local.__table__.c, col_name)
-                            except Exception:
+                        if explicit_field_comment:
+                            field_description = explicit_field_comment
+                        else:
+                            model_cls_local = getattr(bcls, 'model', None)
+                            col_name = src_col or fname
+                            col_obj = None
+                            if hasattr(getattr(model_cls_local, '__table__', None), 'c'):
                                 try:
-                                    col_obj = model_cls_local.__table__.c.get(col_name)
+                                    col_obj = getattr(model_cls_local.__table__.c, col_name)
                                 except Exception:
-                                    col_obj = None
-                        if col_obj is not None:
-                            # Column.comment is preferred; fallback to Column.info["description"|"doc"]
-                            field_description = getattr(col_obj, 'comment', None)
-                            if not field_description:
-                                info_dict = getattr(col_obj, 'info', {}) or {}
-                                field_description = info_dict.get('description') or info_dict.get('doc')
+                                    try:
+                                        col_obj = model_cls_local.__table__.c.get(col_name)
+                                    except Exception:
+                                        col_obj = None
+                            if col_obj is not None:
+                                # Column.comment is preferred; fallback to Column.info["description"|"doc"]
+                                field_description = getattr(col_obj, 'comment', None)
+                                if not field_description:
+                                    info_dict = getattr(col_obj, 'info', {}) or {}
+                                    field_description = info_dict.get('description') or info_dict.get('doc')
                     except Exception:
                         field_description = None
                     # Convert Python Enum classes to Strawberry enums on the fly
@@ -930,6 +938,19 @@ class BerrySchema:
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
                     post_process = fdef.meta.get('post_process')
+                    # Relation description: prefer explicit meta.comment else target model's table comment
+                    relation_description = None
+                    try:
+                        relation_description = (fdef.meta or {}).get('comment')
+                    except Exception:
+                        relation_description = None
+                    if not relation_description and target_name:
+                        try:
+                            tb = self.types.get(target_name)
+                            if tb and getattr(tb, 'model', None) is not None:
+                                relation_description = getattr(getattr(tb.model, '__table__', None), 'comment', None)
+                        except Exception:
+                            relation_description = None
                     if target_name:
                         # Use actual class objects from registry to avoid global forward-ref collisions
                         target_cls_ref = self._st_types.get(target_name)
@@ -1718,7 +1739,10 @@ class BerrySchema:
                         setattr(st_cls, fname, _make_relation_resolver())
                     else:
                         # Attach resolver with explicit argument annotations to make relation args visible in schema
-                        setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver()))
+                        if relation_description:
+                            setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver(), description=str(relation_description)))
+                        else:
+                            setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver()))
                 elif fdef.kind == 'aggregate':
                     if is_private:
                         # Skip exposing private aggregates
@@ -1796,7 +1820,15 @@ class BerrySchema:
                                 return val
                             return None
                         return aggregate_resolver
-                    setattr(st_cls, fname, strawberry.field(_make_aggregate_resolver()))
+                    agg_comment = None
+                    try:
+                        agg_comment = (fdef.meta or {}).get('comment')
+                    except Exception:
+                        agg_comment = None
+                    if agg_comment:
+                        setattr(st_cls, fname, strawberry.field(_make_aggregate_resolver(), description=str(agg_comment)))
+                    else:
+                        setattr(st_cls, fname, strawberry.field(_make_aggregate_resolver()))
                 elif fdef.kind == 'custom':
                     if is_private:
                         # Skip exposing private custom fields
@@ -1868,7 +1900,15 @@ class BerrySchema:
                                     pass
                             return result_obj
                         return custom_resolver
-                    setattr(st_cls, fname, strawberry.field(_make_custom_resolver()))
+                    c_comment = None
+                    try:
+                        c_comment = (fdef.meta or {}).get('comment')
+                    except Exception:
+                        c_comment = None
+                    if c_comment:
+                        setattr(st_cls, fname, strawberry.field(_make_custom_resolver(), description=str(c_comment)))
+                    else:
+                        setattr(st_cls, fname, strawberry.field(_make_custom_resolver()))
                 elif fdef.kind == 'custom_object':
                     if is_private:
                         # Skip exposing private custom object fields
@@ -1911,7 +1951,15 @@ class BerrySchema:
                                 return pre_v
                             return None
                         return _resolver
-                    setattr(st_cls, fname, strawberry.field(_make_custom_obj_resolver()))
+                    co_comment = None
+                    try:
+                        co_comment = (fdef.meta or {}).get('comment')
+                    except Exception:
+                        co_comment = None
+                    if co_comment:
+                        setattr(st_cls, fname, strawberry.field(_make_custom_obj_resolver(), description=str(co_comment)))
+                    else:
+                        setattr(st_cls, fname, strawberry.field(_make_custom_obj_resolver()))
             # Merge in any user-declared strawberry fields that are not part of Berry field defs.
             # Strategy:
             # 1) Copy attributes explicitly annotated on the BerryType subclass (classic dataclass-like fields).
@@ -2507,8 +2555,22 @@ class BerrySchema:
                     query_annotations[fname] = Optional[self._st_types[target_name]]  # type: ignore
                 else:
                     query_annotations[fname] = List[self._st_types[target_name]]  # type: ignore
-                # Attach field on class with explicit resolver
-                setattr(query_cls, fname, strawberry.field(resolver=root_resolver))
+                # Determine description: explicit relation meta comment on Query field or target table comment
+                root_desc = None
+                try:
+                    root_desc = (fdef.meta or {}).get('comment')
+                except Exception:
+                    root_desc = None
+                if not root_desc:
+                    try:
+                        root_desc = getattr(getattr(target_b.model, '__table__', None), 'comment', None)
+                    except Exception:
+                        root_desc = None
+                # Attach field on class with explicit resolver and description when available
+                if root_desc:
+                    setattr(query_cls, fname, strawberry.field(resolver=root_resolver, description=str(root_desc)))
+                else:
+                    setattr(query_cls, fname, strawberry.field(resolver=root_resolver))
 
         # Only add user-declared root fields
         if self._root_query_fields:
@@ -2568,7 +2630,21 @@ class BerrySchema:
                             ann_local[fname] = Optional[target_st]  # type: ignore
                         else:
                             ann_local[fname] = List[target_st]  # type: ignore
-                        setattr(DomSt_local, fname, strawberry.field(resolver=resolver))
+                        # Description for domain relations
+                        d_desc = None
+                        try:
+                            d_desc = (fdef.meta or {}).get('comment')
+                        except Exception:
+                            d_desc = None
+                        if not d_desc:
+                            try:
+                                d_desc = getattr(getattr(target_b.model, '__table__', None), 'comment', None)
+                            except Exception:
+                                d_desc = None
+                        if d_desc:
+                            setattr(DomSt_local, fname, strawberry.field(resolver=resolver, description=str(d_desc)))
+                        else:
+                            setattr(DomSt_local, fname, strawberry.field(resolver=resolver))
                 # Attach nested domain fields declared via DomainDescriptor
                 try:
                     from .core.fields import DomainDescriptor as _DomDesc

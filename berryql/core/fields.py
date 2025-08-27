@@ -47,7 +47,7 @@ class FieldDescriptor:
         """
         return FieldDef(name=self.name or '', kind=self.kind, meta=self.meta)
 
-def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
+def field(column: Optional[str] = None, /, comment: Optional[str] = None, **meta) -> FieldDescriptor:
     """Declare a scalar field on a Berry type.
 
     Place this as a class attribute inside a ``@berry_schema.type`` class to
@@ -63,9 +63,9 @@ def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
     Examples:
         class PostQL(BerryType):
             id = field()
-            title = field(description="Post title")
+            title = field(comment="Post title")
             # Map GraphQL 'id' to DB column 'user_id'
-            id_alias = field('user_id', description="Public id")
+            id_alias = field('user_id', comment="Public id")
             # Or expose DB column with same name directly
             user_id = field()
 
@@ -75,9 +75,12 @@ def field(column: Optional[str] = None, /, **meta) -> FieldDescriptor:
     if column is not None:
         meta = dict(meta)
         meta['column'] = column
+    if comment is not None:
+        meta = dict(meta)
+        meta['comment'] = comment
     return FieldDescriptor(kind='scalar', **meta)
 
-def relation(target: Any = None, *, single: bool | None = None, fk_column_name: str | None = None, **meta) -> FieldDescriptor:
+def relation(target: Any = None, *, single: bool | None = None, fk_column_name: str | None = None, comment: Optional[str] = None, **meta) -> FieldDescriptor:
     """Declare a relation to another Berry type.
 
     Use on both root Query/Domain classes and nested Berry types to model
@@ -133,6 +136,8 @@ def relation(target: Any = None, *, single: bool | None = None, fk_column_name: 
     # - For single relations (parent -> child), this is the FK column on the parent model referencing the child (e.g., "author_id").
     if fk_column_name is not None:
         m['fk_column_name'] = fk_column_name
+    if comment is not None:
+        m['comment'] = comment
     # Backward-incompatible rename: parameter 'where' became 'scope'.
     # If users pass scope=..., keep it under 'scope' key; no implicit aliasing from 'where'.
     return FieldDescriptor(kind='relation', **m)
@@ -155,12 +160,14 @@ class MutationDescriptor:
             posts = relation('PostQL')
             merge_posts = mutation('PostQL')
     """
-    def __init__(self, *, target: Any, single: Optional[bool] = None, scope: Any | None = None):
+    def __init__(self, *, target: Any, single: Optional[bool] = None, scope: Any | None = None, comment: Optional[str] = None):
         self.meta: Dict[str, Any] = {
             'target': target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target,
             'single': single,
             'scope': scope,
         }
+        if comment is not None:
+            self.meta['comment'] = comment
         self.name: str | None = None
 
     def __set_name__(self, owner, name):  # pragma: no cover - trivial
@@ -170,7 +177,7 @@ class MutationDescriptor:
         return FieldDef(name=self.name or '', kind='mutation', meta=self.meta)
 
 
-def mutation(target: Any, *, single: Optional[bool] = None, scope: Any | None = None) -> MutationDescriptor:
+def mutation(target: Any, *, single: Optional[bool] = None, scope: Any | None = None, comment: Optional[str] = None) -> MutationDescriptor:
     """Declare a merge mutation for a Berry type.
 
     Args:
@@ -183,9 +190,9 @@ def mutation(target: Any, *, single: Optional[bool] = None, scope: Any | None = 
 
     The attribute name is the GraphQL mutation field name. Example: ``merge_posts``.
     """
-    return MutationDescriptor(target=target, single=single, scope=scope)
+    return MutationDescriptor(target=target, single=single, scope=scope, comment=comment)
 
-def aggregate(source: str, **meta) -> FieldDescriptor:
+def aggregate(source: str, *, comment: Optional[str] = None, **meta) -> FieldDescriptor:
     """Declare an aggregate derived from a relation.
 
     Aggregates compute a scalar over a related collection (e.g. count, min,
@@ -204,6 +211,9 @@ def aggregate(source: str, **meta) -> FieldDescriptor:
     Returns:
         FieldDescriptor: A descriptor captured by the registry.
     """
+    if comment is not None:
+        meta = dict(meta)
+        meta['comment'] = comment
     return FieldDescriptor(kind='aggregate', source=source, **meta)
 
 def count(source: str) -> FieldDescriptor:
@@ -216,7 +226,7 @@ def count(source: str) -> FieldDescriptor:
     """
     return aggregate(source, op='count')
 
-def custom(builder: Callable[..., Any], *, returns: Any | None = None) -> FieldDescriptor:
+def custom(builder: Callable[..., Any], *, returns: Any | None = None, comment: Optional[str] = None) -> FieldDescriptor:
     """Declare a custom computed scalar backed by a builder function.
 
     The builder should return a SQLAlchemy selectable/expression that yields a
@@ -244,9 +254,12 @@ def custom(builder: Callable[..., Any], *, returns: Any | None = None) -> FieldD
     Returns:
         FieldDescriptor: A descriptor captured by the registry.
     """
-    return FieldDescriptor(kind='custom', builder=builder, returns=returns)
+    meta: Dict[str, Any] = {'builder': builder, 'returns': returns}
+    if comment is not None:
+        meta['comment'] = comment
+    return FieldDescriptor(kind='custom', **meta)
 
-def custom_object(builder: Callable[..., Any], *, returns: Any) -> FieldDescriptor:
+def custom_object(builder: Callable[..., Any], *, returns: Any, comment: Optional[str] = None) -> FieldDescriptor:
     """Declare a custom computed object with a fixed shape.
 
     Similar to :func:`custom` but returns multiple named columns bundled into a
@@ -275,7 +288,10 @@ def custom_object(builder: Callable[..., Any], *, returns: Any) -> FieldDescript
     Returns:
         FieldDescriptor: A descriptor captured by the registry.
     """
-    return FieldDescriptor(kind='custom_object', builder=builder, returns=returns)
+    meta: Dict[str, Any] = {'builder': builder, 'returns': returns}
+    if comment is not None:
+        meta['comment'] = comment
+    return FieldDescriptor(kind='custom_object', **meta)
 
 # --- Domains (namespacing) ---
 

@@ -63,6 +63,7 @@ def build_merge_resolver_for_type(
     post_callback: Any | None = None,
     payload_is_list: bool | None = None,
     return_is_list: bool | None = None,
+    description: str | None = None,
 ):
     """Return (fname, strawberry.field, st_return) implementing recursive merge for a BerryType.
 
@@ -1011,6 +1012,8 @@ def build_merge_resolver_for_type(
 
     _resolver.__name__ = fname
     _resolver.__annotations__ = ann
+    if description:
+        return fname, strawberry.field(resolver=_resolver, description=str(description)), st_return
     return fname, strawberry.field(resolver=_resolver), st_return
 
 # --- Domain mutation support ---------------------------------------------
@@ -1145,6 +1148,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 btype_t,
                 field_name=attr_name,
                 relation_scope=eff_scope,
+                description=(meta.get('comment') if isinstance(meta, dict) else None),
                 payload_is_list=(not is_single),
                 return_is_list=False,
             )
@@ -1242,6 +1246,7 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                             relation_scope=_runtime_scope,
                             pre_callback=meta.get('pre'),
                             post_callback=meta.get('post'),
+                            description=(meta.get('comment') if isinstance(meta, dict) else None),
                             payload_is_list=(not bool(meta.get('single'))),
                             return_is_list=False,
                         )
@@ -1294,6 +1299,7 @@ def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                 relation_scope=eff_scope,
                 pre_callback=meta.get('pre'),
                 post_callback=meta.get('post'),
+                description=(meta.get('comment') if isinstance(meta, dict) else None),
                 payload_is_list=(not is_single),
                 return_is_list=False,
             )

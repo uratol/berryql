@@ -34,6 +34,11 @@ async def test_userql_descriptions_from_comments():
     assert f.get("email") == "Unique login email"
     assert f.get("is_admin") == "Administrative flag"
     assert f.get("created_at") == "Creation timestamp (UTC)"
+    # Scalar field without explicit comment inherits from SA column
+    assert f.get("name") == "Public display name"
+    # Relation without explicit comment inherits target model's table comment
+    assert f.get("posts") == "Blog posts"
+    assert f.get("post_comments") == "User comments on posts"
 
 
 @pytest.mark.asyncio
@@ -43,6 +48,10 @@ async def test_postql_descriptions_from_comments():
     f = _fields_dict(t)
     assert f.get("title") == "Post title"
     assert f.get("author_id") == "Author FK to users.id"
+    # Relation without explicit comment inherits target model's table comment
+    assert f.get("author") == "Application users"
+    assert f.get("post_comments") == "User comments on posts"
+    assert f.get("views") == "Polymorphic views on posts and comments"
 
 
 @pytest.mark.asyncio
@@ -51,3 +60,5 @@ async def test_postcommentql_descriptions_from_comments():
     assert t["description"] == "User comments on posts"
     f = _fields_dict(t)
     assert f.get("content") == "Comment text"
+    # Scalar fallback from SA column
+    assert f.get("rate") == "Simple rating value"
