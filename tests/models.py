@@ -7,6 +7,7 @@ import enum
 from sqlalchemy.orm import DeclarativeBase, relationship, column_property
 from sqlalchemy.types import TypeDecorator, LargeBinary
 from sqlalchemy.dialects import postgresql, mssql
+from berryql import enum_column
 
 class BinaryBlob(TypeDecorator):
     """Single binary blob column normalized to base64 string for GraphQL.
@@ -101,7 +102,6 @@ class Post(Base):
     # New: single binary blob (base64 in GraphQL)
     binary_blob = Column(BinaryBlob(), nullable=True)
     # Enum with helper: ensures hashability and consistent storage; emits named CHECK
-    from berryql.sql.enum_helpers import enum_column
     status = enum_column(
         PostStatus,
         nullable=False,

@@ -11,6 +11,7 @@ directly (avoiding circular imports).
 from typing import Optional
 from .registry import BerrySchema, BerryType, BerryDomain, StrawberryConfig
 from .core.fields import field, relation, aggregate, count, custom, custom_object, domain, mutation
+from .sql.enum_helpers import enum_column
 
 _ACTIVE_SCHEMA: Optional[BerrySchema] = None
 
@@ -26,5 +27,6 @@ def get_active_schema() -> BerrySchema:
 __all__ = [
     'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig',
     'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation',
+    'enum_column',
     'get_active_schema', 'set_active_schema'
 ]
