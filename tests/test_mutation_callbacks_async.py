@@ -24,7 +24,7 @@ async def test_upsert_callbacks_async(db_session, populated_db):
     edge = res.data.get("asyncDomain")
     assert isinstance(edge, dict)
     post = edge["merge_posts"]
-    # Title should have async pre and post markers
+    # Title should have async pre and post markers from decorator-declared async hooks
     assert post["title"].startswith("[apre]Async")
     assert post["title"].endswith("[apost]")
     kinds = [e["event"] for e in CALLBACK_EVENTS]

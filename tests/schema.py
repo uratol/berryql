@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
-from berryql import BerrySchema, BerryType, BerryDomain, field, relation, aggregate, count, custom, custom_object, domain, mutation
+from berryql import BerrySchema, BerryType, BerryDomain, field, relation, count, custom, custom_object, domain, mutation, hooks
 from tests.models import User, Post, PostComment, PostCommentLike, View  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
@@ -76,6 +76,38 @@ async def _test_post_upsert_async(model_cls, info: Info, instance: Any, created:
                 pass
             try:
                 CALLBACK_EVENTS.append({'event': 'apost', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+            except Exception:
+                pass
+    except Exception:
+        return
+
+# Additional test-only hooks declared via HooksDescriptor (berry_schema.hooks)
+# These mark the title with [hpre]/[hpost] and log events 'hpre'/'hpost'.
+def _test_pre_upsert_hook(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+    try:
+        if not (getattr(info, 'context', None) or {}).get('test_callbacks'):
+            return data
+    except Exception:
+        return data
+    d = dict(data or {})
+    d['title'] = f"[hpre]{d.get('title','')}"
+    try:
+        CALLBACK_EVENTS.append({'event': 'hpre', 'model': getattr(model_cls, '__name__', str(model_cls))})
+    except Exception:
+        pass
+    return d
+
+def _test_post_upsert_hook(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
+    try:
+        if (getattr(info, 'context', None) or {}).get('test_callbacks'):
+            try:
+                t = getattr(instance, 'title', None)
+                if t is not None:
+                    setattr(instance, 'title', f"{t}[hpost]")
+            except Exception:
+                pass
+            try:
+                CALLBACK_EVENTS.append({'event': 'hpost', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
             except Exception:
                 pass
     except Exception:
@@ -194,6 +226,14 @@ class PostQL(BerryType):
     @berry_schema.post
     async def _merge_post_async(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
         return await _test_post_upsert_async(model_cls, info, instance, created, ctx)
+
+    # Two ways to declare hooks on a BerryType:
+    # 1) Decorators @berry_schema.pre/@berry_schema.post on methods above.
+    #    These methods will be auto-registered as merge callbacks.
+    # 2) Descriptor-based via berry_schema.hooks(...) which attaches functions (sync or async)
+    #    directly without defining methods. This appends to the same callback lists and
+    #    runs alongside decorators. Here we register extra test hooks adding [hpre]/[hpost].
+    hooks = hooks(pre=_test_pre_upsert_hook, post=_test_post_upsert_hook)
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):

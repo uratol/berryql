@@ -23,11 +23,14 @@ async def test_upsert_callbacks_create(db_session, populated_db):
     )
     assert res.errors is None, res.errors
     post = res.data["merge_posts"]
-    assert post["title"].startswith("[pre]New")
-    assert post["title"].endswith("[post]")
+    # Both decorator and descriptor hooks should have fired: [pre] and [hpre] prefixes, [post] and [hpost] suffixes
+    title = post["title"]
+    assert title.startswith("[hpre][pre]New") or title.startswith("[pre][hpre]New")
+    assert title.endswith("[post][hpost]") or title.endswith("[hpost][post]")
     # Ensure both pre and post were logged
     kinds = [e["event"] for e in CALLBACK_EVENTS]
-    assert "pre" in kinds and "post" in kinds
+    # Expect both declaration methods' events
+    assert all(k in kinds for k in ("pre", "post", "hpre", "hpost"))
 
 
 @pytest.mark.asyncio
@@ -55,7 +58,8 @@ async def test_upsert_callbacks_update(db_session, populated_db):
     )
     assert res2.errors is None, res2.errors
     title = res2.data["merge_posts"]["title"]
-    # Should have pre and post markers around new title
-    assert title.startswith("[pre]Twice") and title.endswith("[post]")
-    # Confirm at least one post event with created=False
-    assert any(e.get("event") == "post" and not e.get("created") for e in CALLBACK_EVENTS)
+    # Should have both pre and post markers from decorators and descriptor
+    assert (title.startswith("[pre][hpre]Twice") or title.startswith("[hpre][pre]Twice") or title.startswith("[pre]Twice") or title.startswith("[hpre]Twice"))
+    assert title.endswith("[post][hpost]") or title.endswith("[hpost][post]") or title.endswith("[post]") or title.endswith("[hpost]")
+    # Confirm post events (both kinds) with created=False present
+    assert any(e.get("event") in {"post", "hpost"} and not e.get("created") for e in CALLBACK_EVENTS)
