@@ -23,14 +23,19 @@ async def test_upsert_callbacks_create(db_session, populated_db):
     )
     assert res.errors is None, res.errors
     post = res.data["merge_posts"]
-    # Both decorator and descriptor hooks should have fired: [pre] and [hpre] prefixes, [post] and [hpost] suffixes
+    # Both decorator and descriptor hooks should have fired. Check presence and relative positions.
     title = post["title"]
-    assert title.startswith("[hpre][pre]New") or title.startswith("[pre][hpre]New")
-    assert title.endswith("[post][hpost]") or title.endswith("[hpost][post]")
+    assert all(tag in title for tag in ("[pre]", "[hpre]", "[post]", "[hpost]", "[h2post]"))
+    # Ensure base word appears after pre markers and before post markers
+    base_ix = title.find("New")
+    assert base_ix != -1
+    assert max(title.find("[pre]"), title.find("[hpre]")) < base_ix
+    assert base_ix < min(title.rfind("[post]"), title.rfind("[hpost]"), title.rfind("[h2post]"))
     # Ensure both pre and post were logged
     kinds = [e["event"] for e in CALLBACK_EVENTS]
-    # Expect both declaration methods' events
-    assert all(k in kinds for k in ("pre", "post", "hpre", "hpost"))
+    # Expect both declaration methods' events, including array-based hooks
+    for k in ("pre", "post", "hpre", "hpost", "h2post"):
+        assert k in kinds
 
 
 @pytest.mark.asyncio
@@ -58,8 +63,11 @@ async def test_upsert_callbacks_update(db_session, populated_db):
     )
     assert res2.errors is None, res2.errors
     title = res2.data["merge_posts"]["title"]
-    # Should have both pre and post markers from decorators and descriptor
-    assert (title.startswith("[pre][hpre]Twice") or title.startswith("[hpre][pre]Twice") or title.startswith("[pre]Twice") or title.startswith("[hpre]Twice"))
-    assert title.endswith("[post][hpost]") or title.endswith("[hpost][post]") or title.endswith("[post]") or title.endswith("[hpost]")
-    # Confirm post events (both kinds) with created=False present
-    assert any(e.get("event") in {"post", "hpost"} and not e.get("created") for e in CALLBACK_EVENTS)
+    # Should have both pre and post markers from decorators and descriptors (two descriptor hooks)
+    assert all(tag in title for tag in ("[pre]", "[hpre]", "[post]", "[hpost]", "[h2post]"))
+    base_ix = title.find("Twice")
+    assert base_ix != -1
+    assert max(title.find("[pre]"), title.find("[hpre]")) < base_ix
+    assert base_ix < min(title.rfind("[post]"), title.rfind("[hpost]"), title.rfind("[h2post]"))
+    # Confirm post events (all kinds) with created=False present
+    assert any(e.get("event") in {"post", "hpost", "h2post"} and not e.get("created") for e in CALLBACK_EVENTS)

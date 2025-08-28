@@ -113,6 +113,22 @@ def _test_post_upsert_hook(model_cls, info: Info, instance: Any, created: bool, 
     except Exception:
         return
 
+def _test_post_upsert_hook2(model_cls, info: Info, instance: Any, created: bool, ctx: dict | None = None):
+    try:
+        if (getattr(info, 'context', None) or {}).get('test_callbacks'):
+            try:
+                t = getattr(instance, 'title', None)
+                if t is not None:
+                    setattr(instance, 'title', f"{t}[h2post]")
+            except Exception:
+                pass
+            try:
+                CALLBACK_EVENTS.append({'event': 'h2post', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+            except Exception:
+                pass
+    except Exception:
+        return
+
 @berry_schema.type(model=PostComment)
 class PostCommentQL(BerryType):
     id = field()
@@ -233,7 +249,7 @@ class PostQL(BerryType):
     # 2) Descriptor-based via berry_schema.hooks(...) which attaches functions (sync or async)
     #    directly without defining methods. This appends to the same callback lists and
     #    runs alongside decorators. Here we register extra test hooks adding [hpre]/[hpost].
-    hooks = hooks(pre=_test_pre_upsert_hook, post=_test_post_upsert_hook)
+    hooks = hooks(pre=_test_pre_upsert_hook, post=[_test_post_upsert_hook, _test_post_upsert_hook2])
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
