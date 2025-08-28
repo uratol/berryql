@@ -59,6 +59,70 @@ from .core.utils import (
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
 
+# --- Public hook descriptor to attach pre/post callbacks declaratively ----
+class HooksDescriptor:
+    """Descriptor that registers pre/post merge hooks on a BerryType.
+
+    Usage inside a @berry_schema.type class body:
+
+        from app.graphql.hooks.invitation import invitation_pre, invitation_post
+
+        class InvitationQL(BerryType):
+            hooks = berry_schema.hooks(pre=invitation_pre, post=invitation_post)
+
+    This avoids direct use of private dunder attributes and keeps hook wiring near the type.
+    """
+    def __init__(self, pre=None, post=None):
+        self._pre = pre
+        self._post = post
+
+    def _iter_funcs(self, val):
+        try:
+            if val is None:
+                return []
+            if isinstance(val, (list, tuple)):
+                return [f for f in val if callable(f)]
+            return [val] if callable(val) else []
+        except Exception:
+            return []
+
+    def __set_name__(self, owner, name):
+        # Append to existing pre hooks
+        try:
+            existing_pre = list(getattr(owner, '__merge_pre_cbs__', ()) or ())
+        except Exception:
+            existing_pre = []
+        pre_funcs = self._iter_funcs(self._pre)
+        if pre_funcs:
+            for f in pre_funcs:
+                if f not in existing_pre:
+                    existing_pre.append(f)
+            try:
+                setattr(owner, '__merge_pre_cbs__', tuple(existing_pre))
+            except Exception:
+                pass
+
+        # Append to existing post hooks
+        try:
+            existing_post = list(getattr(owner, '__merge_post_cbs__', ()) or ())
+        except Exception:
+            existing_post = []
+        post_funcs = self._iter_funcs(self._post)
+        if post_funcs:
+            for f in post_funcs:
+                if f not in existing_post:
+                    existing_post.append(f)
+            try:
+                setattr(owner, '__merge_post_cbs__', tuple(existing_post))
+            except Exception:
+                pass
+
+        # Optionally hide the attribute from instances by replacing with a sentinel
+        try:
+            setattr(owner, name, None)
+        except Exception:
+            pass
+
 __all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
 
 UNSET = getattr(strawberry, 'UNSET')
@@ -259,6 +323,19 @@ class BerrySchema:
                 pass
             return f
         return _deco(fn) if callable(fn) else _deco
+
+    # Public factory for hook registration inside type classes
+    def hooks(self, *, pre: Any | None = None, post: Any | None = None):
+        """Return a descriptor that registers pre/post hooks when set on a type class.
+
+        Example:
+            class MyType(BerryType):
+                hooks = berry_schema.hooks(pre=pre_fn, post=post_fn)
+        """
+        return HooksDescriptor(pre=pre, post=post)
+
+
+    
 
     # ---------- Input/Mutation helpers ----------
     def _ensure_input_type(self, btype_cls: Type[BerryType]):
@@ -2947,3 +3024,14 @@ class BerrySchema:
             else:
                 _inner_schema = strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
             return _inner_schema
+
+# --- Module-level helpers (public) ---------------------------------------------
+def hooks(*, pre: Any | None = None, post: Any | None = None):
+    """Create a hook descriptor for in-class registration.
+
+    Usage:
+        from app.graphql.berryql import hooks
+        class MyType(BerryType):
+            hooks = hooks(pre=pre_fn, post=post_fn)
+    """
+    return HooksDescriptor(pre=pre, post=post)

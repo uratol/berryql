@@ -32,9 +32,13 @@ def __getattr__(name: str):  # PEP 562 lazy exports
     if name in {'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig'}:
         from . import registry as _registry
         return getattr(_registry, name)
-    if name in {'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation'}:
+    if name in {'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks'}:
         from .core import fields as _fields
-        return getattr(_fields, name)
+        if name != 'hooks':
+            return getattr(_fields, name)
+        # hooks is provided by registry
+        from . import registry as _registry
+        return getattr(_registry, 'hooks')
     if name == 'enum_column':
         from .sql.enum_helpers import enum_column as _enum_column
         return _enum_column
@@ -43,7 +47,7 @@ def __getattr__(name: str):  # PEP 562 lazy exports
 
 __all__ = [
     'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig',
-    'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation',
+    'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks',
     'enum_column',
     'get_active_schema', 'set_active_schema',
 ]
