@@ -344,6 +344,9 @@ class BlogDomain(BerryDomain):
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    # A regular public method that should NOT be exposed on Query domain nor Mutation domain
+    def should_not_be_on_domain(self) -> str:
+        return "nope"
     # Declare merge mutation for posts within the domain)
     merge_posts = mutation('PostQL', comment="Create or update posts (domain)")
     # Scoped domain-level mutation: only author_id == 1 allowed
@@ -449,6 +452,10 @@ class Query:
     def hello(self) -> str:
         return "world"
 
+    # A regular public method that should NOT be exposed as a Strawberry field
+    def should_not_be_exposed(self) -> str:
+        return "nope"
+
     # Expose domains under namespaces
     userDomain = domain(UserDomain)
     blogDomain = domain(BlogDomain)
@@ -497,6 +504,10 @@ class Mutation:
         await session.flush()
         await session.commit()
         return int(p.id)
+
+    # A regular public method that should NOT be exposed as a Strawberry mutation
+    async def should_not_be_mutation(self, info: Info) -> int:
+        return 1
 
 @berry_schema.subscription()
 class Subscription:
