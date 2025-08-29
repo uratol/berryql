@@ -1096,6 +1096,18 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
             if fn is None:
                 fn = getattr(fval, 'func', None)
+            # Only treat as a mutation-style field if resolver has params beyond just `self`.
+            # This skips simple self-only @strawberry.field domain helpers from mutation containers.
+            import inspect as _inspect
+            try:
+                _sig = _inspect.signature(getattr(fn, '__wrapped__', fn) or (lambda self: None))
+                _params = [p for p in _sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+                if not _params or _params[0].name != 'self' or len(_params) < 2:
+                    # Not a mutation-like resolver; skip exposing on mutation domain
+                    continue
+            except Exception:
+                # If we cannot reliably inspect, err on the safe side and skip
+                continue
             # Determine return type from resolver annotation and map Berry types to runtime Strawberry types
             ret_ann = None
             if callable(fn):

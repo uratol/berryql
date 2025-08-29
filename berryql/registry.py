@@ -2702,6 +2702,50 @@ class BerrySchema:
                 DomSt_local.__module__ = __name__
                 _domain_type_cache[dom_cls] = DomSt_local  # pre-cache to break cycles
                 ann_local: Dict[str, Any] = {}
+                # Helper: map a return annotation to runtime Strawberry types (unwrap Annotated, preserve Optional/List)
+                def _map_ret_annotation(t: Any) -> Any:
+                    try:
+                        if t is None:
+                            return None
+                        from typing import Annotated as _Annotated  # type: ignore
+                        origin = get_origin(t)
+                        args = list(get_args(t) or [])
+                        # Unwrap Annotated[T, ...]
+                        if origin is _Annotated:
+                            return _map_ret_annotation(args[0]) if args else None
+                        # Optional[T] is Union[T, NoneType]
+                        if origin is getattr(__import__('typing'), 'Union', None):
+                            # Filter out NoneType
+                            non_none = [a for a in args if a is not type(None)]  # noqa: E721
+                            if len(non_none) == 1 and len(args) == 2:
+                                inner = _map_ret_annotation(non_none[0])
+                                return Optional[inner]  # type: ignore
+                            # Generic Union: map each
+                            mapped = tuple(_map_ret_annotation(a) for a in args)
+                            try:
+                                from typing import Union as _Union  # type: ignore
+                                return _Union[mapped]  # type: ignore
+                            except Exception:
+                                return t
+                        # List[T]
+                        if origin in (list, List):
+                            inner = _map_ret_annotation(args[0]) if args else Any
+                            return List[inner]  # type: ignore
+                        # Direct string name of a Berry type
+                        if isinstance(t, str):
+                            # Map to runtime Strawberry type when available
+                            return self._st_types.get(t, t)
+                        # If it's a Berry type class, map by its __name__
+                        try:
+                            if t in self.types.values():
+                                nm = getattr(t, '__name__', None)
+                                if nm and nm in self._st_types:
+                                    return self._st_types[nm]
+                        except Exception:
+                            pass
+                        return t
+                    except Exception:
+                        return t
                 # Attach relation fields from domain class
                 for fname, fval in list(vars(dom_cls).items()):
                     if isinstance(fval, FieldDescriptor):
@@ -2749,6 +2793,44 @@ class BerrySchema:
                             setattr(DomSt_local, fname, strawberry.field(resolver=resolver, description=str(d_desc)))
                         else:
                             setattr(DomSt_local, fname, strawberry.field(resolver=resolver))
+                # Copy regular @strawberry.field resolvers from the domain class verbatim so Strawberry
+                # registers them with their existing base_resolver. Avoid rebuilding wrappers here to
+                # keep behavior identical to the user-declared methods (including Annotated/lazy types).
+                _domain_static_field_resolvers: Dict[str, Any] = {}
+                for uf, val in list(vars(dom_cls).items()):
+                    # Skip dunders, Berry FieldDescriptors and nested domains (handled elsewhere)
+                    if uf.startswith('__') or isinstance(val, FieldDescriptor):
+                        continue
+                    try:
+                        # Only consider Strawberry-decorated fields (objects carrying a base_resolver)
+                        looks_strawberry = (
+                            str(getattr(getattr(val, '__class__', object), '__module__', '') or '').startswith('strawberry')
+                            or hasattr(val, 'base_resolver')
+                        )
+                    except Exception:
+                        looks_strawberry = False
+                    if not looks_strawberry:
+                        continue
+                    try:
+                        # Attach the original Strawberry field object; Strawberry will use its resolver.
+                        setattr(DomSt_local, uf, val)
+                        # Best-effort: expose return type in annotations only when available and simple
+                        try:
+                            br = getattr(val, 'base_resolver', None)
+                            fn = getattr(br, 'wrapped_func', None) if br is not None else None
+                            if callable(fn):
+                                ret_ann = getattr(fn, '__annotations__', {}).get('return')
+                                if ret_ann is not None:
+                                    try:
+                                        ann_local.setdefault(uf, _map_ret_annotation(ret_ann) or ret_ann)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        # Do not pre-populate values here; let Strawberry call the resolver.
+                    except Exception:
+                        # best-effort: skip if we can't attach the field cleanly
+                        continue
                 # Attach nested domain fields declared via DomainDescriptor
                 try:
                     from .core.fields import DomainDescriptor as _DomDesc
@@ -2763,17 +2845,36 @@ class BerrySchema:
                         ann_local[fname] = child_dom_st  # type: ignore
                         def _make_nested_resolver(ChildSt):
                             async def _resolver(self, info: StrawberryInfo):  # noqa: D401
-                                inst = ChildSt()
+                                # Bypass dataclass __init__ to avoid required kw-only args on resolver-backed fields
+                                try:
+                                    inst = object.__new__(ChildSt)
+                                except Exception:
+                                    try:
+                                        import inspect as _inspect
+                                        sig = _inspect.signature(ChildSt)
+                                        kwargs = {p.name: None for p in sig.parameters.values() if p.kind is p.KEYWORD_ONLY}
+                                        inst = ChildSt(**kwargs)
+                                    except Exception:
+                                        inst = ChildSt()
                                 setattr(inst, '__berry_registry__', getattr(self, '__berry_registry__', self))
                                 return inst
                             return _resolver
                         setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
-                # Intentionally do not copy arbitrary strawberry fields from domain classes into Query domain containers.
-                # Domains on Query should expose only Berry relations and nested domains to avoid leaking mutations or
-                # non-Berry custom fields. Custom read fields can be declared on Query directly if needed.
+                # Note: We now intentionally copy regular @strawberry.field attributes from domain classes as read-only
+                # custom fields, in addition to Berry relations and nested domains.
                 DomSt_local.__annotations__ = ann_local
+                # Attach cached resolvers map for use by domain root resolver
+                try:
+                    setattr(DomSt_local, '__berry_domain_static_fields__', _domain_static_field_resolvers)
+                except Exception:
+                    pass
                 # Decorate and cache
                 self._st_types[type_name] = strawberry.type(DomSt_local)  # type: ignore
+                # Mirror the resolver cache onto the decorated class (some Strawberry versions replace the class)
+                try:
+                    setattr(self._st_types[type_name], '__berry_domain_static_fields__', getattr(DomSt_local, '__berry_domain_static_fields__', {}) or _domain_static_field_resolvers)
+                except Exception:
+                    pass
                 # Also export into module globals to satisfy any LazyType lookups by name
                 try:
                     globals()[type_name] = self._st_types[type_name]
@@ -2791,8 +2892,36 @@ class BerrySchema:
                 # Expose on Query as a field that returns the domain container instance
                 def _make_domain_resolver(DomSt_local):
                     async def _resolver(self, info: StrawberryInfo):  # noqa: D401
-                        inst = DomSt_local()
+                        # Prefer bypassing dataclass __init__ to avoid required kw-only args on resolver-backed fields
+                        try:
+                            inst = object.__new__(DomSt_local)
+                        except Exception:
+                            try:
+                                import inspect as _inspect
+                                sig = _inspect.signature(DomSt_local)
+                                kwargs = {p.name: None for p in sig.parameters.values() if p.kind is p.KEYWORD_ONLY}
+                                inst = DomSt_local(**kwargs)
+                            except Exception:
+                                inst = DomSt_local()
                         setattr(inst, '__berry_registry__', self)
+                        # Pre-populate regular strawberry.field values to avoid missing attributes when Strawberry
+                        # falls back to default_resolver on dataclass fields. This keeps behavior deterministic even
+                        # when the field is defined without args and returns a computed constant.
+                        try:
+                            import inspect as _inspect
+                            sfmap = getattr(DomSt_local, '__berry_domain_static_fields__', {}) or {}
+                            for _fname, _res in list(sfmap.items()):
+                                try:
+                                    if _inspect.iscoroutinefunction(_res):
+                                        val = await _res(inst)
+                                    else:
+                                        val = _res(inst)
+                                    setattr(inst, _fname, val)
+                                except Exception:
+                                    # Best-effort: leave unset if computation fails
+                                    pass
+                        except Exception:
+                            pass
                         return inst
                     return _resolver
                 query_annotations[dom_name] = DomSt  # type: ignore

@@ -2,7 +2,7 @@
 
 Not functionally equivalent yet: purely structural placeholder to evolve tests against.
 """
-from typing import Optional, List, Any, AsyncGenerator
+from typing import Optional, List, Any, AsyncGenerator, Annotated
 from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
@@ -344,6 +344,16 @@ class BlogDomain(BerryDomain):
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    # Regular Strawberry field on the domain container (should be exposed on schema)
+    @strawberry.field
+    def helloDomain(self) -> str:
+        return "hello from blogDomain"
+    # Strawberry field with Annotated + lazy return type; returns None for tests
+    @strawberry.field
+    def samplePostAnnotated(self) -> Optional[Annotated['PostQL', strawberry.lazy('tests.schema')]]:
+        # This intentionally returns None; the purpose is to ensure the field is exposed
+        # and the Annotated lazy type resolves without raising.
+        return None
     # A regular public method that should NOT be exposed on Query domain nor Mutation domain
     def should_not_be_on_domain(self) -> str:
         return "nope"
