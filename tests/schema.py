@@ -355,7 +355,8 @@ class BlogDomain(BerryDomain):
     postsAsyncFilter = relation('PostQL', order_by='id', order_dir='asc', arguments={
         'created_at_gt': _created_at_gt_async,
     })
-    # Domain-scoped mutation example
+    # Domain-scoped mutation example (must be explicitly decorated to be exposed)
+    @strawberry.mutation
     async def create_post_mut(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
         if session is None:
@@ -473,6 +474,7 @@ class Mutation:
     # Scoped root-level mutation: only author_id == 1 allowed
     merge_posts_scoped = mutation('PostQL', scope='{"author_id": {"eq": 1}}', comment="Create or update posts (only author_id==1)")
 
+    @strawberry.mutation
     async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
         if session is None:

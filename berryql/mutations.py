@@ -1068,32 +1068,41 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
     DomSt_local = type(type_name, (), {'__doc__': f'Mutation domain container for {getattr(dom_cls, "__name__", type_name)}'})
     DomSt_local.__module__ = schema.__class__.__module__
     ann_local: Dict[str, Any] = {}
-    # Copy callable/strawberry fields from domain class (mutations authored by user)
+    # Copy only strawberry mutation fields from domain class (mutations authored by user)
     from .core.fields import FieldDescriptor as _FldDesc, DomainDescriptor as _DomDesc
     for fname, fval in list(vars(dom_cls).items()):
         if isinstance(fval, _FldDesc) or isinstance(fval, _DomDesc):
             continue
         if fname.startswith('__') or fname.startswith('_'):
             continue
+        # Expose Strawberry-decorated fields (including @strawberry.mutation). Skip plain callables.
         looks_strawberry = False
         try:
             mod = getattr(getattr(fval, "__class__", object), "__module__", "") or ""
             looks_strawberry = (
-                mod.startswith("strawberry") or hasattr(fval, "resolver") or hasattr(fval, "base_resolver")
+                mod.startswith("strawberry")
+                or hasattr(fval, "resolver")
+                or hasattr(fval, "base_resolver")
             )
         except Exception:
             looks_strawberry = False
+        if not looks_strawberry:
+            continue
+        # Convert to a regular field using the underlying resolver to fit inside an object type
         try:
-            if looks_strawberry:
-                setattr(DomSt_local, fname, fval)
-                fn = getattr(fval, 'resolver', None) or getattr(getattr(fval, 'base_resolver', None), 'func', None) or getattr(fval, 'func', None)
-                ret_ann = getattr(fn, '__annotations__', {}).get('return') if callable(fn) else None
-            elif callable(fval):
-                setattr(DomSt_local, fname, strawberry.field(resolver=fval))
-                ret_ann = getattr(fval, '__annotations__', {}).get('return')
-            else:
-                continue
-            # Map BerryType return to runtime Strawberry type
+            fn = getattr(fval, 'resolver', None)
+            if fn is None:
+                br = getattr(fval, 'base_resolver', None)
+                fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+            if fn is None:
+                fn = getattr(fval, 'func', None)
+            # Determine return type from resolver annotation and map Berry types to runtime Strawberry types
+            ret_ann = None
+            if callable(fn):
+                try:
+                    ret_ann = getattr(fn, '__annotations__', {}).get('return')
+                except Exception:
+                    ret_ann = None
             mapped_type = None
             try:
                 if get_origin(ret_ann) is getattr(__import__('typing'), 'Annotated', None):
@@ -1102,13 +1111,19 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                         ret_ann = args[0]
                 if isinstance(ret_ann, str) and ret_ann in schema.types:
                     mapped_type = schema._st_types.get(ret_ann)
-                if ret_ann in schema.types.values():
+                elif ret_ann in schema.types.values():
                     nm = getattr(ret_ann, '__name__', None)
                     if nm:
                         mapped_type = schema._st_types.get(nm)
             except Exception:
                 mapped_type = None
-            ann_local[fname] = mapped_type or ret_ann or Any
+            # Attach field with resolver
+            setattr(DomSt_local, fname, strawberry.field(resolver=fn))
+            # Set annotation to concrete mapped type if available to avoid Any
+            if mapped_type is not None:
+                ann_local[fname] = mapped_type  # type: ignore
+            elif ret_ann is not None:
+                ann_local[fname] = ret_ann  # type: ignore
         except Exception:
             pass
     # Nested mutation domains
@@ -1162,13 +1177,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 pass
     except Exception:
         pass
-    # If no fields were collected, or DomSt_local ended up without any strawberry field/mutation attrs, skip creating the type entirely
-    if not ann_local:
-        try:
-            _logger.warning("berryql.mutations: skip %s (no fields)", type_name)
-        except Exception:
-            pass
-        return None
+    # If DomSt_local ended up without any strawberry field/mutation attrs, skip creating the type entirely
     try:
         any_st_fields = False
         for attr_name in dir(DomSt_local):
@@ -1189,6 +1198,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
     except Exception:
         # best-effort: proceed with annotations gate alone
         pass
+    # Set annotations last (may be empty when only StrawberryField attributes are present)
     DomSt_local.__annotations__ = ann_local
     try:
         _logger.warning("berryql.mutations: create %s with fields=%s", type_name, sorted(list(ann_local.keys())))

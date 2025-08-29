@@ -2768,34 +2768,9 @@ class BerrySchema:
                                 return inst
                             return _resolver
                         setattr(DomSt_local, fname, strawberry.field(resolver=_make_nested_resolver(child_dom_st)))
-                # Copy any strawberry fields defined on the domain class (e.g., @strawberry.field)
-                for uf, val in list(vars(dom_cls).items()):
-                    if (_DomDesc is not None and isinstance(val, _DomDesc)) or isinstance(val, FieldDescriptor):
-                        continue
-                    if uf.startswith('__') or uf.startswith('_'):
-                        continue
-                    if hasattr(DomSt_local, uf):
-                        continue
-                    try:
-                        mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
-                        looks_st = (
-                            mod.startswith("strawberry")
-                            or hasattr(val, "resolver")
-                            or hasattr(val, "base_resolver")
-                        )
-                        if looks_st:
-                            fn = getattr(val, 'resolver', None)
-                            if fn is None:
-                                br = getattr(val, 'base_resolver', None)
-                                fn = getattr(br, 'func', None)
-                            if fn is None:
-                                fn = getattr(val, 'func', None)
-                            if callable(fn):
-                                setattr(DomSt_local, uf, strawberry.field(resolver=fn))
-                            else:
-                                setattr(DomSt_local, uf, val)
-                    except Exception:
-                        pass
+                # Intentionally do not copy arbitrary strawberry fields from domain classes into Query domain containers.
+                # Domains on Query should expose only Berry relations and nested domains to avoid leaking mutations or
+                # non-Berry custom fields. Custom read fields can be declared on Query directly if needed.
                 DomSt_local.__annotations__ = ann_local
                 # Decorate and cache
                 self._st_types[type_name] = strawberry.type(DomSt_local)  # type: ignore
@@ -2880,54 +2855,59 @@ class BerrySchema:
                     _mut.add_mutation_domains(self, MPlain, anns_m)
                 except Exception:
                     pass
-                # Copy user-defined mutation fields (@strawberry.field or callables)
+                # Copy user-defined Strawberry-decorated attributes (@strawberry.mutation, etc.). Ignore plain callables.
                 for uf, val in vars(self._user_mutation_cls).items():
                     if uf.startswith('__'):
                         continue
-                    # If this looks like a strawberry field/mutation, copy as-is
                     looks_strawberry = False
                     try:
+                        mod = getattr(getattr(val, "__class__", object), "__module__", "") or ""
                         looks_strawberry = (
-                            str(getattr(getattr(val, "__class__", object), "module", "") or "").startswith("strawberry")
-                            or hasattr(val, "resolver")
-                            or hasattr(val, "base_resolver")
+                            mod.startswith("strawberry") or hasattr(val, "resolver") or hasattr(val, "base_resolver")
                         )
                     except Exception:
                         looks_strawberry = False
-                    if looks_strawberry:
-                        try:
-                            setattr(MPlain, uf, val)
-                        except Exception:
-                            pass
+                    if not looks_strawberry:
                         continue
-                    # Otherwise, treat callables as resolvers and attach them
-                    if callable(val):
+                    try:
+                        # Extract underlying resolver function from the Strawberry field
+                        fn = getattr(val, 'resolver', None)
+                        if fn is None:
+                            br = getattr(val, 'base_resolver', None)
+                            fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+                        if fn is None:
+                            fn = getattr(val, 'func', None)
+                        # Map return annotation from Berry types to runtime Strawberry types
+                        ret_ann = None
                         try:
-                            setattr(MPlain, uf, strawberry.field(resolver=val))
-                        except Exception:
-                            setattr(MPlain, uf, val)
-                        # Resolve and map return annotation for runtime Berry types (supports Annotated)
-                        try:
-                            ret_ann = getattr(val, '__annotations__', {}).get('return')
+                            ret_ann = getattr(fn, '__annotations__', {}).get('return') if callable(fn) else None
                         except Exception:
                             ret_ann = None
-                        def _map_ret_2(ret_ann_inner):
+                        mapped_type = None
+                        try:
+                            if get_origin(ret_ann) is getattr(__import__('typing'), 'Annotated', None):
+                                args = list(get_args(ret_ann) or [])
+                                if args:
+                                    ret_ann = args[0]
+                            if isinstance(ret_ann, str) and ret_ann in self.types:
+                                mapped_type = self._st_types.get(ret_ann)
+                            elif ret_ann in self.types.values():
+                                nm = getattr(ret_ann, '__name__', None)
+                                if nm:
+                                    mapped_type = self._st_types.get(nm)
+                        except Exception:
+                            mapped_type = None
+                        if callable(fn) and mapped_type is not None:
                             try:
-                                if get_origin(ret_ann_inner) is getattr(__import__('typing'), 'Annotated', None):
-                                    args = list(get_args(ret_ann_inner) or [])
-                                    if args:
-                                        return _map_ret_2(args[0])
-                                if isinstance(ret_ann_inner, str) and ret_ann_inner in self.types:
-                                    return self._st_types.get(ret_ann_inner)
-                                if ret_ann_inner in self.types.values():
-                                    nm = getattr(ret_ann_inner, '__name__', None)
-                                    if nm:
-                                        return self._st_types.get(nm)
+                                anns = getattr(fn, '__annotations__', None)
+                                if isinstance(anns, dict):
+                                    anns['return'] = mapped_type
                             except Exception:
-                                return None
-                            return None
-                        mapped_type = _map_ret_2(ret_ann)
-                        anns_m[uf] = mapped_type or ret_ann or Any
+                                pass
+                        # Attach as a regular strawberry.field using the resolver
+                        setattr(MPlain, uf, strawberry.field(resolver=fn))
+                    except Exception:
+                        pass
                 # Attach explicitly declared top-level merge mutations via mutations module
                 try:
                     if '_mut' not in locals():
@@ -3015,6 +2995,12 @@ class BerrySchema:
                     strawberry_config = StrawberryConfig(name_converter=_nc, auto_camel_case=False)  # type: ignore[arg-type]
                 except Exception:
                     strawberry_config = StrawberryConfig(auto_camel_case=False)  # type: ignore[arg-type]
+            # Allow rebuilding schemas with the same type names without tripping duplicate validation.
+            # This is safe here because we fully control type identity per to_strawberry call.
+            try:
+                setattr(strawberry_config, "_unsafe_disable_same_type_validation", True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
             # Finally, construct schema with config
             # Build base schema
             if Mutation is not None and Subscription is not None:
