@@ -2736,7 +2736,7 @@ class BerrySchema:
                     return DomSt_local
                 # Create plain runtime class
                 DomSt_local = type(type_name, (), {'__doc__': f'Domain container for {getattr(dom_cls, "__name__", type_name)}'})
-                # Ensure the class appears to live in this module to prevent LazyType path lookups
+                # Keep the container in this registry module to minimize circular resolution risk
                 DomSt_local.__module__ = __name__
                 _domain_type_cache[dom_cls] = DomSt_local  # pre-cache to break cycles
                 ann_local: Dict[str, Any] = {}
@@ -2849,30 +2849,93 @@ class BerrySchema:
                         looks_strawberry = False
                     if not looks_strawberry:
                         continue
-                    # Do not expose mutation-like resolvers on Query domain types.
-                    # Heuristic aligned with mutation domain builder: allow only methods with just `self`.
-                    import inspect as _inspect
-                    try:
-                        br = getattr(val, 'base_resolver', None)
-                        fn_impl = None
-                        if br is not None:
-                            fn_impl = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
-                        if fn_impl is None:
-                            fn_impl = getattr(val, 'func', None) or getattr(val, 'resolver', None)
-                        sig = _inspect.signature(getattr(fn_impl, '__wrapped__', fn_impl) or (lambda self: None))
-                        params = [p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-                        # Require a bound instance method with only `self` (no extra args like info/title/...)
-                        if not params or params[0].name != 'self' or len(params) >= 2:
-                            # Treat as mutation-like; skip on Query domain container
-                            continue
-                    except Exception:
-                        # If we can't inspect reliably, err on the safe side and skip exposing
+                    # Skip actual mutations. Strawberry doesn't expose a stable is_mutation flag on
+                    # StrawberryField/StrawberryResolver across versions, so use a robust heuristic:
+                    # 1) Prefer explicit attributes when present.
+                    # 2) Otherwise, inspect base_resolver internals; mutation resolvers tend to carry
+                    #    extra markers like 'strawberry_annotations' or '_namespace' in their __dict__.
+                    def _looks_mutation(obj) -> bool:
+                        try:
+                            br = getattr(obj, 'base_resolver', None)
+                        except Exception:
+                            br = None
+                        # Debug: trace BlogDomain only
+                        _DBG = getattr(dom_cls, '__name__', '') == 'BlogDomain' and uf in ('create_post_mut', 'helloDomain')
+                        # Prefer explicit flags if available
+                        try:
+                            if bool(getattr(obj, 'is_mutation', False)):
+                                if _DBG:
+                                    print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> is_mutation attr True")
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            if br is not None and bool(getattr(br, 'is_mutation', False)):
+                                if _DBG:
+                                    print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> base_resolver.is_mutation True")
+                                return True
+                        except Exception:
+                            pass
+                        # Strawberry exposes field_definition with an is_mutation flag on mutations
+                        try:
+                            fd = getattr(obj, 'field_definition', None)
+                            if fd is not None and bool(getattr(fd, 'is_mutation', False)):
+                                if _DBG:
+                                    print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> field_definition.is_mutation True")
+                                return True
+                        except Exception:
+                            pass
+                        # Fallback: inspect resolver signature. If it looks like a mutation-style
+                        # resolver (has positional params beyond just `self`), treat it as a mutation.
+                        # This mirrors the gate used by mutations.ensure_mutation_domain_type.
+                        try:
+                            import inspect as _inspect
+                            _fn = getattr(obj, 'resolver', None)
+                            if _fn is None and br is not None:
+                                _fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+                            if _fn is None:
+                                _fn = getattr(obj, 'func', None)
+                            if callable(_fn):
+                                _sig = _inspect.signature(getattr(_fn, '__wrapped__', _fn))
+                                _params = [p for p in _sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+                                # If it has positional-or-keyword beyond self, likely a mutation-style
+                                if _DBG:
+                                    try:
+                                        print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} sig={_sig}")
+                                    except Exception:
+                                        pass
+                                if _params and _params[0].name == 'self' and len(_params) >= 2:
+                                    if _DBG:
+                                        print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> looks like mutation by params count")
+                                    return True
+                                # If it explicitly includes an 'info' parameter, it's very likely authored
+                                # as a mutation handler in this project; avoid exposing it on Query.
+                                try:
+                                    if any((p.name == 'info') for p in _sig.parameters.values()):
+                                        if _DBG:
+                                            print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> looks like mutation by 'info' param")
+                                        return True
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # Avoid brittle heuristics based on resolver __dict__ keys; rely on signature/flags only
+                        return False
+                    _is_mut = _looks_mutation(val)
+                    if getattr(dom_cls, '__name__', '') == 'BlogDomain' and uf in ('create_post_mut', 'helloDomain'):
+                        try:
+                            print(f"berryql.registry DBG: decision {dom_cls.__name__}.{uf} -> is_mut={_is_mut}")
+                        except Exception:
+                            pass
+                    if _is_mut:
+                        # Do not expose mutation fields on Query domain container
                         continue
                     try:
                         # Attach the original Strawberry field object; Strawberry will use its resolver.
                         setattr(DomSt_local, uf, val)
                         # Track the underlying implementation for optional pre-population in the domain resolver
                         try:
+                            br = getattr(val, 'base_resolver', None)
                             if br is not None:
                                 _fn_for_cache = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
                             else:
@@ -2881,17 +2944,74 @@ class BerrySchema:
                                 _domain_static_field_resolvers[uf] = _fn_for_cache
                         except Exception:
                             pass
-                        # Best-effort: expose return type in annotations only when available and simple
+                        # Resolve return annotation to a concrete runtime Strawberry type and set field.type_annotation
                         try:
-                            br = getattr(val, 'base_resolver', None)
-                            fn = getattr(br, 'wrapped_func', None) if br is not None else None
-                            if callable(fn):
-                                ret_ann = getattr(fn, '__annotations__', {}).get('return')
-                                if ret_ann is not None:
-                                    try:
-                                        ann_local.setdefault(uf, _map_ret_annotation(ret_ann) or ret_ann)
-                                    except Exception:
-                                        pass
+                            ret_ann = None
+                            try:
+                                _fn_src = getattr(br, 'wrapped_func', None) if br is not None else None
+                            except Exception:
+                                _fn_src = None
+                            if _fn_src is None:
+                                _fn_src = getattr(val, 'func', None)
+                            if callable(_fn_src):
+                                ret_ann = getattr(_fn_src, '__annotations__', {}).get('return')
+                            ann_eff = ret_ann
+                            if ann_eff is not None:
+                                from typing import get_origin as _go, get_args as _ga
+                                # Unwrap Annotated[T, ...] one level and eval any forward refs in dom module
+                                try:
+                                    from typing import Annotated as _Ann, ForwardRef as _FRef  # type: ignore
+                                except Exception:
+                                    _Ann = None  # type: ignore
+                                    _FRef = None  # type: ignore
+                                try:
+                                    if _Ann is not None and _go(ann_eff) is _Ann:
+                                        _args = list(_ga(ann_eff) or [])
+                                        if _args:
+                                            ann_eff = _args[0]
+                                except Exception:
+                                    pass
+                                try:
+                                    import sys as _sys
+                                    _mod = _sys.modules.get(getattr(dom_cls, '__module__', __name__))
+                                    if isinstance(ann_eff, str):
+                                        try:
+                                            ann_eff = eval(ann_eff, vars(_mod) if _mod else {})
+                                        except Exception:
+                                            pass
+                                    elif _FRef is not None and isinstance(ann_eff, _FRef):
+                                        try:
+                                            _name = getattr(ann_eff, '__forward_arg__', '')
+                                            if _name:
+                                                ann_eff = eval(_name, vars(_mod) if _mod else {})
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                # Map BerryType classes and collections to the generated Strawberry runtime classes
+                                try:
+                                    mapped_ann = _map_ret_annotation(ann_eff)
+                                except Exception:
+                                    mapped_ann = ann_eff
+                                # If effective type is a Strawberry type class, pre-register by name
+                                try:
+                                    _cand = mapped_ann
+                                    _orig = _go(_cand)
+                                    if _orig is None and isinstance(_cand, type):
+                                        if getattr(_cand, '__strawberry_definition__', None) or getattr(_cand, '__is_strawberry_type__', False):
+                                            _nm = getattr(_cand, '__name__', None)
+                                            if _nm and not self._st_types.get(_nm):
+                                                self._st_types[_nm] = _cand  # type: ignore[assignment]
+                                except Exception:
+                                    pass
+                                # Finally, set field.type_annotation to the mapped annotation
+                                try:
+                                    from strawberry.annotation import StrawberryAnnotation as _SA  # type: ignore
+                                    _fld_obj = getattr(DomSt_local, uf, None)
+                                    if _fld_obj is not None:
+                                        _fld_obj.type_annotation = _SA.from_annotation(mapped_ann)
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         # Do not pre-populate values here; let Strawberry call the resolver.
