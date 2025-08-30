@@ -867,6 +867,42 @@ class BerrySchema:
                 self._name_converter = getattr(strawberry_config, 'name_converter')
                 # Derive auto_camel_case hint from converter when present
                 self._auto_camel_case = bool(getattr(self._name_converter, 'auto_camel_case', False))
+                # Ensure names starting with '_' are preserved (e.g., special control fields like _Delete)
+                try:
+                    from strawberry.schema.name_converter import NameConverter as _NC  # type: ignore
+                    base_nc = self._name_converter
+                    class _PreserveUnderscoreNC(_NC):  # type: ignore[misc]
+                        def __init__(self, base=None, auto_camel_case: bool = False):
+                            super().__init__(auto_camel_case=auto_camel_case)
+                            self.auto_camel_case = auto_camel_case
+                            self._base = base
+                        def apply_naming_config(self, name: str) -> str:  # type: ignore[override]
+                            try:
+                                if isinstance(name, str) and name.startswith('_'):
+                                    return name
+                            except Exception:
+                                pass
+                            if self._base is not None:
+                                try:
+                                    return self._base.apply_naming_config(name)  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                            return super().apply_naming_config(name)
+                    # Replace the provided converter with a wrapper that preserves leading underscores
+                    try:
+                        ac = bool(getattr(base_nc, 'auto_camel_case', getattr(strawberry_config, 'auto_camel_case', False)))
+                    except Exception:
+                        ac = bool(getattr(strawberry_config, 'auto_camel_case', False))
+                    wrapped = _PreserveUnderscoreNC(base_nc, auto_camel_case=ac)
+                    try:
+                        # Assign back both to config and to our cache
+                        setattr(strawberry_config, 'name_converter', wrapped)
+                    except Exception:
+                        pass
+                    self._name_converter = wrapped
+                except Exception:
+                    # Best-effort; continue with the provided converter
+                    pass
             else:
                 # Fallback to auto_camel_case on config if exposed (older Strawberry)
                 if strawberry_config is not None and hasattr(strawberry_config, 'auto_camel_case'):
@@ -874,6 +910,8 @@ class BerrySchema:
                 else:
                     self._auto_camel_case = False
                 self._name_converter = None
+                # When no explicit converter is provided but auto_camel_case could be True,
+                # we keep our own reference as None and handle defaults later.
         except Exception:
             self._auto_camel_case = False
             self._name_converter = None
@@ -3119,6 +3157,11 @@ class BerrySchema:
                             super().__init__(auto_camel_case=False)
                             self.auto_camel_case = False
                         def apply_naming_config(self, name: str) -> str:  # type: ignore[override]
+                            try:
+                                if isinstance(name, str) and name.startswith('_'):
+                                    return name
+                            except Exception:
+                                pass
                             return name
                     _nc = _IdentityNameConverter()
                     strawberry_config = StrawberryConfig(name_converter=_nc, auto_camel_case=False)  # type: ignore[arg-type]

@@ -1035,7 +1035,6 @@ def add_top_level_upserts(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str,
 def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomain']):
     """Build or return a Strawberry type for domain-scoped mutation container.
 
-    Adds auto-generated merge_* fields for relations on the domain with meta['mutation'] True.
     """
     # Cache key/type name
     type_name = f"{getattr(dom_cls, '__name__', 'Domain')}MutType"
@@ -1066,7 +1065,14 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             # If inspection fails, fall through and rebuild
             pass
     DomSt_local = type(type_name, (), {'__doc__': f'Mutation domain container for {getattr(dom_cls, "__name__", type_name)}'})
-    DomSt_local.__module__ = schema.__class__.__module__
+    # Important: set the module to the domain class' module so that string annotations
+    # (from "from __future__ import annotations") resolve in the correct global scope.
+    # This allows Strawberry to find helper types like S3DownloadResponseType defined
+    # next to the domain in its own module.
+    try:
+        DomSt_local.__module__ = getattr(dom_cls, '__module__', schema.__class__.__module__)
+    except Exception:
+        DomSt_local.__module__ = schema.__class__.__module__
     ann_local: Dict[str, Any] = {}
     # Copy only strawberry mutation fields from domain class (mutations authored by user)
     from .core.fields import FieldDescriptor as _FldDesc, DomainDescriptor as _DomDesc
@@ -1091,8 +1097,8 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
         # Convert to a regular field using the underlying resolver to fit inside an object type
         try:
             fn = getattr(fval, 'resolver', None)
-            if fn is None:
-                br = getattr(fval, 'base_resolver', None)
+            br = getattr(fval, 'base_resolver', None)
+            if fn is None and br is not None:
                 fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
             if fn is None:
                 fn = getattr(fval, 'func', None)
@@ -1108,37 +1114,157 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             except Exception:
                 # If we cannot reliably inspect, err on the safe side and skip
                 continue
-            # Determine return type from resolver annotation and map Berry types to runtime Strawberry types
+            # Determine return type from resolver annotation and map/resolve to a concrete Strawberry type
             ret_ann = None
-            if callable(fn):
+            # Prefer original wrapped function annotations for accuracy
+            _ann_source = None
+            try:
+                if br is not None:
+                    _ann_source = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+            except Exception:
+                _ann_source = None
+            if _ann_source is None:
+                _ann_source = fn if callable(fn) else None
+            if callable(_ann_source):
                 try:
-                    ret_ann = getattr(fn, '__annotations__', {}).get('return')
+                    ret_ann = getattr(_ann_source, '__annotations__', {}).get('return')
                 except Exception:
                     ret_ann = None
             mapped_type = None
             try:
-                if get_origin(ret_ann) is getattr(__import__('typing'), 'Annotated', None):
-                    args = list(get_args(ret_ann) or [])
+                _ret_base = ret_ann
+                from typing import Annotated as _Annotated, ForwardRef as _FwdRef  # type: ignore
+                if get_origin(_ret_base) is _Annotated:
+                    args = list(get_args(_ret_base) or [])
                     if args:
-                        ret_ann = args[0]
-                if isinstance(ret_ann, str) and ret_ann in schema.types:
-                    mapped_type = schema._st_types.get(ret_ann)
-                elif ret_ann in schema.types.values():
-                    nm = getattr(ret_ann, '__name__', None)
+                        _ret_base = args[0]
+                if isinstance(_ret_base, str) and _ret_base in schema.types:
+                    mapped_type = schema._st_types.get(_ret_base)
+                elif _ret_base in schema.types.values():
+                    nm = getattr(_ret_base, '__name__', None)
                     if nm:
                         mapped_type = schema._st_types.get(nm)
+                # Best-effort: resolve forward-ref strings in the domain module for non-Berry types
+                if mapped_type is None and isinstance(_ret_base, str):
+                    import importlib as _importlib
+                    try:
+                        _mod = _importlib.import_module(getattr(dom_cls, '__module__', DomSt_local.__module__))
+                        _resolved = eval(_ret_base, vars(_mod))
+                        # If we evaluated to Annotated, unwrap to the inner target
+                        if get_origin(_resolved) is _Annotated:
+                            _args = list(get_args(_resolved) or [])
+                            if _args:
+                                _target = _args[0]
+                                if isinstance(_target, _FwdRef):
+                                    _target_name = getattr(_target, '__forward_arg__', None)
+                                    if _target_name:
+                                        try:
+                                            mapped_type = eval(_target_name, vars(_mod))
+                                        except Exception:
+                                            mapped_type = None
+                                else:
+                                    mapped_type = _target
+                        else:
+                            mapped_type = _resolved
+                    except Exception:
+                        mapped_type = None
+                # Targeted debug for stubborn field
+                try:
+                    if getattr(dom_cls, '__name__', '') == 'RefDomain' and fname == 'get_s3_download_url':
+                        _dbg_resolved_name = None
+                        try:
+                            import importlib as __importlib
+                            __mod = __importlib.import_module(getattr(dom_cls, '__module__', DomSt_local.__module__))
+                            _dbg_resolved_name = getattr(__mod, 'S3DownloadResponseType', None)
+                        except Exception:
+                            _dbg_resolved_name = None
+                        _logger.warning(
+                            "berryql.mutations: debug %s ret_ann=%r base=%r mapped=%r mod=%s has_strawberry_def=%s",
+                            fname,
+                            ret_ann,
+                            _ret_base,
+                            mapped_type,
+                            getattr(dom_cls, '__module__', DomSt_local.__module__),
+                            bool(getattr(_dbg_resolved_name, '__strawberry_definition__', None) or getattr(_dbg_resolved_name, '__is_strawberry_type__', False)),
+                        )
+                except Exception:
+                    pass
             except Exception:
                 mapped_type = None
-            # Attach field with resolver
-            setattr(DomSt_local, fname, strawberry.field(resolver=fn))
-            # Set annotation to concrete mapped type if available to avoid Any
+            # Build a fresh strawberry.field using the resolver and an explicit return annotation
+            ann_effective = None
             if mapped_type is not None:
-                ann_local[fname] = mapped_type  # type: ignore
-            elif ret_ann is not None:
-                ann_local[fname] = ret_ann  # type: ignore
+                ann_effective = mapped_type
+            else:
+                # Evaluate original string annotation in domain module
+                if isinstance(ret_ann, str):
+                    import importlib as _importlib
+                    try:
+                        _mod = _importlib.import_module(getattr(dom_cls, '__module__', DomSt_local.__module__))
+                        ann_effective = eval(ret_ann, vars(_mod))
+                    except Exception:
+                        ann_effective = ret_ann
+                else:
+                    ann_effective = ret_ann
+            # If the effective return type is a Strawberry-decorated class living outside the
+            # Berry registry, pre-register it into schema._st_types so the schema builder can
+            # discover it when resolving this field.
+            try:
+                _rt = ann_effective
+                # Unwrap Annotated once more if present
+                if _rt is not None and get_origin(_rt) is not None:
+                    from typing import Annotated as _Annotated
+                    if get_origin(_rt) is _Annotated:
+                        _rt_args = list(get_args(_rt) or [])
+                        if _rt_args:
+                            _rt = _rt_args[0]
+                if isinstance(_rt, type):
+                    # Only register if it looks like a strawberry type (avoid deprecated attribute access)
+                    has_def = bool(getattr(_rt, "__strawberry_definition__", None) or getattr(_rt, "__is_strawberry_type__", False))
+                    if has_def:
+                        _nm = getattr(_rt, "__name__", None)
+                        if _nm and schema._st_types.get(_nm) is None:
+                            schema._st_types[_nm] = _rt  # type: ignore[assignment]
+            except Exception:
+                pass
+            try:
+                # Prefer using the original Strawberry field object from the domain.
+                # It carries the correct resolver and lazy annotations resolved in the domain module.
+                setattr(DomSt_local, fname, fval)
+            except Exception:
+                setattr(DomSt_local, fname, strawberry.field(resolver=fn))
+            # If we could compute an effective return type, force the strawberry field
+            # to use it by overriding its type_annotation. This prevents Strawberry from
+            # failing to resolve forward-ref/lazy annotations on dynamically attached fields.
+            try:
+                if ann_effective is not None:
+                    from strawberry.annotation import StrawberryAnnotation as _StrawberryAnnotation  # type: ignore
+                    _fld_eff = getattr(DomSt_local, fname, None)
+                    if _fld_eff is not None:
+                        _fld_eff.type_annotation = _StrawberryAnnotation.from_annotation(ann_effective)
+            except Exception:
+                pass
+            # Targeted inspection of Strawberry internals for stubborn field
+            try:
+                if getattr(dom_cls, '__name__', '') == 'RefDomain' and fname == 'get_s3_download_url':
+                    _fld = getattr(DomSt_local, fname, None)
+                    _ta = getattr(_fld, 'type_annotation', None)
+                    _ta_ann = getattr(_ta, 'annotation', None) if _ta is not None else None
+                    _ta_resolved = None
+                    try:
+                        _ta_resolved = getattr(_ta, 'resolve', None)
+                        if callable(_ta_resolved):
+                            _ta_resolved = _ta.resolve()
+                    except Exception:
+                        _ta_resolved = None
+                    _logger.warning("berryql.mutations: field=%s type_ann=%r ann=%r resolved=%r", fname, _ta, _ta_ann, _ta_resolved)
+            except Exception:
+                pass
+            # Set class annotations accordingly so the decorated type sees a concrete return type
+            if ann_effective is not None:
+                ann_local[fname] = ann_effective  # type: ignore
         except Exception:
             pass
-    # Nested mutation domains
     for fname, fval in list(vars(dom_cls).items()):
         if isinstance(fval, _DomDesc):
             child_cls = fval.domain_cls
@@ -1213,10 +1339,15 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
     # Set annotations last (may be empty when only StrawberryField attributes are present)
     DomSt_local.__annotations__ = ann_local
     try:
-        _logger.warning("berryql.mutations: create %s with fields=%s", type_name, sorted(list(ann_local.keys())))
+        _logger.info("berryql.mutations: create %s with fields=%s", type_name, sorted(list(ann_local.keys())))
     except Exception:
         pass
-    schema._st_types[type_name] = strawberry.type(DomSt_local)  # type: ignore
+    st_type = strawberry.type(DomSt_local)  # type: ignore
+    try:
+        st_type.__module__ = DomSt_local.__module__
+    except Exception:
+        pass
+    schema._st_types[type_name] = st_type
     try:
         globals()[type_name] = schema._st_types[type_name]
     except Exception:
