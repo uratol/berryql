@@ -2849,9 +2849,38 @@ class BerrySchema:
                         looks_strawberry = False
                     if not looks_strawberry:
                         continue
+                    # Do not expose mutation-like resolvers on Query domain types.
+                    # Heuristic aligned with mutation domain builder: allow only methods with just `self`.
+                    import inspect as _inspect
+                    try:
+                        br = getattr(val, 'base_resolver', None)
+                        fn_impl = None
+                        if br is not None:
+                            fn_impl = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+                        if fn_impl is None:
+                            fn_impl = getattr(val, 'func', None) or getattr(val, 'resolver', None)
+                        sig = _inspect.signature(getattr(fn_impl, '__wrapped__', fn_impl) or (lambda self: None))
+                        params = [p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+                        # Require a bound instance method with only `self` (no extra args like info/title/...)
+                        if not params or params[0].name != 'self' or len(params) >= 2:
+                            # Treat as mutation-like; skip on Query domain container
+                            continue
+                    except Exception:
+                        # If we can't inspect reliably, err on the safe side and skip exposing
+                        continue
                     try:
                         # Attach the original Strawberry field object; Strawberry will use its resolver.
                         setattr(DomSt_local, uf, val)
+                        # Track the underlying implementation for optional pre-population in the domain resolver
+                        try:
+                            if br is not None:
+                                _fn_for_cache = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+                            else:
+                                _fn_for_cache = getattr(val, 'func', None)
+                            if callable(_fn_for_cache):
+                                _domain_static_field_resolvers[uf] = _fn_for_cache
+                        except Exception:
+                            pass
                         # Best-effort: expose return type in annotations only when available and simple
                         try:
                             br = getattr(val, 'base_resolver', None)
