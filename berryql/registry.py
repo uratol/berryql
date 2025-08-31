@@ -2288,6 +2288,7 @@ class BerrySchema:
                 requested_custom_root = _plan.requested_custom_root
                 requested_custom_obj_root = _plan.requested_custom_obj_root
                 requested_aggregates_root = _plan.requested_aggregates_root
+                requested_other_root = getattr(_plan, 'requested_other_root', set()) or set()
                 # Coercion of JSON where values moved to core.utils.coerce_where_value
                 # Helper calls to RelationSQLBuilders are instantiated inline where needed
                 # Prepare pushdown COUNT aggregates (centralized)
@@ -2552,7 +2553,11 @@ class BerrySchema:
                         requested_relations=requested_relations,
                         required_fk_parent_cols=required_fk_parent_cols,
                     )
-                    if base_root_cols or select_columns:
+                    # If unknown Strawberry fields are requested at root, select the full entity
+                    # so their resolvers can access underlying model data.
+                    if requested_other_root:
+                        stmt = select(model_cls, *base_root_cols, *select_columns)
+                    elif base_root_cols or select_columns:
                         # When projecting labeled columns only, we must add an explicit FROM
                         # so ORDER BY and correlated subselects can reference the parent table.
                         stmt = select(*base_root_cols, *select_columns).select_from(model_cls)

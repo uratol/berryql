@@ -1697,6 +1697,14 @@ class RootSQLBuilders:
         # Ensure helper FK columns required for relation correlation are present
         for fk in (required_fk_parent_cols or set()):
             effective_root_cols.add(fk)
+        # Always include PK when any relations are requested so hydrator can resolve relations and ids
+        try:
+            if requested_relations:
+                pk_name = self._pk_name(model_cls)
+                if pk_name:
+                    effective_root_cols.add(pk_name)
+        except Exception:
+            pass
         # Access Berry field defs for column mapping
         btype = None
         try:

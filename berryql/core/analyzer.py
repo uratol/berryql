@@ -13,6 +13,7 @@ class QueryPlan:
     requested_custom_root: Set[str]
     requested_custom_obj_root: Set[str]
     requested_aggregates_root: Set[str]
+    requested_other_root: Set[str]
     required_fk_parent_cols: Set[str]
 
 
@@ -45,6 +46,7 @@ class QueryAnalyzer:
         requested_custom_root = set(root_selected.get('custom', set()))
         requested_custom_obj_root = set(root_selected.get('custom_object', set()))
         requested_aggregates_root = set(root_selected.get('aggregate', set()))
+        requested_other_root = set(root_selected.get('other', set()))
         # Compute helper FK columns on parent for single relations
         required_fk_parent_cols: set[str] = set()
         try:
@@ -80,5 +82,6 @@ class QueryAnalyzer:
             requested_custom_root=requested_custom_root,
             requested_custom_obj_root=requested_custom_obj_root,
             requested_aggregates_root=requested_aggregates_root,
+            requested_other_root=requested_other_root,
             required_fk_parent_cols=required_fk_parent_cols,
         )

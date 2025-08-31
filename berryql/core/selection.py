@@ -378,6 +378,38 @@ class RootSelectionExtractor:
     def __init__(self, registry: Any | None = None):
         # Keep reference to registry for naming conversion (camelCase <-> snake_case)
         self.registry = registry or getattr(self, 'registry', None)
+        # Prepare a reverse-name mapper similar to RelationSelectionExtractor for root fields
+        name_conv = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
+        def _to_python(name: str, fields_map: Dict[str, Any]) -> str:
+            # Fast path: direct match
+            if name in fields_map:
+                return name
+            # Auto camelCase support
+            try:
+                if getattr(self.registry, '_auto_camel_case', False):
+                    # local import to avoid circular
+                    def _from_camel(n: str) -> str:
+                        out = []
+                        for i, ch in enumerate(n):
+                            if ch.isupper() and i > 0 and n[i-1] != '_':
+                                out.append('_')
+                            out.append(ch.lower())
+                        return ''.join(out)
+                    snake = _from_camel(str(name))
+                    if snake in fields_map:
+                        return snake
+            except Exception:
+                pass
+            # Try configured converter by applying to python names and comparing
+            if callable(name_conv):
+                try:
+                    for py_name in fields_map.keys():
+                        if name_conv(py_name) == name:
+                            return py_name
+                except Exception:
+                    pass
+            return name
+        self._to_python = _to_python
 
     def _to_camel(self, name: str) -> str:
         # Convert snake_case to lowerCamelCase
@@ -419,11 +451,18 @@ class RootSelectionExtractor:
             name = self._name_of(child)
             if not name or name.startswith('__'):
                 continue
+            # Map GraphQL field to python name when auto-camel-case is used
             try:
-                fdef = getattr(btype, '__berry_fields__', {}).get(name)
+                fields_map = getattr(btype, '__berry_fields__', {}) or {}
+                py_name = self._to_python(str(name), fields_map)
+                fdef = fields_map.get(py_name)
+                if fdef:
+                    name = py_name
             except Exception:
                 fdef = None
             if not fdef:
+                # Unknown to Berry fields -> consider as non-Berry (Strawberry) field
+                out['other'].add(str(name))
                 continue
             k = fdef.kind
             if k == 'scalar':
@@ -438,7 +477,7 @@ class RootSelectionExtractor:
                 out['aggregate'].add(name)
 
     def extract(self, info: Any, root_field_name: str, btype: Any) -> dict[str, set[str]]:
-        out = {'scalars': set(), 'relations': set(), 'custom': set(), 'custom_object': set(), 'aggregate': set()}
+        out = {'scalars': set(), 'relations': set(), 'custom': set(), 'custom_object': set(), 'aggregate': set(), 'other': set()}
         if info is None:
             return out
         # Build candidate root field names to handle auto camelCase
@@ -501,10 +540,15 @@ class RootSelectionExtractor:
                             if not name or name.startswith('__'):
                                 continue
                             try:
-                                fdef = getattr(btype, '__berry_fields__', {}).get(name)
+                                fields_map = getattr(btype, '__berry_fields__', {}) or {}
+                                py_name = self._to_python(str(name), fields_map)
+                                fdef = fields_map.get(py_name)
+                                if fdef:
+                                    name = py_name
                             except Exception:
                                 fdef = None
                             if not fdef:
+                                out['other'].add(str(name))
                                 continue
                             k = fdef.kind
                             if k == 'scalar':
