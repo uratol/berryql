@@ -350,7 +350,11 @@ class BlogDomain(BerryDomain):
         return "hello from blogDomain"
     # Strawberry field with Annotated + lazy return type; returns None for tests
     @strawberry.field
-    def samplePostAnnotated(self) -> Optional[Annotated['PostQL', strawberry.lazy('tests.schema')]]:
+    def samplePostAnnotated(
+        self,
+        id: int | None = None,
+        title: str | None = None,
+    ) -> Optional[Annotated['PostQL', strawberry.lazy('tests.schema')]]:
         # This intentionally returns None; the purpose is to ensure the field is exposed
         # and the Annotated lazy type resolves without raising.
         return None
@@ -370,7 +374,7 @@ class BlogDomain(BerryDomain):
     })
     # Domain-scoped mutation example (must be explicitly decorated to be exposed)
     @strawberry.mutation
-    async def create_post_mut(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
+    async def create_post_mut(self, info: Info, title: str, content: str, author_id: int) -> Annotated['PostQL', strawberry.lazy('tests.schema')]:
         session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
         if session is None:
             raise ValueError("No db_session in context")

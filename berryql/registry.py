@@ -2740,6 +2740,58 @@ class BerrySchema:
                 DomSt_local.__module__ = __name__
                 _domain_type_cache[dom_cls] = DomSt_local  # pre-cache to break cycles
                 ann_local: Dict[str, Any] = {}
+                # Precompute names of mutation fields using explicit Strawberry flags only.
+                # Avoid signature/argument heuristics so the distinction is obvious and stable.
+                excluded_mutation_field_names: set[str] = set()
+                for _fname, _fval in list(vars(dom_cls).items()):
+                    try:
+                        if _fname.startswith('__') or isinstance(_fval, FieldDescriptor):
+                            continue
+                        # Only consider Strawberry-decorated fields
+                        _looks_st = (
+                            str(getattr(getattr(_fval, '__class__', object), '__module__', '') or '').startswith('strawberry')
+                            or hasattr(_fval, 'base_resolver')
+                        )
+                        if not _looks_st:
+                            continue
+                        # Explicit mutation flags from Strawberry
+                        _br = getattr(_fval, 'base_resolver', None)
+                        _is_mut = False
+                        try:
+                            if bool(getattr(_fval, 'is_mutation', False)):
+                                _is_mut = True
+                        except Exception:
+                            pass
+                        if not _is_mut:
+                            try:
+                                if _br is not None and bool(getattr(_br, 'is_mutation', False)):
+                                    _is_mut = True
+                            except Exception:
+                                pass
+                        if not _is_mut:
+                            try:
+                                _fd = getattr(_fval, 'field_definition', None)
+                                if _fd is not None and bool(getattr(_fd, 'is_mutation', False)):
+                                    _is_mut = True
+                            except Exception:
+                                pass
+                        # Stable custom flag we set via our patched strawberry.mutation
+                        if not _is_mut:
+                            try:
+                                if bool(getattr(_fval, '__berry_is_mutation__', False)):
+                                    _is_mut = True
+                                elif _br is not None and bool(getattr(_br, '__berry_is_mutation__', False)):
+                                    _is_mut = True
+                                else:
+                                    _fd = getattr(_fval, 'field_definition', None)
+                                    if _fd is not None and bool(getattr(_fd, '__berry_is_mutation__', False)):
+                                        _is_mut = True
+                            except Exception:
+                                pass
+                        if _is_mut:
+                            excluded_mutation_field_names.add(_fname)
+                    except Exception:
+                        continue
                 # Helper: map a return annotation to runtime Strawberry types (unwrap Annotated, preserve Optional/List)
                 def _map_ret_annotation(t: Any) -> Any:
                     try:
@@ -2839,6 +2891,20 @@ class BerrySchema:
                     # Skip dunders, Berry FieldDescriptors and nested domains (handled elsewhere)
                     if uf.startswith('__') or isinstance(val, FieldDescriptor):
                         continue
+                    # Never expose fields that appear on the mutation domain container
+                    if uf in excluded_mutation_field_names:
+                        continue
+                    # Strong guard: skip anything that carries our mutation marker directly or on its resolver
+                    try:
+                        if bool(getattr(val, '__berry_is_mutation__', False)):
+                            continue
+                        _rv = getattr(val, 'resolver', None)
+                        if _rv is not None and bool(getattr(_rv, '__berry_is_mutation__', False)):
+                            continue
+                    except Exception:
+                        pass
+                    # Strong guard: if the mutation domain container exposes this name,
+                    # do not copy it onto the Query domain type.
                     try:
                         # Only consider Strawberry-decorated fields (objects carrying a base_resolver)
                         looks_strawberry = (
@@ -2849,89 +2915,37 @@ class BerrySchema:
                         looks_strawberry = False
                     if not looks_strawberry:
                         continue
-                    # Skip actual mutations. Strawberry doesn't expose a stable is_mutation flag on
-                    # StrawberryField/StrawberryResolver across versions, so use a robust heuristic:
-                    # 1) Prefer explicit attributes when present.
-                    # 2) Otherwise, inspect base_resolver internals; mutation resolvers tend to carry
-                    #    extra markers like 'strawberry_annotations' or '_namespace' in their __dict__.
+                    # Skip actual mutations using only explicit Strawberry flags.
                     def _looks_mutation(obj) -> bool:
                         try:
-                            br = getattr(obj, 'base_resolver', None)
-                        except Exception:
-                            br = None
-                        # Debug: trace BlogDomain only
-                        _DBG = getattr(dom_cls, '__name__', '') == 'BlogDomain' and uf in ('create_post_mut', 'helloDomain')
-                        # Prefer explicit flags if available
-                        try:
                             if bool(getattr(obj, 'is_mutation', False)):
-                                if _DBG:
-                                    print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> is_mutation attr True")
                                 return True
                         except Exception:
                             pass
                         try:
+                            br = getattr(obj, 'base_resolver', None)
                             if br is not None and bool(getattr(br, 'is_mutation', False)):
-                                if _DBG:
-                                    print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> base_resolver.is_mutation True")
                                 return True
                         except Exception:
                             pass
-                        # Strawberry exposes field_definition with an is_mutation flag on mutations
                         try:
                             fd = getattr(obj, 'field_definition', None)
                             if fd is not None and bool(getattr(fd, 'is_mutation', False)):
-                                if _DBG:
-                                    print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> field_definition.is_mutation True")
                                 return True
                         except Exception:
                             pass
-                        # Fallback: inspect resolver signature. If it looks like a mutation-style
-                        # resolver (has positional params beyond just `self`), treat it as a mutation.
-                        # This mirrors the gate used by mutations.ensure_mutation_domain_type.
                         try:
-                            import inspect as _inspect
-                            _fn = getattr(obj, 'resolver', None)
-                            if _fn is None and br is not None:
-                                _fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
-                            if _fn is None:
-                                _fn = getattr(obj, 'func', None)
-                            if callable(_fn):
-                                _sig = _inspect.signature(getattr(_fn, '__wrapped__', _fn))
-                                _params = [p for p in _sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
-                                # If it has positional-or-keyword beyond self, likely a mutation-style
-                                if _DBG:
-                                    try:
-                                        print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} sig={_sig}")
-                                    except Exception:
-                                        pass
-                                if _params and _params[0].name == 'self' and len(_params) >= 2:
-                                    if _DBG:
-                                        print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> looks like mutation by params count")
-                                    return True
-                                # If it explicitly includes an 'info' parameter, it's very likely authored
-                                # as a mutation handler in this project; avoid exposing it on Query.
-                                try:
-                                    if any((p.name == 'info') for p in _sig.parameters.values()):
-                                        if _DBG:
-                                            print(f"berryql.registry DBG: {dom_cls.__name__}.{uf} -> looks like mutation by 'info' param")
-                                        return True
-                                except Exception:
-                                    pass
+                            if bool(getattr(obj, '__berry_is_mutation__', False)):
+                                return True
                         except Exception:
                             pass
-                        # Avoid brittle heuristics based on resolver __dict__ keys; rely on signature/flags only
                         return False
                     _is_mut = _looks_mutation(val)
-                    if getattr(dom_cls, '__name__', '') == 'BlogDomain' and uf in ('create_post_mut', 'helloDomain'):
-                        try:
-                            print(f"berryql.registry DBG: decision {dom_cls.__name__}.{uf} -> is_mut={_is_mut}")
-                        except Exception:
-                            pass
                     if _is_mut:
                         # Do not expose mutation fields on Query domain container
                         continue
+                    # Attach the original Strawberry field object; Strawberry will use its resolver.
                     try:
-                        # Attach the original Strawberry field object; Strawberry will use its resolver.
                         setattr(DomSt_local, uf, val)
                         # Track the underlying implementation for optional pre-population in the domain resolver
                         try:

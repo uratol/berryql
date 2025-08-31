@@ -51,3 +51,46 @@ __all__ = [
     'enum_column',
     'get_active_schema', 'set_active_schema',
 ]
+
+# --- Runtime patch: mark Strawberry mutations with a stable flag ----------------------
+# Some Strawberry versions do not reliably expose is_mutation on the public field object.
+# We patch strawberry.mutation to set a stable __berry_is_mutation__ attribute on the
+# resulting field (and on nested objects when present). This runs as soon as BerryQL is
+# imported (schema loads BerryQL before domains are declared), so domain-level
+# @strawberry.mutation decorators will carry the marker for precise classification.
+try:  # best-effort, no hard dependency on Strawberry internals
+    import strawberry as _strawberry  # type: ignore
+    _orig_mutation = getattr(_strawberry, 'mutation', None)
+    if callable(_orig_mutation):
+        def _berry_marked_mutation(*args, **kwargs):  # type: ignore
+            f = _orig_mutation(*args, **kwargs)
+            try:
+                setattr(f, '__berry_is_mutation__', True)
+                # Also try to tag nested bits Strawberry may attach
+                try:
+                    fd = getattr(f, 'field_definition', None)
+                    if fd is not None:
+                        setattr(fd, '__berry_is_mutation__', True)
+                except Exception:
+                    pass
+                try:
+                    br = getattr(f, 'base_resolver', None)
+                    if br is not None:
+                        setattr(br, '__berry_is_mutation__', True)
+                except Exception:
+                    pass
+                try:
+                    rv = getattr(f, 'resolver', None)
+                    if rv is not None:
+                        setattr(rv, '__berry_is_mutation__', True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return f
+        try:
+            setattr(_strawberry, 'mutation', _berry_marked_mutation)
+        except Exception:
+            pass
+except Exception:
+    pass

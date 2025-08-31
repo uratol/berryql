@@ -23,7 +23,7 @@ async def test_blog_domain_annotated_lazy_field_exposed(db_session, populated_db
     q = """
     query {
       blogDomain {
-        samplePostAnnotated { id }
+  samplePostAnnotated(id: 1, title: "x") { id }
       }
     }
     """
