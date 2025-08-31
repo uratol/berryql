@@ -2,12 +2,11 @@ from __future__ import annotations
 import re
 import logging
 import uuid
-from typing import Any, Dict, Optional, Type, List, get_args, get_origin, cast
+from typing import Any, Dict, Optional, Type, List, get_args, get_origin
 import strawberry
 from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
 from sqlalchemy import select
-from sqlalchemy.sql.elements import ColumnElement
 from .sql.builders import RelationSQLBuilders
 from .core.enum_utils import get_model_enum_cls, coerce_input_to_storage_value, normalize_instance_enums
 
@@ -1017,12 +1016,6 @@ def build_merge_resolver_for_type(
     return fname, strawberry.field(resolver=_resolver), st_return
 
 # --- Domain mutation support ---------------------------------------------
-
-def _compose_mut_name(schema: 'BerrySchema', rel_attr: str) -> str:
-    if getattr(schema, '_auto_camel_case', False):
-        return f"merge{rel_attr[:1].upper()}{rel_attr[1:]}"
-    out = re.sub(r"([A-Z])", r"_\1", rel_attr).lower().strip('_')
-    return f"merge_{out}"
 
 # Backward-compatibility aliases (no cover)
 def build_upsert_resolver_for_type(*args, **kwargs):  # pragma: no cover
