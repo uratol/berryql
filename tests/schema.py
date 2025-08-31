@@ -188,13 +188,13 @@ class PostQL(BerryType):
     title = field()
     content = field()
     author_id = field()
-    created_at = field()
+    created_at = field(read_only=True)
     # Base64-encoded single binary blob across dialects
     binary_blob = field()
     # New enum field projected from SQLAlchemy Enum
     status = field()
     # Read-only computed scalar mirroring SQLAlchemy column_property on Post
-    content_length = field()
+    content_length = field(read_only=True)
     author = relation('UserQL', single=True, arguments={
         'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
         'created_at_between': lambda M, info, v: (M.created_at.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None),
@@ -257,7 +257,7 @@ class UserQL(BerryType):
     name = field()
     email = field()
     is_admin = field()
-    created_at = field()
+    created_at = field(read_only=True)
     # Regular strawberry field with its own resolver
     @strawberry.field
     def name_upper(self) -> str | None:

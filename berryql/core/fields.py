@@ -47,7 +47,14 @@ class FieldDescriptor:
         """
         return FieldDef(name=self.name or '', kind=self.kind, meta=self.meta)
 
-def field(column: Optional[str] = None, /, comment: Optional[str] = None, **meta) -> FieldDescriptor:
+def field(
+    column: Optional[str] = None,
+    /,
+    *,
+    comment: Optional[str] = None,
+    read_only: Optional[bool] = None,
+    **meta,
+) -> FieldDescriptor:
     """Declare a scalar field on a Berry type.
 
     Place this as a class attribute inside a ``@berry_schema.type`` class to
@@ -59,6 +66,8 @@ def field(column: Optional[str] = None, /, comment: Optional[str] = None, **meta
             this as a positional argument too, e.g. ``id = field('user_id')``.
     - description: Optional GraphQL field description.
     - nullable: Hint about nullability for schema generation.
+    - read_only: When True, the field is exposed for queries but excluded from
+      mutation/domain-mutation input payloads.
 
     Examples:
         class PostQL(BerryType):
@@ -78,6 +87,11 @@ def field(column: Optional[str] = None, /, comment: Optional[str] = None, **meta
     if comment is not None:
         meta = dict(meta)
         meta['comment'] = comment
+    if read_only is not None:
+        # Normalize into meta so downstream registry can detect and exclude
+        # from mutation input type generation.
+        meta = dict(meta)
+        meta['read_only'] = bool(read_only)
     return FieldDescriptor(kind='scalar', **meta)
 
 def relation(target: Any = None, *, single: bool | None = None, fk_column_name: str | None = None, comment: Optional[str] = None, **meta) -> FieldDescriptor:
