@@ -1449,7 +1449,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 break
         if not any_st_fields:
             try:
-                _logger.warning("berryql.mutations: skip %s (no strawberry fields)", type_name)
+                _logger.info("berryql.mutations: skip %s (no strawberry fields)", type_name)
             except Exception:
                 pass
             return None
