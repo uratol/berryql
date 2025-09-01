@@ -40,59 +40,59 @@ async def test_read_only_fields_still_queryable(db_session, populated_db):
 
 
 async def test_domain_merge_posts_response_includes_read_only_fields(db_session, populated_db):
-  # Create a post via domain mutation and ensure created_at is returned
-  m = (
+    # Create a post via domain mutation and ensure created_at is returned
+    m = (
     "mutation Upsert($payload: [PostQLInput!]!) {\n"
     "  blogDomain {\n"
     "    merge_posts(payload: $payload) { id title created_at }\n"
     "  }\n"
     "}"
-  )
-  variables = {"payload": [{"title": "ROnly", "content": "Body", "author_id": 1}]}
-  res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
-  assert res.errors is None, res.errors
-  obj = res.data["blogDomain"]["merge_posts"]
-  assert obj["title"] == "ROnly"
-  # created_at should be present (non-null string or datetime-like)
-  assert obj["created_at"] is not None
+    )
+    variables = {"payload": [{"title": "ROnly", "content": "Body", "author_id": 1}]}
+    res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    obj = res.data["blogDomain"]["merge_posts"]
+    assert obj["title"] == "ROnly"
+    # created_at should be present (non-null string or datetime-like)
+    assert obj["created_at"] is not None
 
 
 async def test_domain_mutation_rejects_read_only_fields_in_payload():
-  # Supplying read-only fields in the domain mutation payload should be rejected
-  mutation = (
+    # Supplying read-only fields in the domain mutation payload should be rejected
+    mutation = (
     "mutation($p: [PostQLInput!]!) {\n"
     "  blogDomain { merge_posts(payload: $p) { id } }\n"
     "}"
-  )
-  variables = {
+    )
+    variables = {
     "p": [
-      {
+        {
         "title": "X",
         "content": "Y",
         "author_id": 1,
         # read-only fields should not be accepted by schema
         "created_at": "2020-01-01T00:00:00",
         "content_length": 42,
-      }
+        }
     ]
-  }
-  res = await schema.execute(mutation, variable_values=variables)
-  # Expect validation error mentioning the unknown fields on PostQLInput
-  assert res.errors, "Expected validation error for read-only fields in input"
-  msg = "\n".join(str(e) for e in res.errors)
-  assert "PostQLInput" in msg and "created_at" in msg
+    }
+    res = await schema.execute(mutation, variable_values=variables)
+    # Expect validation error mentioning the unknown fields on PostQLInput
+    assert res.errors, "Expected validation error for read-only fields in input"
+    msg = "\n".join(str(e) for e in res.errors)
+    assert "PostQLInput" in msg and "created_at" in msg
 
 
 async def test_root_merge_posts_response_includes_read_only_fields(db_session, populated_db):
-  # Ensure root merge returns read-only fields like created_at
-  m = (
+    # Ensure root merge returns read-only fields like created_at
+    m = (
     "mutation($p: [PostQLInput!]!) {\n"
     "  merge_posts(payload: $p) { id title created_at }\n"
     "}"
-  )
-  variables = {"p": [{"title": "RRoot", "content": "Body", "author_id": 1}]}
-  res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
-  assert res.errors is None, res.errors
-  obj = res.data["merge_posts"]
-  assert obj["title"] == "RRoot"
-  assert obj["created_at"] is not None
+    )
+    variables = {"p": [{"title": "RRoot", "content": "Body", "author_id": 1}]}
+    res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    obj = res.data["merge_posts"]
+    assert obj["title"] == "RRoot"
+    assert obj["created_at"] is not None
