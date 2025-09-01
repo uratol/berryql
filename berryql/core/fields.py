@@ -53,6 +53,7 @@ def field(
     *,
     comment: Optional[str] = None,
     read_only: Optional[bool] = None,
+    write_only: Optional[bool] = None,
     **meta,
 ) -> FieldDescriptor:
     """Declare a scalar field on a Berry type.
@@ -66,8 +67,11 @@ def field(
             this as a positional argument too, e.g. ``id = field('user_id')``.
     - description: Optional GraphQL field description.
     - nullable: Hint about nullability for schema generation.
-    - read_only: When True, the field is exposed for queries but excluded from
-      mutation/domain-mutation input payloads.
+        - read_only: When True, the field is exposed for queries but excluded from
+            mutation/domain-mutation input payloads.
+        - write_only: When True, the field is only exposed on mutation input types
+            and never exposed on query output types. Useful for helper inputs processed
+            in pre-hooks (e.g., author_email -> author_id) without persisting directly.
 
     Examples:
         class PostQL(BerryType):
@@ -92,6 +96,10 @@ def field(
         # from mutation input type generation.
         meta = dict(meta)
         meta['read_only'] = bool(read_only)
+    if write_only is not None:
+        # Normalize into meta so registry can include in inputs and exclude from outputs.
+        meta = dict(meta)
+        meta['write_only'] = bool(write_only)
     return FieldDescriptor(kind='scalar', **meta)
 
 def relation(target: Any = None, *, single: bool | None = None, fk_column_name: str | None = None, comment: Optional[str] = None, **meta) -> FieldDescriptor:

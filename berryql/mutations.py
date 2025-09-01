@@ -788,6 +788,13 @@ def build_merge_resolver_for_type(
             # Enum-aware coercion via SAEnum: accept NAME strings and coerce to enum.value before assignment.
             for k, v in list(scalar_vals.items()):
                 try:
+                    # Skip write_only fields at assignment time; pre-hooks should have mapped them.
+                    try:
+                        fmeta = (getattr(btype_local.__berry_fields__.get(k), 'meta', {}) or {})
+                        if fmeta.get('write_only'):
+                            continue
+                    except Exception:
+                        pass
                     # Primary key guard
                     if k == pk_name and (v is None or v == ''):
                         continue

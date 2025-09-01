@@ -136,6 +136,8 @@ class PostCommentQL(BerryType):
     rate = field()
     post_id = field()
     author_id = field()
+    # Write-only helper input to set author by email in pre-hooks
+    author_email = field(write_only=True, comment="Write-only: resolve to author_id in pre-hook")
     created_at = field()
     post = relation('PostQL', single=True)
     author = relation('UserQL', single=True)
@@ -164,6 +166,35 @@ class PostCommentQL(BerryType):
             return s if len(s) <= 10 else s[:10] + '...'
         except Exception:
             return None
+
+    # Map write-only author_email to author_id for comments as well
+    @berry_schema.pre
+    async def _resolve_author_email_comment(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+        try:
+            if not isinstance(data, dict):
+                return data
+            email = data.get('author_email') or data.get('authorEmail')
+            if not email:
+                return data
+            from tests.models import User as _User
+            session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
+            if session is None:
+                return data
+            from sqlalchemy import select as _select
+            res = await session.execute(_select(_User).where(_User.email == email))
+            u = res.scalar_one_or_none()
+            if u is not None:
+                d = dict(data)
+                try:
+                    d['author_id'] = int(getattr(u, 'id'))
+                except Exception:
+                    d['author_id'] = getattr(u, 'id', None)
+                d.pop('author_email', None)
+                d.pop('authorEmail', None)
+                return d
+        except Exception:
+            return data
+        return data
 @berry_schema.type(model=PostCommentLike)
 class PostCommentLikeQL(BerryType):
     id = field()
@@ -188,6 +219,8 @@ class PostQL(BerryType):
     title = field()
     content = field()
     author_id = field()
+    # Write-only helper input to set author by email in pre-hooks
+    author_email = field(write_only=True, comment="Write-only: resolve to author_id in pre-hook")
     created_at = field(read_only=True)
     # Base64-encoded single binary blob across dialects
     binary_blob = field()
@@ -250,6 +283,36 @@ class PostQL(BerryType):
     #    directly without defining methods. This appends to the same callback lists and
     #    runs alongside decorators. Here we register extra test hooks adding [hpre]/[hpost].
     hooks = hooks(pre=_test_pre_upsert_hook, post=[_test_post_upsert_hook, _test_post_upsert_hook2])
+
+    # Resolve write-only author_email to author_id before mutation
+    @berry_schema.pre
+    async def _resolve_author_email(model_cls, info: Info, data: dict | None, ctx: dict | None = None):
+        try:
+            if not isinstance(data, dict):
+                return data
+            email = data.get('author_email') or data.get('authorEmail')
+            if not email:
+                return data
+            from tests.models import User as _User
+            session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
+            if session is None:
+                return data
+            from sqlalchemy import select as _select
+            res = await session.execute(_select(_User).where(_User.email == email))
+            u = res.scalar_one_or_none()
+            if u is not None:
+                d = dict(data)
+                try:
+                    d['author_id'] = int(getattr(u, 'id'))
+                except Exception:
+                    d['author_id'] = getattr(u, 'id', None)
+                # Optionally strip helper
+                d.pop('author_email', None)
+                d.pop('authorEmail', None)
+                return d
+        except Exception:
+            return data
+        return data
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):

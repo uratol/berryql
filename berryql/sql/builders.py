@@ -147,6 +147,12 @@ class RelationSQLBuilders:
             try:
                 for sf, sdef in getattr(target_btype, '__berry_fields__', {}).items():
                     if sdef.kind == 'scalar':
+                        # Exclude write-only helper scalars from SQL projections
+                        try:
+                            if (getattr(sdef, 'meta', {}) or {}).get('write_only'):
+                                continue
+                        except Exception:
+                            pass
                         requested.append(sf)
             except Exception:
                 requested = []
@@ -907,6 +913,12 @@ class RelationSQLBuilders:
             if not requested_scalar_i:
                 for sf, sdef in target_b_i.__berry_fields__.items():
                     if sdef.kind == 'scalar':
+                        # Filter out write-only helper scalars
+                        try:
+                            if (getattr(sdef, 'meta', {}) or {}).get('write_only'):
+                                continue
+                        except Exception:
+                            pass
                         requested_scalar_i.append(sf)
             # Ensure FK helper columns for child's single nested relations are present
             try:
@@ -1031,7 +1043,19 @@ class RelationSQLBuilders:
                         inner_sel_i = inner_sel_i.where(expr)
             # Ordering for child (order_multi -> order_by -> id)
             ordered = False
-            allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
+            # Allowed ordering fields: scalars excluding write-only helpers
+            allowed_fields = []
+            try:
+                for sf, sd in target_b_i.__berry_fields__.items():
+                    if sd.kind == 'scalar':
+                        try:
+                            if (getattr(sd, 'meta', {}) or {}).get('write_only'):
+                                continue
+                        except Exception:
+                            pass
+                        allowed_fields.append(sf)
+            except Exception:
+                allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
             nmulti: List[str] = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or [])
             for spec in nmulti:
                 cn, _, dd = spec.partition(':')

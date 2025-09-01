@@ -388,18 +388,28 @@ class BerrySchema:
                 except Exception:
                     pass
                 src_col = (fdef.meta or {}).get('column') if isinstance(fdef.meta, dict) else None
-                # If the source is not a real table column, treat as read-only (computed) and skip
+                # Include write_only fields even if not a real table column
+                is_write_only = False
                 try:
-                    source_name = src_col or fname
-                    if source_name not in table_cols:
-                        continue
+                    is_write_only = bool((fdef.meta or {}).get('write_only'))
                 except Exception:
-                    pass
+                    is_write_only = False
+                if not is_write_only:
+                    # If the source is not a real table column, treat as read-only (computed) and skip
+                    try:
+                        source_name = src_col or fname
+                        if source_name not in table_cols:
+                            continue
+                    except Exception:
+                        pass
                 # Allow explicit override of Python type via meta.returns
                 try:
-                    py_t = (fdef.meta or {}).get('returns') or col_type_map.get(src_col or fname, str)
+                    if is_write_only:
+                        py_t = (fdef.meta or {}).get('returns') or str
+                    else:
+                        py_t = (fdef.meta or {}).get('returns') or col_type_map.get(src_col or fname, str)
                 except Exception:
-                    py_t = col_type_map.get(src_col or fname, str)
+                    py_t = (str if is_write_only else col_type_map.get(src_col or fname, str))
                 try:
                     if isinstance(py_t, type) and issubclass(py_t, Enum):
                         # Mirror output: wrap Python Enum into a Strawberry enum for input as well
@@ -966,6 +976,12 @@ class BerrySchema:
                     if is_private:
                         # Skip exposing private scalars
                         continue
+                    # Hide write_only fields from output types entirely
+                    try:
+                        if (fdef.meta or {}).get('write_only'):
+                            continue
+                    except Exception:
+                        pass
                     # Optional explicit field comment override
                     try:
                         explicit_field_comment = (fdef.meta or {}).get('comment')
@@ -1529,7 +1545,16 @@ class BerrySchema:
                                 cols.append(pk_expr.label('id'))
                             # Filter requested_fields to scalars known on target type
                             try:
-                                scalars_on_target = {sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar'}
+                                scalars_on_target = set()
+                                for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
+                                    if sd.kind == 'scalar':
+                                        # Hide write_only from SQL projection set
+                                        try:
+                                            if (getattr(sd, 'meta', {}) or {}).get('write_only'):
+                                                continue
+                                        except Exception:
+                                            pass
+                                        scalars_on_target.add(sf)
                             except Exception:
                                 scalars_on_target = set()
                             for fn in requested_fields:
