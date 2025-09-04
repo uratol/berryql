@@ -2917,6 +2917,31 @@ class BerrySchema:
                 # registers them with their existing base_resolver. Avoid rebuilding wrappers here to
                 # keep behavior identical to the user-declared methods (including Annotated/lazy types).
                 _domain_static_field_resolvers: Dict[str, Any] = {}
+                # Helper: detect strawberry subscription fields to avoid exposing them on Query containers
+                def _looks_subscription(obj) -> bool:
+                    try:
+                        if bool(getattr(obj, 'is_subscription', False)):
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        br = getattr(obj, 'base_resolver', None)
+                        if br is not None and bool(getattr(br, 'is_subscription', False)):
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        fd = getattr(obj, 'field_definition', None)
+                        if fd is not None and bool(getattr(fd, 'is_subscription', False)):
+                            return True
+                    except Exception:
+                        pass
+                    try:
+                        if callable(getattr(obj, 'subscribe', None)):
+                            return True
+                    except Exception:
+                        pass
+                    return False
                 for uf, val in list(vars(dom_cls).items()):
                     # Skip dunders, Berry FieldDescriptors and nested domains (handled elsewhere)
                     if uf.startswith('__') or isinstance(val, FieldDescriptor):
@@ -2945,6 +2970,12 @@ class BerrySchema:
                         looks_strawberry = False
                     if not looks_strawberry:
                         continue
+                    # Do not expose subscription fields on Query domain container
+                    try:
+                        if _looks_subscription(val):
+                            continue
+                    except Exception:
+                        pass
                     # Skip actual mutations using only explicit Strawberry flags.
                     def _looks_mutation(obj) -> bool:
                         try:
@@ -3279,11 +3310,15 @@ class BerrySchema:
                 Mutation = strawberry.type(MPlain)  # type: ignore
         except Exception:
             Mutation = None
+        # Build Subscription root from user-declared class and domain subscription fields
         try:
+            # Start with a plain container regardless of user class; we'll decide later if it's empty
+            SPlain = None
+            anns_s: Dict[str, Any] = {}
             if self._user_subscription_cls is not None:
                 SPlain = type('Subscription', (), {'__doc__': 'Auto-generated Berry root subscription.'})
                 setattr(SPlain, '__module__', __name__)
-                # Copy annotated attributes and strawberry subscription fields
+                # Copy annotated attributes and strawberry subscription fields from user class
                 try:
                     anns_s = dict(getattr(self._user_subscription_cls, '__annotations__', {}) or {})
                 except Exception:
@@ -3305,12 +3340,118 @@ class BerrySchema:
                             or hasattr(val, "base_resolver")
                         )
                         if looks_strawberry:
-                            # Preserve subscription objects as-is
                             setattr(SPlain, uf, val)
                     except Exception:
                         pass
-                setattr(SPlain, '__annotations__', anns_s)
+            # Also lift @strawberry.subscription fields declared on domain classes onto root
+            # Detect if any domain provides subscription fields
+            def _is_subscription_field(obj: Any) -> bool:
+                try:
+                    if getattr(obj, 'is_subscription', False):
+                        return True
+                except Exception:
+                    pass
+                try:
+                    if callable(getattr(obj, 'subscribe', None)):
+                        return True
+                except Exception:
+                    pass
+                # Fallback: inspect return annotation of underlying resolver for AsyncGenerator
+                try:
+                    fn = getattr(obj, 'resolver', None) or getattr(getattr(obj, 'base_resolver', None), 'func', None) or getattr(obj, 'func', None)
+                    from typing import get_origin as _go
+                    origin = _go(getattr(fn, '__annotations__', {}).get('return')) if callable(fn) else None
+                    if origin is not None and 'AsyncGenerator' in str(origin):
+                        return True
+                except Exception:
+                    pass
+                return False
+            # Ensure we have a container if we find any domain subscriptions
+            dom_subs_found = False
+            for _dom_name, _cfg in list(self._domains.items()):
+                dom_cls = _cfg.get('class')
+                if not dom_cls:
+                    continue
+                for uf, val in vars(dom_cls).items():
+                    if uf.startswith('__'):
+                        continue
+                    try:
+                        looks_strawberry = (
+                            str(getattr(getattr(val, "__class__", object), "module", "") or "").startswith("strawberry")
+                            or hasattr(val, "resolver")
+                            or hasattr(val, "base_resolver")
+                        )
+                        if not looks_strawberry:
+                            continue
+                        if not _is_subscription_field(val):
+                            continue
+                        # We have a subscription field on a domain; create Subscription container if missing
+                        if SPlain is None:
+                            SPlain = type('Subscription', (), {'__doc__': 'Auto-generated Berry root subscription.'})
+                            setattr(SPlain, '__module__', __name__)
+                        dom_subs_found = True
+                        # Extract underlying resolver function
+                        fn = getattr(val, 'resolver', None)
+                        if fn is None:
+                            br = getattr(val, 'base_resolver', None)
+                            fn = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
+                        if fn is None:
+                            fn = getattr(val, 'func', None)
+                        # Map return annotation to generated Strawberry runtime types
+                        try:
+                            ret_ann = getattr(fn, '__annotations__', {}).get('return') if callable(fn) else None
+                        except Exception:
+                            ret_ann = None
+                        mapped_type = None
+                        try:
+                            from typing import get_origin as _go, get_args as _ga, Annotated as _Ann  # type: ignore
+                        except Exception:
+                            _go = None  # type: ignore
+                            _ga = None  # type: ignore
+                            _Ann = None  # type: ignore
+                        try:
+                            if _Ann is not None and _go and _go(ret_ann) is _Ann:
+                                args = list(_ga(ret_ann) or [])
+                                if args:
+                                    ret_ann = args[0]
+                            # Map BerryType names/classes to runtime types
+                            if isinstance(ret_ann, str) and ret_ann in self.types:
+                                mapped_type = self._st_types.get(ret_ann)
+                            elif ret_ann in self.types.values():
+                                nm = getattr(ret_ann, '__name__', None)
+                                if nm:
+                                    mapped_type = self._st_types.get(nm)
+                        except Exception:
+                            mapped_type = None
+                        if callable(fn) and mapped_type is not None:
+                            try:
+                                anns = getattr(fn, '__annotations__', None)
+                                if isinstance(anns, dict):
+                                    anns['return'] = mapped_type
+                            except Exception:
+                                pass
+                        # Attach as a strawberry.subscription using the resolver directly
+                        # Prefix with domain name to avoid global name collisions and emulate namespacing
+                        try:
+                            new_field_name = f"{_dom_name}_{uf}"
+                        except Exception:
+                            new_field_name = uf
+                        try:
+                            setattr(SPlain, new_field_name, strawberry.subscription(fn))  # type: ignore[arg-type]
+                        except Exception:
+                            # Fallback: expose as a regular field if subscription wrapper fails
+                            setattr(SPlain, new_field_name, strawberry.field(resolver=fn))
+                    except Exception:
+                        continue
+            # Finalize Subscription only if we actually have a class with any fields
+            if SPlain is not None and (dom_subs_found or self._user_subscription_cls is not None):
+                try:
+                    setattr(SPlain, '__annotations__', getattr(SPlain, '__annotations__', {}) or anns_s)
+                except Exception:
+                    pass
                 Subscription = strawberry.type(SPlain)  # type: ignore
+            else:
+                Subscription = None
         except Exception:
             Subscription = None
         # Safety: purge any empty/stale mutation domain types without fields before schema build
