@@ -447,6 +447,13 @@ class BlogDomain(BerryDomain):
         await session.commit()
         return berry_schema.from_model('PostQL', p)
 
+    # Domain-level subscription example: yields simple integers for tests
+    @strawberry.subscription
+    async def new_post_event(self, to: int = 1) -> AsyncGenerator[int, None]:
+        for i in range(1, max(1, int(to)) + 1):
+            yield i
+            await asyncio.sleep(0)
+
 # A nested grouping domain that exposes userDomain and blogDomain inside
 @berry_schema.domain(name='groupDomain')
 class GroupDomain(BerryDomain):

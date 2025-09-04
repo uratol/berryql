@@ -3431,9 +3431,38 @@ class BerrySchema:
                             except Exception:
                                 pass
                         # Attach as a strawberry.subscription using the resolver directly
-                        # Prefix with domain name to avoid global name collisions and emulate namespacing
+                        # Prefix with domain name to avoid global name collisions and emulate namespacing.
+                        # Naming:
+                        # - If auto_camel_case is enabled (via config.name_converter or flag), use
+                        #   {domain}{SubMethodName} where SubMethodName is CamelCased from the original method name.
+                        # - Otherwise, use snake case joined with underscore: {domain}_{sub_method_name}
                         try:
-                            new_field_name = f"{_dom_name}_{uf}"
+                            _method_name = uf
+                            _dom_prefix = _dom_name
+                            use_camel = False
+                            try:
+                                if getattr(self, '_name_converter', None) is not None:
+                                    use_camel = bool(getattr(self._name_converter, 'auto_camel_case', False))
+                                elif hasattr(self, '_auto_camel_case'):
+                                    use_camel = bool(getattr(self, '_auto_camel_case'))
+                            except Exception:
+                                use_camel = False
+                            if use_camel:
+                                # Prefer converter if available to match Strawberry behavior
+                                try:
+                                    if getattr(self, '_name_converter', None) is not None and hasattr(self._name_converter, 'apply_naming_config'):
+                                        _camel = self._name_converter.apply_naming_config(_method_name)  # type: ignore[attr-defined]
+                                    else:
+                                        # Fallback: local snake_to_camel (lowerCamel)
+                                        parts = [p for p in str(_method_name).split('_') if p]
+                                        _camel = parts[0].lower() + ''.join(p.capitalize() for p in parts[1:]) if parts else str(_method_name)
+                                except Exception:
+                                    _camel = str(_method_name)
+                                # Convert to PascalCase for the suffix when concatenated to domain
+                                _suffix = (_camel[:1].upper() + _camel[1:]) if _camel else str(_method_name)
+                                new_field_name = f"{_dom_prefix}{_suffix}"
+                            else:
+                                new_field_name = f"{_dom_prefix}_{_method_name}"
                         except Exception:
                             new_field_name = uf
                         try:
