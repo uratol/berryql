@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
-from berryql import BerrySchema, BerryType, BerryDomain, field, relation, count, custom, custom_object, domain, mutation, hooks
+from berryql import BerrySchema, BerryType, BerryDomain, field, relation, count, custom, custom_object, domain, mutation, hooks, scope
 from tests.models import User, Post, PostComment, PostCommentLike, View  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
@@ -212,6 +212,8 @@ class ViewQL(BerryType):
     user_id = field()
     created_at = field()
     user = relation('UserQL', single=True)
+    # Example of a very permissive type-level scope using helper
+    type_scope = scope({"id": {"gt": 0}})
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):

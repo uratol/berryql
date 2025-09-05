@@ -226,6 +226,12 @@ class RelationSQLBuilders:
             expr_from_where_dict=expr_from_where_dict,
             info=info,
         )
+        # Apply type-level default scope if provided
+        try:
+            type_default_where = getattr(self, 'registry', None) and None
+        except Exception:
+            type_default_where = None
+        # In this single-relation builder path we don't have rel_cfg; the caller combines values.
         # filter args
         expanded_specs = self._expand_arg_specs(arg_specs or {})
         sel = self._apply_filter_args_sqla(sel, child_model_cls, info, filter_args or {}, expanded_specs)
@@ -278,6 +284,21 @@ class RelationSQLBuilders:
             expr_from_where_dict=expr_from_where_dict,
             info=info,
         )
+        # Combine with type-level default where when present
+        try:
+            t_where = rel_cfg.get('type_default_where')
+        except Exception:
+            t_where = None
+        if t_where is not None:
+            sel = self._apply_where_sqla(
+                sel,
+                child_model_cls,
+                t_where,
+                strict=True,
+                to_where_dict=to_where_dict,
+                expr_from_where_dict=expr_from_where_dict,
+                info=info,
+            )
         # filter args
         expanded_specs = self._expand_arg_specs(rel_cfg.get('arg_specs') or {})
         sel = self._apply_filter_args_sqla(sel, child_model_cls, info, rel_cfg.get('filter_args') or {}, expanded_specs)
@@ -429,6 +450,14 @@ class RelationSQLBuilders:
         v = self._resolve_graphql_value(info, value)
         if v is None:
             return sel
+        # If a list/tuple of fragments is passed, apply all in order
+        try:
+            if isinstance(v, (list, tuple)):
+                for part in v:
+                    sel = self._apply_where_common(sel, model_cls, part, strict=strict, to_where_dict=to_where_dict, expr_from_where_dict=expr_from_where_dict, info=info)
+                return sel
+        except Exception:
+            pass
         if isinstance(v, (dict, str)):
             # Do not suppress parse errors here; rely on strict flag in helpers to control behavior
             wdict = to_where_dict(v, strict=strict)
@@ -595,6 +624,7 @@ class RelationSQLBuilders:
         info,
         rel_where: Any,
         rel_default_where: Any,
+        type_default_where: Any,
         filter_args: Dict[str, Any] | None,
         arg_specs: Dict[str, Any] | None,
     ):
@@ -640,6 +670,17 @@ class RelationSQLBuilders:
                 adapter=adapter,
                 info=info,
             )
+            if type_default_where is not None:
+                where_parts = self._mssql_where_from_value(
+                    where_parts,
+                    child_model_cls,
+                    type_default_where,
+                    strict=True,
+                    to_where_dict=to_where_dict,
+                    expr_from_where_dict=expr_from_where_dict,
+                    adapter=adapter,
+                    info=info,
+                )
             # Apply filter args best-effort on MSSQL single relation as well
             try:
                 fa = filter_args or {}
@@ -670,6 +711,17 @@ class RelationSQLBuilders:
             expr_from_where_dict=expr_from_where_dict,
             info=info,
         )
+        # Apply type-level default where after building inner select
+        if type_default_where is not None:
+            inner_sel = self._apply_where_sqla(
+                inner_sel,
+                child_model_cls,
+                type_default_where,
+                strict=True,
+                to_where_dict=to_where_dict,
+                expr_from_where_dict=expr_from_where_dict,
+                info=info,
+            )
         limited = inner_sel.subquery()
         obj_expr = json_object_fn(*self._json_row_args_from_subq(limited, cols))
         query = select(obj_expr).select_from(limited).correlate(parent_model_cls)
@@ -793,6 +845,21 @@ class RelationSQLBuilders:
                                 expr2 = dr2(grand_model, info) if callable(dr2) else dr2
                                 if expr2 is not None:
                                     n_sel = n_sel.where(expr2)
+                        # Also apply type-level scope for the nested target
+                        try:
+                            t_where_n = ncfg.get('type_default_where')
+                        except Exception:
+                            t_where_n = None
+                        if t_where_n is not None:
+                            n_sel = self._apply_where_sqla(
+                                n_sel,
+                                grand_model,
+                                t_where_n,
+                                strict=True,
+                                to_where_dict=to_where_dict,
+                                expr_from_where_dict=expr_from_where_dict,
+                                info=info,
+                            )
                         # Ordering for nested
                         ordered2 = False
                         n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
@@ -1434,6 +1501,22 @@ class RelationSQLBuilders:
                 adapter=adapter,
                 info=info,
             )
+            # Apply type-level default where for MSSQL list path
+            try:
+                t_where2 = rel_cfg.get('type_default_where')
+            except Exception:
+                t_where2 = None
+            if t_where2 is not None:
+                where_parts_rel = self._mssql_where_from_value(
+                    where_parts_rel,
+                    child_model_cls,
+                    t_where2,
+                    strict=True,
+                    to_where_dict=to_where_dict,
+                    expr_from_where_dict=expr_from_where_dict,
+                    adapter=adapter,
+                    info=info,
+                )
             # Callable default_where: emit a correlated EXISTS against any grandchild that FK's to child
             try:
                 d_where_raw = rel_cfg.get('default_where')

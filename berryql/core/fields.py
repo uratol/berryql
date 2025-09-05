@@ -372,3 +372,35 @@ def domain(domain_cls: Type[Any], *, name: Optional[str] = None, **meta: Any) ->
             blogDomain = domain(BlogDomain)
     """
     return DomainDescriptor(domain_cls, name=name, **meta)
+
+
+# --- Type-level scope helper ---------------------------------------------------------
+
+class TypeScopeDescriptor:
+    """Descriptor to declare a BerryType-level scope.
+
+    When placed on a BerryType subclass, this sets ``__type_scope__`` on the
+    class at definition time. The attribute name is irrelevant; use any name.
+
+    Example:
+        class ViewQL(BerryType):
+            type_scope = scope({"id": {"gt": 0}})
+    """
+
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __set_name__(self, owner, name):  # pragma: no cover - trivial
+        setattr(owner, '__type_scope__', self.value)
+
+def scope(value: Any) -> TypeScopeDescriptor:
+    """Declare a BerryType-level scope via a descriptor.
+
+    Args:
+        value: Dict/JSON string/SQLAlchemy expression or callable
+               ``fn(model_cls, info)`` returning one of those.
+
+    Returns:
+        TypeScopeDescriptor: sets ``__type_scope__`` on the class.
+    """
+    return TypeScopeDescriptor(value)

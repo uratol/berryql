@@ -1279,6 +1279,25 @@ class BerrySchema:
                                                     expr = dwhere(child_model_cls, info)
                                                     if expr is not None:
                                                         stmt = stmt.where(expr)
+                                        # Also apply type-level scope when present
+                                        try:
+                                            tgt_b_for_type = self.__berry_registry__.types.get(target_name_i)
+                                            t_scope = getattr(tgt_b_for_type, '__type_scope__', None) if tgt_b_for_type is not None else None
+                                            if t_scope is None and tgt_b_for_type is not None:
+                                                t_scope = getattr(tgt_b_for_type, 'scope', None)
+                                        except Exception:
+                                            t_scope = None
+                                        if t_scope is not None:
+                                            if isinstance(t_scope, (dict, str)):
+                                                wdict_t = _to_where_dict(t_scope, strict=False)
+                                                if wdict_t:
+                                                    expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=False)
+                                                    if expr_t is not None:
+                                                        stmt = stmt.where(expr_t)
+                                            elif callable(t_scope):
+                                                expr_t = t_scope(child_model_cls, info)
+                                                if expr_t is not None:
+                                                    stmt = stmt.where(expr_t)
                                         # Ordering: honor order_by/order_multi if provided; default by id
                                         try:
                                             allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
@@ -1391,6 +1410,25 @@ class BerrySchema:
                                                 expr = dwhere(child_model_cls, info)
                                                 if expr is not None:
                                                     stmt = stmt.where(expr)
+                                    # Also apply type-level scope when present
+                                    try:
+                                        tgt_b_for_type2 = self.__berry_registry__.types.get(target_name_i)
+                                        t_scope2 = getattr(tgt_b_for_type2, '__type_scope__', None) if tgt_b_for_type2 is not None else None
+                                        if t_scope2 is None and tgt_b_for_type2 is not None:
+                                            t_scope2 = getattr(tgt_b_for_type2, 'scope', None)
+                                    except Exception:
+                                        t_scope2 = None
+                                    if t_scope2 is not None:
+                                        if isinstance(t_scope2, (dict, str)):
+                                            wdict_t2 = _to_where_dict(t_scope2, strict=False)
+                                            if wdict_t2:
+                                                expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=False)
+                                                if expr_t2 is not None:
+                                                    stmt = stmt.where(expr_t2)
+                                        elif callable(t_scope2):
+                                            expr_t2 = t_scope2(child_model_cls, info)
+                                            if expr_t2 is not None:
+                                                stmt = stmt.where(expr_t2)
                                     # Add filter where clauses
                                     for arg_name, val in _filter_args.items():
                                         if val is None:
@@ -1683,6 +1721,25 @@ class BerrySchema:
                                         expr = dwhere(child_model_cls, info)
                                         if expr is not None:
                                             stmt = stmt.where(expr)
+                            # Combine with type-level default scope for list fallback
+                            try:
+                                tgt_b_for_type3 = self.__berry_registry__.types.get(target_name_i)
+                                t_scope3 = getattr(tgt_b_for_type3, '__type_scope__', None) if tgt_b_for_type3 is not None else None
+                                if t_scope3 is None and tgt_b_for_type3 is not None:
+                                    t_scope3 = getattr(tgt_b_for_type3, 'scope', None)
+                            except Exception:
+                                t_scope3 = None
+                            if t_scope3 is not None:
+                                if isinstance(t_scope3, (dict, str)):
+                                    wdict_t3 = _to_where_dict(t_scope3, strict=False)
+                                    if wdict_t3:
+                                        expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=False)
+                                        if expr_t3 is not None:
+                                            stmt = stmt.where(expr_t3)
+                                elif callable(t_scope3):
+                                    expr_t3 = t_scope3(child_model_cls, info)
+                                    if expr_t3 is not None:
+                                        stmt = stmt.where(expr_t3)
                             # Ad-hoc JSON where for relation list if present on selection
                             rel_meta_map = getattr(self, '_pushdown_meta', None)  # not reliable; read from extractor cfg instead
                             # Ordering (multi then single) if column whitelist permits
@@ -2462,6 +2519,7 @@ class BerrySchema:
                             info=info,
                             rel_where=rel_cfg.get('where'),
                             rel_default_where=rel_cfg.get('default_where'),
+                            type_default_where=rel_cfg.get('type_default_where'),
                             filter_args=rel_cfg.get('filter_args') or {},
                             arg_specs=rel_cfg.get('arg_specs') or {},
                         )

@@ -45,10 +45,26 @@ class RelationSelectionExtractor:
         def_ob = fdef.meta.get('order_by') if fdef.meta.get('order_by') is not None else None
         def_od = fdef.meta.get('order_dir') if fdef.meta.get('order_dir') is not None else None
         def_om = fdef.meta.get('order_multi') if fdef.meta.get('order_multi') is not None else []
+        # Type-level scope (on target BerryType) is combined with relation-level scope
+        type_default_where = None
+        try:
+            if target and getattr(self, 'registry', None) is not None:
+                tb = getattr(self.registry.types, 'get', lambda *_: None)(target)
+                if tb is None:
+                    tb = (self.registry.types or {}).get(target)
+                if tb is not None:
+                    # Support either explicit __type_scope__ or plain 'scope' on the type class
+                    type_default_where = getattr(tb, '__type_scope__', None)
+                    if type_default_where is None:
+                        type_default_where = getattr(tb, 'scope', None)
+        except Exception:
+            type_default_where = None
         return {
             'fields': [], 'limit': None, 'offset': None,
             'order_by': def_ob, 'order_dir': def_od, 'order_multi': list(def_om) if isinstance(def_om, (list, tuple)) else ([def_om] if def_om else []),
-            'where': None, 'default_where': fdef.meta.get('scope') if fdef.meta.get('scope') is not None else None,
+            'where': None,
+            'default_where': fdef.meta.get('scope') if fdef.meta.get('scope') is not None else None,
+            'type_default_where': type_default_where,
             'single': single, 'target': target, 'nested': {}, 'skip_pushdown': False,
             'fk_column_name': fk_col_name,
             'filter_args': {}, 'arg_specs': fdef.meta.get('arguments') if fdef.meta.get('arguments') is not None else None,
