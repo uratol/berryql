@@ -1894,6 +1894,29 @@ class RootSQLBuilders:
                         raise
                     raise ValueError(f"Invalid where JSON: {e}")
                 raise
+        # type-level scope (BerryType.scope or __type_scope__) must always be enforced at root
+        try:
+            t_scope = getattr(btype_cls, '__type_scope__', None)
+            if t_scope is None:
+                t_scope = getattr(btype_cls, 'scope', None)
+        except Exception:
+            t_scope = None
+        if t_scope is not None:
+            fragments = t_scope if isinstance(t_scope, (list, tuple)) else [t_scope]
+            for frag in fragments:
+                # Use common applier to support dict/str/callable/expr uniformly; strict=True to surface issues
+                tmp2 = select(model_cls)
+                tmp2 = RelationSQLBuilders(self.registry)._apply_where_common(
+                    tmp2,
+                    model_cls,
+                    frag,
+                    strict=True,
+                    to_where_dict=_to_where_dict,
+                    expr_from_where_dict=_expr_from_where_dict,
+                    info=info,
+                )
+                for _w in getattr(tmp2, '_where_criteria', []):  # type: ignore[attr-defined]
+                    where_clauses.append(_w)
         # filter args
         from ..core.filters import OPERATOR_REGISTRY
         for arg_name, value in (passed_filter_args or {}).items():
