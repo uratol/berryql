@@ -467,9 +467,22 @@ class RelationSQLBuilders:
                     sel = sel.where(expr)
             return sel
         # callable or direct expression
-        expr = v(model_cls, info) if callable(v) else v
-        if expr is not None:
-            sel = sel.where(expr)
+        if callable(v):
+            rv = v(model_cls, info)
+            # If callable returns dict/str, parse to SQL expression
+            if isinstance(rv, (dict, str)):
+                wdict2 = to_where_dict(rv, strict=strict)
+                if wdict2:
+                    expr2 = expr_from_where_dict(model_cls, wdict2, strict=strict)
+                    if expr2 is not None:
+                        sel = sel.where(expr2)
+                return sel
+            # If callable returns a SQL expression, apply it; ignore None
+            if rv is not None:
+                sel = sel.where(rv)
+            return sel
+        # direct SQL expression (non-callable, non-dict/str)
+        sel = sel.where(v)
         return sel
 
     def _apply_where_sqla(self, sel, model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, info):

@@ -212,8 +212,13 @@ class ViewQL(BerryType):
     user_id = field()
     created_at = field()
     user = relation('UserQL', single=True)
-    # Example of a very permissive type-level scope using helper
-    type_scope = scope({"id": {"gt": 0}})
+    # Context-aware type-level scope: if context has only_view_user_id, filter Views by that user
+    # Otherwise, return None (no-op)
+    type_scope = scope(lambda M, info: (
+        (lambda uid: ({"user_id": {"eq": int(uid)}} if uid is not None else None))(
+            (getattr(info, 'context', None) or {}).get('only_view_user_id')
+        )
+    ))
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):

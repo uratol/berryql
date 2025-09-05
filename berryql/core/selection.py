@@ -54,11 +54,22 @@ class RelationSelectionExtractor:
                     tb = (self.registry.types or {}).get(target)
                 if tb is not None:
                     # Support either explicit __type_scope__ or plain 'scope' on the type class
-                    type_default_where = getattr(tb, '__type_scope__', None)
-                    # If accumulated as a list, keep it (builders/registry accept list of fragments)
-                    # Otherwise, fall back to single value
-                    if type_default_where is None:
-                        type_default_where = getattr(tb, 'scope', None)
+                    t_scope = getattr(tb, '__type_scope__', None)
+                    if t_scope is None:
+                        t_scope = getattr(tb, 'scope', None)
+                    # Normalize: unwrap single-element list/tuple; drop empty containers
+                    if isinstance(t_scope, (list, tuple)):
+                        if len(t_scope) == 0:
+                            type_default_where = None
+                        elif len(t_scope) == 1:
+                            type_default_where = t_scope[0]
+                        else:
+                            type_default_where = list(t_scope)
+                    else:
+                        type_default_where = t_scope
+                    # Avoid passing empty dict as a filter (invalid for SA .where)
+                    if isinstance(type_default_where, dict) and not type_default_where:
+                        type_default_where = None
         except Exception:
             type_default_where = None
         return {
