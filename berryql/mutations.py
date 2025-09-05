@@ -182,29 +182,21 @@ def build_merge_resolver_for_type(
             return v
 
         def _safe_attrs_dump(model_cls_local, instance_local):
+            """Return a minimal, side-effect-free diagnostic payload.
+
+            Strictly avoid accessing any attributes on the instance to prevent invoking
+            async properties or descriptors that may create un-awaited coroutines.
+            """
             try:
-                out: Dict[str, Any] = {}
-                try:
-                    cols = [c.name for c in getattr(getattr(model_cls_local, '__table__', None), 'columns', [])]
-                except Exception:
-                    cols = []
-                for cn in cols or []:
-                    try:
-                        out[cn] = getattr(instance_local, cn, None)
-                    except Exception:
-                        out[cn] = None
-                if not out:
-                    try:
-                        for k, v in (getattr(instance_local, '__dict__', {}) or {}).items():
-                            if not str(k).startswith('_'):
-                                out[k] = v
-                    except Exception:
-                        pass
-                if not out:
-                    return {'repr': repr(instance_local)}
-                return out
+                pk_name_local = _get_pk_name_safe(model_cls_local)
             except Exception:
-                return {'repr': repr(instance_local)}
+                pk_name_local = 'id'
+            # Only return the pk field name; do not access its value.
+            try:
+                model_name = getattr(model_cls_local, '__name__', str(model_cls_local))
+            except Exception:
+                model_name = 'Model'
+            return {'model': model_name, 'pk_field': pk_name_local}
 
         # Local DRY helpers
         def _get_pk_name_safe(model_cls_local) -> str:

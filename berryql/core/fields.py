@@ -391,7 +391,18 @@ class TypeScopeDescriptor:
         self.value = value
 
     def __set_name__(self, owner, name):  # pragma: no cover - trivial
-        setattr(owner, '__type_scope__', self.value)
+        try:
+            existing = getattr(owner, '__type_scope__', None)
+            if isinstance(existing, list):
+                existing.append(self.value)
+                return
+            if existing is not None:
+                setattr(owner, '__type_scope__', [existing, self.value])
+            else:
+                setattr(owner, '__type_scope__', [self.value])
+        except Exception:
+            # Best-effort: ignore if owner is unexpected
+            pass
 
 def scope(value: Any) -> TypeScopeDescriptor:
     """Declare a BerryType-level scope via a descriptor.

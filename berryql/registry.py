@@ -846,15 +846,41 @@ class BerrySchema:
             setattr(inst, '_model', model_obj)
         except Exception:
             pass
-        # Copy scalar fields directly from model to surface values without extra queries
+        # Pre-populate scalar fields from model for GraphQL response objects.
+        # Only copy values for actual SQLAlchemy table columns to avoid triggering async/computed props.
+        try:
+            _cols = list(getattr(getattr(getattr(b_cls, 'model', None), '__table__', None), 'columns', []) or [])
+            _col_names = {c.name for c in _cols}
+        except Exception:
+            _col_names = set()
         for fname, fdef in (getattr(b_cls, '__berry_fields__', {}) or {}).items():
             if getattr(fdef, 'kind', None) == 'scalar':
+                if _col_names and fname not in _col_names:
+                    continue
                 try:
-                    val = getattr(model_obj, fname, None)
+                    _meta = getattr(fdef, 'meta', {}) or {}
+                    if _meta.get('write_only'):
+                        continue
+                except Exception:
+                    pass
+                # Skip async property getters, if any
+                try:
+                    import inspect as _ins
+                    cls_attr = getattr(type(model_obj), fname, None)
+                    if isinstance(cls_attr, property) and _ins.iscoroutinefunction(getattr(cls_attr, 'fget', None)):
+                        continue
+                except Exception:
+                    pass
+                # Prefer instance dict to avoid descriptor side effects
+                try:
+                    if isinstance(getattr(model_obj, '__dict__', None), dict) and fname in model_obj.__dict__:
+                        val = model_obj.__dict__.get(fname, None)
+                    else:
+                        val = getattr(model_obj, fname, None)
                 except Exception:
                     val = None
+                # Map back DB enum strings to Python Enum if needed
                 try:
-                    # If column is SAEnum and DB stored a raw string, map back to Python Enum
                     enum_cls = None
                     try:
                         col = getattr(getattr(b_cls, 'model', None).__table__.c, fname)
@@ -974,6 +1000,35 @@ class BerrySchema:
                 user_annotations = {}
             # column type mapping
             column_type_map: Dict[str, Any] = self._build_column_type_map(getattr(bcls, 'model', None))
+            # Helper: build a safe scalar resolver that reads from the attached model
+            def _make_scalar_resolver(fname_local: str, src_col_name: Optional[str] = None):
+                def _resolver(self, info: StrawberryInfo):  # noqa: D401
+                    # Prefer reading from the attached SQLAlchemy model to avoid mutating the Strawberry instance
+                    try:
+                        m = getattr(self, '_model', None)
+                    except Exception:
+                        m = None
+                    col_name = src_col_name or fname_local
+                    if m is not None:
+                        # Use instance __dict__ first to avoid triggering descriptors
+                        try:
+                            dct = getattr(m, '__dict__', None)
+                            if isinstance(dct, dict) and col_name in dct:
+                                return dct.get(col_name, None)
+                        except Exception:
+                            pass
+                        try:
+                            return getattr(m, col_name, None)
+                        except Exception:
+                            return None
+                    # Fallback: return already set attribute value if present
+                    try:
+                        dself = object.__getattribute__(self, '__dict__')
+                        return dself.get(fname_local, None) if isinstance(dself, dict) else None
+                    except Exception:
+                        return None
+                return _resolver
+
             for fname, fdef in bcls.__berry_fields__.items():
                 is_private = isinstance(fname, str) and fname.startswith('_')
                 if hasattr(st_cls, fname):
@@ -1082,7 +1137,7 @@ class BerrySchema:
                             annotations[fname] = Optional[py_t]
                     except Exception:
                         annotations[fname] = Optional[py_t]
-                    # Attach Strawberry field with description when available so GraphQL introspection shows it
+                    # Attach Strawberry field with resolver so values come from the attached model
                     try:
                         # If enum, append values list to description or set it when absent
                         try:
@@ -1093,11 +1148,17 @@ class BerrySchema:
                                     field_description = enum_values_desc
                         except Exception:
                             pass
+                        # Prefer explicit mapped source column name when provided
+                        try:
+                            src_col_name = (fdef.meta or {}).get('column')
+                        except Exception:
+                            src_col_name = None
                         if field_description:
-                            setattr(st_cls, fname, strawberry.field(default=None, description=str(field_description)))
+                            setattr(st_cls, fname, strawberry.field(resolver=_make_scalar_resolver(fname, src_col_name), description=str(field_description)))
                         else:
-                            setattr(st_cls, fname, None)
+                            setattr(st_cls, fname, strawberry.field(resolver=_make_scalar_resolver(fname, src_col_name)))
                     except Exception:
+                        # As a fallback, expose a plain attribute with None default
                         setattr(st_cls, fname, None)
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')
@@ -1288,16 +1349,18 @@ class BerrySchema:
                                         except Exception:
                                             t_scope = None
                                         if t_scope is not None:
-                                            if isinstance(t_scope, (dict, str)):
-                                                wdict_t = _to_where_dict(t_scope, strict=False)
-                                                if wdict_t:
-                                                    expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=False)
+                                            fragments = t_scope if isinstance(t_scope, list) else [t_scope]
+                                            for frag in fragments:
+                                                if isinstance(frag, (dict, str)):
+                                                    wdict_t = _to_where_dict(frag, strict=False)
+                                                    if wdict_t:
+                                                        expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=False)
+                                                        if expr_t is not None:
+                                                            stmt = stmt.where(expr_t)
+                                                elif callable(frag):
+                                                    expr_t = frag(child_model_cls, info)
                                                     if expr_t is not None:
                                                         stmt = stmt.where(expr_t)
-                                            elif callable(t_scope):
-                                                expr_t = t_scope(child_model_cls, info)
-                                                if expr_t is not None:
-                                                    stmt = stmt.where(expr_t)
                                         # Ordering: honor order_by/order_multi if provided; default by id
                                         try:
                                             allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
@@ -1419,16 +1482,18 @@ class BerrySchema:
                                     except Exception:
                                         t_scope2 = None
                                     if t_scope2 is not None:
-                                        if isinstance(t_scope2, (dict, str)):
-                                            wdict_t2 = _to_where_dict(t_scope2, strict=False)
-                                            if wdict_t2:
-                                                expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=False)
+                                        fragments2 = t_scope2 if isinstance(t_scope2, list) else [t_scope2]
+                                        for frag2 in fragments2:
+                                            if isinstance(frag2, (dict, str)):
+                                                wdict_t2 = _to_where_dict(frag2, strict=False)
+                                                if wdict_t2:
+                                                    expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=False)
+                                                    if expr_t2 is not None:
+                                                        stmt = stmt.where(expr_t2)
+                                            elif callable(frag2):
+                                                expr_t2 = frag2(child_model_cls, info)
                                                 if expr_t2 is not None:
                                                     stmt = stmt.where(expr_t2)
-                                        elif callable(t_scope2):
-                                            expr_t2 = t_scope2(child_model_cls, info)
-                                            if expr_t2 is not None:
-                                                stmt = stmt.where(expr_t2)
                                     # Add filter where clauses
                                     for arg_name, val in _filter_args.items():
                                         if val is None:
@@ -1730,16 +1795,18 @@ class BerrySchema:
                             except Exception:
                                 t_scope3 = None
                             if t_scope3 is not None:
-                                if isinstance(t_scope3, (dict, str)):
-                                    wdict_t3 = _to_where_dict(t_scope3, strict=False)
-                                    if wdict_t3:
-                                        expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=False)
+                                fragments3 = t_scope3 if isinstance(t_scope3, list) else [t_scope3]
+                                for frag3 in fragments3:
+                                    if isinstance(frag3, (dict, str)):
+                                        wdict_t3 = _to_where_dict(frag3, strict=False)
+                                        if wdict_t3:
+                                            expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=False)
+                                            if expr_t3 is not None:
+                                                stmt = stmt.where(expr_t3)
+                                    elif callable(frag3):
+                                        expr_t3 = frag3(child_model_cls, info)
                                         if expr_t3 is not None:
                                             stmt = stmt.where(expr_t3)
-                                elif callable(t_scope3):
-                                    expr_t3 = t_scope3(child_model_cls, info)
-                                    if expr_t3 is not None:
-                                        stmt = stmt.where(expr_t3)
                             # Ad-hoc JSON where for relation list if present on selection
                             rel_meta_map = getattr(self, '_pushdown_meta', None)  # not reliable; read from extractor cfg instead
                             # Ordering (multi then single) if column whitelist permits

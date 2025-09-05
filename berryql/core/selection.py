@@ -55,6 +55,8 @@ class RelationSelectionExtractor:
                 if tb is not None:
                     # Support either explicit __type_scope__ or plain 'scope' on the type class
                     type_default_where = getattr(tb, '__type_scope__', None)
+                    # If accumulated as a list, keep it (builders/registry accept list of fragments)
+                    # Otherwise, fall back to single value
                     if type_default_where is None:
                         type_default_where = getattr(tb, 'scope', None)
         except Exception:
