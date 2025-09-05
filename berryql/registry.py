@@ -1331,9 +1331,9 @@ class BerrySchema:
                                             dwhere = eff_scope
                                             if dwhere is not None:
                                                 if isinstance(dwhere, (dict, str)):
-                                                    wdict = _to_where_dict(dwhere, strict=False)
+                                                    wdict = _to_where_dict(dwhere, strict=True)
                                                     if wdict:
-                                                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=False)
+                                                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
                                                         if expr is not None:
                                                             stmt = stmt.where(expr)
                                                 elif callable(dwhere):
@@ -1352,9 +1352,9 @@ class BerrySchema:
                                             fragments = t_scope if isinstance(t_scope, list) else [t_scope]
                                             for frag in fragments:
                                                 if isinstance(frag, (dict, str)):
-                                                    wdict_t = _to_where_dict(frag, strict=False)
+                                                    wdict_t = _to_where_dict(frag, strict=True)
                                                     if wdict_t:
-                                                        expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=False)
+                                                        expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=True)
                                                         if expr_t is not None:
                                                             stmt = stmt.where(expr_t)
                                                 elif callable(frag):
@@ -1464,9 +1464,9 @@ class BerrySchema:
                                         dwhere = eff_scope
                                         if dwhere is not None:
                                             if isinstance(dwhere, (dict, str)):
-                                                wdict_def = _to_where_dict(dwhere, strict=False)
+                                                wdict_def = _to_where_dict(dwhere, strict=True)
                                                 if wdict_def:
-                                                    expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=False)
+                                                    expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=True)
                                                     if expr is not None:
                                                         stmt = stmt.where(expr)
                                             elif callable(dwhere):
@@ -1485,9 +1485,9 @@ class BerrySchema:
                                         fragments2 = t_scope2 if isinstance(t_scope2, list) else [t_scope2]
                                         for frag2 in fragments2:
                                             if isinstance(frag2, (dict, str)):
-                                                wdict_t2 = _to_where_dict(frag2, strict=False)
+                                                wdict_t2 = _to_where_dict(frag2, strict=True)
                                                 if wdict_t2:
-                                                    expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=False)
+                                                    expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=True)
                                                     if expr_t2 is not None:
                                                         stmt = stmt.where(expr_t2)
                                             elif callable(frag2):
@@ -1773,13 +1773,13 @@ class BerrySchema:
                                         expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
                                         if expr is not None:
                                             stmt = stmt.where(expr)
-                                # Default where from schema meta: keep permissive
+                                # Default where from schema meta: enforce strict to surface issues
                                 dwhere = eff_scope
                                 if dwhere is not None:
                                     if isinstance(dwhere, (dict, str)):
-                                        wdict = _to_where_dict(dwhere, strict=False)
+                                        wdict = _to_where_dict(dwhere, strict=True)
                                         if wdict:
-                                            expr = _expr_from_where_dict(child_model_cls, wdict, strict=False)
+                                            expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
                                             if expr is not None:
                                                 stmt = stmt.where(expr)
                                     elif callable(dwhere):
@@ -1798,9 +1798,9 @@ class BerrySchema:
                                 fragments3 = t_scope3 if isinstance(t_scope3, list) else [t_scope3]
                                 for frag3 in fragments3:
                                     if isinstance(frag3, (dict, str)):
-                                        wdict_t3 = _to_where_dict(frag3, strict=False)
+                                        wdict_t3 = _to_where_dict(frag3, strict=True)
                                         if wdict_t3:
-                                            expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=False)
+                                            expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=True)
                                             if expr_t3 is not None:
                                                 stmt = stmt.where(expr_t3)
                                     elif callable(frag3):
