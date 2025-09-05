@@ -11,9 +11,10 @@ from sqlalchemy import and_ as _and
 from .adapters import get_adapter  # adapter abstraction
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.orm import load_only
-from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, Numeric as SANumeric, Enum as SAEnumType
+from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, Numeric as SANumeric, Enum as SAEnumType, JSON as SA_JSON
 from sqlalchemy.types import TypeDecorator as _SATypeDecorator
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
+from strawberry.scalars import JSON as ST_JSON
 import uuid as _py_uuid
 from datetime import datetime
 from enum import Enum
@@ -623,8 +624,14 @@ class BerrySchema:
                     return List[inner_t]  # type: ignore[index]
                 except Exception:
                     return list
+            # JSON (cross-dialect) -> Strawberry JSON scalar
+            try:
+                if isinstance(sqlatype, SA_JSON):
+                    return ST_JSON  # type: ignore[return-value]
+            except Exception:
+                pass
             if isinstance(sqlatype, PG_JSONB):
-                return str
+                return ST_JSON  # type: ignore[return-value]
         except Exception:
             pass
         return str
@@ -638,11 +645,11 @@ class BerrySchema:
             if model_cls is not None and hasattr(model_cls, "__table__"):
                 try:
                     pk_cols = list(getattr(model_cls.__table__, "primary_key").columns)
-                except Exception:
-                    pk_cols = [c for c in model_cls.__table__.columns if getattr(c, "primary_key", False)]
-                if pk_cols:
                     # Prefer the first PK column (single-column PK expected)
-                    return pk_cols[0].name
+                    if pk_cols:
+                        return pk_cols[0].name
+                except Exception:
+                    pass
         except Exception:
             pass
         raise ValueError(f"Primary key column not found for model: {getattr(model_cls, '__name__', model_cls)}")

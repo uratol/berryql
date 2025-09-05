@@ -102,6 +102,12 @@ class Post(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
     # New: single binary blob (base64 in GraphQL)
     binary_blob = Column(BinaryBlob(), nullable=True)
+    # New: JSON/JSONB metadata column (JSONB on PostgreSQL, JSON elsewhere)
+    metadata_json = Column(
+        JSON().with_variant(postgresql.JSONB(), 'postgresql'),
+        nullable=True,
+        comment='Arbitrary metadata (JSON/JSONB)'
+    )
     # Enum with helper: ensures hashability and consistent storage; emits named CHECK
     status = enum_column(
         PostStatus,

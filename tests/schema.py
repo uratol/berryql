@@ -224,6 +224,8 @@ class PostQL(BerryType):
     created_at = field(read_only=True)
     # Base64-encoded single binary blob across dialects
     binary_blob = field()
+    # JSON/JSONB column exposed as Strawberry JSON scalar
+    metadata_json = field()
     # New enum field projected from SQLAlchemy Enum
     status = field()
     # Read-only computed scalar mirroring SQLAlchemy column_property on Post
