@@ -492,10 +492,41 @@ class RelationSQLBuilders:
     def _mssql_where_from_value(self, where_parts: List[str], model_cls, value, *, strict: bool, to_where_dict, expr_from_where_dict, adapter, info) -> List[str]:
         """Append MSSQL WHERE fragments for dict/str values. Validates strict=True via SQLAlchemy path.
 
-        Callable/default expressions are handled by the caller when needed.
+        Also supports callables that return dict/str by evaluating them with (model_cls, info).
+        Direct SQLAlchemy expressions are not supported in the MSSQL string builder and will be ignored here.
         """
         v = self._resolve_graphql_value(info, value)
         if v is None:
+            return where_parts
+        # If a list/tuple of fragments is passed, process each
+        if isinstance(v, (list, tuple)):
+            for part in v:
+                where_parts = self._mssql_where_from_value(
+                    where_parts,
+                    model_cls,
+                    part,
+                    strict=strict,
+                    to_where_dict=to_where_dict,
+                    expr_from_where_dict=expr_from_where_dict,
+                    adapter=adapter,
+                    info=info,
+                )
+            return where_parts
+        # Evaluate callables to a concrete dict/str when possible
+        if callable(v):
+            rv = v(model_cls, info)
+            # Only handle dict/str results here; SQL expressions aren't supported in MSSQL string builder
+            if isinstance(rv, (dict, str)):
+                return self._mssql_where_from_value(
+                    where_parts,
+                    model_cls,
+                    rv,
+                    strict=strict,
+                    to_where_dict=to_where_dict,
+                    expr_from_where_dict=expr_from_where_dict,
+                    adapter=adapter,
+                    info=info,
+                )
             return where_parts
         if isinstance(v, (dict, str)):
             # Do not wrap in try/except; helper handles strict behavior
@@ -1236,6 +1267,15 @@ class RelationSQLBuilders:
             nested_cfg_map: Dict[str, Any] = rel_cfg.get('nested') or {}
             if nested_cfg_map:
                 nested_specs: list[dict] = []
+                # Helper to resolve callable/variable type scope values to concrete dict/str
+                def _resolve_type_where_local(raw_val, model_cls_local):
+                    v = self._resolve_graphql_value(info, raw_val)
+                    try:
+                        if callable(v):
+                            v = v(model_cls_local, info)
+                    except Exception:
+                        pass
+                    return v
                 def _mk_nested_specs(parent_model_cls_local, parent_target_name: str | None, nested_map: Dict[str, Any]) -> list[dict]:
                     specs: list[dict] = []
                     for nname_i, ncfg_i in (nested_map or {}).items():
@@ -1339,6 +1379,9 @@ class RelationSQLBuilders:
                             'offset': ncfg_i.get('offset'),
                             'nested': child_specs_i or None,
                         }
+                        # Preserve resolved type-level default scope for deeper application where supported
+                        if 'type_default_where' in ncfg_i:
+                            spec_obj['type_default_where'] = _resolve_type_where_local(ncfg_i.get('type_default_where'), n_model_i)
                         if is_single_i:
                             spec_obj['mode'] = 'single'
                             spec_obj['child_fk_name'] = child_fk_to_nested_i
@@ -1455,6 +1498,8 @@ class RelationSQLBuilders:
                         'offset': ncfg.get('offset'),
                         'nested': nested_children_specs or None,
                     }
+                    if 'type_default_where' in ncfg:
+                        spec_obj2['type_default_where'] = _resolve_type_where_local(ncfg.get('type_default_where'), n_model)
                     if is_single_nested:
                         spec_obj2['mode'] = 'single'
                         spec_obj2['child_fk_name'] = child_fk_to_nested
@@ -1465,6 +1510,16 @@ class RelationSQLBuilders:
                 # Build full JSON for the list relation, including nested arrays
                 # Compute effective top-level order_dir: ASC when order_by explicit without explicit dir
                 effective_order_dir = self._effective_order_dir(rel_cfg)
+                # Resolve top-level type_default_where (callables/variables) before handing to adapter
+                def _resolve_type_where(raw_val, model_cls_local):
+                    v = self._resolve_graphql_value(info, raw_val)
+                    try:
+                        if callable(v):
+                            v = v(model_cls_local, info)
+                    except Exception:
+                        pass
+                    return v
+                top_type_where = _resolve_type_where(rel_cfg.get('type_default_where'), child_model_cls)
                 return adapter.build_relation_list_json_full(
                     parent_table=parent_table,
                     parent_pk_name=parent_pk_name,
@@ -1473,6 +1528,7 @@ class RelationSQLBuilders:
                     projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                     rel_where=self._resolve_graphql_value(info, rel_cfg.get('where')),
                     rel_default_where=rel_cfg.get('default_where'),
+                    type_default_where=top_type_where,
                     limit=rel_cfg.get('limit'),
                     offset=rel_cfg.get('offset'),
                     order_by=(self._mssql_map_columns_pairs(child_model_cls, [rel_cfg.get('order_by')]) or [(rel_cfg.get('order_by'), rel_cfg.get('order_by'))])[0][0] if rel_cfg.get('order_by') else None,

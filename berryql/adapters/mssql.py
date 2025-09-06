@@ -422,7 +422,7 @@ class MSSQLAdapter(BaseAdapter):
             pag_clause = f" ORDER BY {n_order}"
         return f"SELECT {n_col_select}{nested_cols} FROM {self.table_ident(grand_model)} WHERE {n_where}{pag_clause} FOR JSON PATH"
 
-    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, limit: int | None, offset: int | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, nested: list[dict] | None) -> Any:
+    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, type_default_where: dict | str | None = None, limit: int | None = None, offset: int | None = None, order_by: str | None = None, order_dir: str | None = None, order_multi: list[str] | None = None, nested: list[dict] | None = None) -> Any:
         """Assemble full MSSQL JSON aggregation for a to-many relation with optional nested arrays.
 
         nested: list of dicts, each with keys: alias, model, fk_col_name, fields, where, default_where, order_by, order_dir, order_multi, limit
@@ -458,6 +458,10 @@ class MSSQLAdapter(BaseAdapter):
         dwdict = _as_dict(rel_default_where)
         if dwdict:
             where_parts_rel.extend(self.where_from_dict(child_model, dwdict))
+        # Apply top-level type scope when provided
+        tdict = _as_dict(type_default_where)
+        if tdict:
+            where_parts_rel.extend(self.where_from_dict(child_model, tdict))
         where_clause = ' AND '.join(where_parts_rel)
         # order clause
         order_clause = self._build_order_clause(child_model, child_model.__tablename__, order_by, order_dir, order_multi)
@@ -520,6 +524,11 @@ class MSSQLAdapter(BaseAdapter):
                                     child_pk_for_nested = gm_pk
                                 except Exception:
                                     child_pk_for_nested = 'id'
+                                # Include type_default_where for nested list if present on spec
+                                n_extra = []
+                                tdict_nested = _as_dict(sn.get('type_default_where'))
+                                if tdict_nested:
+                                    n_extra.extend(self.where_from_dict(s_model, tdict_nested))
                                 nsql = self.build_nested_list_sql(
                                     alias=s_alias,
                                     grand_model=s_model,
@@ -534,7 +543,7 @@ class MSSQLAdapter(BaseAdapter):
                                     order_multi=sn.get('order_multi'),
                                     limit=sn.get('limit'),
                                     offset=sn.get('offset'),
-                                    extra_where_sql=None,
+                                    extra_where_sql=n_extra or None,
                                     nested_children=sn.get('nested') or None,
                                 )
                                 sub_parts.append(f"ISNULL(({nsql}), '[]') AS [{s_alias}]")
@@ -570,6 +579,10 @@ class MSSQLAdapter(BaseAdapter):
                     child_pk_for_nested = next(iter(child_model.__table__.primary_key.columns)).name
                 except Exception:
                     child_pk_for_nested = 'id'
+                n_extra2 = []
+                tdict_nested2 = _as_dict(n.get('type_default_where'))
+                if tdict_nested2:
+                    n_extra2.extend(self.where_from_dict(gm, tdict_nested2))
                 nsql = self.build_nested_list_sql(
                     alias=alias,
                     grand_model=gm,
@@ -584,7 +597,7 @@ class MSSQLAdapter(BaseAdapter):
                     order_multi=n.get('order_multi'),
                     limit=n.get('limit'),
                     offset=n.get('offset'),
-                    extra_where_sql=None,
+                    extra_where_sql=n_extra2 or None,
                     nested_children=n_children or None,
                 )
                 nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
