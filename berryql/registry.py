@@ -503,6 +503,11 @@ class BerrySchema:
                                 ref_anns[tfname] = Optional[t_py]
                         except Exception:
                             pass
+                        # Include control flag for delete semantics
+                        try:
+                            ref_anns['_Delete'] = Optional[bool]
+                        except Exception:
+                            pass
                         setattr(RefPlain, '__annotations__', ref_anns)
                         # Set defaults to UNSET
                         for an_name in list(ref_anns.keys()):
