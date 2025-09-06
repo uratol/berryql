@@ -1076,7 +1076,7 @@ class BerrySchema:
                             py_t = (fdef.meta or {}).get('returns') or str
                         except Exception:
                             py_t = str
-                    # Optional: discover column description from SQLAlchemy Column.info/comment
+                    # Optional: discover field description from SQLAlchemy mapping metadata
                     field_description = None
                     try:
                         if explicit_field_comment:
@@ -1099,6 +1099,30 @@ class BerrySchema:
                                 if not field_description:
                                     info_dict = getattr(col_obj, 'info', {}) or {}
                                     field_description = info_dict.get('description') or info_dict.get('doc')
+                            # If not a column, attempt relationship / attribute docs
+                            if not field_description:
+                                try:
+                                    from sqlalchemy.inspection import inspect as sa_inspect  # local import to avoid hard dep at module import
+                                    mapper = sa_inspect(model_cls_local) if model_cls_local is not None else None
+                                except Exception:
+                                    mapper = None
+                                # RelationshipProperty: prefer .doc then .info['description']
+                                try:
+                                    if mapper is not None and hasattr(mapper, 'relationships') and (col_name in mapper.relationships):
+                                        rel = mapper.relationships[col_name]
+                                        field_description = getattr(rel, 'doc', None)
+                                        if not field_description:
+                                            rel_info = getattr(rel, 'info', {}) or {}
+                                            field_description = rel_info.get('description') or rel_info.get('doc')
+                                except Exception:
+                                    pass
+                                # Python attribute docstring (hybrid_property, @property, descriptor)
+                                if not field_description and model_cls_local is not None:
+                                    try:
+                                        model_attr2 = getattr(model_cls_local, col_name, None)
+                                        field_description = getattr(model_attr2, '__doc__', None)
+                                    except Exception:
+                                        pass
                     except Exception:
                         field_description = None
                     # Convert Python Enum classes to Strawberry enums on the fly
