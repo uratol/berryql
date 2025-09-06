@@ -339,7 +339,7 @@ class BerrySchema:
     
 
     # ---------- Input/Mutation helpers ----------
-    def _ensure_input_type(self, btype_cls: Type[BerryType]):
+    def _ensure_input_type(self, btype_cls: Type[BerryType], _stack: Optional[List[str]] = None):
         """Build (or return cached) Strawberry input type mirroring a BerryType's writable shape.
 
         Includes scalar fields and relation fields (recursively using corresponding Input types).
@@ -352,6 +352,9 @@ class BerrySchema:
             tname = None
         if not tname:
             raise ValueError("_ensure_input_type requires a BerryType class")
+        # Initialize cycle-detection stack for this build path
+        if _stack is None:
+            _stack = []
         input_name = f"{tname}Input"
         # Return cached if present
         if input_name in self._st_types:
@@ -435,6 +438,12 @@ class BerrySchema:
                     setattr(InPlain, fname, None)
             elif fdef.kind == 'relation':
                 # Build nested inputs recursively
+                # Respect read_only on relations to avoid cycles in input types
+                try:
+                    if (getattr(fdef, 'meta', {}) or {}).get('read_only'):
+                        continue
+                except Exception:
+                    pass
                 target_name = fdef.meta.get('target') if isinstance(fdef.meta, dict) else None
                 is_single = bool(fdef.meta.get('single')) if isinstance(fdef.meta, dict) else False
                 if not target_name:
@@ -442,20 +451,103 @@ class BerrySchema:
                 target_b = self.types.get(target_name)
                 if not target_b:
                     continue
-                child_input = self._ensure_input_type(target_b)
+                # If this relation points to an ancestor in the current build stack, include a slim input
+                # that only allows identifying fields (pk and simple direct FKs) instead of full recursion.
+                use_slim = False
                 try:
-                    if is_single:
-                        anns[fname] = Optional[child_input]  # type: ignore[index]
-                        setattr(InPlain, fname, UNSET)
-                    else:
-                        anns[fname] = Optional[List[child_input]]  # type: ignore[index]
-                        setattr(InPlain, fname, UNSET)
+                    if target_name in _stack:
+                        use_slim = True
                 except Exception:
-                    anns[fname] = Optional[str]
+                    use_slim = False
+                # Use a slim "RefInput" when the target type is an ancestor in the build stack
+                # to prevent infinite recursion. The RefInput includes the target's primary key
+                # and any write-only scalar helper fields (e.g., "characterName").
+                if use_slim:
+                    # Build a minimal ad-hoc input type for the target consisting of pk only.
+                    # Name it deterministically for caching: e.g., PlotlineQLRefInput
+                    ref_input_name = f"{target_name}RefInput"
+                    if ref_input_name in self._st_types:
+                        ref_input = self._st_types[ref_input_name]
+                    else:
+                        RefPlain = type(ref_input_name, (), {'__doc__': f'Reference input for {target_name} (pk only)'})
+                        RefPlain.__module__ = __name__
+                        # Determine pk field name and type
+                        try:
+                            t_model = getattr(target_b, 'model', None)
+                            pk_name = self._get_pk_name(t_model) if t_model is not None else 'id'
+                        except Exception:
+                            pk_name = 'id'
+                        # pk type: default to str for UUIDs; use column type map when available
+                        try:
+                            col_map = self._build_column_type_map(t_model) if t_model is not None else {}
+                            pk_py_t = col_map.get(pk_name, str)
+                        except Exception:
+                            pk_py_t = str
+                        # Start annotations with pk
+                        ref_anns: Dict[str, Any] = {pk_name: Optional[pk_py_t]}
+                        # Also include write-only scalar helper fields from the target type
+                        try:
+                            for tfname, tfdef in (getattr(target_b, '__berry_fields__', {}) or {}).items():
+                                if tfdef.kind != 'scalar':
+                                    continue
+                                try:
+                                    if not (tfdef.meta or {}).get('write_only'):
+                                        continue
+                                except Exception:
+                                    continue
+                                # Prefer explicit returns for helper types; default to str
+                                try:
+                                    t_py = (tfdef.meta or {}).get('returns') or col_map.get((tfdef.meta or {}).get('column') or tfname, str)
+                                except Exception:
+                                    t_py = str
+                                ref_anns[tfname] = Optional[t_py]
+                        except Exception:
+                            pass
+                        setattr(RefPlain, '__annotations__', ref_anns)
+                        # Set defaults to UNSET
+                        for an_name in list(ref_anns.keys()):
+                            try:
+                                setattr(RefPlain, an_name, UNSET)
+                            except Exception:
+                                setattr(RefPlain, an_name, None)
+                        try:
+                            ref_input = strawberry.input(RefPlain)  # type: ignore
+                        except Exception:
+                            ref_input = RefPlain
+                        self._st_types[ref_input_name] = ref_input
+                        try:
+                            globals()[ref_input_name] = ref_input
+                        except Exception:
+                            pass
+                    # Assign the slim ref input for this relation
                     try:
-                        setattr(InPlain, fname, None)
+                        if is_single:
+                            anns[fname] = Optional[ref_input]  # type: ignore[index]
+                        else:
+                            anns[fname] = Optional[List[ref_input]]  # type: ignore[index]
+                        setattr(InPlain, fname, UNSET)
                     except Exception:
-                        pass
+                        anns[fname] = Optional[str]
+                        try:
+                            setattr(InPlain, fname, None)
+                        except Exception:
+                            pass
+                else:
+                    # Recurse while tracking the current path
+                    child_input = self._ensure_input_type(target_b, _stack=(_stack + [tname]))
+                    try:
+                        if is_single:
+                            anns[fname] = Optional[child_input]  # type: ignore[index]
+                            setattr(InPlain, fname, UNSET)
+                        else:
+                            anns[fname] = Optional[List[child_input]]  # type: ignore[index]
+                            setattr(InPlain, fname, UNSET)
+                    except Exception:
+                        anns[fname] = Optional[str]
+                        try:
+                            setattr(InPlain, fname, None)
+                        except Exception:
+                            pass
 
         # Special control flag: allow delete semantics in mutation payloads
         try:
