@@ -1188,12 +1188,38 @@ class BerrySchema:
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
                     post_process = fdef.meta.get('post_process')
-                    # Relation description: prefer explicit meta.comment else target model's table comment
+                    # Relation description: prefer explicit meta.comment; else SQLAlchemy relationship doc/info; else target model's table comment
                     relation_description = None
                     try:
                         relation_description = (fdef.meta or {}).get('comment')
                     except Exception:
                         relation_description = None
+                    # If no explicit comment, inspect the ORM relationship for doc/info
+                    if not relation_description:
+                        try:
+                            model_cls_local = getattr(bcls, 'model', None)
+                            try:
+                                rel_attr_name = (fdef.meta or {}).get('source') or fname
+                            except Exception:
+                                rel_attr_name = fname
+                            if model_cls_local is not None:
+                                try:
+                                    from sqlalchemy.inspection import inspect as sa_inspect
+                                    mapper = sa_inspect(model_cls_local)
+                                except Exception:
+                                    mapper = None
+                                if mapper is not None and hasattr(mapper, 'relationships') and (rel_attr_name in mapper.relationships):
+                                    rel_prop = mapper.relationships[rel_attr_name]
+                                    # Prefer relationship .doc; fallback to .info['description'|'doc']
+                                    relation_description = getattr(rel_prop, 'doc', None)
+                                    if not relation_description:
+                                        try:
+                                            rinfo = getattr(rel_prop, 'info', {}) or {}
+                                            relation_description = rinfo.get('description') or rinfo.get('doc')
+                                        except Exception:
+                                            relation_description = None
+                        except Exception:
+                            relation_description = None
                     if not relation_description and target_name:
                         try:
                             tb = self.types.get(target_name)
