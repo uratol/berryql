@@ -436,12 +436,21 @@ def build_merge_resolver_for_type(
                     ok_parent = await _enforce_scope(parent_model_cls_local, _stub, _parent_scope)
                     if not ok_parent:
                         raise PermissionError("Mutation out of scope for delete; parent not within scope")
+                # Enforce scope for delete:
+                # - When the effective scope is inherited from the parent (domain-level), enforce it on the parent
+                #   instead of the child row (child may not have columns like project_id).
+                # - Otherwise, enforce directly on the child instance being deleted.
                 if eff_scope is not None:
-                    ok = await _enforce_scope(model_cls_local, instance_for_delete, eff_scope)
-                    if not ok:
-                        _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                        _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
-                        raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
+                    if eff_scope_inherited_from_parent and parent_ctx is not None:
+                        # Parent scope was enforced above using the child's FK; skip child enforcement here
+                        # to avoid applying parent-specific filters (e.g., project_id) to child tables.
+                        pass
+                    else:
+                        ok = await _enforce_scope(model_cls_local, instance_for_delete, eff_scope)
+                        if not ok:
+                            _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                            _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
+                            raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
                 # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints)
                 from sqlalchemy import select as _sa_select, delete as _sa_delete
                 async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
