@@ -8,7 +8,7 @@ from sqlalchemy import select, func
 import strawberry
 from strawberry.types import Info
 from berryql import BerrySchema, BerryType, BerryDomain, field, relation, count, custom, custom_object, domain, mutation, hooks, scope
-from tests.models import User, Post, PostComment, PostCommentLike, View  # type: ignore
+from tests.models import User, Post, PostComment, PostCommentLike, View, UuidItem  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
@@ -219,6 +219,11 @@ class ViewQL(BerryType):
             (getattr(info, 'context', None) or {}).get('only_view_user_id')
         )
     ))
+
+@berry_schema.type(model=UuidItem)
+class UuidItemQL(BerryType):
+    id = field()
+    name = field()
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
@@ -519,6 +524,7 @@ class Query:
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
     })
+    uuidItems = relation('UuidItemQL', order_by='name', order_dir='asc')
     # Async where callable support for roots
     async def _gate_users_async(model_cls, info: Info):
         # tiny await to ensure awaitable path is exercised

@@ -7,6 +7,7 @@ import enum
 from sqlalchemy.orm import DeclarativeBase, relationship, column_property
 from sqlalchemy.types import TypeDecorator, LargeBinary
 from sqlalchemy.dialects import postgresql, mssql
+from sqlalchemy import Uuid as SA_Uuid
 from berryql import enum_column
 
 class BinaryBlob(TypeDecorator):
@@ -162,3 +163,12 @@ class View(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
 
     user = relationship("User")
+
+
+class UuidItem(Base):
+    """Simple entity with UUID primary key for where/UUID tests."""
+    __tablename__ = 'uuid_items'
+    __table_args__ = {'comment': 'Items with UUID primary keys for testing'}
+
+    id = Column(SA_Uuid(as_uuid=True), primary_key=True, comment='UUID primary key')
+    name = Column(String(100), nullable=False, comment='Item name')

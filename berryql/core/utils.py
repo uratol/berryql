@@ -3,6 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional, Dict, List
 import os
+import uuid as _py_uuid
 import strawberry
 from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime
 from sqlalchemy import and_ as _and
@@ -28,12 +29,49 @@ def coerce_where_value(col, val):
         from sqlalchemy.sql.sqltypes import Integer as _I, Float as _F, Boolean as _B, DateTime as _DT, Numeric as _N
     except Exception:
         _I = Integer; _F = None; _B = Boolean; _DT = DateTime; _N = None
+    # Best-effort optional UUID types
+    try:
+        # SQLAlchemy 2.0 generic UUID
+        from sqlalchemy import Uuid as _UUID
+    except Exception:
+        _UUID = None  # type: ignore[assignment]
+    try:
+        # PostgreSQL dialect UUID
+        from sqlalchemy.dialects.postgresql import UUID as _PG_UUID
+    except Exception:
+        _PG_UUID = None  # type: ignore[assignment]
     if isinstance(val, (list, tuple)):
         return [ coerce_where_value(col, v) for v in val ]
     ctype = getattr(col, 'type', None)
     if ctype is None:
         return val
     try:
+        # UUID coercion: accept str input and convert to uuid.UUID for UUID-typed columns
+        is_uuid_type = False
+        try:
+            if _UUID is not None and isinstance(ctype, _UUID):
+                is_uuid_type = True
+        except Exception:
+            pass
+        try:
+            if _PG_UUID is not None and isinstance(ctype, _PG_UUID):
+                is_uuid_type = True
+        except Exception:
+            pass
+        # Fallback: some custom UUID types expose python_type
+        try:
+            if not is_uuid_type and getattr(ctype, 'python_type', None) is _py_uuid.UUID:
+                is_uuid_type = True
+        except Exception:
+            pass
+        if is_uuid_type:
+            if isinstance(val, str):
+                try:
+                    return _py_uuid.UUID(val)
+                except Exception:
+                    # Leave as-is if it cannot be parsed; builder/operators may raise later
+                    return val
+            return val
         if isinstance(ctype, _DT):
             if isinstance(val, str):
                 s = val.replace('Z', '+00:00') if 'Z' in val else val

@@ -711,8 +711,18 @@ class BerrySchema:
                     return float
             except Exception:
                 pass
+            # UUID types (PostgreSQL dialect and SQLAlchemy generic)
             if isinstance(sqlatype, PG_UUID):
                 return _py_uuid.UUID
+            try:
+                from sqlalchemy import Uuid as _SA_UUID  # SQLAlchemy 2.0 generic UUID
+            except Exception:
+                _SA_UUID = None  # type: ignore[assignment]
+            try:
+                if _SA_UUID is not None and isinstance(sqlatype, _SA_UUID):
+                    return _py_uuid.UUID
+            except Exception:
+                pass
             if isinstance(sqlatype, PG_ARRAY):
                 inner = getattr(sqlatype, 'item_type', None)
                 inner_t = self._sa_python_type(inner) if inner is not None else str
