@@ -165,10 +165,14 @@ class View(Base):
     user = relationship("User")
 
 
-class UuidItem(Base):
-    """Simple entity with UUID primary key for where/UUID tests."""
-    __tablename__ = 'uuid_items'
-    __table_args__ = {'comment': 'Items with UUID primary keys for testing'}
+class GenericItem(Base):
+    """Generic test entity with UUID id and assorted typed columns for WHERE tests."""
+    __tablename__ = 'generic_items'
+    __table_args__ = {'comment': 'Generic items with various column types for testing'}
 
     id = Column(SA_Uuid(as_uuid=True), primary_key=True, comment='UUID primary key')
     name = Column(String(100), nullable=False, comment='Item name')
+    code = Column(String(50), nullable=False, default='', comment='Short code')
+    count = Column(Integer, nullable=False, default=0, comment='Numeric counter')
+    active = Column(Boolean, nullable=False, default=True, comment='Active flag')
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')

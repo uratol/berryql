@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import User, Post, PostComment, PostCommentLike, View, UuidItem, PostStatus
+from .models import User, Post, PostComment, PostCommentLike, View, GenericItem, PostStatus
 
 
 async def create_sample_users(session: AsyncSession):
@@ -138,12 +138,12 @@ async def seed_populated_db(session: AsyncSession):
     comments = await create_sample_comments(session, users, posts)
     likes = await create_sample_likes(session, users, comments)
     views = await create_sample_views(session, users, posts, comments)
-    # Seed UUID items
+    # Seed Generic items
     import uuid as _uuid
     items = [
-        UuidItem(id=_uuid.uuid4(), name='A'),
-        UuidItem(id=_uuid.uuid4(), name='B'),
-        UuidItem(id=_uuid.uuid4(), name='C'),
+        GenericItem(id=_uuid.uuid4(), name='A', code='A1', count=1, active=True),
+        GenericItem(id=_uuid.uuid4(), name='B', code='B2', count=2, active=False),
+        GenericItem(id=_uuid.uuid4(), name='C', code='C3', count=3, active=True),
     ]
     session.add_all(items)
     await session.flush()
@@ -154,7 +154,7 @@ async def seed_populated_db(session: AsyncSession):
         'post_comments': comments,
         'post_comment_likes': likes,
         'views': views,
-        'uuid_items': items,
+    'generic_items': items,
     }
 
 
@@ -180,12 +180,12 @@ async def sample_views(db_session: AsyncSession, sample_users, sample_posts, sam
     return await create_sample_views(db_session, sample_users, sample_posts, sample_comments)
 
 
-async def create_sample_uuid_items(session: AsyncSession):
+async def create_sample_generic_items(session: AsyncSession):
     import uuid as _uuid
     items = [
-        UuidItem(id=_uuid.uuid4(), name='A'),
-        UuidItem(id=_uuid.uuid4(), name='B'),
-        UuidItem(id=_uuid.uuid4(), name='C'),
+        GenericItem(id=_uuid.uuid4(), name='A', code='A1', count=1, active=True),
+        GenericItem(id=_uuid.uuid4(), name='B', code='B2', count=2, active=False),
+        GenericItem(id=_uuid.uuid4(), name='C', code='C3', count=3, active=True),
     ]
     session.add_all(items)
     await session.flush()
@@ -194,17 +194,17 @@ async def create_sample_uuid_items(session: AsyncSession):
 
 
 @pytest.fixture(scope="function")
-async def sample_uuid_items(db_session: AsyncSession):
-    return await create_sample_uuid_items(db_session)
+async def sample_generic_items(db_session: AsyncSession):
+    return await create_sample_generic_items(db_session)
 
 
 @pytest.fixture(scope="function")
-async def populated_db(sample_users, sample_posts, sample_comments, sample_likes, sample_views, sample_uuid_items):
+async def populated_db(sample_users, sample_posts, sample_comments, sample_likes, sample_views, sample_generic_items):
     return {
         'users': sample_users,
         'posts': sample_posts,
         'post_comments': sample_comments,
         'post_comment_likes': sample_likes,
     'views': sample_views,
-    'uuid_items': sample_uuid_items,
+    'generic_items': sample_generic_items,
     }

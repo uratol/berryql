@@ -147,6 +147,6 @@ from tests.fixtures import (
     sample_comments,
     sample_likes,
     sample_views,
-    sample_uuid_items,
+    sample_generic_items,
     populated_db,
 )
