@@ -111,6 +111,42 @@ class Hydrator:
         except Exception:
             btype = None
             model_cls = None
+        # Helper to resolve underlying source column name from Berry field meta
+        def _source_col_for_scalar(field_name: str) -> str | None:
+            try:
+                fdef = getattr(btype, '__berry_fields__', {}).get(field_name) if btype is not None else None
+                if fdef and getattr(fdef, 'kind', None) == 'scalar':
+                    meta = (getattr(fdef, 'meta', {}) or {})
+                    src = meta.get('column')
+                    return str(src) if src else None
+            except Exception:
+                return None
+            return None
+        # Helper: decamelize GraphQL field names to python/DB snake_case
+        import re as _re
+        def _decamel(name: str) -> str:
+            try:
+                if not name or ('_' in name):
+                    return name
+                s1 = _re.sub('(.)([A-Z][a-z]+)', r'\1_\2', str(name))
+                s2 = _re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1)
+                return s2.lower()
+            except Exception:
+                return str(name)
+        def _normalize_field_name(field_name: str) -> str:
+            # Prefer declared berry field key; else try decamelized variant
+            try:
+                if btype is not None and field_name in getattr(btype, '__berry_fields__', {}):
+                    return field_name
+            except Exception:
+                pass
+            d = _decamel(field_name)
+            try:
+                if btype is not None and d in getattr(btype, '__berry_fields__', {}):
+                    return d
+            except Exception:
+                pass
+            return field_name
         def _coerce_enum_for_model(key: str, value: Any) -> Any:
             enum_cls = get_model_enum_cls(model_cls, key)
             return coerce_mapping_to_enum(enum_cls, value)
@@ -118,11 +154,30 @@ class Hydrator:
         if requested_scalar_root:
             for sf in requested_scalar_root:
                 try:
-                    v = mapping.get(sf, None)
+                    sf_eff = _normalize_field_name(str(sf))
+                    # Try mapping by effective snake_case key first
+                    v = mapping.get(sf_eff, None)
+                    # Fallback: honor field alias mapping (meta.column) when projection labeled under source name
+                    if v is None:
+                        src = _source_col_for_scalar(sf_eff)
+                        if src and (src in mapping):
+                            v = mapping.get(src)
+                    # Additional fallback: original key (in case mapping labeled as camelCase)
+                    if v is None and sf != sf_eff:
+                        v = mapping.get(sf)
+                    # If still None, try reading from attached ORM model when full entity was selected
+                    if v is None:
+                        try:
+                            model_inst = getattr(inst, '_model', None)
+                            if model_inst is not None and hasattr(model_inst, sf_eff):
+                                v = getattr(model_inst, sf_eff)
+                        except Exception:
+                            pass
                     # Coerce datetime and enum when needed
-                    v = self._coerce_datetime_scalar(model_cls, sf, v)
-                    v = _coerce_enum_for_model(sf, v)
-                    setattr(inst, sf, v)
+                    v = self._coerce_datetime_scalar(model_cls, sf_eff, v)
+                    v = _coerce_enum_for_model(sf_eff, v)
+                    # Set attribute on the effective python field name
+                    setattr(inst, sf_eff, v)
                 except Exception:
                     pass
         # Ensure helper cols present (id for relation resolvers + FK helpers)
@@ -133,9 +188,20 @@ class Hydrator:
             for fk in (required_fk_parent_cols or set()):
                 needed.add(fk)
             for name in needed:
-                if getattr(inst, name, None) is None and (name in mapping):
+                if getattr(inst, name, None) is None:
                     try:
                         v2 = mapping.get(name)
+                        if v2 is None:
+                            src = _source_col_for_scalar(name)
+                            if src and (src in mapping):
+                                v2 = mapping.get(src)
+                        if v2 is None:
+                            try:
+                                model_inst2 = getattr(inst, '_model', None)
+                                if model_inst2 is not None and hasattr(model_inst2, name):
+                                    v2 = getattr(model_inst2, name)
+                            except Exception:
+                                pass
                         v2 = self._coerce_datetime_scalar(model_cls, name, v2)
                         v2 = _coerce_enum_for_model(name, v2)
                         setattr(inst, name, v2)

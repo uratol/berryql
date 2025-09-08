@@ -133,13 +133,38 @@ class RelationSQLBuilders:
         """
         rel_cfg = rel_cfg or {}
         requested: List[str] = list(rel_cfg.get('fields') or [])
+        # Normalize requested field names: allow GraphQL camelCase by decamelizing to snake_case
+        import re as _re
+        def _decamel(name: str) -> str:
+            try:
+                if not name or ('_' in name):
+                    return name
+                s1 = _re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+                s2 = _re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1)
+                return s2.lower()
+            except Exception:
+                return name
         try:
             if requested:
                 tmp: list[str] = []
+                fdefs = getattr(target_btype, '__berry_fields__', {})
                 for sf in requested:
-                    sdef = getattr(target_btype, '__berry_fields__', {}).get(sf)
-                    if sdef and sdef.kind == 'scalar':
-                        tmp.append(sf)
+                    key = sf
+                    fdef = fdefs.get(key)
+                    if not fdef:
+                        cand = _decamel(str(sf))
+                        fdef = fdefs.get(cand)
+                        if fdef:
+                            key = cand
+                    if fdef and getattr(fdef, 'kind', None) == 'scalar':
+                        # Exclude write-only helper scalars
+                        try:
+                            if (getattr(fdef, 'meta', {}) or {}).get('write_only'):
+                                continue
+                        except Exception:
+                            pass
+                        if key not in tmp:
+                            tmp.append(key)
                 requested = tmp
         except Exception:
             pass
@@ -1891,32 +1916,61 @@ class RootSQLBuilders:
         except Exception:
             btype = None
         fdefs = getattr(btype, '__berry_fields__', {}) if btype is not None else {}
+        # Helper: decamelize GraphQL field names to snake_case
+        import re as _re
+        def _decamel(name: str) -> str:
+            try:
+                if not name or ('_' in name):
+                    return name
+                s1 = _re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+                s2 = _re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1)
+                return s2.lower()
+            except Exception:
+                return name
         for sf in effective_root_cols:
             try:
+                # Prefer exact model attribute match
                 if hasattr(model_cls, sf):
                     col_obj2 = getattr(model_cls, sf)
                     try:
                         base_root_cols.append(col_obj2.label(sf))
                     except Exception:
                         base_root_cols.append(col_obj2)
-                else:
-                    # Try meta.column mapping
+                    continue
+                # Try decamelized name against model attributes/columns
+                sfd = _decamel(str(sf)) if isinstance(sf, str) else sf
+                if sfd and hasattr(model_cls, sfd):
+                    col_obj3 = getattr(model_cls, sfd)
+                    # Label with snake_case to keep hydration/enum coercion consistent
                     try:
-                        fdef = fdefs.get(sf)
-                        src = (getattr(fdef, 'meta', {}) or {}).get('column') if fdef else None
+                        base_root_cols.append(col_obj3.label(sfd))
                     except Exception:
-                        src = None
-                    if src:
-                        sa_col = None
+                        base_root_cols.append(col_obj3)
+                    continue
+                # Try Berry field meta for either key (original or decamelized)
+                src = None
+                try:
+                    fdef = fdefs.get(sf) or (fdefs.get(sfd) if isinstance(sfd, str) else None)
+                    src = (getattr(fdef, 'meta', {}) or {}).get('column') if fdef else None
+                except Exception:
+                    src = None
+                if src:
+                    sa_col = None
+                    try:
+                        sa_col = getattr(model_cls.__table__.c, src, None) or model_cls.__table__.c.get(src)
+                    except Exception:
+                        sa_col = getattr(model_cls, src, None)
+                    if sa_col is not None:
+                        # Label with the Berry field key when available, prefer snake_case
+                        lbl = None
                         try:
-                            sa_col = getattr(model_cls.__table__.c, src, None) or model_cls.__table__.c.get(src)
+                            lbl = (fdef and fdef.name) or (sfd if isinstance(sfd, str) else sf)
                         except Exception:
-                            sa_col = getattr(model_cls, src, None)
-                        if sa_col is not None:
-                            try:
-                                base_root_cols.append(sa_col.label(sf))
-                            except Exception:
-                                base_root_cols.append(sa_col)
+                            lbl = (sfd if isinstance(sfd, str) else sf)
+                        try:
+                            base_root_cols.append(sa_col.label(lbl))
+                        except Exception:
+                            base_root_cols.append(sa_col)
             except Exception:
                 pass
         return base_root_cols
