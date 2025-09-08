@@ -1810,7 +1810,8 @@ class BerrySchema:
                             if pk_expr is not None:
                                 # Keep label as 'id' for downstream hydration compatibility
                                 cols.append(pk_expr.label('id'))
-                            # Filter requested_fields to scalars known on target type
+                            # Normalize GraphQL names to Python field names when auto-camel-case is enabled or a name converter is used,
+                            # then filter to scalars known on target type
                             try:
                                 scalars_on_target = set()
                                 for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
@@ -1822,13 +1823,74 @@ class BerrySchema:
                                         except Exception:
                                             pass
                                         scalars_on_target.add(sf)
+                                # Prepare reverse mapping helper: GraphQL name -> python field name
+                                def _to_python_name(gql_name: str) -> str:
+                                    # direct match first
+                                    if gql_name in scalars_on_target:
+                                        return gql_name
+                                    # auto camelCase support
+                                    try:
+                                        if getattr(self.__berry_registry__, '_auto_camel_case', False):
+                                            # decamelize
+                                            n = str(gql_name)
+                                            out = []
+                                            for i, ch in enumerate(n):
+                                                if ch.isupper() and i > 0 and n[i-1] != '_':
+                                                    out.append('_')
+                                                out.append(ch.lower())
+                                            snake = ''.join(out)
+                                            if snake in scalars_on_target:
+                                                return snake
+                                    except Exception:
+                                        pass
+                                    # try configured name converter
+                                    try:
+                                        name_conv = getattr(getattr(self.__berry_registry__, '_name_converter', None), 'apply_naming_config', None)
+                                        if callable(name_conv):
+                                            for py in scalars_on_target:
+                                                try:
+                                                    if name_conv(py) == gql_name:
+                                                        return py
+                                                except Exception:
+                                                    continue
+                                    except Exception:
+                                        pass
+                                    return str(gql_name)
                             except Exception:
                                 scalars_on_target = set()
-                            for fn in requested_fields:
+                            # Map requested field names to python names when possible
+                            mapped_requested = []
+                            try:
+                                for _fn in requested_fields:
+                                    mapped = _to_python_name(_fn)
+                                    mapped_requested.append(mapped)
+                            except Exception:
+                                mapped_requested = list(requested_fields)
+                            for fn in mapped_requested:
                                 if fn == 'id':
                                     continue
                                 if scalars_on_target and fn not in scalars_on_target:
                                     continue
+                                # Honor Berry field alias mapping (meta.column) for scalars
+                                source_name = None
+                                try:
+                                    fdef_req = self.__berry_registry__.types[target_name_i].__berry_fields__.get(fn)
+                                    if fdef_req and getattr(fdef_req, 'kind', None) == 'scalar':
+                                        source_name = (getattr(fdef_req, 'meta', {}) or {}).get('column')
+                                except Exception:
+                                    source_name = None
+                                if source_name:
+                                    try:
+                                        src_col_obj = child_model_cls.__table__.c.get(source_name)
+                                    except Exception:
+                                        src_col_obj = None
+                                    if src_col_obj is not None:
+                                        try:
+                                            cols.append(src_col_obj.label(fn))
+                                        except Exception:
+                                            cols.append(src_col_obj)
+                                        continue
+                                # Fallback to selecting column by the same name
                                 try:
                                     col_obj = child_model_cls.__table__.c.get(fn)
                                 except Exception:
