@@ -144,6 +144,7 @@ class PostCommentQL(BerryType):
     # Force resolver fallback for nested path by using a callable where
     # (builders mark skip_pushdown when default_where is callable via meta['scope']).
     likes = relation('PostCommentLikeQL', scope=lambda M, info: (M.id > 0))
+    like_count = count('likes')
     # Likes made by admin users only
     admin_likes = relation(
         'PostCommentLikeQL',

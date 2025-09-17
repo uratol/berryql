@@ -2279,28 +2279,28 @@ class BerrySchema:
                         meta_copy['cache_key'] = meta_copy.get('cache_key') or fdef.meta.get('source') + ':count'
                     def _make_aggregate_resolver(meta_copy=meta_copy, bcls_local=bcls):
                         async def aggregate_resolver(self, info: StrawberryInfo):  # noqa: D401
+                            """Resolve aggregate values.
+
+                            Improvement: when a nested object was hydrated purely from pushdown JSON
+                            (so self._model is absent), count aggregates previously returned 0.
+                            We now attempt a synthetic count using the instance's primary key attribute
+                            if available (e.g., "id") so that count(...) works consistently for nested
+                            pushdown results.
+                            """
                             cache = getattr(self, '_agg_cache', None)
                             is_count_local = meta_copy.get('op') == 'count' or 'count' in meta_copy.get('ops', [])
                             if is_count_local and cache is not None:
                                 key = meta_copy.get('cache_key') or (meta_copy.get('source') + ':count')
                                 if key in cache:
                                     return cache[key]
-                            parent_model = getattr(self, '_model', None)
-                            if parent_model is None:
-                                if is_count_local:
-                                    return 0
-                                return None
-                            session = _get_db(info)
-                            if session is None:
-                                if is_count_local:
-                                    return 0
-                                return None
+
                             source = meta_copy.get('source')
                             rel_def = bcls_local.__berry_fields__.get(source) if source else None
                             if not rel_def or rel_def.kind != 'relation':
                                 if is_count_local:
                                     return 0
                                 return None
+
                             target_name = rel_def.meta.get('target')
                             target_btype = self.__berry_registry__.types.get(target_name) if target_name else None
                             if not target_btype or not target_btype.model:
@@ -2308,34 +2308,63 @@ class BerrySchema:
                                     return 0
                                 return None
                             child_model_cls = target_btype.model
-                            # honor explicit fk if present on the relation meta
+
+                            # Determine parent model instance (if available) OR fallback to id attribute
+                            parent_model = getattr(self, '_model', None)
+                            parent_model_cls = parent_model.__class__ if parent_model is not None else getattr(bcls_local, 'model', None)
+
+                            # Honor explicit fk if present on the relation meta
                             try:
                                 explicit_child_fk_name = (rel_def.meta or {}).get('fk_column_name')
                             except Exception:
                                 explicit_child_fk_name = None
-                            fk_col = self.__berry_registry__._find_child_fk_column(parent_model.__class__, child_model_cls, explicit_child_fk_name)
+                            fk_col = None
+                            if parent_model_cls is not None:
+                                fk_col = self.__berry_registry__._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)
                             if fk_col is None:
                                 if is_count_local:
                                     return 0
                                 return None
-                            if is_count_local:
-                                from sqlalchemy import func, select as _select
-                                try:
+
+                            if not is_count_local:
+                                # Only count aggregates currently supported here; others default to None
+                                return None
+
+                            session = _get_db(info)
+                            if session is None:
+                                return 0
+
+                            from sqlalchemy import func, select as _select
+                            parent_pk_value = None
+                            try:
+                                # Prefer real model instance
+                                if parent_model is not None:
                                     pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
                                     parent_pk_value = getattr(parent_model, pk_name_parent)
-                                except Exception:
-                                    # Fail fast: no PK value on parent
-                                    return 0
+                                else:
+                                    # Fallback: derive pk from the object attribute (e.g., id) when model missing
+                                    if parent_model_cls is not None:
+                                        pk_name_parent = self.__berry_registry__._get_pk_name(parent_model_cls)
+                                        parent_pk_value = getattr(self, pk_name_parent, None)
+                            except Exception:
+                                parent_pk_value = None
+
+                            if parent_pk_value is None:
+                                return 0
+
+                            try:
                                 stmt = _select(func.count()).select_from(child_model_cls).where(fk_col == parent_pk_value)
                                 result = await session.execute(stmt)
                                 val = result.scalar_one() or 0
-                                key = meta_copy.get('cache_key') or (source + ':count')
-                                if cache is None:
-                                    cache = {}
-                                    setattr(self, '_agg_cache', cache)
-                                cache[key] = val
-                                return val
-                            return None
+                            except Exception:
+                                val = 0
+
+                            key = meta_copy.get('cache_key') or (source + ':count')
+                            if cache is None:
+                                cache = {}
+                                setattr(self, '_agg_cache', cache)
+                            cache[key] = val
+                            return val
                         return aggregate_resolver
                     agg_comment = None
                     try:
