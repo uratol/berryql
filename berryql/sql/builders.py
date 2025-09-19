@@ -1564,6 +1564,47 @@ class RelationSQLBuilders:
                         pass
                     return v
                 top_type_where = _resolve_type_where(rel_cfg.get('type_default_where'), child_model_cls)
+                # Resolve order_by which may be a callable or a SQLAlchemy expression
+                order_by_param = None
+                from sqlalchemy.sql.elements import ClauseElement  # type: ignore
+                try:
+                    ob_raw = rel_cfg.get('order_by')
+                except Exception:
+                    ob_raw = None
+                ob_resolved = self._resolve_graphql_value(info, ob_raw)
+                if callable(ob_resolved):
+                    ob_resolved = ob_resolved(child_model_cls, info)
+                # For MSSQL, ensure scalar subqueries return a single row: apply LIMIT 1 when possible
+                try:
+                    from sqlalchemy.sql.selectable import ScalarSelect, Select  # type: ignore
+                    if isinstance(ob_resolved, ScalarSelect):
+                        try:
+                            ob_resolved = ob_resolved.element.limit(1).scalar_subquery()
+                        except Exception:
+                            pass
+                    elif isinstance(ob_resolved, Select):
+                        try:
+                            ob_resolved = ob_resolved.limit(1).scalar_subquery()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if ob_resolved is not None:
+                    # If it's a SQLAlchemy expression, compile it to MSSQL SQL; else map string to physical column
+                    try:
+                        if isinstance(ob_resolved, ClauseElement):
+                            try:
+                                from sqlalchemy.dialects import mssql as _sa_mssql  # type: ignore
+                                compiled = str(ob_resolved.compile(dialect=_sa_mssql.dialect(), compile_kwargs={"literal_binds": True}))
+                            except Exception:
+                                # Fallback to generic compile
+                                compiled = str(ob_resolved)
+                            order_by_param = f"({compiled})"
+                        elif isinstance(ob_resolved, str):
+                            mapped_pairs = self._mssql_map_columns_pairs(child_model_cls, [ob_resolved]) or [(ob_resolved, ob_resolved)]
+                            order_by_param = mapped_pairs[0][0]
+                    except Exception:
+                        order_by_param = None
                 return adapter.build_relation_list_json_full(
                     parent_table=parent_table,
                     parent_pk_name=parent_pk_name,
@@ -1575,7 +1616,7 @@ class RelationSQLBuilders:
                     type_default_where=top_type_where,
                     limit=rel_cfg.get('limit'),
                     offset=rel_cfg.get('offset'),
-                    order_by=(self._mssql_map_columns_pairs(child_model_cls, [rel_cfg.get('order_by')]) or [(rel_cfg.get('order_by'), rel_cfg.get('order_by'))])[0][0] if rel_cfg.get('order_by') else None,
+                    order_by=order_by_param,
                     order_dir=effective_order_dir,
                     order_multi=[
                         f"{(self._mssql_map_columns_pairs(child_model_cls, [spec.split(':',1)[0]]) or [(spec.split(':',1)[0], spec.split(':',1)[0])])[0][0]}:{spec.split(':',1)[1]}"
@@ -1672,13 +1713,73 @@ class RelationSQLBuilders:
             where_clause = ' AND '.join(where_parts_rel)
             # Respect explicit order_by without order_dir -> default ASC (override relation default)
             effective_order_dir2 = self._effective_order_dir(rel_cfg)
-            order_clause = adapter.build_order_clause(
-                child_model_cls,
-                child_model_cls,
-                rel_cfg.get('order_by'),
-                effective_order_dir2,
-                self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
-            )
+            # Resolve order_by: allow callable/SQLAlchemy expression for MSSQL simple path as well
+            order_clause = None
+            try:
+                from sqlalchemy.sql.elements import ClauseElement  # type: ignore
+            except Exception:
+                ClauseElement = tuple()  # type: ignore
+            try:
+                ob_raw2 = rel_cfg.get('order_by')
+            except Exception:
+                ob_raw2 = None
+            ob_resolved2 = self._resolve_graphql_value(info, ob_raw2)
+            try:
+                if callable(ob_resolved2):
+                    ob_resolved2 = ob_resolved2(child_model_cls, info)
+            except Exception:
+                pass
+            # For MSSQL, ensure scalar subqueries return a single row: apply LIMIT 1 when possible
+            try:
+                from sqlalchemy.sql.selectable import ScalarSelect, Select  # type: ignore
+                if isinstance(ob_resolved2, ScalarSelect):
+                    try:
+                        ob_resolved2 = ob_resolved2.element.limit(1).scalar_subquery()
+                    except Exception:
+                        pass
+                elif isinstance(ob_resolved2, Select):
+                    try:
+                        ob_resolved2 = ob_resolved2.limit(1).scalar_subquery()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if ob_resolved2 is not None and isinstance(ob_resolved2, ClauseElement):
+                # Compile the SQLAlchemy expression to MSSQL SQL and combine with order_multi if present
+                try:
+                    from sqlalchemy.dialects import mssql as _sa_mssql  # type: ignore
+                    compiled2 = str(ob_resolved2.compile(dialect=_sa_mssql.dialect(), compile_kwargs={"literal_binds": True}))
+                except Exception:
+                    compiled2 = str(ob_resolved2)
+                expr_part = f"({compiled2}) {'DESC' if (str(effective_order_dir2).lower()=='desc') else 'ASC'}"
+                # Build order_multi parts manually to avoid unintended PK fallback
+                multi_specs = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []) or []
+                multi_parts: list[str] = []
+                try:
+                    alias_ident3 = adapter.table_ident(child_model_cls)
+                except Exception:
+                    alias_ident3 = f"[{getattr(child_model_cls,'__tablename__','')}]"
+                try:
+                    cols = getattr(child_model_cls, '__table__').columns  # type: ignore
+                except Exception:
+                    cols = {}
+                for spec in multi_specs:
+                    try:
+                        cn, _, dd = str(spec).partition(':')
+                        if cn and cn in cols:
+                            multi_parts.append(f"{alias_ident3}.[{cn}] {'DESC' if (dd or '').lower()=='desc' else 'ASC'}")
+                    except Exception:
+                        continue
+                order_clause = expr_part if not multi_parts else f"{expr_part}, {', '.join(multi_parts)}"
+            else:
+                # Fall back to adapter's standard column-based order builder
+                order_clause = adapter.build_order_clause(
+                    child_model_cls,
+                    child_model_cls,
+                    ob_resolved2 if isinstance(ob_resolved2, str) else rel_cfg.get('order_by'),
+                    effective_order_dir2,
+                    self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
+                )
             return adapter.build_list_relation_json(
                 child_table=child_model_cls,
                 projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],

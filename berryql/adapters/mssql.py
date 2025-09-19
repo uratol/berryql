@@ -198,9 +198,23 @@ class MSSQLAdapter(BaseAdapter):
                     parts.append(f"{alias_ident}.[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
             except Exception:
                 continue
-        if not parts and ob_str and ob_str in model_cls.__table__.columns:
-            dd = od_str
-            parts.append(f"{alias_ident}.[{ob_str}] {'DESC' if dd=='desc' else 'ASC'}")
+        # Primary order_by can be a column name or a raw SQL expression
+        if ob_str:
+            tbl_cols = getattr(model_cls, '__table__').columns  # type: ignore
+            if ob_str in tbl_cols:
+                # Only add named column if no multi specified
+                if not parts:
+                    dd = od_str
+                    parts.append(f"{alias_ident}.[{ob_str}] {'DESC' if dd=='desc' else 'ASC'}")
+            else:
+                # Raw SQL expression (already mapped/compiled by caller); include even when multi present
+                raw = str(ob_str).strip()
+                low = raw.lower()
+                expr_with_dir = raw if (low.endswith(' asc') or low.endswith(' desc')) else f"{raw} {'DESC' if od_str=='desc' else 'ASC'}"
+                if parts:
+                    parts.insert(0, expr_with_dir)
+                else:
+                    parts.append(expr_with_dir)
         if not parts:
             try:
                 pk_col = next(iter(model_cls.__table__.primary_key.columns)).name
