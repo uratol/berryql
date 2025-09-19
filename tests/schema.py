@@ -253,6 +253,13 @@ class PostQL(BerryType):
         'is_admin_eq': lambda M, info, v: M.is_admin == (bool(v) if isinstance(v, str) else v),
     })
     post_comments = relation('PostCommentQL', order_by='created_at', order_dir='desc')
+    # Demonstrate callable order_by using related record column via correlated subquery
+    # Order PostComment rows by their author's created_at ascending
+    post_comments_ordered_asc = relation(
+        'PostCommentQL',
+        order_by=lambda M, info: select(User.created_at).where(User.id == M.author_id).scalar_subquery(),
+        order_dir='asc'
+    )
     post_comments_agg = count('post_comments')
     # Demonstration custom field: total length of all comment contents for the post
     def _comment_text_len_builder(model_cls):

@@ -2037,7 +2037,7 @@ class BerrySchema:
                                 allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
                             applied_any = False
                             # Validate invalid order_by up front
-                            if order_by and order_by not in allowed_order:
+                            if order_by and isinstance(order_by, str) and order_by not in allowed_order:
                                 raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
                             if order_multi:
                                 for spec in order_multi:
@@ -2051,19 +2051,32 @@ class BerrySchema:
                                                 applied_any = True
                                     except Exception:
                                         raise
-                            if not applied_any and order_by and order_by in allowed_order:
-                                try:
-                                    col_obj = child_model_cls.__table__.c.get(order_by)
-                                except Exception:
-                                    col_obj = None
-                                if col_obj is not None:
-                                    # If no order_dir provided, default to ASC when explicit order_by is present
+                            if not applied_any and order_by:
+                                # Accept callable (lambda M, info -> expr) or direct SA expression
+                                expr = None
+                                if callable(order_by):
+                                    try:
+                                        expr = order_by(child_model_cls, info)
+                                    except Exception:
+                                        expr = None
+                                elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
+                                    expr = order_by
+                                elif isinstance(order_by, str) and order_by in allowed_order:
+                                    try:
+                                        expr = child_model_cls.__table__.c.get(order_by)
+                                    except Exception:
+                                        expr = None
+                                if expr is not None:
                                     descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
                                     try:
-                                        stmt = stmt.order_by(col_obj.desc() if descending else col_obj.asc())
+                                        # Prefer calling .desc/.asc when available
+                                        if hasattr(expr, 'desc') and hasattr(expr, 'asc'):
+                                            stmt = stmt.order_by(expr.desc() if descending else expr.asc())
+                                        else:
+                                            stmt = stmt.order_by(expr)
                                         applied_any = True
                                     except Exception:
-                                        raise
+                                        pass
                             # Apply default ordering from schema meta if still no order applied
                             if not applied_any and (not order_by) and (meta_copy.get('order_by') or meta_copy.get('order_multi')):
                                 try:
@@ -2079,10 +2092,27 @@ class BerrySchema:
                                     elif meta_copy.get('order_by'):
                                         cn = meta_copy.get('order_by')
                                         dd = def_dir
-                                        col = child_model_cls.__table__.c.get(cn)
-                                        if col is not None:
-                                            stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
-                                            applied_any = True
+                                        expr2 = None
+                                        # Support callables and SA expressions in schema default too
+                                        if callable(cn):
+                                            try:
+                                                expr2 = cn(child_model_cls, info)
+                                            except Exception:
+                                                expr2 = None
+                                        elif hasattr(cn, 'desc') or hasattr(cn, 'asc'):
+                                            expr2 = cn
+                                        else:
+                                            col = child_model_cls.__table__.c.get(cn)
+                                            expr2 = col
+                                        if expr2 is not None:
+                                            try:
+                                                if hasattr(expr2, 'desc') and hasattr(expr2, 'asc'):
+                                                    stmt = stmt.order_by(expr2.desc() if dd=='desc' else expr2.asc())
+                                                else:
+                                                    stmt = stmt.order_by(expr2)
+                                                applied_any = True
+                                            except Exception:
+                                                pass
                                 except Exception:
                                     pass
                             # Apply filters
@@ -2782,7 +2812,9 @@ class BerrySchema:
                     except Exception:
                         allowed_fields_rel = []
                     ob_rel = rel_cfg.get('order_by')
-                    if ob_rel and ob_rel not in allowed_fields_rel:
+                    # Only validate against allowed field names when order_by is a string.
+                    # Callables and SQLAlchemy expressions are allowed and handled later.
+                    if isinstance(ob_rel, str) and ob_rel and ob_rel not in allowed_fields_rel:
                         raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     child_model_cls = target_b.model
                     # Determine FK from child->parent, allow explicit override via relation meta

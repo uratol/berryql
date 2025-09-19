@@ -1202,18 +1202,37 @@ class RelationSQLBuilders:
                     if col is not None:
                         inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
                         ordered = True
-            if not ordered and rel_cfg.get('order_by') in allowed_fields:
-                cn = rel_cfg.get('order_by')
-                # When explicit order_by is provided without explicit dir, default to ASC
-                try:
-                    eff_dir_top = self._effective_order_dir(rel_cfg)
-                except Exception:
-                    eff_dir_top = None
-                dd = (eff_dir_top or dir_value_fn(rel_cfg.get('order_dir'))).lower()
-                col = getattr(child_model_cls_i, cn, None)
-                if col is not None:
-                    inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
-                    ordered = True
+            if not ordered:
+                ob_val = rel_cfg.get('order_by')
+                if ob_val is not None:
+                    # Support callable or direct SQLAlchemy expression for ordering
+                    expr = None
+                    if callable(ob_val):
+                        try:
+                            expr = ob_val(child_model_cls_i, info)
+                        except Exception:
+                            expr = None
+                    elif hasattr(ob_val, 'desc') or hasattr(ob_val, 'asc'):
+                        expr = ob_val
+                    # Fallback: string column name (allowed_fields guard)
+                    if expr is None and ob_val in allowed_fields:
+                        expr = getattr(child_model_cls_i, ob_val, None)
+                    if expr is not None:
+                        try:
+                            eff_dir_top = self._effective_order_dir(rel_cfg)
+                        except Exception:
+                            eff_dir_top = None
+                        dd = (eff_dir_top or dir_value_fn(rel_cfg.get('order_dir')) or 'asc')
+                        try:
+                            inner_sel_i = inner_sel_i.order_by(expr.desc() if str(dd).lower() == 'desc' else expr.asc())
+                            ordered = True
+                        except Exception:
+                            # As a last resort, try plain order_by(expr)
+                            try:
+                                inner_sel_i = inner_sel_i.order_by(expr)
+                                ordered = True
+                            except Exception:
+                                pass
             if not ordered:
                 try:
                     inner_sel_i = inner_sel_i.order_by(self._pk_col(child_model_cls_i).asc())
