@@ -453,9 +453,11 @@ class BerrySchema:
                     continue
                 # If this relation points to an ancestor in the current build stack, include a slim input
                 # that only allows identifying fields (pk and simple direct FKs) instead of full recursion.
+                # IMPORTANT: Apply slimming only for single (to-one) relations to break cycles, but allow
+                # full inputs for list (to-many) relations so nested payloads can include writable FK fields.
                 use_slim = False
                 try:
-                    if target_name in _stack:
+                    if (target_name in _stack) and is_single:
                         use_slim = True
                 except Exception:
                     use_slim = False
