@@ -1758,7 +1758,9 @@ class BerrySchema:
                             if fk_col is None:
                                 return []
                             from sqlalchemy import select as _select
-                            # Determine parent id value: use ORM model if available; else fallback to hydrated scalar 'id'
+                            # Determine parent id value robustly:
+                            # Prefer ORM model's PK when available; otherwise attempt to read a non-callable
+                            # attribute on the Strawberry instance (guarding against resolver functions).
                             if parent_model is not None:
                                 try:
                                     pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
@@ -1766,7 +1768,23 @@ class BerrySchema:
                                 except Exception:
                                     parent_id_val = None
                             else:
-                                parent_id_val = getattr(self, 'id', None)
+                                # Try by declared PK name on the Berry type, fallback to 'id'
+                                pk_attr_name = None
+                                try:
+                                    parent_model_cls2 = getattr(parent_btype_local, 'model', None)
+                                    if parent_model_cls2 is not None:
+                                        pk_attr_name = self.__berry_registry__._get_pk_name(parent_model_cls2)
+                                except Exception:
+                                    pk_attr_name = None
+                                if not pk_attr_name:
+                                    pk_attr_name = 'id'
+                                parent_id_val = getattr(self, pk_attr_name, None)
+                                # If the attribute is a resolver/callable, ignore and fallback to instance dict
+                                try:
+                                    if callable(parent_id_val):
+                                        parent_id_val = getattr(self, '__dict__', {}).get(pk_attr_name, None)
+                                except Exception:
+                                    pass
                             if parent_id_val is None:
                                 return []
                             # Determine requested scalar fields for this relation, prefer extractor meta from root if present
