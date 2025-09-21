@@ -1,5 +1,4 @@
 from __future__ import annotations
-import re
 import logging
 import uuid
 from typing import Any, Dict, Optional, Type, List, get_args, get_origin
@@ -452,7 +451,7 @@ def build_merge_resolver_for_type(
                             _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
                             raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
                 # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints)
-                from sqlalchemy import select as _sa_select, delete as _sa_delete
+                from sqlalchemy import select as _sa_select
                 async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
                     try:
                         bfields = getattr(parent_btype_cls, '__berry_fields__', {}) or {}

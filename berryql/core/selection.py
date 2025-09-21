@@ -145,8 +145,7 @@ class RelationSelectionExtractor:
             sub_children = self._children(sub_node)
             if not sub_children:
                 return
-            tgt_b = self.registry.types.get(getattr(getattr(parent_btype.__berry_fields__.get(cfg.get('relation_name') or ''), 'meta', {}), 'target', None)) if False else None  # placeholder not used
-            # Instead, infer the btype from cfg when available; fallback to scanning by names at runtime
+            # Infer the btype from cfg when available; fallback to scanning by names at runtime
             # We accept that fields list is filled as we walk
             for sub in sub_children:
                 sub_name = getattr(getattr(sub, 'name', None), 'value', None) or getattr(sub, 'name', None)

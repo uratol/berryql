@@ -1,6 +1,5 @@
 from __future__ import annotations
-from sqlalchemy import func, text as _text, literal
-from sqlalchemy.dialects.postgresql import BYTEA as _PG_BYTEA
+from sqlalchemy import func, text as _text
 from .base import BaseAdapter
 
 class PostgresAdapter(BaseAdapter):
@@ -13,6 +12,7 @@ class PostgresAdapter(BaseAdapter):
         # Prefer a typed literal over raw text for JSON to avoid deprecation warnings
         try:
             from sqlalchemy.dialects.postgresql import JSON as _PG_JSON
+            from sqlalchemy import literal
             return func.coalesce(expr, literal('[]', type_=_PG_JSON()))
         except Exception:
             # Fallback keeps previous behavior if dialect types aren't available at import time

@@ -252,10 +252,7 @@ class RelationSQLBuilders:
             info=info,
         )
         # Apply type-level default scope if provided
-        try:
-            type_default_where = getattr(self, 'registry', None) and None
-        except Exception:
-            type_default_where = None
+        # type_default_where not used in single-child builder; kept for parity with list builder
         # In this single-relation builder path we don't have rel_cfg; the caller combines values.
         # filter args
         expanded_specs = self._expand_arg_specs(arg_specs or {})

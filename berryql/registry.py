@@ -1,25 +1,31 @@
 from __future__ import annotations
-from dataclasses import dataclass, field as dc_field
-import re
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_type_hints, get_origin, get_args
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_origin, get_args
+from enum import Enum
+from datetime import datetime
 import asyncio
 import strawberry
-from sqlalchemy import select, func, text as _text
-from sqlalchemy import and_ as _and
+from sqlalchemy import select
 from .adapters import get_adapter  # adapter abstraction
-from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.orm import load_only
-from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, Numeric as SANumeric, Enum as SAEnumType, JSON as SA_JSON
-from sqlalchemy.types import TypeDecorator as _SATypeDecorator
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
-from strawberry.scalars import JSON as ST_JSON
-import uuid as _py_uuid
-from datetime import datetime
-from enum import Enum
 from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
+from .core.utils import _py_uuid
+from strawberry.scalars import JSON as ST_JSON
+from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, JSON as SA_JSON, Numeric as SANumeric
+try:
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
+except Exception:  # pragma: no cover
+    PG_UUID = PG_ARRAY = PG_JSONB = object  # type: ignore
+try:
+    from sqlalchemy.types import TypeDecorator as _SATypeDecorator
+except Exception:  # pragma: no cover
+    class _SATypeDecorator:  # type: ignore
+        pass
+try:
+    from sqlalchemy import Enum as SAEnumType
+except Exception:  # pragma: no cover
+    SAEnumType = object  # type: ignore
 if TYPE_CHECKING:  # pragma: no cover - type checking only
     class Registry: ...  # forward ref placeholder
 
@@ -43,16 +49,13 @@ except Exception:  # pragma: no cover
 T = TypeVar('T')
 
 # DRY split: import core building blocks
-from .core.fields import FieldDef, FieldDescriptor, field, relation, aggregate, count, custom, custom_object, DomainDescriptor
-from .core.filters import FilterSpec, OPERATOR_REGISTRY, register_operator, normalize_filter_spec as _normalize_filter_spec
-from .core.selection import RelationSelectionExtractor, RootSelectionExtractor
+from .core.fields import FieldDef, FieldDescriptor, DomainDescriptor
+from .core.filters import FilterSpec, OPERATOR_REGISTRY, normalize_filter_spec as _normalize_filter_spec
 from .core.analyzer import QueryAnalyzer
 from .core.utils import (
     Direction,
     dir_value as _dir_value,
     coerce_where_value as _coerce_where_value,
-    coerce_literal as _coerce_literal,
-    normalize_relation_cfg as _normalize_rel_cfg,
     expr_from_where_dict as _expr_from_where_dict,
     to_where_dict as _to_where_dict,
     normalize_order_multi_values as _norm_order_multi,
@@ -658,15 +661,13 @@ class BerrySchema:
         Defaults to str for unknown types (safe GraphQL scalar mapping).
         """
         try:
-            # Allow passing a SQLAlchemy Column; if so, unwrap to its .type but keep a ref
-            col_obj = None
+            # Allow passing a SQLAlchemy Column; if so, unwrap to its .type
             try:
                 # A Column-like will have both 'type' and 'info' attributes
                 if hasattr(sqlatype, 'type') and hasattr(sqlatype, 'info'):
-                    col_obj = sqlatype
                     sqlatype = getattr(sqlatype, 'type', sqlatype)
             except Exception:
-                col_obj = None
+                pass
             # Unwrap TypeDecorator when possible and special-case BinaryBlob/BinaryArray
             if isinstance(sqlatype, _SATypeDecorator):
                 # Special-case our BinaryArray -> List[str]
@@ -1296,7 +1297,6 @@ class BerrySchema:
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
-                    post_process = fdef.meta.get('post_process')
                     # Relation description: prefer explicit meta.comment; else SQLAlchemy relationship doc/info; else target model's table comment
                     relation_description = None
                     try:
@@ -1386,7 +1386,7 @@ class BerrySchema:
                                     pp = None
                                 if pp is not None:
                                     try:
-                                        import inspect, asyncio
+                                        import inspect
                                         res = pp(val, info)
                                         if inspect.isawaitable(res):
                                             res = await res
@@ -2028,8 +2028,7 @@ class BerrySchema:
                                         expr_t3 = frag3(child_model_cls, info)
                                         if expr_t3 is not None:
                                             stmt = stmt.where(expr_t3)
-                            # Ad-hoc JSON where for relation list if present on selection
-                            rel_meta_map = getattr(self, '_pushdown_meta', None)  # not reliable; read from extractor cfg instead
+                            # Ad-hoc JSON where for relation list if present on selection (not used; keep future hook comment)
                             # Ordering (multi then single) if column whitelist permits
                             allowed_order = getattr(target_cls_i, '__ordering__', None)
                             if allowed_order is None:
@@ -2123,7 +2122,6 @@ class BerrySchema:
                                     f_spec = target_filters.get(arg_name)
                                     if not f_spec:
                                         raise ValueError(f"Unknown filter argument: {arg_name}")
-                                    orig_val = val
                                     if f_spec.transform:
                                         try:
                                             val = f_spec.transform(val)

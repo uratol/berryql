@@ -1,8 +1,7 @@
 from __future__ import annotations
-from typing import Any
-from sqlalchemy import func, literal
 
 class BaseAdapter:
+    """Base SQL adapter interface used by BerryQL builders."""
     name = 'base'
     def json_object(self, *args):
         raise NotImplementedError
