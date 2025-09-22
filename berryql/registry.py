@@ -380,6 +380,11 @@ class BerrySchema:
             table_cols = set(c.name for c in getattr(getattr(model_cls, '__table__', None), 'columns', []) or []) if model_cls is not None else set()
         except Exception:
             table_cols = set()
+        # Map of column name -> SQLAlchemy Column to fetch comments/descriptions
+        try:
+            col_obj_map: Dict[str, Any] = {c.name: c for c in getattr(getattr(model_cls, '__table__', None), 'columns', []) or []} if model_cls is not None else {}
+        except Exception:
+            col_obj_map = {}
 
         # Scalars and relations
         for fname, fdef in (getattr(btype_cls, '__berry_fields__', {}) or {}).items():
@@ -434,11 +439,34 @@ class BerrySchema:
                         anns[fname] = Optional[py_t]
                 except Exception:
                     anns[fname] = Optional[str]
-                # Use strawberry.UNSET to distinguish omitted vs explicit null
+                # Compute description from field meta comment or SQLAlchemy Column.comment
+                desc: str | None = None
                 try:
-                    setattr(InPlain, fname, UNSET)
+                    desc = (getattr(fdef, 'meta', {}) or {}).get('comment')
                 except Exception:
-                    setattr(InPlain, fname, None)
+                    desc = None
+                if not desc:
+                    try:
+                        source_name = src_col or fname
+                        col_obj = col_obj_map.get(source_name)
+                        if col_obj is not None:
+                            desc = getattr(col_obj, 'comment', None)
+                    except Exception:
+                        pass
+                # Use strawberry.field to attach description while keeping UNSET semantics
+                try:
+                    if desc:
+                        setattr(InPlain, fname, strawberry.field(default=UNSET, description=desc))  # type: ignore[arg-type]
+                    else:
+                        setattr(InPlain, fname, UNSET)
+                except Exception:
+                    try:
+                        if desc:
+                            setattr(InPlain, fname, strawberry.field(default=None, description=desc))  # type: ignore[arg-type]
+                        else:
+                            setattr(InPlain, fname, None)
+                    except Exception:
+                        setattr(InPlain, fname, None)
             elif fdef.kind == 'relation':
                 # Build nested inputs recursively
                 # Respect read_only on relations to avoid cycles in input types
@@ -548,10 +576,27 @@ class BerrySchema:
                     try:
                         if is_single:
                             anns[fname] = Optional[child_input]  # type: ignore[index]
-                            setattr(InPlain, fname, UNSET)
+                            # Attach relation comment if provided
+                            _rel_desc = None
+                            try:
+                                _rel_desc = (getattr(fdef, 'meta', {}) or {}).get('comment')
+                            except Exception:
+                                _rel_desc = None
+                            if _rel_desc:
+                                setattr(InPlain, fname, strawberry.field(default=UNSET, description=_rel_desc))  # type: ignore[arg-type]
+                            else:
+                                setattr(InPlain, fname, UNSET)
                         else:
                             anns[fname] = Optional[List[child_input]]  # type: ignore[index]
-                            setattr(InPlain, fname, UNSET)
+                            _rel_desc = None
+                            try:
+                                _rel_desc = (getattr(fdef, 'meta', {}) or {}).get('comment')
+                            except Exception:
+                                _rel_desc = None
+                            if _rel_desc:
+                                setattr(InPlain, fname, strawberry.field(default=UNSET, description=_rel_desc))  # type: ignore[arg-type]
+                            else:
+                                setattr(InPlain, fname, UNSET)
                     except Exception:
                         anns[fname] = Optional[str]
                         try:
