@@ -271,10 +271,35 @@ class RelationSelectionExtractor:
             setattr(self, '_info', info)
         except Exception:
             pass
+        # Build candidate root field names to handle auto camelCase/name converters
+        candidates = {root_field_name}
+        try:
+            # Prefer explicit name converter if available
+            name_conv = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
+            if callable(name_conv):
+                try:
+                    candidates.add(name_conv(root_field_name))
+                except Exception:
+                    pass
+            # Fallback to naive snake->camel when auto_camel_case is enabled
+            if getattr(self.registry, '_auto_camel_case', False):
+                def _to_camel(n: str) -> str:
+                    if not n:
+                        return n
+                    parts = str(n).split('_')
+                    if not parts:
+                        return n
+                    head = parts[0]
+                    tail = ''.join(p.capitalize() for p in parts[1:])
+                    return head + tail
+                candidates.add(_to_camel(root_field_name))
+        except Exception:
+            # best-effort; keep original only
+            pass
         try:
             fields = getattr(info, 'selected_fields', None)
             for f in (fields or []):
-                if getattr(f, 'name', None) == root_field_name:
+                if getattr(f, 'name', None) in candidates:
                     fake = type('Sel2', (), {})()
                     setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
                     self._walk_selected(fake, btype, out)
@@ -317,7 +342,7 @@ class RelationSelectionExtractor:
             field_nodes = None
         if field_nodes:
             try:
-                root_nodes = [n for n in field_nodes if _name_ast(n) == root_field_name]
+                root_nodes = [n for n in field_nodes if _name_ast(n) in candidates]
                 if root_nodes:
                     root_node = root_nodes[0]
                     for rel_node in _children_ast(root_node):
