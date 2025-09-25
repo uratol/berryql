@@ -843,30 +843,56 @@ class RelationSQLBuilders:
                         if not nb or not nb.model:
                             continue
                         grand_model = nb.model
-                        # FK grandchild -> current_model_cls (respect explicit fk_column_name when provided)
-                        g_fk = None
+                        # Determine correlation for nested relation based on mode
+                        g_fk = None  # foreign key on grand_model -> current_model (for list nested)
+                        child_fk_to_nested_name: str | None = None  # FK on current_model -> grand_model (for single nested)
                         try:
-                            explicit_child_fk = ncfg.get('fk_column_name')
+                            is_single_nested = bool(ncfg.get('single') or False)
                         except Exception:
-                            explicit_child_fk = None
-                        try:
-                            if explicit_child_fk and hasattr(grand_model, '__table__'):
+                            is_single_nested = False
+                        if is_single_nested:
+                            # For single nested (e.g., Scene.location), correlate grand_model PK to current_subq's FK column
+                            try:
+                                # Allow explicit override via fk_column_name on the relation config
+                                explicit_parent_fk = ncfg.get('fk_column_name')
+                            except Exception:
+                                explicit_parent_fk = None
+                            # Prefer registry discovery of parent FK column name, fallback to conventional '<rel>_id'
+                            try:
+                                child_fk_to_nested_name = explicit_parent_fk or self.registry._find_parent_fk_column_name(current_model_cls, grand_model, nname) or f"{nname}_id"
+                            except Exception:
+                                child_fk_to_nested_name = f"{nname}_id"
+                            # Validate the FK helper column exists on current_subq
+                            try:
+                                if not hasattr(current_subq.c, child_fk_to_nested_name):
+                                    # If helper not present, skip this nested (no way to correlate)
+                                    continue
+                            except Exception:
+                                continue
+                        else:
+                            # For list nested, find FK on grand_model referencing current_model
+                            try:
+                                explicit_child_fk = ncfg.get('fk_column_name')
+                            except Exception:
+                                explicit_child_fk = None
+                            try:
+                                if explicit_child_fk and hasattr(grand_model, '__table__'):
+                                    for c in grand_model.__table__.columns:
+                                        if c.name == explicit_child_fk:
+                                            g_fk = c
+                                            break
+                            except Exception:
+                                g_fk = None
+                            if g_fk is None:
                                 for c in grand_model.__table__.columns:
-                                    if c.name == explicit_child_fk:
-                                        g_fk = c
+                                    for fk in c.foreign_keys:
+                                        if fk.column.table.name == current_model_cls.__table__.name:
+                                            g_fk = c
+                                            break
+                                    if g_fk is not None:
                                         break
-                        except Exception:
-                            g_fk = None
-                        if g_fk is None:
-                            for c in grand_model.__table__.columns:
-                                for fk in c.foreign_keys:
-                                    if fk.column.table.name == current_model_cls.__table__.name:
-                                        g_fk = c
-                                        break
-                                if g_fk is not None:
-                                    break
-                        if g_fk is None:
-                            continue
+                            if g_fk is None:
+                                continue
                         # Projected scalar fields for nested
                         n_cols = list(ncfg.get('fields') or [])
                         if n_cols:
@@ -877,15 +903,38 @@ class RelationSQLBuilders:
                         if not n_cols:
                             for sf2, sd2 in nb.__berry_fields__.items():
                                 if sd2.kind == 'scalar':
+                                    # Exclude write-only helper scalars
+                                    try:
+                                        if (getattr(sd2, 'meta', {}) or {}).get('write_only'):
+                                            continue
+                                    except Exception:
+                                        pass
                                     n_cols.append(sf2)
-                        is_single_nested = bool(ncfg.get('single') or False)
-                        # Base select for nested correlated to current_subq PK column
-                        n_sel = (
-                            select(*self._project_columns(grand_model, n_cols or []))
-                            .select_from(grand_model)
-                            .where(g_fk == getattr(current_subq.c, self._pk_name(current_model_cls)))
-                            .correlate(current_subq)
-                        )
+                        # Ensure FK helper columns for any single nested relations requested under this node
+                        try:
+                            nested_map_local = ncfg.get('nested') or {}
+                            if nested_map_local:
+                                # Reuse centralized helper to append '<rel>_id' when needed and available
+                                n_cols = self._ensure_helper_fk_for_single_nested(n_cols, grand_model, nb, nested_map_local)
+                        except Exception:
+                            pass
+                        # Base select for nested: correlate appropriately depending on mode
+                        if is_single_nested and child_fk_to_nested_name:
+                            # grand_model PK equals current_subq's FK to nested
+                            n_sel = (
+                                select(*self._project_columns(grand_model, n_cols or []))
+                                .select_from(grand_model)
+                                .where(self._pk_col(grand_model) == getattr(current_subq.c, child_fk_to_nested_name))
+                                .correlate(current_subq)
+                            )
+                        else:
+                            # list nested: grand_model's FK back to current equals current PK
+                            n_sel = (
+                                select(*self._project_columns(grand_model, n_cols or []))
+                                .select_from(grand_model)
+                                .where(g_fk == getattr(current_subq.c, self._pk_name(current_model_cls)))
+                                .correlate(current_subq)
+                            )
                         # Apply nested where/default_where
                         rr2 = ncfg.get('where')
                         if rr2 is not None:
@@ -1063,6 +1112,7 @@ class RelationSQLBuilders:
                         and r2 in nested_requested
                     ):
                         fk2 = f"{r2}_id"
+                        # Avoid selecting write-only helpers unless needed for correlation
                         if fk2 in child_model_cls_i.__table__.columns and fk2 not in requested_scalar_i:
                             requested_scalar_i.append(fk2)
             except Exception:
