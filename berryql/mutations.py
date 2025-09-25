@@ -450,6 +450,16 @@ def build_merge_resolver_for_type(
                             _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
                             _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
                             raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
+                # Before deleting children, run type-level pre-callbacks with delete context
+                # so application hooks can perform cleanup while child rows still exist
+                data_local = await _maybe_call_pre_many(
+                    local_type_pre_cbs,
+                    model_cls_local,
+                    info,
+                    data_local,
+                    {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True}
+                )
+
                 # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints)
                 from sqlalchemy import select as _sa_select
                 async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
@@ -510,8 +520,6 @@ def build_merge_resolver_for_type(
                         except Exception:
                             continue
                 await _cascade_delete_children(model_cls_local, btype_local, pk_val_local)
-                # Type-level pre callbacks
-                data_local = await _maybe_call_pre_many(local_type_pre_cbs, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
                 # Use bulk DELETE to avoid ORM trying to NULL-out child FKs (which may be NOT NULL)
                 try:
                     from sqlalchemy import delete as _sa_delete

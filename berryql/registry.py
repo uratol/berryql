@@ -1158,14 +1158,21 @@ class BerrySchema:
             # Helper: build a safe scalar resolver that reads from the attached model
             def _make_scalar_resolver(fname_local: str, src_col_name: Optional[str] = None):
                 def _resolver(self, info: StrawberryInfo):  # noqa: D401
-                    # Prefer reading from the attached SQLAlchemy model to avoid mutating the Strawberry instance
+                    # Prefer an explicitly set value on the Strawberry instance first.
+                    # This allows from_model() or custom resolvers to override values when needed.
+                    try:
+                        dself = object.__getattribute__(self, '__dict__')
+                        if isinstance(dself, dict) and fname_local in dself:
+                            return dself.get(fname_local, None)
+                    except Exception:
+                        pass
+                    # Otherwise, read from the attached SQLAlchemy model when available.
                     try:
                         m = getattr(self, '_model', None)
                     except Exception:
                         m = None
                     col_name = src_col_name or fname_local
                     if m is not None:
-                        # Use instance __dict__ first to avoid triggering descriptors
                         try:
                             dct = getattr(m, '__dict__', None)
                             if isinstance(dct, dict) and col_name in dct:
@@ -1176,7 +1183,7 @@ class BerrySchema:
                             return getattr(m, col_name, None)
                         except Exception:
                             return None
-                    # Fallback: return already set attribute value if present
+                    # Lastly, return whatever is set on the instance (if any)
                     try:
                         dself = object.__getattribute__(self, '__dict__')
                         return dself.get(fname_local, None) if isinstance(dself, dict) else None
