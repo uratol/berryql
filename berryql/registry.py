@@ -2495,9 +2495,21 @@ class BerrySchema:
                     meta_copy = dict(fdef.meta)
                     def _make_custom_resolver(meta_copy=meta_copy, fname_local=fname):
                         async def custom_resolver(self, info: StrawberryInfo):  # noqa: D401
-                            # Fast-path: if root query already populated attribute (no N+1), return it
-                            pre_value = getattr(self, fname_local, None)
-                            if pre_value is not None:
+                            # Fast-path: if root query already populated attribute (no N+1), return it.
+                            # Important: avoid accidentally returning the bound resolver method itself
+                            # when the attribute isn't set on the instance (__dict__).
+                            pre_value = None
+                            try:
+                                # Prefer instance dict value if present (set by hydration)
+                                if hasattr(self, '__dict__') and fname_local in getattr(self, '__dict__', {}):
+                                    pre_value = self.__dict__[fname_local]
+                                else:
+                                    # Fallback to explicit prefetched marker used by hydrators
+                                    pre_value = getattr(self, f"_{fname_local}_prefetched", None)
+                            except Exception:
+                                pre_value = None
+                            # Only short-circuit when we have a real value (and not a callable)
+                            if pre_value is not None and not callable(pre_value):
                                 return pre_value
                             parent_model = getattr(self, '_model', None)
                             if parent_model is None:
@@ -2509,15 +2521,17 @@ class BerrySchema:
                             if builder is None:
                                 return None
                             import inspect, asyncio, json as _json
-                            # Try builder(parent_model) only for fallback (may be less efficient)
+                            # Try builder(model_cls) for robust evaluation; scope by PK when possible
                             try:
+                                # Determine model class for the parent
+                                model_cls_for_builder = type(parent_model)
                                 if len(inspect.signature(builder).parameters) == 1:
-                                    result_obj = builder(parent_model)
+                                    result_obj = builder(model_cls_for_builder)
                                 else:
-                                    result_obj = builder(parent_model, session)
+                                    result_obj = builder(model_cls_for_builder, session)
                             except Exception:
                                 try:
-                                    result_obj = builder(parent_model)
+                                    result_obj = builder(model_cls_for_builder)
                                 except Exception:
                                     return None
                             if asyncio.iscoroutine(result_obj):
@@ -2527,6 +2541,20 @@ class BerrySchema:
                             except Exception:
                                 _Select = None  # type: ignore
                             if _Select is not None and isinstance(result_obj, _Select):
+                                # If possible, constrain the SELECT to this instance by primary key
+                                try:
+                                    from sqlalchemy.inspection import inspect as _sa_inspect  # type: ignore
+                                    pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
+                                    if pk_cols:
+                                        pk_col = pk_cols[0]
+                                        pk_val = getattr(parent_model, getattr(pk_col, 'key', 'id'), None)
+                                        if pk_val is not None:
+                                            try:
+                                                result_obj = result_obj.where(pk_col == pk_val)
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
                                 exec_result = await session.execute(result_obj)
                                 row = exec_result.first()
                                 if not row:
