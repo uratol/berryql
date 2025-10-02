@@ -271,7 +271,7 @@ def build_merge_resolver_for_type(
                 pass
             return None
 
-        async def _enforce_scope(model_cls_local, instance_local, scope_raw: Any | None):
+        async def _enforce_scope(model_cls_local, instance_local, scope_raw: Any | None, scope_ctx: Any | None = None):
             """Enforce mutation scope using the same where builder as queries.
 
             Accepts dict/JSON string/callable/SQLA expression. Callable may return any of those.
@@ -305,15 +305,55 @@ def build_merge_resolver_for_type(
             )
             # Reuse common builder to apply where regardless of type (dict/str/expr)
             builder = RelationSQLBuilders(schema)
-            stmt = builder._apply_where_common(
-                stmt,
-                model_cls_local,
-                v,
-                strict=True,
-                to_where_dict=_to_where_dict,
-                expr_from_where_dict=_expr_from_where_dict,
-                info=info,
-            )
+            try:
+                stmt = builder._apply_where_common(
+                    stmt,
+                    model_cls_local,
+                    v,
+                    strict=True,
+                    to_where_dict=_to_where_dict,
+                    expr_from_where_dict=_expr_from_where_dict,
+                    info=info,
+                )
+            except ValueError as e:
+                # Fallback: if scope refers to columns not present on the immediate model (e.g., episode_id on Beat/Line),
+                # and a scope root model/instance is available, enforce against the root instead.
+                if 'Unknown where column' in str(e):
+                    try:
+                        root_model = (scope_ctx or {}).get('scope_root_model') if isinstance(scope_ctx, dict) else None
+                        root_inst = (scope_ctx or {}).get('scope_root_inst') if isinstance(scope_ctx, dict) else None
+                    except Exception:
+                        root_model = None
+                        root_inst = None
+                    if root_model is not None and root_inst is not None:
+                        try:
+                            root_pk_name = _get_pk_name_safe(root_model)
+                        except Exception:
+                            root_pk_name = 'id'
+                        try:
+                            root_pk_val = getattr(root_inst, root_pk_name, None)
+                        except Exception:
+                            root_pk_val = None
+                        if root_pk_val is None:
+                            root_pk_val = await _get_pk_value(root_inst, root_model)
+                        # Rebuild statement for root model and apply scope there
+                        stmt = select(getattr(root_model.__table__.c, root_pk_name)).select_from(root_model).where(
+                            getattr(root_model.__table__.c, root_pk_name) == root_pk_val
+                        )
+                        stmt = builder._apply_where_common(
+                            stmt,
+                            root_model,
+                            v,
+                            strict=True,
+                            to_where_dict=_to_where_dict,
+                            expr_from_where_dict=_expr_from_where_dict,
+                            info=info,
+                        )
+                        res = await session.execute(stmt)
+                        row = res.first()
+                        return bool(row)
+                # No viable fallback; re-raise
+                raise
             res = await session.execute(stmt)
             row = res.first()
             return bool(row)
@@ -432,7 +472,7 @@ def build_merge_resolver_for_type(
                         pass
                     _stub = _StubParent()
                     setattr(_stub, parent_pk_name_scope, _child_fk_val)
-                    ok_parent = await _enforce_scope(parent_model_cls_local, _stub, _parent_scope)
+                    ok_parent = await _enforce_scope(parent_model_cls_local, _stub, _parent_scope, parent_ctx)
                     if not ok_parent:
                         raise PermissionError("Mutation out of scope for delete; parent not within scope")
                 # Enforce scope for delete:
@@ -745,7 +785,7 @@ def build_merge_resolver_for_type(
                     parent_model_cls_local = parent_ctx.get('parent_model') if isinstance(parent_ctx, dict) else None
                     parent_inst_local = parent_ctx.get('parent_inst') if isinstance(parent_ctx, dict) else None
                     if parent_model_cls_local is not None and parent_inst_local is not None:
-                        ok_parent = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'))
+                        ok_parent = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'), parent_ctx)
                         if not ok_parent:
                             raise PermissionError("Mutation out of scope for update; parent not within scope")
                 else:
@@ -900,7 +940,7 @@ def build_merge_resolver_for_type(
                     parent_model_cls_local = parent_ctx.get('parent_model') if isinstance(parent_ctx, dict) else None
                     parent_inst_local = parent_ctx.get('parent_inst') if isinstance(parent_ctx, dict) else None
                     if parent_model_cls_local is not None and parent_inst_local is not None:
-                        ok2p = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'))
+                        ok2p = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'), parent_ctx)
                         if not ok2p:
                             try:
                                 await session.rollback()
@@ -939,7 +979,19 @@ def build_merge_resolver_for_type(
                     child_pk_name = 'id'
                 if is_single:
                     child_data = schema._input_to_dict(rel_value)
-                    child_inst = await _merge_single(child_model, child_btype, child_data, parent_ctx={'parent_model': model_cls_local, 'parent_inst': instance}, rel_name_from_parent=rel_key)
+                    child_inst = await _merge_single(
+                        child_model,
+                        child_btype,
+                        child_data,
+                        parent_ctx={
+                            'parent_model': model_cls_local,
+                            'parent_inst': instance,
+                            # Establish/propagate scope root for inherited domain scopes
+                            'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
+                            'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
+                        },
+                        rel_name_from_parent=rel_key,
+                    )
                     try:
                         fk_name = schema._find_parent_fk_column_name(model_cls_local, child_model, rel_key)
                     except Exception:
@@ -980,6 +1032,9 @@ def build_merge_resolver_for_type(
                                 'parent_inst': instance,
                                 'child_fk_col_name': child_fk_col_name,
                                 'parent_scope': eff_scope,
+                                # Establish/propagate scope root for inherited domain scopes
+                                'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
+                                'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
                             },
                             rel_name_from_parent=rel_key,
                         )
