@@ -1331,10 +1331,16 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             # Always attach a fresh Strawberry field with explicit resolver to avoid
             # leaking the original field's unresolved annotation into this container.
             try:
-                # Reuse description if present on the original field
-                _desc = getattr(getattr(fval, 'field_definition', None), 'description', None)
+                # Reuse description and custom GraphQL name (if provided on the original field)
+                _fd = getattr(fval, 'field_definition', None)
+                # Prefer StrawberryField attributes directly; some versions don't populate field_definition here
+                _desc = getattr(fval, 'description', None)
+                _gql_name = getattr(fval, 'graphql_name', None)
+                if not _gql_name and _fd is not None:
+                    _gql_name = getattr(_fd, 'name', None)
             except Exception:
                 _desc = None
+                _gql_name = None
             # Resolve callable to the underlying plain function for Strawberry
             try:
                 _fn_eff = fn
@@ -1345,10 +1351,19 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             except Exception:
                 _fn_eff = fn
             try:
-                fld = strawberry.field(resolver=_fn_eff, description=str(_desc)) if _desc else strawberry.field(resolver=_fn_eff)
-                setattr(DomSt_local, fname, fld)
+                # Preserve original GraphQL field name if available (e.g., name="import")
+                if _gql_name:
+                    fld = strawberry.field(name=str(_gql_name), resolver=_fn_eff, description=str(_desc)) if _desc else strawberry.field(name=str(_gql_name), resolver=_fn_eff)
+                else:
+                    fld = strawberry.field(resolver=_fn_eff, description=str(_desc)) if _desc else strawberry.field(resolver=_fn_eff)
+                # If GraphQL name is provided, also attach the field under that attribute name to ensure
+                # Strawberry uses it verbatim when decorating the container type.
+                attr_name_to_set = str(_gql_name) if _gql_name else fname
+                setattr(DomSt_local, attr_name_to_set, fld)
             except Exception:
-                setattr(DomSt_local, fname, strawberry.field(resolver=_fn_eff))
+                # Fallback without description/name
+                attr_name_to_set = str(_gql_name) if _gql_name else fname
+                setattr(DomSt_local, attr_name_to_set, strawberry.field(resolver=_fn_eff))
             # If we could compute an effective return type, force the strawberry field
             # to use it by overriding its type_annotation. This prevents Strawberry from
             # failing to resolve forward-ref/lazy annotations on dynamically attached fields.
@@ -1387,8 +1402,10 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 pass
             # Set class annotations accordingly so the decorated type sees a concrete return type
             if ann_effective is not None:
-                ann_local[fname] = ann_effective  # type: ignore
-                _forced_type_anns[fname] = ann_effective
+                # Keep annotations aligned with the effective attribute name exposed on the container
+                ann_key = str(_gql_name) if _gql_name else fname
+                ann_local[ann_key] = ann_effective  # type: ignore
+                _forced_type_anns[ann_key] = ann_effective
         except Exception:
             pass
     for fname, fval in list(vars(dom_cls).items()):
