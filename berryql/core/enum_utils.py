@@ -7,16 +7,36 @@ except Exception:  # pragma: no cover
     SAEnumType = object  # type: ignore
 
 
+# Cache for model enum classes to avoid repeated introspection
+# Key: (model_cls_id, column_key), Value: enum_cls or sentinel
+_ENUM_CLASS_CACHE: dict[tuple[int, str], Optional[type]] = {}
+_CACHE_MISS_SENTINEL = object()
+
+
 def get_model_enum_cls(model_cls: Any, key: str) -> Optional[type]:
-    """Return the Python Enum class for a given model column when column type is SAEnum."""
+    """Return the Python Enum class for a given model column when column type is SAEnum.
+    
+    Uses caching to avoid expensive repeated introspection of SQLAlchemy models.
+    """
     if model_cls is None or not key:
         return None
+    
+    # Check cache first
+    cache_key = (id(model_cls), key)
+    if cache_key in _ENUM_CLASS_CACHE:
+        cached = _ENUM_CLASS_CACHE[cache_key]
+        return None if cached is _CACHE_MISS_SENTINEL else cached
+    
+    # Cache miss - perform introspection
     try:
         col = getattr(getattr(model_cls, '__table__', None).c, key)
     except Exception:
         col = None
+    
     if col is None:
+        _ENUM_CLASS_CACHE[cache_key] = _CACHE_MISS_SENTINEL
         return None
+    
     try:
         sa_t = getattr(col, 'type', None)
         if isinstance(sa_t, SAEnumType):
@@ -28,9 +48,12 @@ def get_model_enum_cls(model_cls: Any, key: str) -> Optional[type]:
                     ensure_enum_hashable(enum_cls)
                 except Exception:
                     pass
-            return enum_cls
+                _ENUM_CLASS_CACHE[cache_key] = enum_cls
+                return enum_cls
     except Exception:
-        return None
+        pass
+    
+    _ENUM_CLASS_CACHE[cache_key] = _CACHE_MISS_SENTINEL
     return None
 
 

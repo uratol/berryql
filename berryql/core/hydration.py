@@ -23,6 +23,10 @@ class Hydrator:
       - populating aggregate caches
     """
 
+    # Cache for datetime column detection to avoid repeated introspection
+    # Key: (model_cls_id, column_key), Value: is_datetime_column
+    _datetime_column_cache: dict[tuple[int, str], bool] = {}
+
     def __init__(self, registry):
         self.registry = registry
 
@@ -320,11 +324,29 @@ class Hydrator:
 
     # ----- relations hydration -----
     def _coerce_datetime_scalar(self, target_model_cls: Any, key: str, value: Any) -> Any:
-        try:
-            col = target_model_cls.__table__.c.get(key)
-        except Exception:
-            col = None
-        if col is not None and isinstance(getattr(col, 'type', None), DateTime) and isinstance(value, str):
+        """Coerce string datetime values to Python datetime objects.
+        
+        Uses caching to avoid repeated column introspection.
+        """
+        if target_model_cls is None or not isinstance(value, str):
+            return value
+        
+        # Check cache first
+        cache_key = (id(target_model_cls), key)
+        if cache_key in self._datetime_column_cache:
+            is_datetime_col = self._datetime_column_cache[cache_key]
+        else:
+            # Cache miss - perform introspection
+            is_datetime_col = False
+            try:
+                col = target_model_cls.__table__.c.get(key)
+                if col is not None and isinstance(getattr(col, 'type', None), DateTime):
+                    is_datetime_col = True
+            except Exception:
+                pass
+            self._datetime_column_cache[cache_key] = is_datetime_col
+        
+        if is_datetime_col:
             try:
                 return datetime.fromisoformat(value)
             except Exception:
