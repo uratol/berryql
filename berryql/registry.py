@@ -2342,8 +2342,8 @@ class BerrySchema:
                         if target_b and target_b.model and hasattr(target_b.model, '__table__'):
                             col_type_map = self._build_column_type_map(target_b.model)
                         for a, spec in target_filters.items():
-                            base_t = str
-                            if spec.column and spec.column in col_type_map:
+                            base_t = getattr(spec, 'arg_type', None) or str
+                            if base_t is str and spec.column and spec.column in col_type_map:
                                 base_t = col_type_map[spec.column]
                             if spec.op in ('in','between'):
                                 anns[a] = Optional[List[base_t]]  # type: ignore
@@ -2777,8 +2777,8 @@ class BerrySchema:
             # Build argument annotations dynamically
             filter_arg_types: Dict[str, Any] = {}
             for arg_name, f_spec in declared_filters.items():
-                base_type = str
-                if f_spec.column and f_spec.column in col_py_types:
+                base_type = getattr(f_spec, 'arg_type', None) or str
+                if base_type is str and f_spec.column and f_spec.column in col_py_types:
                     base_type = col_py_types[f_spec.column]
                 if f_spec.op in ('in', 'between'):
                     filter_arg_types[arg_name] = Optional[List[base_type]]  # type: ignore

@@ -12,7 +12,7 @@ async def test_posts_commented_by_filters_posts_having_comment_by_user(db_sessio
     # Query posts commented by user2
     q = f"""
     query {{
-      posts(commented_by: \"{int(user2.id)}\") {{ id title }}
+      posts(commented_by: {int(user2.id)}) {{ id title }}
     }}
     """
     res = await berry_strawberry_schema.execute(q, context_value={'db_session': db_session})
@@ -27,7 +27,7 @@ async def test_posts_commented_by_filters_posts_having_comment_by_user(db_sessio
     # Query posts commented by user1
     q2 = f"""
     query {{
-      posts(commented_by: \"{int(user1.id)}\") {{ id title }}
+      posts(commented_by: {int(user1.id)}) {{ id title }}
     }}
     """
     res2 = await berry_strawberry_schema.execute(q2, context_value={'db_session': db_session})
@@ -41,7 +41,7 @@ async def test_posts_commented_by_filters_posts_having_comment_by_user(db_sessio
     # No posts should be returned for an unknown user id
     q3 = """
     query {
-      posts(commented_by: \"9999\") { id }
+      posts(commented_by: 9999) { id }
     }
     """
     res3 = await berry_strawberry_schema.execute(q3, context_value={'db_session': db_session})

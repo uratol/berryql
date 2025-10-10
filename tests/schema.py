@@ -535,13 +535,17 @@ class Query:
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
-        # Return posts that have at least one comment authored by the given user id
-        'commented_by': lambda M, info, v: exists(
-            select(PostComment.id).where(
-                PostComment.post_id == M.id,
-                PostComment.author_id == (int(v) if isinstance(v, str) else v)
-            )
-        ),
+        # Int-typed argument (inferred from Post.author_id column) with custom EXISTS filter
+        'commented_by': {
+            'column': 'author_id',
+            'arg_type': int,
+            'builder': lambda M, info, v: exists(
+                select(PostComment.id).where(
+                    PostComment.post_id == M.id,
+                    PostComment.author_id == v
+                )
+            ),
+        },
     })
     genericItems = relation('GenericItemQL', order_by='name', order_dir='asc')
     # Async where callable support for roots

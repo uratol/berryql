@@ -30,6 +30,9 @@ class FilterSpec:
     builder: Optional[Callable[..., Any]] = None
     required: bool = False
     description: Optional[str] = None
+    # Explicit GraphQL argument type override (e.g., int, str, bool, datetime)
+    # If provided, this takes precedence over inferring from `column`.
+    arg_type: Optional[Any] = None
 
     def clone_with(self, **overrides: Any) -> "FilterSpec":
         data = {
@@ -59,7 +62,8 @@ def normalize_filter_spec(raw: Any) -> FilterSpec:
             alias=raw.get('alias'),
             builder=raw.get('builder'),
             required=raw.get('required', False),
-            description=raw.get('description')
+            description=raw.get('description'),
+            arg_type=raw.get('arg_type') or raw.get('type') or raw.get('returns')
         )
     raise TypeError(f"Unsupported filter spec form: {raw!r}")
 
