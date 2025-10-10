@@ -4,7 +4,7 @@ Not functionally equivalent yet: purely structural placeholder to evolve tests a
 """
 from typing import Optional, List, Any, AsyncGenerator, Annotated
 from datetime import datetime
-from sqlalchemy import select, func
+from sqlalchemy import select, func, exists
 import strawberry
 from strawberry.types import Info
 from berryql import BerrySchema, BerryType, BerryDomain, field, relation, count, custom, custom_object, domain, mutation, hooks, scope
@@ -535,6 +535,13 @@ class Query:
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
         'created_at_lt': lambda M, info, v: M.created_at < (datetime.fromisoformat(v) if isinstance(v, str) else v),
+        # Return posts that have at least one comment authored by the given user id
+        'commented_by': lambda M, info, v: exists(
+            select(PostComment.id).where(
+                PostComment.post_id == M.id,
+                PostComment.author_id == (int(v) if isinstance(v, str) else v)
+            )
+        ),
     })
     genericItems = relation('GenericItemQL', order_by='name', order_dir='asc')
     # Async where callable support for roots
