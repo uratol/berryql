@@ -126,7 +126,6 @@ class Post(Base):
 
 
 class PostComment(Base):
-    """User comments on posts (docstring)"""
     __tablename__ = 'post_comments'
     __table_args__ = {'comment': 'User comments on posts'}
     

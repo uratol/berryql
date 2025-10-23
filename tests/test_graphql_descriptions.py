@@ -38,7 +38,7 @@ async def test_userql_descriptions_from_comments():
     assert f.get("name") == "Public display name"
     # Relation without explicit comment prefers target model's docstring, then table comment
     assert f.get("posts") == "Blog posts (docstring)"
-    assert f.get("post_comments") == "User comments on posts (docstring)"
+    assert f.get("post_comments") == "User comments on posts"
 
 
 @pytest.mark.asyncio
@@ -50,7 +50,7 @@ async def test_postql_descriptions_from_comments():
     assert f.get("author_id") == "Author FK to users.id"
     # Relation without explicit comment prefers target model's docstring
     assert f.get("author") == "Application users (docstring)"
-    assert f.get("post_comments") == "User comments on posts (docstring)"
+    assert f.get("post_comments") == "User comments on posts"
     assert f.get("views") == "Polymorphic views on posts and comments"
     # Enum field should include a values list in its description
     status_desc = f.get("status") or ""
@@ -60,7 +60,7 @@ async def test_postql_descriptions_from_comments():
 @pytest.mark.asyncio
 async def test_postcommentql_descriptions_from_comments():
     t = await _introspect_type("PostCommentQL")
-    assert t["description"] == "User comments on posts (docstring)"
+    assert t["description"] == "User comments on posts"
     f = _fields_dict(t)
     assert f.get("content") == "Comment text"
     # Scalar fallback from SA column
