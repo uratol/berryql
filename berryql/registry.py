@@ -1128,14 +1128,15 @@ class BerrySchema:
         for name, bcls in self.types.items():
             st_cls = self._st_types[name]
             annotations: Dict[str, Any] = getattr(st_cls, '__annotations__', {}) or {}
-            # Prefer SQLAlchemy table comment or model docstring for type description
+            # Prefer model docstring, then SQLAlchemy table comment for type description
             try:
                 model_cls_doc = None
                 model_cls = getattr(bcls, 'model', None)
-                if hasattr(getattr(model_cls, '__table__', None), 'comment'):
+                # 1) Class docstring
+                model_cls_doc = getattr(model_cls, '__doc__', None)
+                # 2) Fallback to table comment
+                if not model_cls_doc and hasattr(getattr(model_cls, '__table__', None), 'comment'):
                     model_cls_doc = getattr(model_cls.__table__, 'comment')  # type: ignore[attr-defined]
-                if not model_cls_doc:
-                    model_cls_doc = getattr(model_cls, '__doc__', None)
                 if model_cls_doc:
                     # Set both __doc__ (best-effort) and a stable attribute consumed at decoration time
                     setattr(st_cls, '__doc__', model_cls_doc)
@@ -1349,7 +1350,7 @@ class BerrySchema:
                 elif fdef.kind == 'relation':
                     target_name = fdef.meta.get('target')
                     is_single = bool(fdef.meta.get('single'))
-                    # Relation description: prefer explicit meta.comment; else SQLAlchemy relationship doc/info; else target model's table comment
+                    # Relation description: prefer explicit meta.comment; else SQLAlchemy relationship doc/info; else target model's docstring or table comment
                     relation_description = None
                     try:
                         relation_description = (fdef.meta or {}).get('comment')
@@ -1385,7 +1386,10 @@ class BerrySchema:
                         try:
                             tb = self.types.get(target_name)
                             if tb and getattr(tb, 'model', None) is not None:
-                                relation_description = getattr(getattr(tb.model, '__table__', None), 'comment', None)
+                                # Prefer target model docstring first
+                                relation_description = getattr(tb.model, '__doc__', None)
+                                if not relation_description:
+                                    relation_description = getattr(getattr(tb.model, '__table__', None), 'comment', None)
                         except Exception:
                             relation_description = None
                     if target_name:
@@ -3237,7 +3241,7 @@ class BerrySchema:
                     query_annotations[fname] = Optional[self._st_types[target_name]]  # type: ignore
                 else:
                     query_annotations[fname] = List[self._st_types[target_name]]  # type: ignore
-                # Determine description: explicit relation meta comment on Query field or target table comment
+                # Determine description: explicit relation meta comment on Query field or target model docstring/table comment
                 root_desc = None
                 try:
                     root_desc = (fdef.meta or {}).get('comment')
@@ -3245,7 +3249,10 @@ class BerrySchema:
                     root_desc = None
                 if not root_desc:
                     try:
-                        root_desc = getattr(getattr(target_b.model, '__table__', None), 'comment', None)
+                        # Prefer target model docstring first
+                        root_desc = getattr(target_b.model, '__doc__', None)
+                        if not root_desc:
+                            root_desc = getattr(getattr(target_b.model, '__table__', None), 'comment', None)
                     except Exception:
                         root_desc = None
                 # Attach field on class with explicit resolver and description when available
@@ -3416,7 +3423,10 @@ class BerrySchema:
                             d_desc = None
                         if not d_desc:
                             try:
-                                d_desc = getattr(getattr(target_b.model, '__table__', None), 'comment', None)
+                                # Prefer target model docstring first
+                                d_desc = getattr(target_b.model, '__doc__', None)
+                                if not d_desc:
+                                    d_desc = getattr(getattr(target_b.model, '__table__', None), 'comment', None)
                             except Exception:
                                 d_desc = None
                         if d_desc:

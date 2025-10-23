@@ -72,6 +72,7 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
+    """Application users (docstring)"""
     __tablename__ = 'users'
     __table_args__ = {'comment': 'Application users'}
     
@@ -92,6 +93,7 @@ class PostStatus(enum.Enum):
 
 
 class Post(Base):
+    """Blog posts (docstring)"""
     __tablename__ = 'posts'
     # SQLAlchemy Enum with explicit CHECK constraint name for all dialects
     __table_args__ = {'comment': 'Blog posts'}
@@ -124,6 +126,7 @@ class Post(Base):
 
 
 class PostComment(Base):
+    """User comments on posts (docstring)"""
     __tablename__ = 'post_comments'
     __table_args__ = {'comment': 'User comments on posts'}
     
