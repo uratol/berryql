@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_origin, get_args
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_origin, get_args, Annotated
 from enum import Enum
 from datetime import datetime
 import asyncio
@@ -62,6 +62,27 @@ from .core.utils import (
 )
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
+
+# --- Standard argument descriptions for default query parameters ---
+# These descriptions are attached to GraphQL arguments so that tools and UIs
+# (e.g., GraphiQL) show helpful guidance and examples for users.
+_ARG_DESC_ORDER_BY = (
+    "Name of a scalar field to order by. Use together with order_dir or order_multi. "
+    "Example: order_by: \"created_at\""
+)
+_ARG_DESC_ORDER_DIR = (
+    "Sort direction for order_by. Accepted values: asc or desc. "
+    "Example: order_dir: desc"
+)
+_ARG_DESC_WHERE = (
+    "JSON filter expressed as a JSON object (string). Supports simple operators like "
+    "eq, ne, gt, gte, lt, lte, like, ilike, in, between, and/or. "
+    "Examples: {\"id\": {\"eq\": 1}}, {\"created_at\": {\"between\": [\"2020-01-01T00:00:00\", \"2020-12-31T23:59:59\"]}}"
+)
+_ARG_DESC_ORDER_MULTI = (
+    "List of ordering specs in 'column:direction' format. Multiple entries define tie-breakers. "
+    "Examples: ['id:asc'], ['created_at:desc', 'id:asc']"
+)
 
 # --- Public hook descriptor to attach pre/post callbacks declaratively ----
 class HooksDescriptor:
@@ -2337,9 +2358,20 @@ class BerrySchema:
                             fn.__module__ = __name__
                         # annotations
                         if is_single_value:
-                            anns: Dict[str, Any] = {'info': StrawberryInfo, 'where': Optional[str]}
+                            anns: Dict[str, Any] = {
+                                'info': StrawberryInfo,
+                                'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                            }
                         else:
-                            anns: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
+                            anns: Dict[str, Any] = {
+                                'info': StrawberryInfo,
+                                'limit': Optional[int],
+                                'offset': Optional[int],
+                                'order_by': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_ORDER_BY)],
+                                'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_ARG_DESC_ORDER_DIR)],
+                                'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_ARG_DESC_ORDER_MULTI)],
+                                'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                            }
                         # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
                         target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
                         col_type_map: Dict[str, Any] = {}
@@ -3206,9 +3238,20 @@ class BerrySchema:
             if not getattr(generated_fn, '__module__', None):
                 generated_fn.__module__ = __name__
             if is_single:
-                ann: Dict[str, Any] = {'info': StrawberryInfo, 'where': Optional[str]}
+                ann: Dict[str, Any] = {
+                    'info': StrawberryInfo,
+                    'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                }
             else:
-                ann: Dict[str, Any] = {'info': StrawberryInfo, 'limit': Optional[int], 'offset': Optional[int], 'order_by': Optional[str], 'order_dir': Optional[Direction], 'order_multi': Optional[List[str]], 'where': Optional[str]}
+                ann: Dict[str, Any] = {
+                    'info': StrawberryInfo,
+                    'limit': Optional[int],
+                    'offset': Optional[int],
+                    'order_by': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_ORDER_BY)],
+                    'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_ARG_DESC_ORDER_DIR)],
+                    'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_ARG_DESC_ORDER_MULTI)],
+                    'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                }
             ann.update(filter_arg_types)
             generated_fn.__annotations__ = ann
             return generated_fn
