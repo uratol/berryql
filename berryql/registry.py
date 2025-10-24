@@ -67,21 +67,23 @@ from .core.hydration import Hydrator
 # These descriptions are attached to GraphQL arguments so that tools and UIs
 # (e.g., GraphiQL) show helpful guidance and examples for users.
 _ARG_DESC_ORDER_BY = (
-    "Name of a scalar field to order by. Use together with order_dir or order_multi. "
+    "Name of a scalar field to order by. Use together with order_dir."
     "Example: order_by: \"created_at\""
 )
 _ARG_DESC_ORDER_DIR = (
-    "Sort direction for order_by. Accepted values: asc or desc. "
+    "Sort direction for order_by. Accepted values: asc or desc. If not provided, defaults to asc."
     "Example: order_dir: desc"
 )
+
+_ARG_DESC_ORDER_MULTI = (
+    "List of ordering specs in 'column:direction' format. Multiple entries define tie-breakers. "
+    "Examples: ['id:asc'], ['created_at:desc', 'id:asc']"
+)
+
 _ARG_DESC_WHERE = (
     "JSON filter expressed as a JSON object (string). Supports simple operators like "
     "eq, ne, gt, gte, lt, lte, like, ilike, in, between, and/or. "
     "Examples: {\"id\": {\"eq\": 1}}, {\"created_at\": {\"between\": [\"2020-01-01T00:00:00\", \"2020-12-31T23:59:59\"]}}"
-)
-_ARG_DESC_ORDER_MULTI = (
-    "List of ordering specs in 'column:direction' format. Multiple entries define tie-breakers. "
-    "Examples: ['id:asc'], ['created_at:desc', 'id:asc']"
 )
 
 # --- Public hook descriptor to attach pre/post callbacks declaratively ----
