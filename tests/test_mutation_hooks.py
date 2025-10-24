@@ -2,6 +2,7 @@ import pytest
 
 from tests.schema import schema, CALLBACK_EVENTS
 from tests.fixtures import populated_db  # noqa: F401
+from tests.models import Post
 
 
 @pytest.mark.asyncio
@@ -36,6 +37,11 @@ async def test_merge_hooks_create(db_session, populated_db):
     # Expect both declaration methods' events, including array-based hooks
     for k in ("pre", "post", "hpre", "hpost", "h2post"):
         assert k in kinds
+
+    # Also verify non-exposed column 'internal_note' persisted via pre-hook
+    pid = int(post["id"])
+    inst = await db_session.get(Post, pid)
+    assert getattr(inst, 'internal_note', None) == 'in-pre'
 
 
 @pytest.mark.asyncio

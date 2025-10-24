@@ -118,6 +118,9 @@ class Post(Base):
         default=PostStatus.DRAFT,
         constraint_name="ck_post_status",
     )
+    # Hidden from Berry schema on purpose: used to verify pre-hook can write
+    # to model columns that are not exposed as Berry fields
+    internal_note = Column(String(255), nullable=True, comment='Internal note (not exposed)')
     # Computed (read-only) column: length of content; uses SQL function for cross-dialect support
     content_length = column_property(func.length(content))
     

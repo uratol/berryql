@@ -25,6 +25,13 @@ def _test_pre_upsert(model_cls, info: Info, data: dict | None, ctx: dict | None 
         return data
     d = dict(data or {})
     d['title'] = f"[pre]{d.get('title','')}"
+    # For tests: set a non-exposed SA column to verify persistence from pre-hook
+    # Only apply for Post model to avoid touching others
+    try:
+        if getattr(model_cls, '__tablename__', None) == 'posts':
+            d.setdefault('internal_note', 'in-pre')
+    except Exception:
+        pass
     try:
         CALLBACK_EVENTS.append({
             'event': 'pre',
