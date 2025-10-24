@@ -3281,8 +3281,13 @@ class BerrySchema:
                     DomSt_local = self._st_types[type_name]
                     _domain_type_cache[dom_cls] = DomSt_local
                     return DomSt_local
-                # Create plain runtime class
-                DomSt_local = type(type_name, (), {'__doc__': f'Domain container for {getattr(dom_cls, "__name__", type_name)}'})
+                # Create plain runtime class; prefer domain class docstring when available
+                _dom_doc = getattr(dom_cls, '__doc__', None)
+                DomSt_local = type(
+                    type_name,
+                    (),
+                    {'__doc__': (_dom_doc if _dom_doc else f'Domain container for {getattr(dom_cls, "__name__", type_name)}')}
+                )
                 # Keep the container in this registry module to minimize circular resolution risk
                 DomSt_local.__module__ = __name__
                 _domain_type_cache[dom_cls] = DomSt_local  # pre-cache to break cycles
@@ -3652,6 +3657,18 @@ class BerrySchema:
                     pass
                 # Decorate and cache
                 self._st_types[type_name] = strawberry.type(DomSt_local)  # type: ignore
+                # Ensure the GraphQL type description reflects the domain docstring when available
+                try:
+                    _dom_desc2 = getattr(dom_cls, '__doc__', None)
+                except Exception:
+                    _dom_desc2 = None
+                if _dom_desc2:
+                    try:
+                        _sd = getattr(self._st_types[type_name], '__strawberry_definition__', None)
+                        if _sd is not None:
+                            setattr(_sd, 'description', str(_dom_desc2))
+                    except Exception:
+                        pass
                 # Mirror the resolver cache onto the decorated class (some Strawberry versions replace the class)
                 try:
                     setattr(self._st_types[type_name], '__berry_domain_static_fields__', getattr(DomSt_local, '__berry_domain_static_fields__', {}) or _domain_static_field_resolvers)
@@ -3707,7 +3724,16 @@ class BerrySchema:
                         return inst
                     return _resolver
                 query_annotations[dom_name] = DomSt  # type: ignore
-                setattr(QueryPlain, dom_name, strawberry.field(resolver=_make_domain_resolver(DomSt)))
+                # Expose domain docstring as GraphQL field description when present
+                _dom_desc = None
+                try:
+                    _dom_desc = getattr(dom_cls, '__doc__', None)
+                except Exception:
+                    _dom_desc = None
+                if _dom_desc:
+                    setattr(QueryPlain, dom_name, strawberry.field(resolver=_make_domain_resolver(DomSt), description=str(_dom_desc)))
+                else:
+                    setattr(QueryPlain, dom_name, strawberry.field(resolver=_make_domain_resolver(DomSt)))
         # Merge any regular @strawberry.field resolvers defined on the user Query class
         try:
             if getattr(self, '_user_query_cls', None) is not None:

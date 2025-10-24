@@ -387,6 +387,7 @@ class UserQL(BerryType):
 
 @berry_schema.domain(name='userDomain')
 class UserDomain(BerryDomain):
+    """User operations domain"""
     # Reuse same relations as flat roots
     def _gate_users(model_cls, info: Info):
         try:
@@ -428,6 +429,7 @@ class UserDomain(BerryDomain):
 
 @berry_schema.domain(name='blogDomain')
 class BlogDomain(BerryDomain):
+    """Blog operations domain"""
     posts = relation('PostQL', order_by='id', order_dir='asc', arguments={
         'title_ilike': lambda M, info, v: M.title.ilike(f"%{v}%"),
         'created_at_gt': lambda M, info, v: M.created_at > (datetime.fromisoformat(v) if isinstance(v, str) else v),
@@ -483,6 +485,7 @@ class BlogDomain(BerryDomain):
 # A nested grouping domain that exposes userDomain and blogDomain inside
 @berry_schema.domain(name='groupDomain')
 class GroupDomain(BerryDomain):
+    """Grouping of user and blog domains"""
     # Nest other domains inside this domain
     userDomain = domain(UserDomain)
     blogDomain = domain(BlogDomain)
@@ -490,6 +493,7 @@ class GroupDomain(BerryDomain):
 # Domain solely for async callback tests
 @berry_schema.domain(name='asyncDomain')
 class AsyncDomain(BerryDomain):
+    """Async callbacks test domain"""
     # Explicit async callbacks for merge
     merge_posts = mutation('PostQL', comment="Create or update posts (async domain)")
 

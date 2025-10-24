@@ -1081,8 +1081,17 @@ def build_merge_resolver_for_type(
 
     _resolver.__name__ = fname
     _resolver.__annotations__ = ann
-    if description:
-        return fname, strawberry.field(resolver=_resolver, description=str(description)), st_return
+    # Determine effective description: explicit param first; else prefer model docstring, then table comment
+    eff_desc = description
+    if not eff_desc:
+        try:
+            eff_desc = getattr(model_cls, '__doc__', None)
+            if not eff_desc:
+                eff_desc = getattr(getattr(model_cls, '__table__', None), 'comment', None)
+        except Exception:
+            eff_desc = None
+    if eff_desc:
+        return fname, strawberry.field(resolver=_resolver, description=str(eff_desc)), st_return
     return fname, strawberry.field(resolver=_resolver), st_return
 
 # --- Domain mutation support ---------------------------------------------
@@ -1127,7 +1136,13 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
         except Exception:
             # If inspection fails, fall through and rebuild
             pass
-    DomSt_local = type(type_name, (), {'__doc__': f'Mutation domain container for {getattr(dom_cls, "__name__", type_name)}'})
+    # Prefer domain class docstring for the mutation domain container description
+    _dom_doc = getattr(dom_cls, '__doc__', None)
+    DomSt_local = type(
+        type_name,
+        (),
+        {'__doc__': (_dom_doc if _dom_doc else f'Mutation domain container for {getattr(dom_cls, "__name__", type_name)}')}
+    )
     # Important: set the module to the domain class' module so that string annotations
     # (from "from __future__ import annotations") resolve in the correct global scope.
     # This allows Strawberry to find helper types like S3DownloadResponseType defined
@@ -1543,6 +1558,18 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
     except Exception:
         pass
     st_type = strawberry.type(DomSt_local)  # type: ignore
+    # Ensure GraphQL type description on mutation domain reflects domain docstring
+    try:
+        _dom_desc2 = getattr(dom_cls, '__doc__', None)
+    except Exception:
+        _dom_desc2 = None
+    if _dom_desc2:
+        try:
+            _sd = getattr(st_type, '__strawberry_definition__', None)
+            if _sd is not None:
+                setattr(_sd, 'description', str(_dom_desc2))
+        except Exception:
+            pass
     # Enforce type annotations on the decorated Strawberry field definitions
     try:
         sd = getattr(st_type, '__strawberry_definition__', None)
@@ -1594,7 +1621,16 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                     return inst
                 return _resolver
             anns_m[uf] = DomSt  # type: ignore
-            setattr(MPlain, uf, strawberry.field(resolver=_make_domain_resolver(DomSt)))
+            # Expose domain docstring as Mutation field description when present
+            _dom_desc = None
+            try:
+                _dom_desc = getattr(dom_cls, '__doc__', None)
+            except Exception:
+                _dom_desc = None
+            if _dom_desc:
+                setattr(MPlain, uf, strawberry.field(resolver=_make_domain_resolver(DomSt), description=str(_dom_desc)))
+            else:
+                setattr(MPlain, uf, strawberry.field(resolver=_make_domain_resolver(DomSt)))
             # Best-effort: ensure merge_* are present on the decorated runtime type too
             try:
                 DomRuntime = schema._st_types.get(f"{getattr(dom_cls,'__name__','Domain')}MutType")
