@@ -120,3 +120,15 @@ async def test_merge_hooks_nested_relation(db_session, populated_db):
     kinds = [e.get("event") for e in CALLBACK_EVENTS]
     for k in ("pre", "post", "hpre", "hpost", "h2post"):
         assert k in kinds
+
+    # Validate that the post-hook instance corresponds to the Post entity
+    post_events = [
+        e for e in CALLBACK_EVENTS
+        if e.get("event") in {"post", "hpost", "h2post"}
+    ]
+    assert any(e.get("instance_model") == "Post" for e in post_events), post_events
+    assert any(e.get("has_post_attrs") is True for e in post_events), post_events
+
+    # Also validate pre-hook data was for the Post payload (keys include post fields)
+    pre_events = [e for e in CALLBACK_EVENTS if e.get("event") in {"pre", "hpre"}]
+    assert any({"title", "content", "author_id"}.issubset(set(e.get("data_keys") or [])) for e in pre_events)

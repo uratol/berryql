@@ -26,7 +26,11 @@ def _test_pre_upsert(model_cls, info: Info, data: dict | None, ctx: dict | None 
     d = dict(data or {})
     d['title'] = f"[pre]{d.get('title','')}"
     try:
-        CALLBACK_EVENTS.append({'event': 'pre', 'model': getattr(model_cls, '__name__', str(model_cls))})
+        CALLBACK_EVENTS.append({
+            'event': 'pre',
+            'model': getattr(model_cls, '__name__', str(model_cls)),
+            'data_keys': list(d.keys())
+        })
     except Exception:
         pass
     return d
@@ -42,7 +46,13 @@ def _test_post_upsert(model_cls, info: Info, instance: Any, created: bool, ctx: 
             except Exception:
                 pass
             try:
-                CALLBACK_EVENTS.append({'event': 'post', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+                CALLBACK_EVENTS.append({
+                    'event': 'post',
+                    'model': getattr(model_cls, '__name__', str(model_cls)),
+                    'created': bool(created),
+                    'instance_model': getattr(getattr(instance, '__class__', None), '__name__', type(instance).__name__),
+                    'has_post_attrs': all(hasattr(instance, k) for k in ('title', 'content', 'author_id'))
+                })
             except Exception:
                 pass
     except Exception:
@@ -92,7 +102,11 @@ def _test_pre_upsert_hook(model_cls, info: Info, data: dict | None, ctx: dict | 
     d = dict(data or {})
     d['title'] = f"[hpre]{d.get('title','')}"
     try:
-        CALLBACK_EVENTS.append({'event': 'hpre', 'model': getattr(model_cls, '__name__', str(model_cls))})
+        CALLBACK_EVENTS.append({
+            'event': 'hpre',
+            'model': getattr(model_cls, '__name__', str(model_cls)),
+            'data_keys': list(d.keys())
+        })
     except Exception:
         pass
     return d
@@ -107,7 +121,13 @@ def _test_post_upsert_hook(model_cls, info: Info, instance: Any, created: bool, 
             except Exception:
                 pass
             try:
-                CALLBACK_EVENTS.append({'event': 'hpost', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+                CALLBACK_EVENTS.append({
+                    'event': 'hpost',
+                    'model': getattr(model_cls, '__name__', str(model_cls)),
+                    'created': bool(created),
+                    'instance_model': getattr(getattr(instance, '__class__', None), '__name__', type(instance).__name__),
+                    'has_post_attrs': all(hasattr(instance, k) for k in ('title', 'content', 'author_id'))
+                })
             except Exception:
                 pass
     except Exception:
@@ -123,7 +143,13 @@ def _test_post_upsert_hook2(model_cls, info: Info, instance: Any, created: bool,
             except Exception:
                 pass
             try:
-                CALLBACK_EVENTS.append({'event': 'h2post', 'model': getattr(model_cls, '__name__', str(model_cls)), 'created': bool(created)})
+                CALLBACK_EVENTS.append({
+                    'event': 'h2post',
+                    'model': getattr(model_cls, '__name__', str(model_cls)),
+                    'created': bool(created),
+                    'instance_model': getattr(getattr(instance, '__class__', None), '__name__', type(instance).__name__),
+                    'has_post_attrs': all(hasattr(instance, k) for k in ('title', 'content', 'author_id'))
+                })
             except Exception:
                 pass
     except Exception:
