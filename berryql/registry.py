@@ -359,7 +359,7 @@ class BerrySchema:
         created = 'createdAt' if ac else 'created_at'
         desc_where = (
             "JSON filter expressed as a JSON object (string). Supports simple operators like "
-            "eq, ne, gt, gte, lt, lte, like, ilike, in, between, and/or. "
+            "eq, ne, gt, gte, lt, lte, like, ilike, in, between. Multiple field conditions are combined with AND. "
             f"Examples: {{\"id\": {{\"eq\": 1}}}}, {{\"{created}\": {{\"between\": [\"2020-01-01T00:00:00\", \"2020-12-31T23:59:59\"]}}}}"
         )
         desc_order_by = (
