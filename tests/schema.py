@@ -602,6 +602,8 @@ class Mutation:
 
     # Top-level merge for posts at Query level)
     merge_posts = mutation('PostQL', comment="Create or update posts")
+    # Top-level merge for users to enable nested mutations of related posts in tests
+    merge_users = mutation('UserQL', comment="Create or update users")
     # Single-payload variant: accepts a single PostQLInput instead of a list
     merge_post = mutation('PostQL', single=True, comment="Create or update a single post")
     # Scoped root-level mutation: only author_id == 1 allowed

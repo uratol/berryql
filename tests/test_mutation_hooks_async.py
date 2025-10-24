@@ -5,7 +5,7 @@ from tests.fixtures import populated_db  # noqa: F401
 
 
 @pytest.mark.asyncio
-async def test_upsert_callbacks_async(db_session, populated_db):
+async def test_merge_hooks_async(db_session, populated_db):
     CALLBACK_EVENTS.clear()
     uid = populated_db["users"][0].id
     # Invoke async callbacks via domain field under Mutation
