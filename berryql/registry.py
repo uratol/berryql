@@ -63,28 +63,8 @@ from .core.utils import (
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
 
-# --- Standard argument descriptions for default query parameters ---
-# These descriptions are attached to GraphQL arguments so that tools and UIs
-# (e.g., GraphiQL) show helpful guidance and examples for users.
-_ARG_DESC_ORDER_BY = (
-    "Name of a scalar field to order by. Use together with order_dir."
-    "Example: order_by: \"created_at\""
-)
-_ARG_DESC_ORDER_DIR = (
-    "Sort direction for order_by. Accepted values: asc or desc. If not provided, defaults to asc."
-    "Example: order_dir: desc"
-)
-
-_ARG_DESC_ORDER_MULTI = (
-    "List of ordering specs in 'column:direction' format. Multiple entries define tie-breakers. "
-    "Examples: ['id:asc'], ['created_at:desc', 'id:asc']"
-)
-
-_ARG_DESC_WHERE = (
-    "JSON filter expressed as a JSON object (string). Supports simple operators like "
-    "eq, ne, gt, gte, lt, lte, like, ilike, in, between, and/or. "
-    "Examples: {\"id\": {\"eq\": 1}}, {\"created_at\": {\"between\": [\"2020-01-01T00:00:00\", \"2020-12-31T23:59:59\"]}}"
-)
+# Standard argument descriptions for default query parameters are generated dynamically
+# based on the current schema naming (auto-camel-case) via BerrySchema._get_standard_arg_descriptions.
 
 # --- Public hook descriptor to attach pre/post callbacks declaratively ----
 class HooksDescriptor:
@@ -365,6 +345,44 @@ class BerrySchema:
     
 
     # ---------- Input/Mutation helpers ----------
+    def _get_standard_arg_descriptions(self) -> Dict[str, str]:
+        """Return standard descriptions for where/order args honoring naming style.
+
+        The examples adapt to the current schema naming configuration (auto-camel-case).
+        Keys returned: 'order_by', 'order_dir', 'order_multi', 'where'.
+        """
+        try:
+            ac = bool(getattr(self, '_auto_camel_case', False))
+        except Exception:
+            ac = False
+        obn, odn, omn = (('orderBy', 'orderDir', 'orderMulti') if ac else ('order_by', 'order_dir', 'order_multi'))
+        created = 'createdAt' if ac else 'created_at'
+        desc_where = (
+            "JSON filter expressed as a JSON object (string). Supports simple operators like "
+            "eq, ne, gt, gte, lt, lte, like, ilike, in, between, and/or. "
+            f"Examples: {{\"id\": {{\"eq\": 1}}}}, {{\"{created}\": {{\"between\": [\"2020-01-01T00:00:00\", \"2020-12-31T23:59:59\"]}}}}"
+        )
+        desc_order_by = (
+            f"Name of a scalar field to order by. Use together with {odn}. "
+            f"Mutually exclusive with {omn} (specify either {obn}+{odn} or {omn}). "
+            f"Example: {obn}: \"{created}\""
+        )
+        desc_order_dir = (
+            f"Sort direction for {obn}. Accepted values: asc or desc. If not provided, defaults to asc. "
+            f"Mutually exclusive with {omn} (specify either {obn}+{odn} or {omn}). "
+            f"Example: {odn}: desc"
+        )
+        desc_order_multi = (
+            "List of ordering specs in 'column:direction' format. Multiple entries define tie-breakers. "
+            f"Mutually exclusive with {obn}/{odn} (specify either {obn}+{odn} or {omn}). "
+            f"Examples: ['id:asc'], ['{created}:desc', 'id:asc']"
+        )
+        return {
+            'where': desc_where,
+            'order_by': desc_order_by,
+            'order_dir': desc_order_dir,
+            'order_multi': desc_order_multi,
+        }
     def _ensure_input_type(self, btype_cls: Type[BerryType], _stack: Optional[List[str]] = None):
         """Build (or return cached) Strawberry input type mirroring a BerryType's writable shape.
 
@@ -2359,20 +2377,22 @@ class BerrySchema:
                         if not getattr(fn, '__module__', None):  # ensure module for strawberry introspection
                             fn.__module__ = __name__
                         # annotations
+                        # Build descriptions via unified helper respecting auto-camel-case
+                        _descs = self._get_standard_arg_descriptions()
                         if is_single_value:
                             anns: Dict[str, Any] = {
                                 'info': StrawberryInfo,
-                                'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                                'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
                             }
                         else:
                             anns: Dict[str, Any] = {
                                 'info': StrawberryInfo,
                                 'limit': Optional[int],
                                 'offset': Optional[int],
-                                'order_by': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_ORDER_BY)],
-                                'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_ARG_DESC_ORDER_DIR)],
-                                'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_ARG_DESC_ORDER_MULTI)],
-                                'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                                'order_by': Annotated[Optional[str], strawberry.argument(description=_descs['order_by'])],
+                                'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_descs['order_dir'])],
+                                'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_descs['order_multi'])],
+                                'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
                             }
                         # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
                         target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
@@ -3239,20 +3259,22 @@ class BerrySchema:
             generated_fn = ns[func_name]
             if not getattr(generated_fn, '__module__', None):
                 generated_fn.__module__ = __name__
+            # Build descriptions via unified helper respecting auto-camel-case
+            _descs = self._get_standard_arg_descriptions()
             if is_single:
                 ann: Dict[str, Any] = {
                     'info': StrawberryInfo,
-                    'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                    'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
                 }
             else:
                 ann: Dict[str, Any] = {
                     'info': StrawberryInfo,
                     'limit': Optional[int],
                     'offset': Optional[int],
-                    'order_by': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_ORDER_BY)],
-                    'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_ARG_DESC_ORDER_DIR)],
-                    'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_ARG_DESC_ORDER_MULTI)],
-                    'where': Annotated[Optional[str], strawberry.argument(description=_ARG_DESC_WHERE)],
+                    'order_by': Annotated[Optional[str], strawberry.argument(description=_descs['order_by'])],
+                    'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_descs['order_dir'])],
+                    'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_descs['order_multi'])],
+                    'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
                 }
             ann.update(filter_arg_types)
             generated_fn.__annotations__ = ann
