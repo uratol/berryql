@@ -84,6 +84,35 @@ def build_merge_resolver_for_type(
             raise ValueError("No db_session in context")
         data = schema._input_to_dict(payload)
 
+        # Serialize access to a shared AsyncSession across parallel GraphQL resolvers.
+        # GraphQL executes sibling fields concurrently; without a guard, multiple
+        # mutations can flush/execute on the same session at once causing
+        # "concurrent operations are not permitted" or "Session is already flushing".
+        import asyncio as _asyncio
+        _lock = None
+        # Prefer storing the lock on SQLAlchemy Session.info dict when available
+        try:
+            _info_dict = getattr(session, 'info', None)
+            if isinstance(_info_dict, dict):
+                _lock = _info_dict.get('berryql_session_lock')
+                if _lock is None:
+                    _lock = _asyncio.Lock()
+                    _info_dict['berryql_session_lock'] = _lock
+        except Exception:
+            _lock = None
+        # Fallback to attribute on the session object
+        if _lock is None:
+            try:
+                _lock = getattr(session, '_berryql_session_lock', None)
+            except Exception:
+                _lock = None
+            if _lock is None:
+                _lock = _asyncio.Lock()
+                try:
+                    setattr(session, '_berryql_session_lock', _lock)
+                except Exception:
+                    pass
+
         # Helpers to compile and enforce scope for a given model instance
         from .core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
 
@@ -1044,25 +1073,27 @@ def build_merge_resolver_for_type(
             await _maybe_call_post_many(eff_post_cbs, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             return instance
 
-        # Support list payloads when configured by caller
-        pl_is_list = bool(payload_is_list)
-        rt_is_list = bool(return_is_list)
-        if pl_is_list:
-            items = data if isinstance(data, list) else ([data] if data is not None else [])
-            out_models = []
-            for item in items:
-                inst = await _merge_single(model_cls, btype_cls, item)
-                out_models.append(inst)
-            await session.commit()
-            if rt_is_list:
-                return [schema.from_model(type_name, m) for m in out_models]
-            # Fallback: return last item if single return requested
-            last = out_models[-1] if out_models else None
-            return schema.from_model(type_name, last) if last is not None else None
-        else:
-            inst = await _merge_single(model_cls, btype_cls, data)
-            await session.commit()
-            return schema.from_model(type_name, inst)
+        # Execute the entire merge under the session-level lock
+        async with (_lock or _asyncio.Lock()):
+            # Support list payloads when configured by caller
+            pl_is_list = bool(payload_is_list)
+            rt_is_list = bool(return_is_list)
+            if pl_is_list:
+                items = data if isinstance(data, list) else ([data] if data is not None else [])
+                out_models = []
+                for item in items:
+                    inst = await _merge_single(model_cls, btype_cls, item)
+                    out_models.append(inst)
+                await session.commit()
+                if rt_is_list:
+                    return [schema.from_model(type_name, m) for m in out_models]
+                # Fallback: return last item if single return requested
+                last = out_models[-1] if out_models else None
+                return schema.from_model(type_name, last) if last is not None else None
+            else:
+                inst = await _merge_single(model_cls, btype_cls, data)
+                await session.commit()
+                return schema.from_model(type_name, inst)
 
     fname = field_name or (f"merge_{type_name[:-2].lower()}" if type_name.endswith('QL') else f"merge_{type_name.lower()}")
     # Decide arg/return annotations (list vs single)
