@@ -19,14 +19,9 @@ from tests.models import Base
 # Try to load environment variables from .env file
 load_dotenv()
 
-
-@pytest.fixture(scope="session", autouse=True)
-def event_loop_policy():
-    """Set event loop policy for Windows compatibility."""
-    if sys.platform.startswith("win"):
-        # Use SelectorEventLoop instead of ProactorEventLoop on Windows
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    yield
+# Set event loop policy for Windows compatibility at module level
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 @pytest.fixture(scope="function")
