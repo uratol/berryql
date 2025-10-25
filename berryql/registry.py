@@ -427,7 +427,7 @@ class BerrySchema:
         except Exception:
             col_obj_map = {}
 
-        # Scalars and relations
+        # Scalars, customs and relations
         for fname, fdef in (getattr(btype_cls, '__berry_fields__', {}) or {}).items():
             if fdef.kind == 'scalar':
                 # Skip private scalars
@@ -495,6 +495,43 @@ class BerrySchema:
                     except Exception:
                         pass
                 # Use strawberry.field to attach description while keeping UNSET semantics
+                try:
+                    if desc:
+                        setattr(InPlain, fname, strawberry.field(default=UNSET, description=desc))  # type: ignore[arg-type]
+                    else:
+                        setattr(InPlain, fname, UNSET)
+                except Exception:
+                    try:
+                        if desc:
+                            setattr(InPlain, fname, strawberry.field(default=None, description=desc))  # type: ignore[arg-type]
+                        else:
+                            setattr(InPlain, fname, None)
+                    except Exception:
+                        setattr(InPlain, fname, None)
+            elif fdef.kind == 'custom':
+                # Include custom fields in input when explicitly marked writable (read_only=False)
+                try:
+                    _meta = (getattr(fdef, 'meta', {}) or {})
+                    if _meta.get('read_only', True):
+                        continue
+                except Exception:
+                    # Default to skipping when meta missing
+                    continue
+                # Determine Python type from returns or default to str
+                try:
+                    py_t = (fdef.meta or {}).get('returns') or str
+                except Exception:
+                    py_t = str
+                try:
+                    anns[fname] = Optional[py_t]
+                except Exception:
+                    anns[fname] = Optional[str]
+                # Description
+                desc: str | None = None
+                try:
+                    desc = (getattr(fdef, 'meta', {}) or {}).get('comment')
+                except Exception:
+                    desc = None
                 try:
                     if desc:
                         setattr(InPlain, fname, strawberry.field(default=UNSET, description=desc))  # type: ignore[arg-type]

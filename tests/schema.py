@@ -304,6 +304,8 @@ class PostQL(BerryType):
             .where(PostComment.post_id == model_cls.id)
         )
     comment_text_len = custom(_comment_text_len_builder, returns=int)
+    # Writable custom field for tests: length of title, allowed in inputs
+    title_len_custom_input = custom(lambda M: select(func.length(M.title)), returns=int, read_only=False)
     # Multi-column aggregate object (min_created_at, comments_count)
     post_comments_agg_obj = custom_object(
         lambda model_cls: (

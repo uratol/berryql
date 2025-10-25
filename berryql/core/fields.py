@@ -248,7 +248,13 @@ def count(source: str) -> FieldDescriptor:
     """
     return aggregate(source, op='count')
 
-def custom(builder: Callable[..., Any], *, returns: Any | None = None, comment: Optional[str] = None) -> FieldDescriptor:
+def custom(
+    builder: Callable[..., Any],
+    *,
+    returns: Any | None = None,
+    comment: Optional[str] = None,
+    read_only: bool = True,
+) -> FieldDescriptor:
     """Declare a custom computed scalar backed by a builder function.
 
     The builder should return a SQLAlchemy selectable/expression that yields a
@@ -261,6 +267,9 @@ def custom(builder: Callable[..., Any], *, returns: Any | None = None, comment: 
             expression producing the scalar.
         returns: Optional Python type for GraphQL schema generation (e.g. ``int``).
             When omitted, the adapter may try to infer it.
+        read_only: When True (default), the field is excluded from mutation input
+            types and only exposed on query output types. This mirrors the
+            ``read_only`` flag of :func:`field`.
 
     Example:
         class PostQL(BerryType):
@@ -279,6 +288,9 @@ def custom(builder: Callable[..., Any], *, returns: Any | None = None, comment: 
     meta: Dict[str, Any] = {'builder': builder, 'returns': returns}
     if comment is not None:
         meta['comment'] = comment
+    # Normalize read_only flag for downstream registry/builders. By default,
+    # custom scalars are read-only and thus should not appear in mutation inputs.
+    meta['read_only'] = bool(read_only)
     return FieldDescriptor(kind='custom', **meta)
 
 def custom_object(builder: Callable[..., Any], *, returns: Any, comment: Optional[str] = None) -> FieldDescriptor:

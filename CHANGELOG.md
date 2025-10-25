@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- custom field helper: add `read_only` argument (default: true) matching `field` semantics. When true, custom fields are excluded from mutation input types.
+
 ## [0.1.0] - 2025-08-14
 
 - Reorganized requirements into core/dev with umbrella requirements.txt
