@@ -2186,16 +2186,46 @@ class BerrySchema:
                             if allowed_order is None:
                                 # derive from scalar fields
                                 allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+                            # When auto-camel-case is enabled, accept camelCase order_by/columns
+                            try:
+                                ac = bool(getattr(self, '_auto_camel_case', False))
+                            except Exception:
+                                ac = False
+                            if ac:
+                                from inflection import underscore as _underscore
+                                try:
+                                    allowed_order_snake = [
+                                        (s if '_' in s else _underscore(s)) for s in allowed_order
+                                    ]
+                                except Exception:
+                                    allowed_order_snake = allowed_order
+                            else:
+                                allowed_order_snake = allowed_order
                             applied_any = False
-                            # Validate invalid order_by up front
-                            if order_by and isinstance(order_by, str) and order_by not in allowed_order:
-                                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
+                            # Validate invalid order_by up front (honoring auto-camel-case)
+                            if order_by and isinstance(order_by, str):
+                                ob_key = order_by
+                                if ac:
+                                    try:
+                                        from inflection import underscore as _underscore
+                                        ob_key = ob_key if '_' in ob_key else _underscore(ob_key)
+                                    except Exception:
+                                        ob_key = order_by
+                                if ob_key not in allowed_order_snake:
+                                    raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
                             if order_multi:
                                 for spec in order_multi:
                                     try:
                                         col_name, _, dir_part = spec.partition(':')
                                         dir_part = dir_part or 'asc'
-                                        if col_name in allowed_order:
+                                        col_key = col_name
+                                        if ac:
+                                            try:
+                                                from inflection import underscore as _underscore
+                                                col_key = col_key if '_' in col_key else _underscore(col_key)
+                                            except Exception:
+                                                col_key = col_name
+                                        if col_key in allowed_order_snake:
                                             col_obj = child_model_cls.__table__.c.get(col_name)
                                             if col_obj is not None:
                                                 stmt = stmt.order_by(col_obj.desc() if dir_part.lower()=='desc' else col_obj.asc())
@@ -2212,11 +2242,19 @@ class BerrySchema:
                                         expr = None
                                 elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
                                     expr = order_by
-                                elif isinstance(order_by, str) and order_by in allowed_order:
-                                    try:
-                                        expr = child_model_cls.__table__.c.get(order_by)
-                                    except Exception:
-                                        expr = None
+                                elif isinstance(order_by, str):
+                                    ob_key2 = order_by
+                                    if ac:
+                                        try:
+                                            from inflection import underscore as _underscore
+                                            ob_key2 = ob_key2 if '_' in ob_key2 else _underscore(ob_key2)
+                                        except Exception:
+                                            ob_key2 = order_by
+                                    if ob_key2 in allowed_order_snake:
+                                        try:
+                                            expr = child_model_cls.__table__.c.get(order_by)
+                                        except Exception:
+                                            expr = None
                                 if expr is not None:
                                     descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
                                     try:
@@ -3002,11 +3040,34 @@ class BerrySchema:
                         allowed_fields_rel = [sf for sf, sd in target_b.__berry_fields__.items() if sd.kind == 'scalar']
                     except Exception:
                         allowed_fields_rel = []
+                    # When auto-camel-case is enabled, also accept camelCase order_by names
+                    try:
+                        ac_rel = bool(getattr(self, '_auto_camel_case', False))
+                    except Exception:
+                        ac_rel = False
+                    if ac_rel:
+                        try:
+                            from inflection import underscore as _underscore
+                            allowed_fields_rel_snake = [
+                                (s if '_' in s else _underscore(s)) for s in allowed_fields_rel
+                            ]
+                        except Exception:
+                            allowed_fields_rel_snake = allowed_fields_rel
+                    else:
+                        allowed_fields_rel_snake = allowed_fields_rel
                     ob_rel = rel_cfg.get('order_by')
                     # Only validate against allowed field names when order_by is a string.
                     # Callables and SQLAlchemy expressions are allowed and handled later.
-                    if isinstance(ob_rel, str) and ob_rel and ob_rel not in allowed_fields_rel:
-                        raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
+                    if isinstance(ob_rel, str) and ob_rel:
+                        ob_key_rel = ob_rel
+                        if ac_rel:
+                            try:
+                                from inflection import underscore as _underscore
+                                ob_key_rel = ob_key_rel if '_' in ob_key_rel else _underscore(ob_key_rel)
+                            except Exception:
+                                ob_key_rel = ob_rel
+                        if ob_key_rel not in allowed_fields_rel_snake:
+                            raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     child_model_cls = target_b.model
                     # Determine FK from child->parent, allow explicit override via relation meta
                     try:

@@ -2006,6 +2006,11 @@ class RelationSQLBuilders:
 class RootSQLBuilders:
     def __init__(self, registry):
         self.registry = registry
+        # Back-reference to BerrySchema/registry for configuration (e.g. auto-camel-case)
+        try:
+            from .utils import dir_value  # type: ignore  # noqa: F401
+        except Exception:
+            pass
 
     # --- helpers -------------------------------------------------------------
     def _pk_col(self, model_cls):
@@ -2238,6 +2243,34 @@ class RootSQLBuilders:
 
     def apply_ordering(self, stmt, *, model_cls, btype_cls, order_by, order_dir, order_multi):
         from ..core.utils import dir_value as _dir_value
+        # Determine auto-camel-case mode from BerrySchema/registry if attached
+        try:
+            ac = bool(getattr(self.registry, '_auto_camel_case', False))
+        except Exception:
+            ac = False
+
+        def _normalize_name(name: str, allowed: list[str]) -> str:
+            """Normalize order field respecting auto-camel-case.
+
+            When auto-camel-case is enabled, accept camelCase names by comparing
+            their snake_case form against the allowed field list.
+            """
+            if not isinstance(name, str):
+                return name
+            if not ac:
+                return name
+            try:
+                from inflection import underscore as _underscore
+            except Exception:
+                return name
+            if '_' in name:
+                return name
+            try:
+                cand = _underscore(name)
+            except Exception:
+                return name
+            return cand if cand in allowed else name
+
         # multi first
         if order_multi:
             allowed_order_fields = getattr(btype_cls, '__ordering__', None)
@@ -2247,9 +2280,10 @@ class RootSQLBuilders:
                 try:
                     cn, _, dd = str(spec).partition(':')
                     dd = (dd or 'asc').lower()
-                    if cn not in allowed_order_fields:
+                    norm_cn = _normalize_name(cn, allowed_order_fields)
+                    if norm_cn not in allowed_order_fields:
                         continue
-                    col = model_cls.__table__.c.get(cn)
+                    col = model_cls.__table__.c.get(norm_cn)
                     if col is None:
                         continue
                     stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
@@ -2261,14 +2295,15 @@ class RootSQLBuilders:
             allowed_order_fields = getattr(btype_cls, '__ordering__', None)
             if allowed_order_fields is None:
                 allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-            if order_by not in allowed_order_fields:
+            norm_ob = _normalize_name(order_by, allowed_order_fields)
+            if norm_ob not in allowed_order_fields:
                 raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order_fields}")
             try:
-                col = model_cls.__table__.c.get(order_by)
+                col = model_cls.__table__.c.get(norm_ob)
             except Exception:
                 col = None
             if col is None:
-                raise ValueError(f"Unknown order_by column: {order_by}")
+                raise ValueError(f"Unknown order_by column: {norm_ob}")
             dv = _dir_value(order_dir)
             if dv not in ('asc','desc'):
                 raise ValueError(f"Invalid order_dir '{order_dir}'. Use asc or desc")
@@ -2289,14 +2324,17 @@ class RootSQLBuilders:
                 for spec in default_multi:
                     cn, _, dd = str(spec).partition(':')
                     dd = dd or def_dir
-                    if cn in allowed_order_fields:
-                        col = model_cls.__table__.c.get(cn)
+                    norm_cn = _normalize_name(cn, allowed_order_fields)
+                    if norm_cn in allowed_order_fields:
+                        col = model_cls.__table__.c.get(norm_cn)
                         if col is not None:
                             stmt = stmt.order_by(col.desc() if (dd=='desc') else col.asc())
-            elif default_by and default_by in allowed_order_fields:
-                col = model_cls.__table__.c.get(default_by)
-                if col is not None:
-                    stmt = stmt.order_by(col.desc() if def_dir=='desc' else col.asc())
+            elif default_by:
+                norm_db = _normalize_name(default_by, allowed_order_fields)
+                if norm_db in allowed_order_fields:
+                    col = model_cls.__table__.c.get(norm_db)
+                    if col is not None:
+                        stmt = stmt.order_by(col.desc() if def_dir=='desc' else col.asc())
         except Exception:
             pass
         return stmt
