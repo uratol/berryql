@@ -14,40 +14,147 @@ BerryQL lets you define GraphQL types on top of SQLAlchemy models with a minimal
 It’s designed for async SQLAlchemy 2.x and Strawberry GraphQL.
 
 
-Quick start
------------
+Hello world example
+-------------------
 
-Install
+Here is a minimal end‑to‑end sketch using BerryQL with two types, relations, a query, and a merge mutation:
 
-- Core:
-    - pip install berryql
-- Optional DB drivers and helpers (choose what you need):
-    - pip install "berryql[adapters]"  # asyncpg, pyodbc, python-dotenv
+```python
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.ext.asyncio import AsyncSession
+import strawberry
+from strawberry.types import Info
+from berryql import BerrySchema, BerryType, field, relation, mutation
 
-Requirements: Python 3.8+ (tested up to 3.13), Strawberry GraphQL, SQLAlchemy 2.x
+berry_schema = BerrySchema()
+
+# SQLAlchemy models (simplified)
+class User:
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str]
+        posts: Mapped[list["Post"]] = relationship(back_populates="author")
+
+class Post:
+        id: Mapped[int] = mapped_column(primary_key=True)
+        title: Mapped[str]
+        author_id: Mapped[int]
+        author: Mapped[User] = relationship(back_populates="posts")
 
 
-Define your models (SQLAlchemy)
+@berry_schema.type(model=Post)
+class PostQL(BerryType):
+        id = field()
+        title = field()
+        author_id = field()  # autoCamelCase → authorId
+    # many‑to‑one relation: post → author
+    author = relation("UserQL", single=True)
 
-This repo ships demo models in `tests/models.py` (User, Post, PostComment). Any SQLAlchemy ORM models work.
+
+@berry_schema.type(model=User)
+class UserQL(BerryType):
+        id = field()
+        name = field()
+        # one‑to‑many relation: user → posts
+        posts = relation("PostQL")
 
 
-Define Berry types
+@berry_schema.query()
+class Query:
+        # root collection
+        users = relation("UserQL")
 
-Map models to GraphQL using Berry’s DSL: scalars, relations, aggregates, and custom fields.
 
-Example (excerpt adapted from tests):
+@berry_schema.mutation()
+class Mutation:
+        # generated merge mutation: upsert Post rows from payload
+        merge_posts = mutation("PostQL")
 
-- File: `tests/schema.py` builds the runtime Strawberry schema from Berry’s registry.
-- You only need to provide an async SQLAlchemy session via GraphQL context as `db_session` or `db`.
 
-Highlights in the example below:
+schema = berry_schema.to_strawberry()
+```
 
-- field(): map model columns
-- relation(): to-one or to-many; supports arguments, ordering, pagination
-- count(): quick aggregate of a relation (e.g., posts count)
-- custom()/custom_object(): inject SQL selects for computed values (pushed down when possible)
-- @berry_schema.query(): define root collections (users, posts, etc.)
+GraphQL usage examples:
+
+```graphql
+{
+    users {
+        id
+        name
+        posts { id title }
+    }
+}
+```
+
+```graphql
+mutation {
+    mergePosts(payload: [{ title: "Hello", authorId: 1 }]) {
+        id
+        title
+    }
+}
+```
+
+
+5‑minute try-out
+-----------------
+
+If you just want to see it working quickly, you don’t need to design a schema from scratch – this repo already contains a full demo schema and models.
+
+**1. Install and run tests (uses in‑memory SQLite)**
+
+```bash
+pip install -r requirements.txt
+pytest -q
+```
+
+This spins up the demo models (`tests/models.py`), Berry schema (`tests/schema.py`), and exercises queries, relations, domains, and mutations.
+
+**2. Run the demo GraphQL API (FastAPI + Strawberry)**
+
+```bash
+python -m uvicorn examples.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Then open GraphiQL at: http://127.0.0.1:8000/graphql
+
+Try a simple query:
+
+```graphql
+{
+    users {
+        id
+        name
+        postAggObj { count }
+    }
+}
+```
+
+Or a mutation using Berry’s merge API via a domain:
+
+```graphql
+mutation {
+    blogDomain {
+        merge_posts(payload: [{ title: "Hello", content: "Body", authorId: 1 }]) {
+            id
+            title
+            authorId
+        }
+    }
+}
+```
+
+Behind the scenes this uses the Berry schema from `tests/schema.py` and an async SQLAlchemy session from the FastAPI app.
+
+**3. Minimal “how would I use this in my app?” sketch**
+
+At a high level you will:
+
+1. Define SQLAlchemy models (or reuse existing ones).
+2. Map them to Berry types with `@berry_schema.type` and `field()/relation()`.
+3. Define a `@berry_schema.query()` class for roots and optionally `@berry_schema.mutation()` / `@berry_schema.domain()` classes for mutations and domains.
+4. Call `berry_schema.to_strawberry()` and plug the resulting schema into Strawberry/FastAPI.
+
+The rest of this README goes into the details of fields, relations, filters, JSON where, custom scalars/objects, domains, and merge mutations.
 
 
 What queries look like (and what SQL runs)
@@ -154,6 +261,14 @@ Custom fields and objects/aggregation
 - For custom_object, specify returns as a dict, e.g., { 'min_created_at': datetime, 'comments_count': int }.
 - On Postgres/SQLite, JSON composition uses native json functions; on MSSQL it uses FOR JSON PATH.
 
+Subscriptions
+-------------
+
+BerryQL can also participate in Strawberry subscriptions via `@berry_schema.subscription()` classes:
+
+- Define a subscription container with `@berry_schema.subscription()`.
+- Inside, declare `@strawberry.subscription` methods that yield values (e.g. integers or BerryQL objects) using async generators.
+- The test schema includes a simple `tick` subscription and a `new_post_event` subscription under a domain to exercise this path.
 
 Root query
 ----------
@@ -210,24 +325,38 @@ Testing and development
 Mutations
 ---------
 
-BerryQL supports two mutation styles inside the class registered with `@berry_schema.mutation()`:
+BerryQL supports two styles of mutations, both inside a class registered with `@berry_schema.mutation()`:
 
-1) Plain Python method (BerryQL maps the return annotation to the runtime Strawberry type):
+1) **BerryQL merge mutations** (generated resolvers)
 
-        - Annotate with the Berry type name (e.g., `-> "PostQL"`) or the Berry class; BerryQL resolves it to the generated Strawberry type.
-        - Return an instance using `berry_schema.from_model('PostQL', orm_instance)` to attach the SQLAlchemy model and seed scalar fields.
+- Use the `mutation("TypeName", ...)` helper on a domain or the root mutation class to create upsert-style mutations backed by the ORM model of that Berry type.
+- Variants in the test schema include:
+    - `merge_posts`, `merge_users`: bulk upserts from a `payload` list.
+    - `merge_post`: single-payload variant (one object instead of a list).
+    - Scoped mutations: pass `scope` (JSON or callable) to enforce filters server-side, e.g. `scope='{"author_id": {"eq": 1}}'`.
+- Merge callbacks can be attached on the Berry type:
+    - `@berry_schema.pre` / `@berry_schema.post` methods on the BerryType class.
+    - `hooks = hooks(pre=..., post=...)` descriptor combining sync/async callbacks.
+- Callbacks can modify input data, enforce invariants, and even mutate the ORM instance before it’s returned.
 
-2) Classic Strawberry mutation with `@strawberry.mutation`:
+2) **Plain Python / Strawberry mutations**
 
-        - Best for returning primitives (e.g., integers) or simple payloads.
+- Plain async methods on the mutation class with return annotations pointing to Berry types; BerryQL resolves them to the generated Strawberry types.
+- Classic Strawberry mutations decorated with `@strawberry.mutation`, ideal for returning primitives or simple payloads.
 
-Example:
+Example (simplified from `tests/schema.py`):
 
 ```python
 @berry_schema.mutation()
 class Mutation:
-        # Full object mutation
-        async def create_post(self, info: Info, title: str, content: str, author_id: int) -> "PostQL":
+        # Generated merge mutations
+        merge_posts = mutation('PostQL', comment="Create or update posts")
+        merge_users = mutation('UserQL', comment="Create or update users")
+        merge_post = mutation('PostQL', single=True, comment="Create or update a single post")
+
+        # Full object mutation implemented manually
+        @strawberry.mutation
+        async def create_post(self, info: Info, title: str, content: str, author_id: int) -> PostQL:
                 session: AsyncSession = info.context["db_session"]
                 p = Post(title=title, content=content, author_id=author_id)
                 session.add(p)
@@ -244,17 +373,24 @@ class Mutation:
                 return int(p.id)
 ```
 
-Querying the object mutation:
+Merge mutations accept `payload` arguments inferred from the Berry type’s fields (including write-only helpers such as `author_email`) and return BerryQL objects that include read-only fields.
 
-```graphql
-mutation {
-    create_post(title: "Hello", content: "Body", author_id: 1) {
-        id
-        title
-        author_id
-    }
-}
-```
+
+Domains
+-------
+
+Domains let you group related operations (queries and mutations) under a nested namespace while still benefiting from BerryQL’s relation/merge machinery.
+
+- Define a domain by subclassing `BerryDomain` and decorating it with `@berry_schema.domain(name="userDomain")`, `@berry_schema.domain(name="blogDomain")`, etc.
+- Inside a domain you can declare:
+    - Relations to Berry types (e.g. `users`, `posts`, `postsAsyncFilter`) exactly like on the root query.
+    - Domain-scoped merge mutations via `merge_posts = mutation('PostQL', ...)` and similar.
+    - Regular Strawberry fields (e.g. `helloDomain`) and subscriptions.
+- Nest domains using `domain(OtherDomain)` to build grouped hierarchies (see `groupDomain` in `tests/schema.py`).
+- Domains can be exposed on both the root `Query` and root `Mutation` classes:
+    - On `Query` they appear as read-only containers (no mutations exposed there).
+    - On `Mutation` they expose only their mutation fields (e.g. `blogDomain { merge_posts ... }`, `asyncDomain { merge_posts ... }`).
+- Domain-level filters and scopes work the same way as on roots: you can attach `scope` (JSON or callable/async callable) to relations and mutations to enforce contextual rules (user gating, author_id constraints, etc.).
 
 
 FAQ
