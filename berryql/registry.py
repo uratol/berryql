@@ -3283,13 +3283,13 @@ class BerrySchema:
                         result = await session.execute(stmt)
                         sa_rows = result.fetchall()
                         out = []
+                        _hydr = Hydrator(self)
                         for row_index, sa_row in enumerate(sa_rows):
                             inst = st_cls()
                             try:
                                 mapping = getattr(sa_row, '_mapping')
                             except Exception:
                                 mapping = {}
-                            _hydr = Hydrator(self)
                             # Attach model and copy base mapping fields (for direct labeled columns)
                             _hydr.attach_model(inst, sa_row)
                             _hydr.copy_mapping_fields(inst, mapping)

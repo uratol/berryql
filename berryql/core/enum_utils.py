@@ -13,6 +13,41 @@ _ENUM_CLASS_CACHE: dict[tuple[int, str], Optional[type]] = {}
 _CACHE_MISS_SENTINEL = object()
 
 
+def _get_sa_enum_class(model_cls: Any, key: str) -> Optional[type]:
+    if model_cls is None or not key:
+        return None
+    try:
+        table = getattr(model_cls, '__table__', None)
+        columns = getattr(table, 'c', None)
+        col = columns.get(key) if columns is not None else None
+    except Exception:
+        col = None
+    if col is None:
+        return None
+    try:
+        sa_t = getattr(col, 'type', None)
+        if isinstance(sa_t, SAEnumType):
+            return getattr(sa_t, 'enum_class', None)
+    except Exception:
+        return None
+    return None
+
+
+def _iter_enum_columns(model_cls: Any):
+    table = getattr(model_cls, '__table__', None)
+    columns = getattr(table, 'columns', []) or []
+    for col in columns:
+        enum_cls = None
+        try:
+            sa_t = getattr(col, 'type', None)
+            if isinstance(sa_t, SAEnumType):
+                enum_cls = getattr(sa_t, 'enum_class', None)
+        except Exception:
+            enum_cls = None
+        if enum_cls is not None:
+            yield col.name, enum_cls
+
+
 def get_model_enum_cls(model_cls: Any, key: str) -> Optional[type]:
     """Return the Python Enum class for a given model column when column type is SAEnum.
     
@@ -28,33 +63,17 @@ def get_model_enum_cls(model_cls: Any, key: str) -> Optional[type]:
         return None if cached is _CACHE_MISS_SENTINEL else cached
     
     # Cache miss - perform introspection
-    try:
-        col = getattr(getattr(model_cls, '__table__', None).c, key)
-    except Exception:
-        col = None
-    
-    if col is None:
+    enum_cls = _get_sa_enum_class(model_cls, key)
+    if enum_cls is None:
         _ENUM_CLASS_CACHE[cache_key] = _CACHE_MISS_SENTINEL
         return None
-    
     try:
-        sa_t = getattr(col, 'type', None)
-        if isinstance(sa_t, SAEnumType):
-            enum_cls = getattr(sa_t, 'enum_class', None)
-            if enum_cls is not None:
-                # Defensive: make sure enum is hashable for any downstream maps
-                try:
-                    from berryql.sql.enum_helpers import ensure_enum_hashable
-                    ensure_enum_hashable(enum_cls)
-                except Exception:
-                    pass
-                _ENUM_CLASS_CACHE[cache_key] = enum_cls
-                return enum_cls
+        from berryql.sql.enum_helpers import ensure_enum_hashable
+        ensure_enum_hashable(enum_cls)
     except Exception:
         pass
-    
-    _ENUM_CLASS_CACHE[cache_key] = _CACHE_MISS_SENTINEL
-    return None
+    _ENUM_CLASS_CACHE[cache_key] = enum_cls
+    return enum_cls
 
 
 def coerce_input_to_storage_value(enum_cls: Any, value: Any) -> Any:
@@ -121,27 +140,14 @@ def normalize_instance_enums(model_cls: Any, instance: Any) -> None:
     """
     if model_cls is None or instance is None:
         return
-    try:
-        cols = getattr(getattr(model_cls, '__table__', None), 'columns', []) or []
-    except Exception:
-        cols = []
-    for _col in cols:
-        enum_cls = None
+    for col_name, enum_cls in _iter_enum_columns(model_cls):
         try:
-            sa_t = getattr(_col, 'type', None)
-            if isinstance(sa_t, SAEnumType):
-                enum_cls = getattr(sa_t, 'enum_class', None)
-        except Exception:
-            enum_cls = None
-        if enum_cls is None:
-            continue
-        try:
-            cur = getattr(instance, _col.name, None)
+            cur = getattr(instance, col_name, None)
         except Exception:
             cur = None
         try:
             new_val = coerce_input_to_storage_value(enum_cls, cur)
             if new_val is not cur:
-                setattr(instance, _col.name, new_val)
+                setattr(instance, col_name, new_val)
         except Exception:
             continue

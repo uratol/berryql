@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 from .enum_utils import get_model_enum_cls, coerce_mapping_to_enum
 from datetime import datetime
+from .naming import from_camel
 
 # SQLAlchemy DateTime for value coercion
 try:
@@ -43,35 +44,25 @@ class Hydrator:
             pass
         setattr(inst, '_model', None)
 
-    @staticmethod
-    def copy_mapping_fields(inst: Any, mapping: Dict[str, Any]) -> None:
+    def copy_mapping_fields(self, inst: Any, mapping: Dict[str, Any]) -> None:
         """Best-effort copy of mapping keys as attributes on the instance.
 
     Enum-aware: when a mapped field corresponds to a model column of SAEnum type
     and the value is a raw string (DB value or NAME), it is converted to the
     Python Enum instance so Strawberry serializes it as ENUM.
         """
-        # Infer the Berry type and model class from the runtime instance
-        btype = None
-        model_cls = None
+        registry = self.registry
         try:
-            registry = getattr(inst, '__berry_registry__', None)
             if registry is None:
-                # Some call sites construct the hydrator with a registry; fall back via self when available
+                registry = getattr(inst, '__berry_registry__', None)
+            if registry is None:
                 registry = getattr(getattr(inst, '__class__', object), '__berry_registry__', None)
         except Exception:
             registry = None
         try:
-            if registry is None:
-                # Hydrator always has a registry; access it via closure variable
-                registry = getattr(Hydrator, 'registry', None)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        try:
-            if registry is not None:
-                type_name = getattr(getattr(inst, '__class__', None), '__name__', None)
-                btype = registry.types.get(type_name) if type_name else None
-                model_cls = getattr(btype, 'model', None) if btype is not None else None
+            type_name = getattr(getattr(inst, '__class__', None), '__name__', None)
+            btype = registry.types.get(type_name) if (registry and type_name) else None
+            model_cls = getattr(btype, 'model', None) if btype is not None else None
         except Exception:
             btype = None
             model_cls = None
@@ -127,14 +118,11 @@ class Hydrator:
                 return None
             return None
         # Helper: decamelize GraphQL field names to python/DB snake_case
-        import re as _re
         def _decamel(name: str) -> str:
             try:
                 if not name or ('_' in name):
                     return name
-                s1 = _re.sub('(.)([A-Z][a-z]+)', r'\1_\2', str(name))
-                s2 = _re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1)
-                return s2.lower()
+                return from_camel(str(name))
             except Exception:
                 return str(name)
         def _normalize_field_name(field_name: str) -> str:

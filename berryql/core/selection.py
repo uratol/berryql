@@ -1,41 +1,47 @@
 from __future__ import annotations
 from typing import Any, Dict, Optional
 
-def _from_camel(name: str) -> str:
-    # Convert lowerCamelCase or UpperCamelCase to snake_case
-    out = []
-    for i, ch in enumerate(name):
-        if ch.isupper() and i > 0 and name[i-1] != '_':
-            out.append('_')
-        out.append(ch.lower())
-    return ''.join(out)
+from .naming import (
+    build_name_candidates,
+    ensure_list,
+    fields_map_for,
+    map_graphql_to_python,
+)
+
+_REL_ARGS = {'limit', 'offset', 'order_by', 'order_dir', 'order_multi', 'where'}
+_ORDER_FLAGS = {
+    'order_by': '_has_explicit_order_by',
+    'order_dir': '_has_explicit_order_dir',
+    'order_multi': '_has_explicit_order_multi',
+}
+
+
+def _assign_rel_arg(cfg: Dict[str, Any], arg_name: Optional[str], value: Any) -> None:
+    if not arg_name:
+        return
+    if arg_name == 'order_multi':
+        value = ensure_list(value)
+    if arg_name in _REL_ARGS:
+        cfg[arg_name] = value
+        flag = _ORDER_FLAGS.get(arg_name)
+        if flag:
+            cfg[flag] = True
+    else:
+        cfg['filter_args'][arg_name] = value
 
 class RelationSelectionExtractor:
     def __init__(self, registry: Any | None = None):
         self.registry = registry or getattr(self, 'registry', None)
-        # Extract a name normalizer function from registry.name_converter if present
         self._name_converter = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
-        # Precompute a mapping function from GraphQL -> Python name
-        # If a name_converter is present, reverse apply_naming_config by comparing candidates; fallback to camel->snake.
-        def _to_python(name: str, fields_map: Dict[str, Any]) -> str:
-            # Fast path: direct match
-            if name in fields_map:
-                return name
-            # Try auto camel-case hint
-            if getattr(self.registry, '_auto_camel_case', False):
-                snake = _from_camel(str(name))
-                if snake in fields_map:
-                    return snake
-            # If we have a converter, try to reverse map by applying converter to known python names
-            if callable(self._name_converter):
-                for py_name in fields_map.keys():
-                    try:
-                        if self._name_converter(py_name) == name:
-                            return py_name
-                    except Exception:
-                        continue
-            return name
-        self._to_python = _to_python
+        self._auto_camel = bool(getattr(self.registry, '_auto_camel_case', False))
+
+    def _map_name(self, name: str, fields_map: Dict[str, Any]) -> str:
+        return map_graphql_to_python(
+            str(name),
+            fields_map,
+            auto_camel=self._auto_camel,
+            name_converter=self._name_converter,
+        )
 
     def _init_rel_cfg(self, fdef: Any) -> Dict[str, Any]:
         single = bool(fdef.meta.get('single') or (fdef.meta.get('mode') == 'single'))
@@ -90,6 +96,19 @@ class RelationSelectionExtractor:
     def _children(self, sel: Any) -> list[Any]:
         kids = getattr(sel, 'selections', None) or getattr(sel, 'children', None)
         return list(kids or [])
+
+    def _iter_arguments(self, raw_args: Any):
+        info = getattr(self, '_info', None)
+        if raw_args is None:
+            return
+        if isinstance(raw_args, dict):
+            for arg_name, raw_val in raw_args.items():
+                yield arg_name, self._ast_value(raw_val, info)
+            return
+        for arg in (raw_args or []):
+            arg_name = getattr(getattr(arg, 'name', None), 'value', None) or getattr(arg, 'name', None)
+            raw_val = getattr(arg, 'value', None)
+            yield arg_name, self._ast_value(raw_val, info)
 
     def _ast_value(self, node: Any, info: Any) -> Any:
         try:
@@ -151,14 +170,13 @@ class RelationSelectionExtractor:
                 sub_name = getattr(getattr(sub, 'name', None), 'value', None) or getattr(sub, 'name', None)
                 if not sub_name or str(sub_name).startswith('__'):
                     continue
-                # target subtype map
                 try:
                     target_name = cfg.get('target') or None
                     tgt_b2 = self.registry.types.get(target_name) if target_name else None
-                    sub_fields_map = getattr(tgt_b2, '__berry_fields__', {}) if tgt_b2 else {}
                 except Exception:
-                    sub_fields_map = {}
-                py_sub = self._to_python(str(sub_name), sub_fields_map) if sub_fields_map else sub_name
+                    tgt_b2 = None
+                sub_fields_map = fields_map_for(tgt_b2) if tgt_b2 else {}
+                py_sub = self._map_name(str(sub_name), sub_fields_map) if sub_fields_map else sub_name
                 sdef = sub_fields_map.get(py_sub) if sub_fields_map else None
                 if sdef:
                     sub_name = py_sub
@@ -172,38 +190,8 @@ class RelationSelectionExtractor:
                     ncfg['target'] = sdef.meta.get('target')
                     # parse arguments for this nested sub-relation
                     try:
-                        _nargs = getattr(sub, 'arguments', None)
-                        if isinstance(_nargs, dict):
-                            for narg_name, nval in _nargs.items():
-                                try:
-                                    nv_coerced = self._ast_value(nval, getattr(self, '_info', None))
-                                except Exception:
-                                    nv_coerced = nval
-                                if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                                    ncfg[narg_name] = nv_coerced
-                                    if narg_name == 'order_by':
-                                        ncfg['_has_explicit_order_by'] = True
-                                    if narg_name == 'order_multi':
-                                        ncfg['_has_explicit_order_multi'] = True
-                                    if narg_name == 'order_dir':
-                                        ncfg['_has_explicit_order_dir'] = True
-                                else:
-                                    ncfg['filter_args'][narg_name] = nv_coerced
-                        else:
-                            for narg in (_nargs or []):
-                                narg_name = getattr(getattr(narg, 'name', None), 'value', None) or getattr(narg, 'name', None)
-                                nraw = getattr(narg, 'value', None)
-                                nval = self._ast_value(nraw, getattr(self, '_info', None))
-                                if narg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                                    ncfg[narg_name] = nval
-                                    if narg_name == 'order_by':
-                                        ncfg['_has_explicit_order_by'] = True
-                                    if narg_name == 'order_multi':
-                                        ncfg['_has_explicit_order_multi'] = True
-                                    if narg_name == 'order_dir':
-                                        ncfg['_has_explicit_order_dir'] = True
-                                else:
-                                    ncfg['filter_args'][narg_name] = nval
+                        for narg_name, nval in self._iter_arguments(getattr(sub, 'arguments', None)):
+                            _assign_rel_arg(ncfg, narg_name, nval)
                     except Exception:
                         pass
                     # recurse deeper
@@ -213,9 +201,9 @@ class RelationSelectionExtractor:
             if not name or name.startswith('__'):
                 continue
             # Support camelCase field names when schema is configured with auto_camel_case
-            fields_map = getattr(btype, '__berry_fields__', {}) or {}
+            fields_map = fields_map_for(btype)
             # Normalize name using config-aware converter
-            py_name = self._to_python(str(name), fields_map)
+            py_name = self._map_name(str(name), fields_map)
             fdef = fields_map.get(py_name)
             if fdef:
                 name = py_name
@@ -223,39 +211,8 @@ class RelationSelectionExtractor:
                 continue
             rel_cfg = out.setdefault(name, self._init_rel_cfg(fdef))
             try:
-                _args = getattr(child, 'arguments', None)
-                if isinstance(_args, dict):
-                    for arg_name, val in _args.items():
-                        # Resolve variables/AST even if arguments come as a dict
-                        try:
-                            v_coerced = self._ast_value(val, getattr(self, '_info', None))
-                        except Exception:
-                            v_coerced = val
-                        if arg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                            rel_cfg[arg_name] = v_coerced
-                            if arg_name == 'order_by':
-                                rel_cfg['_has_explicit_order_by'] = True
-                            if arg_name == 'order_multi':
-                                rel_cfg['_has_explicit_order_multi'] = True
-                            if arg_name == 'order_dir':
-                                rel_cfg['_has_explicit_order_dir'] = True
-                        else:
-                            rel_cfg['filter_args'][arg_name] = v_coerced
-                else:
-                    for arg in (_args or []):
-                        arg_name = getattr(getattr(arg, 'name', None), 'value', None) or getattr(arg, 'name', None)
-                        raw_val = getattr(arg, 'value', None)
-                        val = self._ast_value(raw_val, getattr(self, '_info', None))
-                        if arg_name in ('limit','offset','order_by','order_dir','order_multi','where'):
-                            rel_cfg[arg_name] = val
-                            if arg_name == 'order_by':
-                                rel_cfg['_has_explicit_order_by'] = True
-                            if arg_name == 'order_multi':
-                                rel_cfg['_has_explicit_order_multi'] = True
-                            if arg_name == 'order_dir':
-                                rel_cfg['_has_explicit_order_dir'] = True
-                        else:
-                            rel_cfg['filter_args'][arg_name] = val
+                for arg_name, val in self._iter_arguments(getattr(child, 'arguments', None)):
+                    _assign_rel_arg(rel_cfg, arg_name, val)
             except Exception:
                 pass
             # Recursively collect nested under this relation
@@ -272,30 +229,11 @@ class RelationSelectionExtractor:
         except Exception:
             pass
         # Build candidate root field names to handle auto camelCase/name converters
-        candidates = {root_field_name}
-        try:
-            # Prefer explicit name converter if available
-            name_conv = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
-            if callable(name_conv):
-                try:
-                    candidates.add(name_conv(root_field_name))
-                except Exception:
-                    pass
-            # Fallback to naive snake->camel when auto_camel_case is enabled
-            if getattr(self.registry, '_auto_camel_case', False):
-                def _to_camel(n: str) -> str:
-                    if not n:
-                        return n
-                    parts = str(n).split('_')
-                    if not parts:
-                        return n
-                    head = parts[0]
-                    tail = ''.join(p.capitalize() for p in parts[1:])
-                    return head + tail
-                candidates.add(_to_camel(root_field_name))
-        except Exception:
-            # best-effort; keep original only
-            pass
+        candidates = build_name_candidates(
+            root_field_name,
+            auto_camel=self._auto_camel,
+            name_converter=self._name_converter,
+        )
         try:
             fields = getattr(info, 'selected_fields', None)
             for f in (fields or []):
@@ -323,18 +261,10 @@ class RelationSelectionExtractor:
             except Exception:
                 return None
         def _merge_rel_args(cfg_dst: Dict[str, Any], args_dict: Dict[str, Any]):
-            if not isinstance(cfg_dst, dict):
+            if not isinstance(cfg_dst, dict) or not isinstance(args_dict, dict):
                 return
-            for k in ('limit','offset','order_by','order_dir','order_multi','where'):
-                if k in args_dict and args_dict[k] is not None:
-                    cfg_dst[k] = args_dict[k]
-            # Record explicitness flags for precedence rules
-            if 'order_by' in args_dict and args_dict.get('order_by') is not None:
-                cfg_dst['_has_explicit_order_by'] = True
-            if 'order_multi' in args_dict and args_dict.get('order_multi') is not None:
-                cfg_dst['_has_explicit_order_multi'] = True
-            if 'order_dir' in args_dict and args_dict.get('order_dir') is not None:
-                cfg_dst['_has_explicit_order_dir'] = True
+            for k, v in args_dict.items():
+                _assign_rel_arg(cfg_dst, k, v)
         try:
             raw_info = getattr(info, '_raw_info', None)
             field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None
@@ -350,8 +280,8 @@ class RelationSelectionExtractor:
                         if not rname or rname.startswith('__'):
                             continue
                         # root relation camelCase support
-                        fields_map = getattr(btype, '__berry_fields__', {}) or {}
-                        py_r = self._to_python(str(rname), fields_map)
+                        fields_map = fields_map_for(btype)
+                        py_r = self._map_name(str(rname), fields_map)
                         fdef = fields_map.get(py_r)
                         if fdef:
                             rname = py_r
@@ -362,8 +292,6 @@ class RelationSelectionExtractor:
                             for a in getattr(rel_node, 'arguments', []) or []:
                                 an = _name_ast(a)
                                 av = self._ast_value(getattr(a, 'value', None), info)
-                                if an == 'order_multi' and av is not None and not isinstance(av, list):
-                                    av = [av]
                                 ast_args[an] = av
                         except Exception:
                             pass
@@ -378,8 +306,8 @@ class RelationSelectionExtractor:
                                 sub_name = _name_ast(sub)
                                 if not sub_name or sub_name.startswith('__'):
                                     continue
-                                sub_fields = getattr(tgt_b, '__berry_fields__', {}) if tgt_b else {}
-                                py_sub = self._to_python(str(sub_name), sub_fields) if tgt_b else sub_name
+                                sub_fields = fields_map_for(tgt_b) if tgt_b else {}
+                                py_sub = self._map_name(str(sub_name), sub_fields) if tgt_b else sub_name
                                 sdef = sub_fields.get(py_sub) if tgt_b else None
                                 if sdef:
                                     sub_name = py_sub
@@ -395,8 +323,8 @@ class RelationSelectionExtractor:
                                 sub_name = _name_ast(sub)
                                 if not sub_name or sub_name.startswith('__'):
                                     continue
-                                sub_fields = getattr(parent_b, '__berry_fields__', {}) if parent_b else {}
-                                py_sub = self._to_python(str(sub_name), sub_fields) if parent_b else sub_name
+                                sub_fields = fields_map_for(parent_b) if parent_b else {}
+                                py_sub = self._map_name(str(sub_name), sub_fields) if parent_b else sub_name
                                 sub_def = sub_fields.get(py_sub) if parent_b else None
                                 if sub_def:
                                     sub_name = py_sub
@@ -410,8 +338,6 @@ class RelationSelectionExtractor:
                                     for na in getattr(sub, 'arguments', []) or []:
                                         an = _name_ast(na)
                                         av = self._ast_value(getattr(na, 'value', None), info)
-                                        if an == 'order_multi' and av is not None and not isinstance(av, list):
-                                            av = [av]
                                         n_args[an] = av
                                 except Exception:
                                     pass
@@ -431,49 +357,16 @@ class RootSelectionExtractor:
     def __init__(self, registry: Any | None = None):
         # Keep reference to registry for naming conversion (camelCase <-> snake_case)
         self.registry = registry or getattr(self, 'registry', None)
-        # Prepare a reverse-name mapper similar to RelationSelectionExtractor for root fields
-        name_conv = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
-        def _to_python(name: str, fields_map: Dict[str, Any]) -> str:
-            # Fast path: direct match
-            if name in fields_map:
-                return name
-            # Auto camelCase support
-            try:
-                if getattr(self.registry, '_auto_camel_case', False):
-                    # local import to avoid circular
-                    def _from_camel(n: str) -> str:
-                        out = []
-                        for i, ch in enumerate(n):
-                            if ch.isupper() and i > 0 and n[i-1] != '_':
-                                out.append('_')
-                            out.append(ch.lower())
-                        return ''.join(out)
-                    snake = _from_camel(str(name))
-                    if snake in fields_map:
-                        return snake
-            except Exception:
-                pass
-            # Try configured converter by applying to python names and comparing
-            if callable(name_conv):
-                try:
-                    for py_name in fields_map.keys():
-                        if name_conv(py_name) == name:
-                            return py_name
-                except Exception:
-                    pass
-            return name
-        self._to_python = _to_python
+        self._name_converter = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
+        self._auto_camel = bool(getattr(self.registry, '_auto_camel_case', False))
 
-    def _to_camel(self, name: str) -> str:
-        # Convert snake_case to lowerCamelCase
-        if not name:
-            return name
-        parts = name.split('_')
-        if not parts:
-            return name
-        head = parts[0]
-        tail = ''.join(p.capitalize() for p in parts[1:])
-        return head + tail
+    def _map_name(self, name: str, fields_map: Dict[str, Any]) -> str:
+        return map_graphql_to_python(
+            str(name),
+            fields_map,
+            auto_camel=self._auto_camel,
+            name_converter=self._name_converter,
+        )
     def _children(self, node: Any) -> list[Any]:
         selset = getattr(node, 'selection_set', None)
         if selset is not None and getattr(selset, 'selections', None) is not None:
@@ -506,8 +399,8 @@ class RootSelectionExtractor:
                 continue
             # Map GraphQL field to python name when auto-camel-case is used
             try:
-                fields_map = getattr(btype, '__berry_fields__', {}) or {}
-                py_name = self._to_python(str(name), fields_map)
+                fields_map = fields_map_for(btype)
+                py_name = self._map_name(str(name), fields_map)
                 fdef = fields_map.get(py_name)
                 if fdef:
                     name = py_name
@@ -534,21 +427,11 @@ class RootSelectionExtractor:
         if info is None:
             return out
         # Build candidate root field names to handle auto camelCase
-        candidates = {root_field_name}
-        try:
-            # Prefer explicit name converter if available
-            name_conv = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
-            if callable(name_conv):
-                try:
-                    candidates.add(name_conv(root_field_name))
-                except Exception:
-                    pass
-            # Fallback to naive snake->camel when auto_camel_case is enabled
-            if getattr(self.registry, '_auto_camel_case', False):
-                candidates.add(self._to_camel(root_field_name))
-        except Exception:
-            # best-effort; keep original only
-            pass
+        candidates = build_name_candidates(
+            root_field_name,
+            auto_camel=self._auto_camel,
+            name_converter=self._name_converter,
+        )
         try:
             fields = getattr(info, 'selected_fields', None)
             frags = None
@@ -593,8 +476,8 @@ class RootSelectionExtractor:
                             if not name or name.startswith('__'):
                                 continue
                             try:
-                                fields_map = getattr(btype, '__berry_fields__', {}) or {}
-                                py_name = self._to_python(str(name), fields_map)
+                                fields_map = fields_map_for(btype)
+                                py_name = self._map_name(str(name), fields_map)
                                 fdef = fields_map.get(py_name)
                                 if fdef:
                                     name = py_name

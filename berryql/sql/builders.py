@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import select, text as _text, literal_column, func
+from ..core.naming import fields_map_for, from_camel
 
 # Centralized SQL builders. Keep registry thin and DRY.
 
@@ -8,6 +9,23 @@ from sqlalchemy import select, text as _text, literal_column, func
 class RelationSQLBuilders:
     def __init__(self, registry):
         self.registry = registry
+        self._model_to_btype: dict[int, Any] = {}
+
+    def _get_btype_for_model(self, model_cls):
+        key = id(model_cls)
+        cached = self._model_to_btype.get(key)
+        if cached is not None:
+            return cached
+        found = None
+        try:
+            for _bt in (self.registry.types or {}).values():
+                if getattr(_bt, 'model', None) is model_cls:
+                    found = _bt
+                    break
+        except Exception:
+            found = None
+        self._model_to_btype[key] = found
+        return found
 
     # --- helpers -------------------------------------------------------------
     def _pk_col(self, model_cls):
@@ -31,16 +49,8 @@ class RelationSQLBuilders:
         out: list = []
         seen_labels: set[str] = set()
         # Fetch Berry field defs if available to consult meta.column
-        btype = None
-        try:
-            # Reverse lookup: model -> btype by scanning registry
-            for _name, _bt in (self.registry.types or {}).items():
-                if getattr(_bt, 'model', None) is model_cls:
-                    btype = _bt
-                    break
-        except Exception:
-            btype = None
-        fdefs = getattr(btype, '__berry_fields__', {}) if btype is not None else {}
+        btype = self._get_btype_for_model(model_cls)
+        fdefs = fields_map_for(btype) if btype is not None else {}
         for name in cols:
             source_col_name = None
             try:
@@ -89,15 +99,8 @@ class RelationSQLBuilders:
         cols = list(columns or [])
         out: list[tuple[str, str]] = []
         # lookup btype to access field meta
-        btype = None
-        try:
-            for _name, _bt in (self.registry.types or {}).items():
-                if getattr(_bt, 'model', None) is model_cls:
-                    btype = _bt
-                    break
-        except Exception:
-            btype = None
-        fdefs = getattr(btype, '__berry_fields__', {}) if btype is not None else {}
+        btype = self._get_btype_for_model(model_cls)
+        fdefs = fields_map_for(btype) if btype is not None else {}
         for name in cols:
             src = None
             try:
@@ -134,16 +137,6 @@ class RelationSQLBuilders:
         rel_cfg = rel_cfg or {}
         requested: List[str] = list(rel_cfg.get('fields') or [])
         # Normalize requested field names: allow GraphQL camelCase by decamelizing to snake_case
-        import re as _re
-        def _decamel(name: str) -> str:
-            try:
-                if not name or ('_' in name):
-                    return name
-                s1 = _re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-                s2 = _re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1)
-                return s2.lower()
-            except Exception:
-                return name
         try:
             if requested:
                 tmp: list[str] = []
@@ -152,7 +145,7 @@ class RelationSQLBuilders:
                     key = sf
                     fdef = fdefs.get(key)
                     if not fdef:
-                        cand = _decamel(str(sf))
+                        cand = from_camel(str(sf))
                         fdef = fdefs.get(cand)
                         if fdef:
                             key = cand

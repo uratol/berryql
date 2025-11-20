@@ -1,4 +1,5 @@
 from __future__ import annotations
+import inspect
 import logging
 import uuid
 from typing import Any, Dict, Optional, Type, List, get_args, get_origin
@@ -29,16 +30,15 @@ def compose_scope_with_guard(dom_cls: Any, desc_scope: Any):
     Returns an async function (model_cls, info) -> scope_value suitable for _apply_where_common.
     """
     async def _inner(model_cls_local, info_local):
-        import inspect as _ins
         ds_val = desc_scope
         if callable(ds_val):
             ds_val = ds_val(model_cls_local, info_local)
-            if _ins.isawaitable(ds_val):
+            if inspect.isawaitable(ds_val):
                 ds_val = await ds_val  # type: ignore
         guard = getattr(dom_cls, '__domain_guard__', None)
         if callable(guard):
             g_val = guard(model_cls_local, info_local)
-            if _ins.isawaitable(g_val):
+            if inspect.isawaitable(g_val):
                 g_val = await g_val  # type: ignore
         else:
             g_val = guard
@@ -117,8 +117,6 @@ def build_merge_resolver_for_type(
         from .core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
 
         # --- Callback helpers -------------------------------------------------
-        import inspect
-
         def _norm_callable(cb):
             return cb if callable(cb) else None
 
@@ -321,8 +319,7 @@ def build_merge_resolver_for_type(
             if callable(v):
                 try:
                     v_res = v(model_cls_local, info)
-                    import inspect as _ins
-                    if _ins.isawaitable(v_res):
+                    if inspect.isawaitable(v_res):
                         v_res = await v_res  # type: ignore
                     v = v_res
                 except Exception:

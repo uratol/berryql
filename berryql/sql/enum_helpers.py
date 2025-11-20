@@ -101,8 +101,6 @@ def enum_column(
             status = enum_column(PostStatus, nullable=False, default=PostStatus.DRAFT,
                                  constraint_name="ck_post_status")
     """
-    # Ensure hashability before constructing SAEnum
-    ensure_enum_hashable(enum_cls)
     type_ = sa_enum_type(
         enum_cls,
         native_enum=native_enum,
