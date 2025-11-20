@@ -7,7 +7,7 @@ A tiny, declarative GraphQL mapper for Strawberry + SQLAlchemy that optimizes qu
 BerryQL lets you define GraphQL types on top of SQLAlchemy models with a minimal DSL. At runtime it:
 
 - Projects only the columns you ask for (column-level projection pushdown)
-- Pushes down relations into a single SQL per root field when possible (JSON aggregation; FOR JSON PATH on MSSQL)
+- Pushes down relations into a single SQL per root field when possible
 - Supports relation filters, ordering, and pagination without N+1
 - Adds simple aggregates (e.g., count) and custom SQL-backed fields/objects
 
