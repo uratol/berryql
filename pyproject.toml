@@ -7,8 +7,10 @@ name = "berryql"
 version = "0.1.0"
 description = "A powerful GraphQL query optimization library for Strawberry GraphQL and SQLAlchemy"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
+    {name = "Yurii Tolkunov", email = "uratol@gmail.com"},
     {name = "BerryQL Contributors"},
 ]
 keywords = ["graphql", "strawberry", "sqlalchemy", "query-optimization", "orm"]
