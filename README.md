@@ -83,7 +83,6 @@ Environment variables (optional):
 
 - BERRYQL_TEST_DATABASE_URL: async SQLAlchemy URL (e.g., postgresql+asyncpg://… or mssql+aioodbc:///?odbc_connect=…)
 - SQL_ECHO: set 1 to log SQL (default 1)
-- DEMO_SEED: set 1 to seed demo data (default 1)
 
 See `README_RUN_FASTAPI.md` for more.
 

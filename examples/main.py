@@ -5,7 +5,6 @@ Run this file to start a local server and open http://127.0.0.1:8000/graphql
 Environment variables:
   BERRYQL_TEST_DATABASE_URL  optional SQLAlchemy async URL, e.g. postgresql+asyncpg://user:pass@localhost/db
                      defaults to sqlite+aiosqlite:///./berryql_demo.db
-  DEMO_SEED          set to '0' to skip demo data seeding (default '1')
     SQL_ECHO           set to '1' (default) to log SQL, '0' to disable; uses 'debug' to include params
 """
 from __future__ import annotations
@@ -77,14 +76,13 @@ async def _init_db(app: FastAPI) -> None:
         await conn.run_sync(Base.metadata.create_all)
 
     # Seed demo data on first run (in-memory DB is empty every boot)
-    if os.getenv("DEMO_SEED", "1") != "0":
-        async with app.state.async_session() as session:
-            # Only seed if empty
-            from sqlalchemy import select
+    async with app.state.async_session() as session:
+        # Only seed if empty
+        from sqlalchemy import select
 
-            users_count = (await session.execute(select(User).limit(1))).first()
-            if not users_count:
-                await seed_populated_db(session)
+        users_count = (await session.execute(select(User).limit(1))).first()
+        if not users_count:
+            await seed_populated_db(session)
 
 
 async def _seed_demo(session: AsyncSession) -> None:

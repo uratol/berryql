@@ -2824,6 +2824,9 @@ class BerrySchema:
             st_cls.__annotations__ = annotations
         # Decorate all types now
         for name, cls in list(self._st_types.items()):
+            # Do not re-wrap Enum classes with strawberry.type; strawberry.enum already decorated
+            if isinstance(cls, type) and issubclass(cls, Enum):
+                continue
             if not getattr(cls, '__is_strawberry_type__', False):
                 # Ensure typing symbols available for forward refs
                 mod_globals = globals()
