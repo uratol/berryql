@@ -178,3 +178,4 @@ Desktop.ini
 .pre-commit-config.yaml
 
 publish_version.py
+update_version_and_upload.ps1
