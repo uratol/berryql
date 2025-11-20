@@ -1,4 +1,3 @@
-# BerryQL
 BerryQL
 ========
 
@@ -17,7 +16,7 @@ It’s designed for async SQLAlchemy 2.x and Strawberry GraphQL.
 Hello world example
 -------------------
 
-Here is a minimal end‑to‑end sketch using BerryQL with two types, relations, a query, and a merge mutation:
+Here is a minimal end‑to‑end sketch using BerryQL with three types, relations, a query, and a merge mutation:
 
 ```python
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -30,44 +29,68 @@ berry_schema = BerrySchema()
 
 # SQLAlchemy models (simplified)
 class User:
-        id: Mapped[int] = mapped_column(primary_key=True)
-        name: Mapped[str]
-        posts: Mapped[list["Post"]] = relationship(back_populates="author")
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    posts: Mapped[list["Post"]] = relationship(back_populates="author")
+    # extra relation for comments authored by the user (optional)
+    comments: Mapped[list["PostComment"]] = relationship(back_populates="author")
 
 class Post:
-        id: Mapped[int] = mapped_column(primary_key=True)
-        title: Mapped[str]
-        author_id: Mapped[int]
-        author: Mapped[User] = relationship(back_populates="posts")
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int]
+    author: Mapped[User] = relationship(back_populates="posts")
+    comments: Mapped[list["PostComment"]] = relationship(back_populates="post")
+
+
+class PostComment:
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content: Mapped[str]
+    post_id: Mapped[int]
+    author_id: Mapped[int]
+    post: Mapped[Post] = relationship(back_populates="comments")
+    author: Mapped[User] = relationship(back_populates="comments")
 
 
 @berry_schema.type(model=Post)
 class PostQL(BerryType):
-        id = field()
-        title = field()
-        author_id = field()  # autoCamelCase → authorId
+    id = field()
+    title = field()
+    author_id = field()  # autoCamelCase → authorId
     # many‑to‑one relation: post → author
+    author = relation("UserQL", single=True)
+    # one‑to‑many relation: post → comments
+    comments = relation("PostCommentQL")
+
+
+@berry_schema.type(model=PostComment)
+class PostCommentQL(BerryType):
+    id = field()
+    content = field()
+    post_id = field(name="postId")
+    author_id = field(name="authorId")
+    post = relation("PostQL", single=True)
     author = relation("UserQL", single=True)
 
 
 @berry_schema.type(model=User)
 class UserQL(BerryType):
-        id = field()
-        name = field()
-        # one‑to‑many relation: user → posts
-        posts = relation("PostQL")
+    id = field()
+    name = field()
+    # one‑to‑many relation: user → posts
+    posts = relation("PostQL")
 
 
 @berry_schema.query()
 class Query:
-        # root collection
-        users = relation("UserQL")
+    # root collection
+    users = relation("UserQL")
 
 
 @berry_schema.mutation()
 class Mutation:
-        # generated merge mutation: upsert Post rows from payload
-        merge_posts = mutation("PostQL")
+    # generated merge mutation: upsert Post rows from payload
+    merge_posts = mutation("PostQL")
 
 
 schema = berry_schema.to_strawberry()
@@ -80,16 +103,30 @@ GraphQL usage examples:
     users {
         id
         name
-        posts { id title }
+        posts {
+            id
+            title
+            comments {
+                id
+                content
+            }
+        }
     }
 }
 ```
 
 ```graphql
 mutation {
-    mergePosts(payload: [{ title: "Hello", authorId: 1 }]) {
+    mergePosts(
+        payload: [{
+            title: "Hello",
+            authorId: 1,
+            comments: [{ content: "Nice post" }]
+        }]
+    ) {
         id
         title
+        comments { id content }
     }
 }
 ```
