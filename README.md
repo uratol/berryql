@@ -135,20 +135,27 @@ mutation {
 5‑minute try-out
 -----------------
 
-If you just want to see it working quickly, you don’t need to design a schema from scratch – this repo already contains a full demo schema and models.
+If you just want to see it working quickly, you don’t need to design a schema from scratch – this repo already contains a full demo schema, models, and a FastAPI app.
 
-**1. Install and run tests (uses in‑memory SQLite)**
+**1. Create a virtualenv and install deps (PowerShell)**
 
-```bash
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+```
+
+**2. Run tests (uses in‑memory SQLite)**
+
+```powershell
 pytest -q
 ```
 
-This spins up the demo models (`tests/models.py`), Berry schema (`tests/schema.py`), and exercises queries, relations, domains, and mutations.
+This spins up the demo models (`tests/models.py`), Berry schema (`tests/schema.py`), and exercises queries, relations, domains, mutations, and subscriptions.
 
-**2. Run the demo GraphQL API (FastAPI + Strawberry)**
+**3. Run the demo GraphQL API (FastAPI + Strawberry)**
 
-```bash
+```powershell
 python -m uvicorn examples.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -180,18 +187,23 @@ mutation {
 }
 ```
 
-Behind the scenes this uses the Berry schema from `tests/schema.py` and an async SQLAlchemy session from the FastAPI app.
+Environment variables (optional):
 
-**3. Minimal “how would I use this in my app?” sketch**
+- `BERRYQL_TEST_DATABASE_URL`: async SQLAlchemy URL (e.g., `postgresql+asyncpg://…` or `mssql+aioodbc:///?odbc_connect=…`)
+- `SQL_ECHO`: set `1` to log SQL (default `1`)
+
+See `README_RUN_FASTAPI.md` for more.
+
+**4. Minimal “how would I use this in my app?” sketch**
 
 At a high level you will:
 
 1. Define SQLAlchemy models (or reuse existing ones).
 2. Map them to Berry types with `@berry_schema.type` and `field()/relation()`.
-3. Define a `@berry_schema.query()` class for roots and optionally `@berry_schema.mutation()` / `@berry_schema.domain()` classes for mutations and domains.
+3. Define a `@berry_schema.query()` class for roots and optionally `@berry_schema.mutation()` / `@berry_schema.domain()` / `@berry_schema.subscription()` classes for mutations, domains, and subscriptions.
 4. Call `berry_schema.to_strawberry()` and plug the resulting schema into Strawberry/FastAPI.
 
-The rest of this README goes into the details of fields, relations, filters, JSON where, custom scalars/objects, domains, and merge mutations.
+The rest of this README goes into the details of fields, relations, filters, JSON where, custom scalars/objects, domains, merge mutations, and subscriptions.
 
 
 What queries look like (and what SQL runs)
@@ -204,31 +216,6 @@ See tests for concrete assertions:
 
 - `tests/test_sql_projection.py` ensures only requested columns are present and unrelated tables aren’t touched.
 - `tests/test_relations_pagination_aggregate.py` ensures “one SQL per root field” when pushdown is supported.
-
-
-Run the example API (GraphiQL)
-------------------------------
-
-There’s a minimal FastAPI app that mounts the Berry-generated Strawberry schema.
-
-- File: `examples/main.py`
-- Endpoint: http://127.0.0.1:8000/graphql (GraphiQL enabled)
-
-Quick steps (PowerShell):
-
-1) Create venv and install deps
-     - python -m venv .venv
-     - .venv\Scripts\Activate.ps1
-     - pip install -r requirements.txt
-2) Run the app
-     - python -m uvicorn examples.main:app --reload --host 127.0.0.1 --port 8000
-
-Environment variables (optional):
-
-- BERRYQL_TEST_DATABASE_URL: async SQLAlchemy URL (e.g., postgresql+asyncpg://… or mssql+aioodbc:///?odbc_connect=…)
-- SQL_ECHO: set 1 to log SQL (default 1)
-
-See `README_RUN_FASTAPI.md` for more.
 
 
 Core concepts
