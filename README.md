@@ -429,3 +429,10 @@ License
 -------
 
 MIT (see LICENSE).
+
+Support This Project
+-------
+
+If you find this library useful, please consider supporting its development:
+
+👉 [![Donate](https://img.shields.io/badge/PayPal-Donate-blue)](https://www.paypal.com/donate/?business=SFJ6EM3NBP3PL&no_recurring=0&currency_code=USD)
