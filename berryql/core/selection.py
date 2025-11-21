@@ -15,6 +15,23 @@ _ORDER_FLAGS = {
     'order_multi': '_has_explicit_order_multi',
 }
 
+def _children_ast(node: Any) -> list[Any]:
+    try:
+        selset = getattr(node, 'selection_set', None)
+        if selset is not None and getattr(selset, 'selections', None) is not None:
+            return list(selset.selections) or []
+    except Exception:
+        pass
+    return []
+
+def _name_ast(node: Any) -> Optional[str]:
+    try:
+        n = getattr(node, 'name', None)
+        if hasattr(n, 'value'):
+            return getattr(n, 'value', None)
+        return n
+    except Exception:
+        return None
 
 def _assign_rel_arg(cfg: Dict[str, Any], arg_name: Optional[str], value: Any) -> None:
     if not arg_name:
@@ -244,22 +261,7 @@ class RelationSelectionExtractor:
                     break
         except Exception:
             pass
-        def _children_ast(node: Any) -> list[Any]:
-            try:
-                selset = getattr(node, 'selection_set', None)
-                if selset is not None and getattr(selset, 'selections', None) is not None:
-                    return list(selset.selections) or []
-            except Exception:
-                pass
-            return []
-        def _name_ast(node: Any) -> Optional[str]:
-            try:
-                n = getattr(node, 'name', None)
-                if hasattr(n, 'value'):
-                    return getattr(n, 'value', None)
-                return n
-            except Exception:
-                return None
+
         def _merge_rel_args(cfg_dst: Dict[str, Any], args_dict: Dict[str, Any]):
             if not isinstance(cfg_dst, dict) or not isinstance(args_dict, dict):
                 return
@@ -449,22 +451,6 @@ class RootSelectionExtractor:
             pass
         if not any(out.values()):
             try:
-                def _children_ast(node: Any) -> list[Any]:
-                    try:
-                        selset = getattr(node, 'selection_set', None)
-                        if selset is not None and getattr(selset, 'selections', None) is not None:
-                            return list(selset.selections) or []
-                    except Exception:
-                        pass
-                    return []
-                def _name_ast(node: Any) -> Optional[str]:
-                    try:
-                        n = getattr(node, 'name', None)
-                        if hasattr(n, 'value'):
-                            return getattr(n, 'value', None)
-                        return n
-                    except Exception:
-                        return None
                 raw_info = getattr(info, '_raw_info', None)
                 field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None
                 if field_nodes:

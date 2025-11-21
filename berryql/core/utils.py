@@ -1,12 +1,26 @@
 from __future__ import annotations
+import ast as _ast
+import json as _json
+import uuid as _py_uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional, Dict, List
-import uuid as _py_uuid
+
 import strawberry
-from sqlalchemy.sql.sqltypes import Integer, Boolean, DateTime
+from sqlalchemy.sql.sqltypes import Integer, Boolean, DateTime, Float, Numeric
 from sqlalchemy import and_ as _and
 from .filters import OPERATOR_REGISTRY
+
+# Try to import UUID types
+try:
+    from sqlalchemy import Uuid as _UUID
+except ImportError:
+    _UUID = None  # type: ignore
+
+try:
+    from sqlalchemy.dialects.postgresql import UUID as _PG_UUID
+except ImportError:
+    _PG_UUID = None  # type: ignore
 
 class _DirectionEnum(Enum):
     asc = 'asc'
@@ -24,83 +38,56 @@ def dir_value(order_dir: Any) -> str:
         return 'asc'
 
 def coerce_where_value(col, val):
-    try:
-        from sqlalchemy.sql.sqltypes import Integer as _I, Float as _F, Boolean as _B, DateTime as _DT, Numeric as _N
-    except Exception:
-        _I = Integer; _F = None; _B = Boolean; _DT = DateTime; _N = None
-    # Best-effort optional UUID types
-    try:
-        # SQLAlchemy 2.0 generic UUID
-        from sqlalchemy import Uuid as _UUID
-    except Exception:
-        _UUID = None  # type: ignore[assignment]
-    try:
-        # PostgreSQL dialect UUID
-        from sqlalchemy.dialects.postgresql import UUID as _PG_UUID
-    except Exception:
-        _PG_UUID = None  # type: ignore[assignment]
     if isinstance(val, (list, tuple)):
-        return [ coerce_where_value(col, v) for v in val ]
+        return [coerce_where_value(col, v) for v in val]
+    
     ctype = getattr(col, 'type', None)
     if ctype is None:
         return val
+
     try:
-        # UUID coercion: accept str input and convert to uuid.UUID for UUID-typed columns
+        # UUID coercion
         is_uuid_type = False
-        try:
-            if _UUID is not None and isinstance(ctype, _UUID):
-                is_uuid_type = True
-        except Exception:
-            pass
-        try:
-            if _PG_UUID is not None and isinstance(ctype, _PG_UUID):
-                is_uuid_type = True
-        except Exception:
-            pass
-        # Fallback: some custom UUID types expose python_type
-        try:
-            if not is_uuid_type and getattr(ctype, 'python_type', None) is _py_uuid.UUID:
-                is_uuid_type = True
-        except Exception:
-            pass
+        if _UUID is not None and isinstance(ctype, _UUID):
+            is_uuid_type = True
+        elif _PG_UUID is not None and isinstance(ctype, _PG_UUID):
+            is_uuid_type = True
+        elif getattr(ctype, 'python_type', None) is _py_uuid.UUID:
+            is_uuid_type = True
+            
         if is_uuid_type:
             if isinstance(val, str):
                 try:
                     return _py_uuid.UUID(val)
                 except Exception:
-                    # Leave as-is if it cannot be parsed; builder/operators may raise later
                     return val
             return val
-        if isinstance(ctype, _DT):
+
+        if isinstance(ctype, DateTime):
             if isinstance(val, str):
                 s = val.replace('Z', '+00:00') if 'Z' in val else val
                 try:
                     dv = datetime.fromisoformat(s)
-                    try:
-                        if getattr(ctype, 'timezone', False) is False and getattr(dv, 'tzinfo', None) is not None:
-                            dv = dv.replace(tzinfo=None)
-                    except Exception:
-                        pass
+                    if getattr(ctype, 'timezone', False) is False and getattr(dv, 'tzinfo', None) is not None:
+                        dv = dv.replace(tzinfo=None)
                     return dv
                 except Exception:
                     return val
             return val
-        if isinstance(ctype, _I):
+
+        if isinstance(ctype, Integer):
             try:
                 return int(val) if isinstance(val, str) else val
             except Exception:
                 return val
-        if _N is not None and isinstance(ctype, _N):
-            try:
+
+        if isinstance(ctype, (Float, Numeric)):
+             try:
                 return float(val) if isinstance(val, str) else val
-            except Exception:
+             except Exception:
                 return val
-        if _F is not None and isinstance(ctype, _F):
-            try:
-                return float(val) if isinstance(val, str) else val
-            except Exception:
-                return val
-        if isinstance(ctype, _B):
+
+        if isinstance(ctype, Boolean):
             if isinstance(val, str):
                 lv = val.strip().lower()
                 if lv in ('true','t','1','yes','y'):
@@ -108,6 +95,7 @@ def coerce_where_value(col, val):
                 if lv in ('false','f','0','no','n'):
                     return False
             return bool(val)
+            
     except Exception:
         return val
     return val
@@ -178,8 +166,6 @@ def normalize_relation_cfg(cfg: Dict[str, Any]) -> None:
                 if isinstance(val, str):
                     s = val.strip()
                     if (s.startswith('{') and s.endswith('}')) or (s.startswith('"{') and s.endswith('}"')):
-                        import json as _json
-                        import ast as _ast
                         try:
                             parsed = _json.loads(s)
                             # Unwrap if still a JSON string up to two times
@@ -244,7 +230,6 @@ def expr_from_where_dict(model_cls, wdict: Dict[str, Any], *, strict: bool = Tru
         wdict: where dict.
         strict: when False, unknown columns/operators are ignored instead of raising.
     """
-    from .utils import coerce_where_value  # local import to avoid cycles
     exprs: List[Any] = []
     for col_name, op_map in (wdict or {}).items():
         try:
@@ -288,7 +273,6 @@ def to_where_dict(val: Any, *, strict: bool = True) -> Optional[Dict[str, Any]]:
     if isinstance(val, str):
         s = val.strip()
         try:
-            import json as _json
             parsed = _json.loads(s)
         except Exception as e:
             if strict:

@@ -29,7 +29,7 @@ class FieldDescriptor:
 
     def __init__(self, *, kind: str, **meta):
         self.kind = kind
-        self.meta = dict(meta)
+        self.meta = meta
         self.name: str | None = None
 
     def __set_name__(self, owner, name):  # pragma: no cover - simple
@@ -86,19 +86,15 @@ def field(
         FieldDescriptor: A descriptor captured by the registry.
     """
     if column is not None:
-        meta = dict(meta)
         meta['column'] = column
     if comment is not None:
-        meta = dict(meta)
         meta['comment'] = comment
     if read_only is not None:
         # Normalize into meta so downstream registry can detect and exclude
         # from mutation input type generation.
-        meta = dict(meta)
         meta['read_only'] = bool(read_only)
     if write_only is not None:
         # Normalize into meta so registry can include in inputs and exclude from outputs.
-        meta = dict(meta)
         meta['write_only'] = bool(write_only)
     return FieldDescriptor(kind='scalar', **meta)
 
@@ -147,22 +143,21 @@ def relation(target: Any = None, *, single: bool | None = None, fk_column_name: 
     Returns:
         FieldDescriptor: A descriptor captured by the registry.
     """
-    m = dict(meta)
     if target is not None:
-        m['target'] = target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target
+        meta['target'] = target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target
     if single is not None:
-        m['single'] = single
+        meta['single'] = single
     # Optional override for foreign key column name.
     # Semantics:
     # - For list relations (child -> parent), this is the FK column on the child model referencing the parent (e.g., "entity_id").
     # - For single relations (parent -> child), this is the FK column on the parent model referencing the child (e.g., "author_id").
     if fk_column_name is not None:
-        m['fk_column_name'] = fk_column_name
+        meta['fk_column_name'] = fk_column_name
     if comment is not None:
-        m['comment'] = comment
+        meta['comment'] = comment
     # Backward-incompatible rename: parameter 'where' became 'scope'.
     # If users pass scope=..., keep it under 'scope' key; no implicit aliasing from 'where'.
-    return FieldDescriptor(kind='relation', **m)
+    return FieldDescriptor(kind='relation', **meta)
 
 
 # --- Mutations (write registration) ---
@@ -234,7 +229,6 @@ def aggregate(source: str, *, comment: Optional[str] = None, **meta) -> FieldDes
         FieldDescriptor: A descriptor captured by the registry.
     """
     if comment is not None:
-        meta = dict(meta)
         meta['comment'] = comment
     return FieldDescriptor(kind='aggregate', source=source, **meta)
 
@@ -404,14 +398,14 @@ class TypeScopeDescriptor:
 
     def __set_name__(self, owner, name):  # pragma: no cover - trivial
         try:
-            existing = getattr(owner, '__type_scope__', None)
-            if isinstance(existing, list):
-                existing.append(self.value)
-                return
-            if existing is not None:
-                setattr(owner, '__type_scope__', [existing, self.value])
-            else:
+            # Check if __type_scope__ is in the class's own dict to avoid modifying parent's list
+            existing = owner.__dict__.get('__type_scope__')
+            if existing is None:
                 setattr(owner, '__type_scope__', [self.value])
+            elif isinstance(existing, list):
+                existing.append(self.value)
+            else:
+                setattr(owner, '__type_scope__', [existing, self.value])
         except Exception:
             # Best-effort: ignore if owner is unexpected
             pass

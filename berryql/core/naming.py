@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, Optional, Set
+import re
+from typing import Any, Callable, Dict, Iterable, Optional, Set, List, Union
 
 NameConverter = Optional[Callable[[str], str]]
 
@@ -14,19 +15,13 @@ __all__ = [
     'fields_map_for',
 ]
 
+_camel_to_snake_pattern = re.compile(r'(?<!^)(?=[A-Z])')
 
 def from_camel(name: str) -> str:
     """Convert lower/upper camelCase to snake_case."""
     if not name:
         return name
-    text = str(name)
-    out: list[str] = []
-    for idx, ch in enumerate(text):
-        prev = text[idx - 1] if idx > 0 else ''
-        if ch.isupper() and idx > 0 and prev != '_':
-            out.append('_')
-        out.append(ch.lower())
-    return ''.join(out)
+    return _camel_to_snake_pattern.sub('_', str(name)).lower()
 
 
 def to_camel(name: str) -> str:
@@ -36,9 +31,7 @@ def to_camel(name: str) -> str:
     parts = str(name).split('_')
     if not parts:
         return name
-    head = parts[0]
-    tail = ''.join(p.capitalize() for p in parts[1:])
-    return head + tail
+    return parts[0] + ''.join(p.capitalize() for p in parts[1:])
 
 
 def map_graphql_to_python(
@@ -85,10 +78,10 @@ def build_name_candidates(
     return candidates
 
 
-def ensure_list(value: Any) -> list[Any] | Any:
+def ensure_list(value: Any) -> Optional[List[Any]]:
     """Wrap scalars into a list, preserving list inputs."""
     if value is None:
-        return value
+        return None
     if isinstance(value, list):
         return value
     if isinstance(value, tuple):
