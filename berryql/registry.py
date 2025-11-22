@@ -1135,6 +1135,1128 @@ class BerrySchema:
                     pass
         return inst
 
+    def _create_scalar_resolver(self, fname_local: str, src_col_name: Optional[str] = None):
+        def _resolver(root_self, info: StrawberryInfo):  # noqa: D401
+            # Prefer an explicitly set value on the Strawberry instance first.
+            # This allows from_model() or custom resolvers to override values when needed.
+            try:
+                dself = object.__getattribute__(root_self, '__dict__')
+                if isinstance(dself, dict) and fname_local in dself:
+                    return dself.get(fname_local, None)
+            except Exception:
+                pass
+            # Otherwise, read from the attached SQLAlchemy model when available.
+            try:
+                m = getattr(root_self, '_model', None)
+            except Exception:
+                m = None
+            col_name = src_col_name or fname_local
+            if m is not None:
+                try:
+                    dct = getattr(m, '__dict__', None)
+                    if isinstance(dct, dict) and col_name in dct:
+                        return dct.get(col_name, None)
+                except Exception:
+                    pass
+                try:
+                    return getattr(m, col_name, None)
+                except Exception:
+                    return None
+            # Lastly, return whatever is set on the instance (if any)
+            try:
+                dself = object.__getattribute__(root_self, '__dict__')
+                return dself.get(fname_local, None) if isinstance(dself, dict) else None
+            except Exception:
+                return None
+        return _resolver
+
+    def _create_relation_resolver(self, meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType]):
+        # Build filter specs exclusively from relation-specific arguments
+        target_filters: Dict[str, FilterSpec] = {}
+        # overlay relation-specific arguments
+        rel_args_spec = meta_copy.get('arguments')
+        if isinstance(rel_args_spec, dict):
+            target_filters.update(self._expand_filter_args(rel_args_spec))
+        
+        arg_defs = []
+        for a in target_filters.keys():
+            arg_defs.append(f"{a}=None")
+        
+        if is_single_value:
+            params = 'self, info, where=None'
+            if arg_defs:
+                params += ', ' + ', '.join(arg_defs)
+        else:
+            params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None'
+            if arg_defs:
+                params += ', ' + ', '.join(arg_defs)
+        
+        fname_inner = f"_rel_{fname_local}_resolver"
+        
+        src = f"async def {fname_inner}({params}):\n"
+        src += "    _fa={}\n"
+        for a in target_filters.keys():
+            src += f"    _fa['{a}']={a}\n"
+            
+        if is_single_value:
+            src += "    return await _impl(schema_self, self, info, None, None, None, None, None, where, _fa, meta_copy, is_single_value, fname_local, parent_btype_local, target_filters)\n"
+        else:
+            src += "    return await _impl(schema_self, self, info, limit, offset, order_by, order_dir, order_multi, where, _fa, meta_copy, is_single_value, fname_local, parent_btype_local, target_filters)\n"
+            
+        env: Dict[str, Any] = {
+            '_impl': self._relation_resolver_impl,
+            'schema_self': self,
+            'meta_copy': meta_copy,
+            'is_single_value': is_single_value,
+            'fname_local': fname_local,
+            'parent_btype_local': parent_btype_local,
+            'target_filters': target_filters
+        }
+        
+        exec(src, env)
+        fn = env[fname_inner]
+        if not getattr(fn, '__module__', None):
+            fn.__module__ = __name__
+            
+        _descs = self._get_standard_arg_descriptions()
+        if is_single_value:
+            anns: Dict[str, Any] = {
+                'info': StrawberryInfo,
+                'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
+            }
+        else:
+            anns: Dict[str, Any] = {
+                'info': StrawberryInfo,
+                'limit': Optional[int],
+                'offset': Optional[int],
+                'order_by': Annotated[Optional[str], strawberry.argument(description=_descs['order_by'])],
+                'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_descs['order_dir'])],
+                'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_descs['order_multi'])],
+                'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
+            }
+            
+        target_b = self.types.get(meta_copy.get('target')) if meta_copy.get('target') else None
+        col_type_map: Dict[str, Any] = {}
+        if target_b and target_b.model and hasattr(target_b.model, '__table__'):
+            col_type_map = self._build_column_type_map(target_b.model)
+        for a, spec in target_filters.items():
+            base_t = getattr(spec, 'arg_type', None) or str
+            if base_t is str and spec.column and spec.column in col_type_map:
+                base_t = col_type_map[spec.column]
+            if spec.op in ('in','between'):
+                anns[a] = Optional[List[base_t]]  # type: ignore
+            else:
+                anns[a] = Optional[base_t]
+        fn.__annotations__ = anns
+        return fn
+
+    async def _relation_resolver_impl(self, root_self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any], meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType], target_filters: Dict[str, FilterSpec]):
+        prefetch_attr = f'_{fname_local}_prefetched'
+        if hasattr(root_self, prefetch_attr):
+            prefetched = getattr(root_self, prefetch_attr)
+            val = prefetched if is_single_value else list(prefetched or [])
+            try:
+                pp = meta_copy.get('post_process')
+            except Exception:
+                pp = None
+            if pp is not None:
+                try:
+                    import inspect
+                    res = pp(val, info)
+                    if inspect.isawaitable(res):
+                        res = await res
+                    return res
+                except Exception:
+                    return val
+            return val
+        target_name_i = meta_copy.get('target')
+        target_cls_i = self._st_types.get(target_name_i)
+        parent_model = getattr(root_self, '_model', None)
+        if not target_cls_i:
+            return None if is_single_value else []
+        session = _get_db(info)
+        if session is None:
+            return None if is_single_value else []
+        lock = self._get_context_lock(info)
+        target_btype = self.types.get(target_name_i)
+        if not target_btype or not target_btype.model:
+            return None if is_single_value else []
+        child_model_cls = target_btype.model
+        if is_single_value:
+            candidate_fk_val = None
+            fallback_parent_id = None
+            try:
+                explicit_fk_name = meta_copy.get('fk_column_name') or (getattr(root_self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
+            except Exception:
+                explicit_fk_name = None
+            try:
+                if explicit_fk_name:
+                    candidate_fk_val = getattr(root_self, explicit_fk_name, None)
+                else:
+                    candidate_fk_val = getattr(root_self, f"{fname_local}_id", None)
+            except Exception:
+                candidate_fk_val = None
+            try:
+                if parent_model is not None:
+                    try:
+                        pk_name_parent = self._get_pk_name(parent_model.__class__)
+                        fallback_parent_id = getattr(parent_model, pk_name_parent, None)
+                    except Exception:
+                        fallback_parent_id = None
+                else:
+                    fallback_parent_id = None
+            except Exception:
+                fallback_parent_id = None
+            if fallback_parent_id is None:
+                try:
+                    fallback_parent_id = getattr(root_self, 'id', None)
+                except Exception:
+                    fallback_parent_id = None
+            if candidate_fk_val is None and parent_model is not None:
+                for col in parent_model.__table__.columns:
+                    if explicit_fk_name and col.name == explicit_fk_name:
+                        try:
+                            candidate_fk_val = getattr(parent_model, col.name)
+                        except Exception:
+                            candidate_fk_val = None
+                        if candidate_fk_val is not None:
+                            break
+                    if col.name.endswith('_id') and col.foreign_keys:
+                        for fk in col.foreign_keys:
+                            if fk.column.table.name == child_model_cls.__table__.name:
+                                candidate_fk_val = getattr(parent_model, col.name)
+                                break
+                    if candidate_fk_val is not None:
+                        break
+            if candidate_fk_val is None and fallback_parent_id is not None:
+                from sqlalchemy import select as _select
+                try:
+                    explicit_child_fk_name = meta_copy.get('fk_column_name') or (getattr(root_self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
+                except Exception:
+                    explicit_child_fk_name = None
+                child_fk_to_parent = self._find_child_fk_column(
+                    parent_model.__class__ if parent_model is not None else None,
+                    child_model_cls,
+                    explicit_child_fk_name,
+                )
+                if child_fk_to_parent is not None:
+                    stmt = _select(child_model_cls).where(child_fk_to_parent == fallback_parent_id)
+                    eff_scope = meta_copy.get('scope')
+                    if related_where is not None or eff_scope is not None:
+                        wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
+                        if wdict_arg:
+                            expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
+                            if expr is not None:
+                                stmt = stmt.where(expr)
+                        dwhere = eff_scope
+                        if dwhere is not None:
+                            if isinstance(dwhere, (dict, str)):
+                                wdict_def = _to_where_dict(dwhere, strict=True)
+                                if wdict_def:
+                                    expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=True)
+                                    if expr is not None:
+                                        stmt = stmt.where(expr)
+                            elif callable(dwhere):
+                                expr = dwhere(child_model_cls, info)
+                                if expr is not None:
+                                    stmt = stmt.where(expr)
+                    try:
+                        tgt_b_for_type = self.types.get(target_name_i)
+                        t_scope = getattr(tgt_b_for_type, '__type_scope__', None) if tgt_b_for_type is not None else None
+                        if t_scope is None and tgt_b_for_type is not None:
+                            t_scope = getattr(tgt_b_for_type, 'scope', None)
+                    except Exception:
+                        t_scope = None
+                    if t_scope is not None:
+                        fragments = t_scope if isinstance(t_scope, list) else [t_scope]
+                        for frag in fragments:
+                            if isinstance(frag, (dict, str)):
+                                wdict_t = _to_where_dict(frag, strict=True)
+                                if wdict_t:
+                                    expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=True)
+                                    if expr_t is not None:
+                                        stmt = stmt.where(expr_t)
+                            elif callable(frag):
+                                expr_t = frag(child_model_cls, info)
+                                if expr_t is not None:
+                                    stmt = stmt.where(expr_t)
+                    try:
+                        allowed_order = [sf for sf, sd in self.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+                    except Exception:
+                        allowed_order = []
+                    ordered_any = False
+                    if order_multi:
+                        for spec in order_multi:
+                            try:
+                                cn, _, dd = str(spec).partition(':')
+                                dd = dd or 'asc'
+                                if not allowed_order or cn in allowed_order:
+                                    col = child_model_cls.__table__.c.get(cn)
+                                    if col is not None:
+                                        stmt = stmt.order_by(col.desc() if dd.lower()=='desc' else col.asc())
+                                        ordered_any = True
+                            except Exception:
+                                pass
+                    if not ordered_any and order_by and (not allowed_order or order_by in allowed_order):
+                        col = child_model_cls.__table__.c.get(order_by)
+                        if col is not None:
+                            desc = _dir_value(order_dir) == 'desc' if order_dir is not None else False
+                            stmt = stmt.order_by(col.desc() if desc else col.asc())
+                            ordered_any = True
+                    if not ordered_any:
+                        try:
+                            pk_col_child = self._get_pk_column(child_model_cls)
+                            stmt = stmt.order_by(pk_col_child.asc())
+                        except Exception:
+                            pass
+                    async with lock:
+                        result = await session.execute(stmt.limit(1))
+                    row = result.scalar_one_or_none()
+                    if row is None:
+                        return None
+                    inst = target_cls_i()
+                    setattr(inst, '_model', row)
+                    for sf, sdef in self.types[target_name_i].__berry_fields__.items():
+                        if sdef.kind == 'scalar':
+                            try:
+                                setattr(inst, sf, getattr(row, sf, None))
+                            except Exception:
+                                pass
+                    try:
+                        pp = meta_copy.get('post_process')
+                    except Exception:
+                        pp = None
+                    if pp is not None:
+                        try:
+                            import inspect
+                            res = pp(inst, info)
+                            if inspect.isawaitable(res):
+                                res = await res
+                            return res
+                        except Exception:
+                            return inst
+                    return inst
+            if candidate_fk_val is None:
+                return None
+            if any(v is not None for v in _filter_args.values()) or related_where is not None:
+                from sqlalchemy import select as _select
+                try:
+                    reason = None
+                    try:
+                        meta_map = getattr(root_self, '_pushdown_meta', None)
+                        if isinstance(meta_map, dict):
+                            reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                    except Exception:
+                        reason = None
+                    if reason:
+                        _logger.warning(
+                            "berryql: falling back to per-parent select for single relation '%s' (reason=%s)",
+                            fname_local,
+                            reason,
+                        )
+                    else:
+                        _logger.warning(
+                            "berryql: falling back to per-parent select for single relation '%s' (no pushdown)",
+                            fname_local,
+                        )
+                except Exception:
+                    pass
+                try:
+                    pk_col_child = self._get_pk_column(child_model_cls)
+                    stmt = _select(child_model_cls).where(pk_col_child == candidate_fk_val)
+                except Exception:
+                    raise
+                eff_scope = meta_copy.get('scope')
+                if related_where is not None or eff_scope is not None:
+                    wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
+                    if wdict_arg:
+                        expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
+                        if expr is not None:
+                            stmt = stmt.where(expr)
+                    dwhere = eff_scope
+                    if dwhere is not None:
+                        if isinstance(dwhere, (dict, str)):
+                            wdict_def = _to_where_dict(dwhere, strict=True)
+                            if wdict_def:
+                                expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=True)
+                                if expr is not None:
+                                    stmt = stmt.where(expr)
+                        elif callable(dwhere):
+                            expr = dwhere(child_model_cls, info)
+                            if expr is not None:
+                                stmt = stmt.where(expr)
+                try:
+                    tgt_b_for_type2 = self.types.get(target_name_i)
+                    t_scope2 = getattr(tgt_b_for_type2, '__type_scope__', None) if tgt_b_for_type2 is not None else None
+                    if t_scope2 is None and tgt_b_for_type2 is not None:
+                        t_scope2 = getattr(tgt_b_for_type2, 'scope', None)
+                except Exception:
+                    t_scope2 = None
+                if t_scope2 is not None:
+                    fragments2 = t_scope2 if isinstance(t_scope2, list) else [t_scope2]
+                    for frag2 in fragments2:
+                        if isinstance(frag2, (dict, str)):
+                            wdict_t2 = _to_where_dict(frag2, strict=True)
+                            if wdict_t2:
+                                expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=True)
+                                if expr_t2 is not None:
+                                    stmt = stmt.where(expr_t2)
+                        elif callable(frag2):
+                            expr_t2 = frag2(child_model_cls, info)
+                            if expr_t2 is not None:
+                                stmt = stmt.where(expr_t2)
+                for arg_name, val in _filter_args.items():
+                    if val is None:
+                        continue
+                    f_spec = target_filters.get(arg_name)
+                    if not f_spec:
+                        raise ValueError(f"Unknown filter argument: {arg_name}")
+                    expr = None
+                    if f_spec.transform:
+                        try:
+                            val = f_spec.transform(val)
+                        except Exception as e:
+                            raise ValueError(f"Filter transform failed for {arg_name}: {e}")
+                    if f_spec.builder:
+                        try:
+                            expr = f_spec.builder(child_model_cls, info, val)
+                        except Exception as e:
+                            raise ValueError(f"Filter builder failed for {arg_name}: {e}")
+                    elif f_spec.column:
+                        try:
+                            col = child_model_cls.__table__.c.get(f_spec.column)
+                        except Exception:
+                            col = None
+                        if col is None:
+                            raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
+                        op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                        if not op_fn:
+                            raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
+                        try:
+                            val2 = _coerce_where_value(col, val)
+                            expr = op_fn(col, val2)
+                        except Exception as e:
+                            raise ValueError(f"Filter operation failed for {arg_name}: {e}")
+                    if expr is not None:
+                        stmt = stmt.where(expr)
+                async with lock:
+                    result = await session.execute(stmt.limit(1))
+                row = result.scalar_one_or_none()
+            else:
+                try:
+                    reason = None
+                    try:
+                        meta_map = getattr(root_self, '_pushdown_meta', None)
+                        if isinstance(meta_map, dict):
+                            reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                    except Exception:
+                        reason = None
+                    if reason:
+                        _logger.warning(
+                            "berryql: falling back to per-parent get() for single relation '%s' (reason=%s)",
+                            fname_local,
+                            reason,
+                        )
+                    else:
+                        _logger.warning(
+                            "berryql: falling back to per-parent get() for single relation '%s' (no pushdown)",
+                            fname_local,
+                        )
+                except Exception:
+                    pass
+                async with lock:
+                    row = await session.get(child_model_cls, candidate_fk_val)
+            if not row:
+                return None
+            inst = target_cls_i()
+            setattr(inst, '_model', row)
+            for sf, sdef in self.types[target_name_i].__berry_fields__.items():
+                if sdef.kind == 'scalar':
+                    try:
+                        setattr(inst, sf, getattr(row, sf, None))
+                    except Exception:
+                        pass
+            try:
+                pp = meta_copy.get('post_process')
+            except Exception:
+                pp = None
+            if pp is not None:
+                try:
+                    import inspect
+                    res = pp(inst, info)
+                    if inspect.isawaitable(res):
+                        res = await res
+                    return res
+                except Exception:
+                    return inst
+            return inst
+        fk_col = None
+        parent_model_cls = getattr(parent_btype_local, 'model', None)
+        try:
+            explicit_child_fk = meta_copy.get('fk_column_name') or (getattr(root_self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
+        except Exception:
+            explicit_child_fk = None
+        fk_col = self._find_child_fk_column(
+            parent_model_cls if parent_model_cls is not None else (parent_model.__class__ if parent_model is not None else None),
+            child_model_cls,
+            explicit_child_fk,
+        )
+        if fk_col is None:
+            return []
+        from sqlalchemy import select as _select
+        if parent_model is not None:
+            try:
+                pk_name_parent = self._get_pk_name(parent_model.__class__)
+                parent_id_val = getattr(parent_model, pk_name_parent, None)
+            except Exception:
+                parent_id_val = None
+        else:
+            pk_attr_name = None
+            try:
+                parent_model_cls2 = getattr(parent_btype_local, 'model', None)
+                if parent_model_cls2 is not None:
+                    pk_attr_name = self._get_pk_name(parent_model_cls2)
+            except Exception:
+                pk_attr_name = None
+            if not pk_attr_name:
+                pk_attr_name = 'id'
+            parent_id_val = getattr(root_self, pk_attr_name, None)
+            try:
+                if callable(parent_id_val):
+                    parent_id_val = getattr(root_self, '__dict__', {}).get(pk_attr_name, None)
+            except Exception:
+                pass
+        if parent_id_val is None:
+            return []
+        requested_fields: list[str] = []
+        try:
+            meta_map0 = getattr(root_self, '_pushdown_meta', None)
+            if isinstance(meta_map0, dict):
+                cfg = meta_map0.get(fname_local) or {}
+                req = cfg.get('fields') or []
+                if isinstance(req, (list, tuple)):
+                    requested_fields = [str(x) for x in req]
+        except Exception:
+            requested_fields = []
+        if not requested_fields:
+            try:
+                raw_info = getattr(info, '_raw_info', None) or info
+                fnodes = list(getattr(raw_info, 'field_nodes', []) or [])
+                if fnodes:
+                    node = fnodes[0]
+                    selset = getattr(node, 'selection_set', None)
+                    sels = list(getattr(selset, 'selections', []) or []) if selset is not None else []
+                    for s in sels:
+                        nm = None
+                        try:
+                            nobj = getattr(s, 'name', None)
+                            nm = getattr(nobj, 'value', None) if nobj is not None else None
+                            if nm is None:
+                                nm = getattr(s, 'name', None)
+                        except Exception:
+                            nm = None
+                        if nm and not str(nm).startswith('__'):
+                            requested_fields.append(str(nm))
+            except Exception:
+                requested_fields = []
+        cols = []
+        pk_expr = None
+        try:
+            pk_expr = self._get_pk_column(child_model_cls)
+        except Exception:
+            pk_expr = None
+        if pk_expr is not None:
+            cols.append(pk_expr.label('id'))
+        try:
+            scalars_on_target = set()
+            for sf, sd in self.types[target_name_i].__berry_fields__.items():
+                if sd.kind == 'scalar':
+                    try:
+                        if (getattr(sd, 'meta', {}) or {}).get('write_only'):
+                            continue
+                    except Exception:
+                        pass
+                    scalars_on_target.add(sf)
+            def _to_python_name(gql_name: str) -> str:
+                if gql_name in scalars_on_target:
+                    return gql_name
+                try:
+                    if getattr(self, '_auto_camel_case', False):
+                        n = str(gql_name)
+                        out = []
+                        for i, ch in enumerate(n):
+                            if ch.isupper() and i > 0 and n[i-1] != '_':
+                                out.append('_')
+                            out.append(ch.lower())
+                        snake = ''.join(out)
+                        if snake in scalars_on_target:
+                            return snake
+                except Exception:
+                    pass
+                try:
+                    name_conv = getattr(getattr(self, '_name_converter', None), 'apply_naming_config', None)
+                    if callable(name_conv):
+                        for py in scalars_on_target:
+                            try:
+                                if name_conv(py) == gql_name:
+                                    return py
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                return str(gql_name)
+        except Exception:
+            scalars_on_target = set()
+        mapped_requested = []
+        try:
+            for _fn in requested_fields:
+                mapped = _to_python_name(_fn)
+                mapped_requested.append(mapped)
+        except Exception:
+            mapped_requested = list(requested_fields)
+        for fn in mapped_requested:
+            if fn == 'id':
+                continue
+            if scalars_on_target and fn not in scalars_on_target:
+                continue
+            source_name = None
+            try:
+                fdef_req = self.types[target_name_i].__berry_fields__.get(fn)
+                if fdef_req and getattr(fdef_req, 'kind', None) == 'scalar':
+                    source_name = (getattr(fdef_req, 'meta', {}) or {}).get('column')
+            except Exception:
+                source_name = None
+            if source_name:
+                try:
+                    src_col_obj = child_model_cls.__table__.c.get(source_name)
+                except Exception:
+                    src_col_obj = None
+                if src_col_obj is not None:
+                    try:
+                        cols.append(src_col_obj.label(fn))
+                    except Exception:
+                        cols.append(src_col_obj)
+                    continue
+            try:
+                col_obj = child_model_cls.__table__.c.get(fn)
+            except Exception:
+                col_obj = None
+            if col_obj is not None:
+                cols.append(col_obj.label(fn))
+        try:
+            rel_fields_on_target = {
+                rf: rd for rf, rd in self.types[target_name_i].__berry_fields__.items()
+                if rd.kind == 'relation'
+            }
+        except Exception:
+            rel_fields_on_target = {}
+        for rf_name, rf_def in rel_fields_on_target.items():
+            if rf_name not in requested_fields:
+                continue
+            try:
+                is_single_rel = bool(rf_def.meta.get('single'))
+            except Exception:
+                is_single_rel = False
+            if not is_single_rel:
+                continue
+            try:
+                target_rel_name = rf_def.meta.get('target')
+                target_rel_btype = self.types.get(target_rel_name) if target_rel_name else None
+                target_rel_model = target_rel_btype.model if target_rel_btype and target_rel_btype.model else None
+            except Exception:
+                target_rel_model = None
+            fk_col_obj = None
+            try:
+                fk_col_obj = child_model_cls.__table__.c.get(f"{rf_name}_id")
+            except Exception:
+                fk_col_obj = None
+            if fk_col_obj is None and target_rel_model is not None:
+                try:
+                    explicit_child_fk_name = None
+                    try:
+                        explicit_child_fk_name = (rf_def.meta or {}).get('fk_column_name')
+                    except Exception:
+                        explicit_child_fk_name = None
+                    fk_col_obj = self._find_child_fk_column(target_rel_model, child_model_cls, explicit_child_fk_name)
+                except Exception:
+                    fk_col_obj = None
+            if fk_col_obj is not None:
+                try:
+                    label_name = f"{rf_name}_id"
+                    if all(getattr(cl, 'name', None) != label_name for cl in cols):
+                        cols.append(fk_col_obj.label(label_name))
+                except Exception:
+                    pass
+        if cols:
+            stmt = _select(*cols).select_from(child_model_cls).where(fk_col == parent_id_val)
+        else:
+            try:
+                pk_expr_fallback = self._get_pk_column(child_model_cls)
+                stmt = _select(pk_expr_fallback).select_from(child_model_cls).where(fk_col == parent_id_val)
+            except Exception:
+                return []
+        try:
+            reason = None
+            try:
+                meta_map = getattr(root_self, '_pushdown_meta', None)
+                if isinstance(meta_map, dict):
+                    reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+            except Exception:
+                reason = None
+            if reason:
+                _logger.warning(
+                    "berryql: falling back to per-parent query for relation '%s' (reason=%s)",
+                    fname_local,
+                    reason,
+                )
+            else:
+                _logger.warning(
+                    "berryql: falling back to per-parent query for relation '%s' (no lateral pushdown)",
+                    fname_local,
+                )
+        except Exception:
+            pass
+        eff_scope = meta_copy.get('scope')
+        if related_where is not None or eff_scope is not None:
+            if related_where is not None:
+                wdict = _to_where_dict(related_where, strict=True)
+                if wdict:
+                    expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
+                    if expr is not None:
+                        stmt = stmt.where(expr)
+            dwhere = eff_scope
+            if dwhere is not None:
+                if isinstance(dwhere, (dict, str)):
+                    wdict = _to_where_dict(dwhere, strict=True)
+                    if wdict:
+                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
+                        if expr is not None:
+                            stmt = stmt.where(expr)
+                elif callable(dwhere):
+                    expr = dwhere(child_model_cls, info)
+                    if expr is not None:
+                        stmt = stmt.where(expr)
+        try:
+            tgt_b_for_type3 = self.types.get(target_name_i)
+            t_scope3 = getattr(tgt_b_for_type3, '__type_scope__', None) if tgt_b_for_type3 is not None else None
+            if t_scope3 is None and tgt_b_for_type3 is not None:
+                t_scope3 = getattr(tgt_b_for_type3, 'scope', None)
+        except Exception:
+            t_scope3 = None
+        if t_scope3 is not None:
+            fragments3 = t_scope3 if isinstance(t_scope3, list) else [t_scope3]
+            for frag3 in fragments3:
+                if isinstance(frag3, (dict, str)):
+                    wdict_t3 = _to_where_dict(frag3, strict=True)
+                    if wdict_t3:
+                        expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=True)
+                        if expr_t3 is not None:
+                            stmt = stmt.where(expr_t3)
+                elif callable(frag3):
+                    expr_t3 = frag3(child_model_cls, info)
+                    if expr_t3 is not None:
+                        stmt = stmt.where(expr_t3)
+        allowed_order = getattr(target_cls_i, '__ordering__', None)
+        if allowed_order is None:
+            allowed_order = [sf for sf, sd in self.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+        try:
+            ac = bool(getattr(self, '_auto_camel_case', False))
+        except Exception:
+            ac = False
+        if ac:
+            from inflection import underscore as _underscore
+            try:
+                allowed_order_snake = [
+                    (s if '_' in s else _underscore(s)) for s in allowed_order
+                ]
+            except Exception:
+                allowed_order_snake = allowed_order
+        else:
+            allowed_order_snake = allowed_order
+        applied_any = False
+        if order_by and isinstance(order_by, str):
+            ob_key = order_by
+            if ac:
+                try:
+                    from inflection import underscore as _underscore
+                    ob_key = ob_key if '_' in ob_key else _underscore(ob_key)
+                except Exception:
+                    ob_key = order_by
+            if ob_key not in allowed_order_snake:
+                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
+        if order_multi:
+            for spec in order_multi:
+                try:
+                    col_name, _, dir_part = spec.partition(':')
+                    dir_part = dir_part or 'asc'
+                    col_key = col_name
+                    if ac:
+                        try:
+                            from inflection import underscore as _underscore
+                            col_key = col_key if '_' in col_key else _underscore(col_key)
+                        except Exception:
+                            col_key = col_name
+                    if col_key in allowed_order_snake:
+                        col_obj = child_model_cls.__table__.c.get(col_name)
+                        if col_obj is not None:
+                            stmt = stmt.order_by(col_obj.desc() if dir_part.lower()=='desc' else col_obj.asc())
+                            applied_any = True
+                except Exception:
+                    raise
+        if not applied_any and order_by:
+            expr = None
+            if callable(order_by):
+                try:
+                    expr = order_by(child_model_cls, info)
+                except Exception:
+                    expr = None
+            elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
+                expr = order_by
+            elif isinstance(order_by, str):
+                ob_key2 = order_by
+                if ac:
+                    try:
+                        from inflection import underscore as _underscore
+                        ob_key2 = ob_key2 if '_' in ob_key2 else _underscore(ob_key2)
+                    except Exception:
+                        ob_key2 = order_by
+                if ob_key2 in allowed_order_snake:
+                    try:
+                        expr = child_model_cls.__table__.c.get(order_by)
+                    except Exception:
+                        expr = None
+            if expr is not None:
+                descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
+                try:
+                    if hasattr(expr, 'desc') and hasattr(expr, 'asc'):
+                        stmt = stmt.order_by(expr.desc() if descending else expr.asc())
+                    else:
+                        stmt = stmt.order_by(expr)
+                    applied_any = True
+                except Exception:
+                    pass
+        if not applied_any and (not order_by) and (meta_copy.get('order_by') or meta_copy.get('order_multi')):
+            try:
+                def_dir = _dir_value(meta_copy.get('order_dir'))
+                if meta_copy.get('order_multi'):
+                    for spec in meta_copy.get('order_multi') or []:
+                        cn, _, dd = str(spec).partition(':')
+                        dd = dd or def_dir
+                        col = child_model_cls.__table__.c.get(cn)
+                        if col is not None:
+                            stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
+                            applied_any = True
+                elif meta_copy.get('order_by'):
+                    cn = meta_copy.get('order_by')
+                    dd = def_dir
+                    expr2 = None
+                    if callable(cn):
+                        try:
+                            expr2 = cn(child_model_cls, info)
+                        except Exception:
+                            expr2 = None
+                    elif hasattr(cn, 'desc') or hasattr(cn, 'asc'):
+                        expr2 = cn
+                    else:
+                        col = child_model_cls.__table__.c.get(cn)
+                        expr2 = col
+                    if expr2 is not None:
+                        try:
+                            if hasattr(expr2, 'desc') and hasattr(expr2, 'asc'):
+                                stmt = stmt.order_by(expr2.desc() if dd=='desc' else expr2.asc())
+                            else:
+                                stmt = stmt.order_by(expr2)
+                            applied_any = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        if target_filters:
+            for arg_name, val in _filter_args.items():
+                if val is None:
+                    continue
+                f_spec = target_filters.get(arg_name)
+                if not f_spec:
+                    raise ValueError(f"Unknown filter argument: {arg_name}")
+                if f_spec.transform:
+                    try:
+                        val = f_spec.transform(val)
+                    except Exception as e:
+                        raise ValueError(f"Filter transform failed for {arg_name}: {e}")
+                expr = None
+                if f_spec.builder:
+                    try:
+                        expr = f_spec.builder(child_model_cls, info, val)
+                    except Exception as e:
+                        raise ValueError(f"Filter builder failed for {arg_name}: {e}")
+                elif f_spec.column:
+                    try:
+                        col = child_model_cls.__table__.c.get(f_spec.column)
+                    except Exception:
+                        col = None
+                    if col is None:
+                        raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
+                    op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                    if not op_fn:
+                        raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
+                    try:
+                        val2 = _coerce_where_value(col, val)
+                        expr = op_fn(col, val2)
+                    except Exception as e:
+                        raise ValueError(f"Filter operation failed for {arg_name}: {e}")
+                if expr is not None:
+                    stmt = stmt.where(expr)
+        if offset is not None:
+            try:
+                o = int(offset)
+            except Exception:
+                raise ValueError("offset must be an integer")
+            if o < 0:
+                raise ValueError("offset must be non-negative")
+            if o:
+                stmt = stmt.offset(o)
+        if limit is not None:
+            try:
+                l = int(limit)
+            except Exception:
+                raise ValueError("limit must be an integer")
+            if l < 0:
+                raise ValueError("limit must be non-negative")
+            stmt = stmt.limit(l)
+        async with lock:
+            result = await session.execute(stmt)
+        rows = []
+        try:
+            rows = result.mappings().all()  # type: ignore[attr-defined]
+        except Exception:
+            rows = [getattr(r, '_mapping', None) or r for r in result.fetchall()]
+        results_list = []
+        for m in rows:
+            init_kwargs: Dict[str, Any] = {}
+            try:
+                mapping_obj = getattr(m, '_mapping', None) or m
+            except Exception:
+                mapping_obj = m
+            try:
+                from collections.abc import Mapping as _Mapping  # type: ignore
+            except Exception:
+                _Mapping = None  # type: ignore
+            if (_Mapping is not None and isinstance(mapping_obj, _Mapping)) or isinstance(mapping_obj, dict):
+                try:
+                    items_iter = mapping_obj.items()
+                except Exception:
+                    items_iter = []  # type: ignore
+                for k, v in items_iter:
+                    try:
+                        init_kwargs[str(k)] = v
+                    except Exception:
+                        pass
+            else:
+                try:
+                    init_kwargs['id'] = mapping_obj[0]
+                except Exception:
+                    pass
+            try:
+                inst = target_cls_i(**init_kwargs)
+            except Exception:
+                inst = target_cls_i()
+                for k, v in init_kwargs.items():
+                    try:
+                        setattr(inst, k, v)
+                    except Exception:
+                        pass
+            try:
+                setattr(inst, '_model', None)
+            except Exception:
+                pass
+            results_list.append(inst)
+        try:
+            pp = meta_copy.get('post_process')
+        except Exception:
+            pp = None
+        if pp is not None:
+            try:
+                import inspect
+                res = pp(results_list, info)
+                if inspect.isawaitable(res):
+                    res = await res
+                return res
+            except Exception:
+                return results_list
+        return results_list
+
+    def _create_aggregate_resolver(self, meta_copy: Dict[str, Any], bcls_local: Type[BerryType]):
+        async def aggregate_resolver(self, info: StrawberryInfo):
+            """Resolve aggregate values."""
+            cache = getattr(self, '_agg_cache', None)
+            is_count_local = meta_copy.get('op') == 'count' or 'count' in meta_copy.get('ops', [])
+            if is_count_local and cache is not None:
+                key = meta_copy.get('cache_key') or (meta_copy.get('source') + ':count')
+                if key in cache:
+                    return cache[key]
+
+            source = meta_copy.get('source')
+            rel_def = bcls_local.__berry_fields__.get(source) if source else None
+            if not rel_def or rel_def.kind != 'relation':
+                if is_count_local:
+                    return 0
+                return None
+
+            target_name = rel_def.meta.get('target')
+            target_btype = self.types.get(target_name) if target_name else None
+            if not target_btype or not target_btype.model:
+                if is_count_local:
+                    return 0
+                return None
+            child_model_cls = target_btype.model
+
+            parent_model = getattr(self, '_model', None)
+            parent_model_cls = parent_model.__class__ if parent_model is not None else getattr(bcls_local, 'model', None)
+
+            try:
+                explicit_child_fk_name = (rel_def.meta or {}).get('fk_column_name')
+            except Exception:
+                explicit_child_fk_name = None
+            fk_col = None
+            if parent_model_cls is not None:
+                fk_col = self._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)
+            if fk_col is None:
+                if is_count_local:
+                    return 0
+                return None
+
+            if not is_count_local:
+                return None
+
+            session = _get_db(info)
+            if session is None:
+                return 0
+
+            from sqlalchemy import func, select as _select
+            parent_pk_value = None
+            try:
+                if parent_model is not None:
+                    pk_name_parent = self._get_pk_name(parent_model.__class__)
+                    parent_pk_value = getattr(parent_model, pk_name_parent)
+                else:
+                    if parent_model_cls is not None:
+                        pk_name_parent = self._get_pk_name(parent_model_cls)
+                        parent_pk_value = getattr(self, pk_name_parent, None)
+            except Exception:
+                parent_pk_value = None
+
+            if parent_pk_value is None:
+                return 0
+
+            try:
+                stmt = _select(func.count()).select_from(child_model_cls).where(fk_col == parent_pk_value)
+                result = await session.execute(stmt)
+                val = result.scalar_one() or 0
+            except Exception:
+                val = 0
+
+            key = meta_copy.get('cache_key') or (source + ':count')
+            if cache is None:
+                cache = {}
+                setattr(self, '_agg_cache', cache)
+            cache[key] = val
+            return val
+        return aggregate_resolver
+
+    def _create_custom_resolver(self, meta_copy: Dict[str, Any], fname_local: str):
+        async def custom_resolver(self, info: StrawberryInfo):  # noqa: D401
+            # Fast-path: if root query already populated attribute (no N+1), return it.
+            # Important: avoid accidentally returning the bound resolver method itself
+            # when the attribute isn't set on the instance (__dict__).
+            pre_value = None
+            try:
+                # Prefer instance dict value if present (set by hydration)
+                if hasattr(self, '__dict__') and fname_local in getattr(self, '__dict__', {}):
+                    pre_value = self.__dict__[fname_local]
+                else:
+                    # Fallback to explicit prefetched marker used by hydrators
+                    pre_value = getattr(self, f"_{fname_local}_prefetched", None)
+            except Exception:
+                pre_value = None
+            # Only short-circuit when we have a real value (and not a callable)
+            if pre_value is not None and not callable(pre_value):
+                return pre_value
+            parent_model = getattr(self, '_model', None)
+            if parent_model is None:
+                return None
+            session = _get_db(info)
+            if session is None:
+                return None
+            builder = meta_copy.get('builder')
+            if builder is None:
+                return None
+            import inspect, asyncio, json as _json
+            # Try builder(model_cls) for robust evaluation; scope by PK when possible
+            try:
+                # Determine model class for the parent
+                model_cls_for_builder = type(parent_model)
+                if len(inspect.signature(builder).parameters) == 1:
+                    result_obj = builder(model_cls_for_builder)
+                else:
+                    result_obj = builder(model_cls_for_builder, session)
+            except Exception:
+                try:
+                    result_obj = builder(model_cls_for_builder)
+                except Exception:
+                    return None
+            if asyncio.iscoroutine(result_obj):
+                result_obj = await result_obj
+            try:
+                from sqlalchemy.sql import Select as _Select  # type: ignore
+            except Exception:
+                _Select = None  # type: ignore
+            if _Select is not None and isinstance(result_obj, _Select):
+                # If possible, constrain the SELECT to this instance by primary key
+                try:
+                    from sqlalchemy.inspection import inspect as _sa_inspect  # type: ignore
+                    pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
+                    if pk_cols:
+                        pk_col = pk_cols[0]
+                        pk_val = getattr(parent_model, getattr(pk_col, 'key', 'id'), None)
+                        if pk_val is not None:
+                            try:
+                                result_obj = result_obj.where(pk_col == pk_val)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                exec_result = await session.execute(result_obj)
+                row = exec_result.first()
+                if not row:
+                    return None
+                try:
+                    mv = row._mapping
+                    if len(mv) == 1:
+                        result_obj = list(mv.values())[0]
+                    else:
+                        result_obj = dict(mv)
+
+                except Exception:
+                    result_obj = row[0]
+            if isinstance(result_obj, str):
+                try:
+                    result_obj = _json.loads(result_obj)
+                except Exception:
+                    pass
+            return result_obj
+        return custom_resolver
+
+    def _create_custom_obj_resolver(self, fname_local: str):
+        async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+            # Prefer pre-hydrated values; no N+1 fallback
+            pre_json = getattr(self, f"_{fname_local}_prefetched", None)
+            if pre_json is not None:
+                return pre_json
+            pre_v = getattr(self, f"_{fname_local}_data", None)
+            if pre_v is not None:
+                return pre_v
+            return None
+        return _resolver
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
         # Persist naming behavior for extractor logic
         try:
@@ -2626,96 +3748,15 @@ class BerrySchema:
                     except Exception:
                         annotations[fname] = Optional[str]
                     meta_copy = dict(fdef.meta)
-                    def _make_custom_resolver(meta_copy=meta_copy, fname_local=fname):
-                        async def custom_resolver(self, info: StrawberryInfo):  # noqa: D401
-                            # Fast-path: if root query already populated attribute (no N+1), return it.
-                            # Important: avoid accidentally returning the bound resolver method itself
-                            # when the attribute isn't set on the instance (__dict__).
-                            pre_value = None
-                            try:
-                                # Prefer instance dict value if present (set by hydration)
-                                if hasattr(self, '__dict__') and fname_local in getattr(self, '__dict__', {}):
-                                    pre_value = self.__dict__[fname_local]
-                                else:
-                                    # Fallback to explicit prefetched marker used by hydrators
-                                    pre_value = getattr(self, f"_{fname_local}_prefetched", None)
-                            except Exception:
-                                pre_value = None
-                            # Only short-circuit when we have a real value (and not a callable)
-                            if pre_value is not None and not callable(pre_value):
-                                return pre_value
-                            parent_model = getattr(self, '_model', None)
-                            if parent_model is None:
-                                return None
-                            session = _get_db(info)
-                            if session is None:
-                                return None
-                            builder = meta_copy.get('builder')
-                            if builder is None:
-                                return None
-                            import inspect, asyncio, json as _json
-                            # Try builder(model_cls) for robust evaluation; scope by PK when possible
-                            try:
-                                # Determine model class for the parent
-                                model_cls_for_builder = type(parent_model)
-                                if len(inspect.signature(builder).parameters) == 1:
-                                    result_obj = builder(model_cls_for_builder)
-                                else:
-                                    result_obj = builder(model_cls_for_builder, session)
-                            except Exception:
-                                try:
-                                    result_obj = builder(model_cls_for_builder)
-                                except Exception:
-                                    return None
-                            if asyncio.iscoroutine(result_obj):
-                                result_obj = await result_obj
-                            try:
-                                from sqlalchemy.sql import Select as _Select  # type: ignore
-                            except Exception:
-                                _Select = None  # type: ignore
-                            if _Select is not None and isinstance(result_obj, _Select):
-                                # If possible, constrain the SELECT to this instance by primary key
-                                try:
-                                    from sqlalchemy.inspection import inspect as _sa_inspect  # type: ignore
-                                    pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
-                                    if pk_cols:
-                                        pk_col = pk_cols[0]
-                                        pk_val = getattr(parent_model, getattr(pk_col, 'key', 'id'), None)
-                                        if pk_val is not None:
-                                            try:
-                                                result_obj = result_obj.where(pk_col == pk_val)
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
-                                exec_result = await session.execute(result_obj)
-                                row = exec_result.first()
-                                if not row:
-                                    return None
-                                try:
-                                    mv = row._mapping
-                                    if len(mv) == 1:
-                                        result_obj = list(mv.values())[0]
-                                    else:
-                                        result_obj = dict(mv)
-                                except Exception:
-                                    result_obj = row[0]
-                            if isinstance(result_obj, str):
-                                try:
-                                    result_obj = _json.loads(result_obj)
-                                except Exception:
-                                    pass
-                            return result_obj
-                        return custom_resolver
                     c_comment = None
                     try:
                         c_comment = (fdef.meta or {}).get('comment')
                     except Exception:
                         c_comment = None
                     if c_comment:
-                        setattr(st_cls, fname, strawberry.field(_make_custom_resolver(), description=str(c_comment)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_resolver(meta_copy, fname), description=str(c_comment)))
                     else:
-                        setattr(st_cls, fname, strawberry.field(_make_custom_resolver()))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_resolver(meta_copy, fname)))
                 elif fdef.kind == 'custom_object':
                     if is_private:
                         # Skip exposing private custom object fields
@@ -2747,26 +3788,15 @@ class BerrySchema:
                     meta_copy = dict(fdef.meta)
                     # store nested type for resolver reconstruction
                     meta_copy['_nested_type'] = nested_type
-                    def _make_custom_obj_resolver(meta_copy=meta_copy, fname_local=fname):
-                        async def _resolver(self, info: StrawberryInfo):  # noqa: D401
-                            # Prefer pre-hydrated values; no N+1 fallback
-                            pre_json = getattr(self, f"_{fname_local}_prefetched", None)
-                            if pre_json is not None:
-                                return pre_json
-                            pre_v = getattr(self, f"_{fname_local}_data", None)
-                            if pre_v is not None:
-                                return pre_v
-                            return None
-                        return _resolver
                     co_comment = None
                     try:
                         co_comment = (fdef.meta or {}).get('comment')
                     except Exception:
                         co_comment = None
                     if co_comment:
-                        setattr(st_cls, fname, strawberry.field(_make_custom_obj_resolver(), description=str(co_comment)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname), description=str(co_comment)))
                     else:
-                        setattr(st_cls, fname, strawberry.field(_make_custom_obj_resolver()))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname)))
             # Merge in any user-declared strawberry fields that are not part of Berry field defs.
             # Strategy:
             # 1) Copy attributes explicitly annotated on the BerryType subclass (classic dataclass-like fields).
