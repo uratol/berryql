@@ -352,38 +352,25 @@ class Hydrator:
         requested_relations: Dict[str, Any],
         rel_push_status: Dict[str, Dict[str, Any]] | None = None,
     ) -> None:
-        import json as _json
-        # Helper to coerce enum scalars for target model class
-        def _coerce_enum_scalar(target_model_cls: Any, key: str, value: Any) -> Any:
-            enum_cls = get_model_enum_cls(target_model_cls, key)
-            return coerce_mapping_to_enum(enum_cls, value)
         for rel_name, rel_meta in (requested_relations or {}).items():
             key = f"_pushrel_{rel_name}"
             if key in mapping:
                 raw_json = mapping[key]
                 is_single = bool(rel_meta.get('single'))
-                if raw_json is None:
-                    parsed_value = None if is_single else []
-                else:
-                    try:
-                        parsed_value = _json.loads(raw_json) if isinstance(raw_json, (str, bytes)) else raw_json
-                    except Exception:
-                        parsed_value = (None if is_single else [])
+                parsed_value = self._parse_json(raw_json)
+                if parsed_value is None and not is_single:
+                    parsed_value = []
+
                 target_name = rel_meta.get('target')
                 target_b = self.registry.types.get(target_name) if target_name else None
                 target_st = self.registry._st_types.get(target_name) if target_name else None
+                
                 built_value = None if is_single else []
+                
                 if target_b and target_b.model and target_st and parsed_value is not None:
                     if is_single:
                         if isinstance(parsed_value, dict):
-                            child_inst = target_st()
-                            for sf, sdef in target_b.__berry_fields__.items():
-                                if sdef.kind == 'scalar':
-                                    val = self._coerce_datetime_scalar(target_b.model, sf, parsed_value.get(sf))
-                                    val = _coerce_enum_scalar(target_b.model, sf, val)
-                                    setattr(child_inst, sf, val)
-                            setattr(child_inst, '_model', None)
-                            built_value = child_inst
+                            built_value = self._hydrate_object(target_b, target_st, parsed_value)
                         else:
                             built_value = None
                     else:
@@ -392,13 +379,7 @@ class Hydrator:
                             for item in parsed_value:
                                 if not isinstance(item, dict):
                                     continue
-                                child_inst = target_st()
-                                for sf, sdef in target_b.__berry_fields__.items():
-                                    if sdef.kind == 'scalar':
-                                        val = self._coerce_datetime_scalar(target_b.model, sf, item.get(sf))
-                                        val = _coerce_enum_scalar(target_b.model, sf, val)
-                                        setattr(child_inst, sf, val)
-                                setattr(child_inst, '_model', None)
+                                child_inst = self._hydrate_object(target_b, target_st, item)
                                 # hydrate nested relations recursively if present in item
                                 try:
                                     parent_meta = (requested_relations.get(rel_name) or {})
@@ -456,32 +437,23 @@ class Hydrator:
         nested_meta_src_map: Dict[str, Any] | None,
     ) -> None:
         """Hydrate nested relations under a child instance using nested JSON attached under keys."""
-        import json as _json
         for nname_i, ndef_i in (getattr(parent_b, '__berry_fields__', {}) or {}).items():
             if getattr(ndef_i, 'kind', None) != 'relation':
                 continue
             raw_nested_i = item_dict.get(nname_i, None)
             if raw_nested_i is None:
                 continue
-            try:
-                parsed_nested_i = _json.loads(raw_nested_i) if isinstance(raw_nested_i, (str, bytes)) else raw_nested_i
-            except Exception:
-                parsed_nested_i = None
+            
+            parsed_nested_i = self._parse_json(raw_nested_i)
+            
             n_target_b = self.registry.types.get(ndef_i.meta.get('target')) if ndef_i.meta.get('target') else None
             n_st = self.registry._st_types.get(ndef_i.meta.get('target')) if ndef_i.meta.get('target') else None
             if not n_target_b or not n_target_b.model or not n_st:
                 continue
+            
             if ndef_i.meta.get('single'):
                 if isinstance(parsed_nested_i, dict):
-                    ni = n_st()
-                    for nsf, nsdef in n_target_b.__berry_fields__.items():
-                        if nsdef.kind == 'scalar':
-                            val = self._coerce_datetime_scalar(n_target_b.model, nsf, parsed_nested_i.get(nsf))
-                            # Enum coercion for nested single relation
-                            enum_cls = get_model_enum_cls(n_target_b.model, nsf)
-                            val = coerce_mapping_to_enum(enum_cls, val)
-                            setattr(ni, nsf, val)
-                    setattr(ni, '_model', None)
+                    ni = self._hydrate_object(n_target_b, n_st, parsed_nested_i)
                     setattr(parent_inst, nname_i, ni)
                     setattr(parent_inst, f"_{nname_i}_prefetched", ni)
                 else:
@@ -493,15 +465,7 @@ class Hydrator:
                     for nv_i in parsed_nested_i:
                         if not isinstance(nv_i, dict):
                             continue
-                        ni = n_st()
-                        for nsf, nsdef in n_target_b.__berry_fields__.items():
-                            if nsdef.kind == 'scalar':
-                                val = self._coerce_datetime_scalar(n_target_b.model, nsf, nv_i.get(nsf))
-                                # Enum coercion for nested list relation
-                                enum_cls = get_model_enum_cls(n_target_b.model, nsf)
-                                val = coerce_mapping_to_enum(enum_cls, val)
-                                setattr(ni, nsf, val)
-                        setattr(ni, '_model', None)
+                        ni = self._hydrate_object(n_target_b, n_st, nv_i)
                         # recurse deeper if any
                         deeper_meta = (nested_meta_src_map.get(nname_i) or {}).get('nested') if isinstance(nested_meta_src_map, dict) else None
                         try:
@@ -547,3 +511,33 @@ class Hydrator:
                 val = None
             cache_key = (getattr(agg_def, 'meta', {}) or {}).get('cache_key') or ((getattr(agg_def, 'meta', {}) or {}).get('source') + ':count')
             cache[cache_key] = val or 0
+
+    def _parse_json(self, raw_json: Any) -> Any:
+        import json as _json
+        if raw_json is None:
+            return None
+        try:
+            return _json.loads(raw_json) if isinstance(raw_json, (str, bytes)) else raw_json
+        except Exception:
+            return None
+
+    def _hydrate_object(self, target_b: Any, target_st: Any, data: Dict[str, Any]) -> Any:
+        """Hydrate a single Strawberry object from a data dictionary."""
+        inst = target_st()
+        model_cls = getattr(target_b, 'model', None)
+        
+        # Pre-fetch fields to avoid repeated attribute access
+        fields = getattr(target_b, '__berry_fields__', {}).items()
+        
+        for sf, sdef in fields:
+            if getattr(sdef, 'kind', None) == 'scalar':
+                val = data.get(sf)
+                # Coerce datetime
+                val = self._coerce_datetime_scalar(model_cls, sf, val)
+                # Coerce enum
+                enum_cls = get_model_enum_cls(model_cls, sf)
+                val = coerce_mapping_to_enum(enum_cls, val)
+                setattr(inst, sf, val)
+        
+        setattr(inst, '_model', None)
+        return inst
