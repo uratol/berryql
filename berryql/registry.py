@@ -3079,11 +3079,24 @@ class BerrySchema:
                         explicit_child_fk = None
                     fk_col = self._find_child_fk_column(model_cls, child_model_cls, explicit_child_fk)
                     if fk_col is None:
-                        try:
-                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
-                        except Exception:
-                            pass
-                        continue
+                        # PATCH: For single relations, we might use parent->child FK instead of child->parent FK.
+                        # If fk_col is missing but it's a single relation, check for parent FK before giving up.
+                        is_single_rel = bool(rel_cfg.get('single'))
+                        parent_fk_found = False
+                        if is_single_rel:
+                            try:
+                                pfk = rel_cfg.get('fk_column_name') or self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
+                                if pfk:
+                                    parent_fk_found = True
+                            except Exception:
+                                pass
+                        
+                        if not parent_fk_found:
+                            try:
+                                rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
+                            except Exception:
+                                pass
+                            continue
                     # Determine projected scalar fields
                     requested_scalar = rel_cfg.get('fields') or []
                     if rel_cfg.get('single'):
