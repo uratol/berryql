@@ -49,123 +49,6 @@ def compose_scope_with_guard(dom_cls: Any, desc_scope: Any):
         return (ds_val, g_val)
     return _inner
 
-# --- Callback helpers -------------------------------------------------
-
-async def _invoke_pre_callback(cb, schema, model_cls, info, data, context):
-    if not callable(cb):
-        return data
-    try:
-        sig = inspect.signature(cb)
-        params = list(sig.parameters.keys())
-    except Exception:
-        params = []
-    
-    if len(params) >= 4:
-        res = cb(model_cls, info, data, context)
-    elif len(params) == 3:
-        res = cb(model_cls, info, data)
-    elif len(params) == 2:
-        res = cb(data, info)
-    else:
-        res = cb(data)
-        
-    if inspect.isawaitable(res):
-        res = await res
-    return schema._input_to_dict(res) if res is not None else data
-
-async def _invoke_post_callback(cb, model_cls, info, instance, created, context):
-    if not callable(cb):
-        return
-    try:
-        sig = inspect.signature(cb)
-        params = list(sig.parameters.keys())
-    except Exception:
-        params = []
-    
-    if len(params) >= 5:
-        res = cb(model_cls, info, instance, created, context)
-    elif len(params) == 4:
-        res = cb(model_cls, info, instance, created)
-    elif len(params) == 3:
-        res = cb(instance, info, created)
-    elif len(params) == 2:
-        res = cb(instance, info)
-    else:
-        res = cb(instance)
-        
-    if inspect.isawaitable(res):
-        await res
-
-def _collect_cbs(cbs_or_one):
-    out: List[Any] = []
-    try:
-        if cbs_or_one is None:
-            return out
-        if isinstance(cbs_or_one, (list, tuple)):
-            for it in cbs_or_one:
-                if callable(it):
-                    out.append(it)
-            return out
-        if callable(cbs_or_one):
-            return [cbs_or_one]
-    except Exception:
-        return out
-    return out
-
-async def _maybe_call_pre_many(cbs, schema, model_cls_local, info_local, data_local, context_local):
-    current = data_local
-    for cb in _collect_cbs(cbs):
-        current = await _invoke_pre_callback(cb, schema, model_cls_local, info_local, current, context_local)
-    return current
-
-async def _maybe_call_post_many(cbs, model_cls_local, info_local, instance_local, created_local, context_local):
-    for cb in _collect_cbs(cbs):
-        await _invoke_post_callback(cb, model_cls_local, info_local, instance_local, created_local, context_local)
-
-def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
-    from .core.fields import MutationDescriptor as _MutDesc
-    if getattr(schema, '_user_mutation_cls', None) is None:
-        return
-    for attr_name, desc in list(vars(schema._user_mutation_cls).items()):
-        if not isinstance(desc, _MutDesc):
-            continue
-        # Skip domain-grouped mutations (handled by add_mutation_domains)
-        if getattr(desc, 'domain_cls', None) is not None:
-            continue
-            
-        meta = getattr(desc, 'meta', {}) or {}
-        target_name = meta.get('target')
-        if not target_name:
-            continue
-        btype_t = schema.types.get(target_name)
-        if not btype_t:
-            continue
-            
-        # Build effective scope
-        eff_scope = meta.get('scope')
-        is_single = bool(meta.get('single'))
-        
-        triplet = build_merge_resolver_for_type(
-            schema,
-            btype_t,
-            field_name=attr_name,
-            relation_scope=eff_scope,
-            pre_callback=meta.get('pre'),
-            post_callback=meta.get('post'),
-            description=(meta.get('comment') if isinstance(meta, dict) else None),
-            payload_is_list=(not is_single),
-            return_is_list=False,
-        )
-        if triplet is None:
-            continue
-            
-        fname_u, field_obj, st_ret = triplet
-        try:
-            setattr(MPlain, fname_u, field_obj)
-            anns_m[fname_u] = st_ret
-        except Exception:
-            pass
-
 # --- Merge builder -------------------------------------------------------
 
 def build_merge_resolver_for_type(
@@ -233,7 +116,74 @@ def build_merge_resolver_for_type(
         # Helpers to compile and enforce scope for a given model instance
         from .core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
 
-        # --- Callback helpers (moved to module level) ---
+        # --- Callback helpers -------------------------------------------------
+        async def _maybe_call_pre(cb, model_cls_local, info_local, data_local, context_local):
+            if not callable(cb):
+                return data_local
+            try:
+                sig = inspect.signature(cb)
+                params = list(sig.parameters.keys())
+            except Exception:
+                params = []
+            if len(params) >= 4:
+                res = cb(model_cls_local, info_local, data_local, context_local)
+            elif len(params) == 3:
+                res = cb(model_cls_local, info_local, data_local)
+            elif len(params) == 2:
+                res = cb(data_local, info_local)
+            else:
+                res = cb(data_local)
+            if inspect.isawaitable(res):
+                res = await res  # type: ignore
+            return schema._input_to_dict(res) if res is not None else data_local
+
+        async def _maybe_call_post(cb, model_cls_local, info_local, instance_local, created_local, context_local):
+            if not callable(cb):
+                return None
+            try:
+                sig = inspect.signature(cb)
+                params = list(sig.parameters.keys())
+            except Exception:
+                params = []
+            if len(params) >= 5:
+                res = cb(model_cls_local, info_local, instance_local, created_local, context_local)
+            elif len(params) == 4:
+                res = cb(model_cls_local, info_local, instance_local, created_local)
+            elif len(params) == 3:
+                res = cb(instance_local, info_local, created_local)
+            elif len(params) == 2:
+                res = cb(instance_local, info_local)
+            else:
+                res = cb(instance_local)
+            if inspect.isawaitable(res):
+                await res
+
+        # Multi-callback helpers
+        def _collect_cbs(cbs_or_one):
+            out: List[Any] = []
+            try:
+                if cbs_or_one is None:
+                    return out
+                if isinstance(cbs_or_one, (list, tuple)):
+                    for it in cbs_or_one:
+                        if callable(it):
+                            out.append(it)
+                    return out
+                if callable(cbs_or_one):
+                    return [cbs_or_one]
+            except Exception:
+                return out
+            return out
+
+        async def _maybe_call_pre_many(cbs, model_cls_local, info_local, data_local, context_local):
+            current = data_local
+            for cb in _collect_cbs(cbs):
+                current = await _maybe_call_pre(cb, model_cls_local, info_local, current, context_local)
+            return current
+
+        async def _maybe_call_post_many(cbs, model_cls_local, info_local, instance_local, created_local, context_local):
+            for cb in _collect_cbs(cbs):
+                await _maybe_call_post(cb, model_cls_local, info_local, instance_local, created_local, context_local)
 
         def _resolve_scope_value(value):
             v = value
@@ -566,7 +516,6 @@ def build_merge_resolver_for_type(
                 # so application hooks can perform cleanup while child rows still exist
                 data_local = await _maybe_call_pre_many(
                     local_type_pre_cbs,
-                    schema,
                     model_cls_local,
                     info,
                     data_local,
@@ -653,7 +602,7 @@ def build_merge_resolver_for_type(
                 return instance_for_delete
 
             # Call pre-callbacks before any processing
-            data_local = await _maybe_call_pre_many(local_type_pre_cbs, schema, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            data_local = await _maybe_call_pre_many(local_type_pre_cbs, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
 
             # Split scalars and relations
             scalar_vals: Dict[str, Any] = {}
@@ -1059,6 +1008,7 @@ def build_merge_resolver_for_type(
                         parent_ctx={
                             'parent_model': model_cls_local,
                             'parent_inst': instance,
+                            'parent_ctx': parent_ctx,
                             # Establish/propagate scope root for inherited domain scopes
                             'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
                             'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
@@ -1105,6 +1055,7 @@ def build_merge_resolver_for_type(
                                 'parent_inst': instance,
                                 'child_fk_col_name': child_fk_col_name,
                                 'parent_scope': eff_scope,
+                                'parent_ctx': parent_ctx,
                                 # Establish/propagate scope root for inherited domain scopes
                                 'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
                                 'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
@@ -1751,3 +1702,47 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                         schema._st_types[f"{getattr(dom_cls,'__name__','Domain')}MutType"] = DomRuntime
             except Exception:
                 pass
+
+
+# --- Top-level merges ----------------------------------------------------
+
+def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
+    """Attach explicitly declared merge mutations at the root Mutation class.
+
+    Uses MutationDescriptor entries on the user-declared Mutation class.
+    """
+    user_mut = getattr(schema, '_user_mutation_cls', None)
+    if user_mut is None:
+        return
+    try:
+        from .core.fields import MutationDescriptor as _MutDesc
+        for attr_name, desc in list(vars(user_mut).items()):
+            if not isinstance(desc, _MutDesc):
+                continue
+            meta = getattr(desc, 'meta', {}) or {}
+            target_name = meta.get('target')
+            if not target_name:
+                continue
+            btype_cls = schema.types.get(target_name)
+            if not btype_cls:
+                continue
+            is_single = bool(meta.get('single'))
+            eff_scope = meta.get('scope')
+            triplet = build_merge_resolver_for_type(
+                schema,
+                btype_cls,
+                field_name=attr_name,
+                relation_scope=eff_scope,
+                pre_callback=meta.get('pre'),
+                post_callback=meta.get('post'),
+                description=(meta.get('comment') if isinstance(meta, dict) else None),
+                payload_is_list=(not is_single),
+                return_is_list=False,
+            )
+            if triplet is None:
+                continue
+            an, field_obj, st_ret = triplet
+            setattr(MPlain, an, field_obj)
+            anns_m[an] = st_ret  # type: ignore
+    except Exception:
+        return
