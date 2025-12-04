@@ -462,6 +462,17 @@ class UserDomain(BerryDomain):
         }
     })
 
+    @strawberry.field
+    async def users_strawberry(self, info: Info) -> List[Annotated['UserQL', strawberry.lazy('tests.schema')]]:
+        session: AsyncSession | None = info.context.get('db_session') if info and info.context else None
+        if session is None:
+            return []
+        from sqlalchemy.orm import selectinload
+        stmt = select(User).options(selectinload(User.posts)).order_by(User.id)
+        result = await session.execute(stmt)
+        users = result.scalars().all()
+        return users
+
 @berry_schema.domain(name='blogDomain')
 class BlogDomain(BerryDomain):
     """Blog operations domain"""

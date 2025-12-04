@@ -31,3 +31,32 @@ async def test_blog_domain_annotated_lazy_field_exposed(db_session, populated_db
     assert res.errors is None, res.errors
     # Value can be None; just ensure key present (null in GraphQL)
     assert "samplePostAnnotated" in res.data["blogDomain"], res.data
+
+
+@pytest.mark.asyncio
+async def test_user_domain_strawberry_field_users(db_session, populated_db):
+    q = """
+    query {
+      userDomain {
+        users_strawberry {
+          id
+          name
+          posts {
+            id
+            title
+          }
+        }
+      }
+    }
+    """
+    res = await berry_strawberry_schema.execute(q, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    data = res.data["userDomain"]["users_strawberry"]
+    assert len(data) > 0
+    # Check if posts are populated
+    has_posts = False
+    for u in data:
+        if u["posts"]:
+            has_posts = True
+            break
+    assert has_posts
