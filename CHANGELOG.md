@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.5] - 2025-12-04
+### Fixed
+- Fixed relation resolution when the parent object is a raw SQLAlchemy model instance (e.g. returned from a native Strawberry field) instead of a BerryQL type instance.
+- Fixed `self.__berry_registry__` access in relation resolvers by capturing the schema instance in closure.
+
 ## [0.1.4] - 2025-11-26
 ### Added
 - Enhanced foreign key handling for single relations in BerrySchema.
