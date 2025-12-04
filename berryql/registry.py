@@ -2258,6 +2258,7 @@ class BerrySchema:
             return None
         return _resolver
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
+        schema_instance = self
         # Persist naming behavior for extractor logic
         try:
             # Prefer explicit name_converter when available
@@ -2651,16 +2652,18 @@ class BerrySchema:
                                         return val
                                 return val
                             target_name_i = meta_copy.get('target')
-                            target_cls_i = self.__berry_registry__._st_types.get(target_name_i)
+                            target_cls_i = schema_instance._st_types.get(target_name_i)
                             parent_model = getattr(self, '_model', None)
+                            if parent_model is None and hasattr(self, '__table__'):
+                                parent_model = self
                             if not target_cls_i:
                                 return None if is_single_value else []
                             session = _get_db(info)
                             if session is None:
                                 return None if is_single_value else []
                             # Acquire per-request lock for DB I/O in relation resolvers as well
-                            lock = self.__berry_registry__._get_context_lock(info)
-                            target_btype = self.__berry_registry__.types.get(target_name_i)
+                            lock = schema_instance._get_context_lock(info)
+                            target_btype = schema_instance.types.get(target_name_i)
                             if not target_btype or not target_btype.model:
                                 return None if is_single_value else []
                             child_model_cls = target_btype.model
@@ -2684,7 +2687,7 @@ class BerrySchema:
                                 try:
                                     if parent_model is not None:
                                         try:
-                                            pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
+                                            pk_name_parent = schema_instance._get_pk_name(parent_model.__class__)
                                             fallback_parent_id = getattr(parent_model, pk_name_parent, None)
                                         except Exception:
                                             fallback_parent_id = None
@@ -2724,7 +2727,7 @@ class BerrySchema:
                                         explicit_child_fk_name = meta_copy.get('fk_column_name') or (getattr(self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
                                     except Exception:
                                         explicit_child_fk_name = None
-                                    child_fk_to_parent = self.__berry_registry__._find_child_fk_column(
+                                    child_fk_to_parent = schema_instance._find_child_fk_column(
                                         parent_model.__class__ if parent_model is not None else None,
                                         child_model_cls,
                                         explicit_child_fk_name,
@@ -2757,7 +2760,7 @@ class BerrySchema:
                                                         stmt = stmt.where(expr)
                                         # Also apply type-level scope when present
                                         try:
-                                            tgt_b_for_type = self.__berry_registry__.types.get(target_name_i)
+                                            tgt_b_for_type = schema_instance.types.get(target_name_i)
                                             t_scope = getattr(tgt_b_for_type, '__type_scope__', None) if tgt_b_for_type is not None else None
                                             if t_scope is None and tgt_b_for_type is not None:
                                                 t_scope = getattr(tgt_b_for_type, 'scope', None)
@@ -2778,7 +2781,7 @@ class BerrySchema:
                                                         stmt = stmt.where(expr_t)
                                         # Ordering: honor order_by/order_multi if provided; default by id
                                         try:
-                                            allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+                                            allowed_order = [sf for sf, sd in schema_instance.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
                                         except Exception:
                                             allowed_order = []
                                         ordered_any = False
@@ -2802,7 +2805,7 @@ class BerrySchema:
                                                 ordered_any = True
                                         if not ordered_any:
                                             try:
-                                                pk_col_child = self.__berry_registry__._get_pk_column(child_model_cls)
+                                                pk_col_child = schema_instance._get_pk_column(child_model_cls)
                                                 stmt = stmt.order_by(pk_col_child.asc())
                                             except Exception:
                                                 pass
@@ -2813,7 +2816,7 @@ class BerrySchema:
                                             return None
                                         inst = target_cls_i()
                                         setattr(inst, '_model', row)
-                                        for sf, sdef in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
+                                        for sf, sdef in schema_instance.types[target_name_i].__berry_fields__.items():
                                             if sdef.kind == 'scalar':
                                                 try:
                                                     setattr(inst, sf, getattr(row, sf, None))
@@ -2862,7 +2865,7 @@ class BerrySchema:
                                     except Exception:
                                         pass
                                     try:
-                                        pk_col_child = self.__berry_registry__._get_pk_column(child_model_cls)
+                                        pk_col_child = schema_instance._get_pk_column(child_model_cls)
                                         stmt = _select(child_model_cls).where(pk_col_child == candidate_fk_val)
                                     except Exception:
                                         # If PK not resolvable, fail fast to signal schema/model issue
@@ -2890,7 +2893,7 @@ class BerrySchema:
                                                     stmt = stmt.where(expr)
                                     # Also apply type-level scope when present
                                     try:
-                                        tgt_b_for_type2 = self.__berry_registry__.types.get(target_name_i)
+                                        tgt_b_for_type2 = schema_instance.types.get(target_name_i)
                                         t_scope2 = getattr(tgt_b_for_type2, '__type_scope__', None) if tgt_b_for_type2 is not None else None
                                         if t_scope2 is None and tgt_b_for_type2 is not None:
                                             t_scope2 = getattr(tgt_b_for_type2, 'scope', None)
@@ -2977,7 +2980,7 @@ class BerrySchema:
                                     return None
                                 inst = target_cls_i()
                                 setattr(inst, '_model', row)
-                                for sf, sdef in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
+                                for sf, sdef in schema_instance.types[target_name_i].__berry_fields__.items():
                                     if sdef.kind == 'scalar':
                                         try:
                                             setattr(inst, sf, getattr(row, sf, None))
@@ -3006,7 +3009,7 @@ class BerrySchema:
                                 explicit_child_fk = meta_copy.get('fk_column_name') or (getattr(self, '_pushdown_meta', {}) or {}).get(fname_local, {}).get('fk_column_name')
                             except Exception:
                                 explicit_child_fk = None
-                            fk_col = self.__berry_registry__._find_child_fk_column(
+                            fk_col = schema_instance._find_child_fk_column(
                                 parent_model_cls if parent_model_cls is not None else (parent_model.__class__ if parent_model is not None else None),
                                 child_model_cls,
                                 explicit_child_fk,
@@ -3019,7 +3022,7 @@ class BerrySchema:
                             # attribute on the Strawberry instance (guarding against resolver functions).
                             if parent_model is not None:
                                 try:
-                                    pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
+                                    pk_name_parent = schema_instance._get_pk_name(parent_model.__class__)
                                     parent_id_val = getattr(parent_model, pk_name_parent, None)
                                 except Exception:
                                     parent_id_val = None
@@ -3029,7 +3032,7 @@ class BerrySchema:
                                 try:
                                     parent_model_cls2 = getattr(parent_btype_local, 'model', None)
                                     if parent_model_cls2 is not None:
-                                        pk_attr_name = self.__berry_registry__._get_pk_name(parent_model_cls2)
+                                        pk_attr_name = schema_instance._get_pk_name(parent_model_cls2)
                                 except Exception:
                                     pk_attr_name = None
                                 if not pk_attr_name:
@@ -3080,7 +3083,7 @@ class BerrySchema:
                             cols = []
                             pk_expr = None
                             try:
-                                pk_expr = self.__berry_registry__._get_pk_column(child_model_cls)
+                                pk_expr = schema_instance._get_pk_column(child_model_cls)
                             except Exception:
                                 pk_expr = None
                             if pk_expr is not None:
@@ -3090,7 +3093,7 @@ class BerrySchema:
                             # then filter to scalars known on target type
                             try:
                                 scalars_on_target = set()
-                                for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items():
+                                for sf, sd in schema_instance.types[target_name_i].__berry_fields__.items():
                                     if sd.kind == 'scalar':
                                         # Hide write_only from SQL projection set
                                         try:
@@ -3106,7 +3109,7 @@ class BerrySchema:
                                         return gql_name
                                     # auto camelCase support
                                     try:
-                                        if getattr(self.__berry_registry__, '_auto_camel_case', False):
+                                        if getattr(schema_instance, '_auto_camel_case', False):
                                             # decamelize
                                             n = str(gql_name)
                                             out = []
@@ -3121,7 +3124,7 @@ class BerrySchema:
                                         pass
                                     # try configured name converter
                                     try:
-                                        name_conv = getattr(getattr(self.__berry_registry__, '_name_converter', None), 'apply_naming_config', None)
+                                        name_conv = getattr(getattr(schema_instance, '_name_converter', None), 'apply_naming_config', None)
                                         if callable(name_conv):
                                             for py in scalars_on_target:
                                                 try:
@@ -3150,7 +3153,7 @@ class BerrySchema:
                                 # Honor Berry field alias mapping (meta.column) for scalars
                                 source_name = None
                                 try:
-                                    fdef_req = self.__berry_registry__.types[target_name_i].__berry_fields__.get(fn)
+                                    fdef_req = schema_instance.types[target_name_i].__berry_fields__.get(fn)
                                     if fdef_req and getattr(fdef_req, 'kind', None) == 'scalar':
                                         source_name = (getattr(fdef_req, 'meta', {}) or {}).get('column')
                                 except Exception:
@@ -3177,7 +3180,7 @@ class BerrySchema:
                             # so their resolvers can work even when the FK wasn't explicitly selected
                             try:
                                 rel_fields_on_target = {
-                                    rf: rd for rf, rd in self.__berry_registry__.types[target_name_i].__berry_fields__.items()
+                                    rf: rd for rf, rd in schema_instance.types[target_name_i].__berry_fields__.items()
                                     if rd.kind == 'relation'
                                 }
                             except Exception:
@@ -3196,7 +3199,7 @@ class BerrySchema:
                                 # Compute target model to find FK direction
                                 try:
                                     target_rel_name = rf_def.meta.get('target')
-                                    target_rel_btype = self.__berry_registry__.types.get(target_rel_name) if target_rel_name else None
+                                    target_rel_btype = schema_instance.types.get(target_rel_name) if target_rel_name else None
                                     target_rel_model = target_rel_btype.model if target_rel_btype and target_rel_btype.model else None
                                 except Exception:
                                     target_rel_model = None
@@ -3214,7 +3217,7 @@ class BerrySchema:
                                             explicit_child_fk_name = (rf_def.meta or {}).get('fk_column_name')
                                         except Exception:
                                             explicit_child_fk_name = None
-                                        fk_col_obj = self.__berry_registry__._find_child_fk_column(target_rel_model, child_model_cls, explicit_child_fk_name)
+                                        fk_col_obj = schema_instance._find_child_fk_column(target_rel_model, child_model_cls, explicit_child_fk_name)
                                     except Exception:
                                         fk_col_obj = None
                                 if fk_col_obj is not None:
@@ -3232,7 +3235,7 @@ class BerrySchema:
                             else:
                                 # Fallback to selecting id if nothing resolvable
                                 try:
-                                    pk_expr_fallback = self.__berry_registry__._get_pk_column(child_model_cls)
+                                    pk_expr_fallback = schema_instance._get_pk_column(child_model_cls)
                                     stmt = _select(pk_expr_fallback).select_from(child_model_cls).where(fk_col == parent_id_val)
                                 except Exception:
                                     return []
@@ -3283,7 +3286,7 @@ class BerrySchema:
                                             stmt = stmt.where(expr)
                             # Combine with type-level default scope for list fallback
                             try:
-                                tgt_b_for_type3 = self.__berry_registry__.types.get(target_name_i)
+                                tgt_b_for_type3 = schema_instance.types.get(target_name_i)
                                 t_scope3 = getattr(tgt_b_for_type3, '__type_scope__', None) if tgt_b_for_type3 is not None else None
                                 if t_scope3 is None and tgt_b_for_type3 is not None:
                                     t_scope3 = getattr(tgt_b_for_type3, 'scope', None)
@@ -3307,7 +3310,7 @@ class BerrySchema:
                             allowed_order = getattr(target_cls_i, '__ordering__', None)
                             if allowed_order is None:
                                 # derive from scalar fields
-                                allowed_order = [sf for sf, sd in self.__berry_registry__.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
+                                allowed_order = [sf for sf, sd in schema_instance.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
                             # When auto-camel-case is enabled, accept camelCase order_by/columns
                             try:
                                 ac = bool(getattr(self, '_auto_camel_case', False))
@@ -3657,7 +3660,7 @@ class BerrySchema:
                                 return None
 
                             target_name = rel_def.meta.get('target')
-                            target_btype = self.__berry_registry__.types.get(target_name) if target_name else None
+                            target_btype = schema_instance.types.get(target_name) if target_name else None
                             if not target_btype or not target_btype.model:
                                 if is_count_local:
                                     return 0
@@ -3666,6 +3669,8 @@ class BerrySchema:
 
                             # Determine parent model instance (if available) OR fallback to id attribute
                             parent_model = getattr(self, '_model', None)
+                            if parent_model is None and hasattr(self, '__table__'):
+                                parent_model = self
                             parent_model_cls = parent_model.__class__ if parent_model is not None else getattr(bcls_local, 'model', None)
 
                             # Honor explicit fk if present on the relation meta
@@ -3675,7 +3680,7 @@ class BerrySchema:
                                 explicit_child_fk_name = None
                             fk_col = None
                             if parent_model_cls is not None:
-                                fk_col = self.__berry_registry__._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)
+                                fk_col = schema_instance._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)
                             if fk_col is None:
                                 if is_count_local:
                                     return 0
@@ -3694,12 +3699,12 @@ class BerrySchema:
                             try:
                                 # Prefer real model instance
                                 if parent_model is not None:
-                                    pk_name_parent = self.__berry_registry__._get_pk_name(parent_model.__class__)
+                                    pk_name_parent = schema_instance._get_pk_name(parent_model.__class__)
                                     parent_pk_value = getattr(parent_model, pk_name_parent)
                                 else:
                                     # Fallback: derive pk from the object attribute (e.g., id) when model missing
                                     if parent_model_cls is not None:
-                                        pk_name_parent = self.__berry_registry__._get_pk_name(parent_model_cls)
+                                        pk_name_parent = schema_instance._get_pk_name(parent_model_cls)
                                         parent_pk_value = getattr(self, pk_name_parent, None)
                             except Exception:
                                 parent_pk_value = None
