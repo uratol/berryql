@@ -51,7 +51,7 @@ async def test_domain_merge_posts_response_includes_read_only_fields(db_session,
     variables = {"payload": [{"title": "ROnly", "content": "Body", "author_id": 1}]}
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    obj = res.data["blogDomain"]["merge_posts"]
+    obj = res.data["blogDomain"]["merge_posts"][0]
     assert obj["title"] == "ROnly"
     # created_at should be present (non-null string or datetime-like)
     assert obj["created_at"] is not None
@@ -93,6 +93,6 @@ async def test_root_merge_posts_response_includes_read_only_fields(db_session, p
     variables = {"p": [{"title": "RRoot", "content": "Body", "author_id": 1}]}
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    obj = res.data["merge_posts"]
+    obj = res.data["merge_posts"][0]
     assert obj["title"] == "RRoot"
     assert obj["created_at"] is not None

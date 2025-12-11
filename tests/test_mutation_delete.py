@@ -24,7 +24,9 @@ async def test_merge_delete_invokes_callbacks(db_session, populated_db):
     assert res.errors is None, res.errors
     # We return the deleted instance snapshot; id should match
     out = res.data["merge_posts"]
-    assert int(out["id"]) == pid
+    assert isinstance(out, list)
+    assert len(out) == 1
+    assert int(out[0]["id"]) == pid
 
     # Pre and post should both have been logged with created=False
     kinds = [e.get("event") for e in CALLBACK_EVENTS]

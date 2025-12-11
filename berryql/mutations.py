@@ -1064,6 +1064,11 @@ def build_merge_resolver_for_type(
                         )
 
             await session.flush()
+            # Refresh instance to ensure all columns (including computed/defaults) are available for read
+            try:
+                await session.refresh(instance)
+            except Exception:
+                pass
             # Fire post-callbacks
             await _maybe_call_post_many(eff_post_cbs, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
             return instance
@@ -1117,8 +1122,8 @@ def build_merge_resolver_for_type(
         except Exception:
             eff_desc = None
     if eff_desc:
-        return fname, strawberry.field(resolver=_resolver, description=str(eff_desc)), st_return
-    return fname, strawberry.field(resolver=_resolver), st_return
+        return fname, strawberry.field(resolver=_resolver, description=str(eff_desc)), ann_return
+    return fname, strawberry.field(resolver=_resolver), ann_return
 
 # --- Domain mutation support ---------------------------------------------
 
@@ -1543,7 +1548,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 relation_scope=eff_scope,
                 description=(meta.get('comment') if isinstance(meta, dict) else None),
                 payload_is_list=(not is_single),
-                return_is_list=False,
+                return_is_list=(not is_single),
             )
             if triplet is None:
                 continue
@@ -1684,7 +1689,7 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                             post_callback=meta.get('post'),
                             description=(meta.get('comment') if isinstance(meta, dict) else None),
                             payload_is_list=(not bool(meta.get('single'))),
-                            return_is_list=False,
+                            return_is_list=(not bool(meta.get('single'))),
                         )
                         if triplet is None:
                             continue
@@ -1727,6 +1732,13 @@ def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
             if not btype_cls:
                 continue
             is_single = bool(meta.get('single'))
+            if is_single:
+                pl_list = False
+                rt_list = False
+            else:
+                pl_list = True
+                rt_list = True
+
             eff_scope = meta.get('scope')
             triplet = build_merge_resolver_for_type(
                 schema,
@@ -1736,8 +1748,8 @@ def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                 pre_callback=meta.get('pre'),
                 post_callback=meta.get('post'),
                 description=(meta.get('comment') if isinstance(meta, dict) else None),
-                payload_is_list=(not is_single),
-                return_is_list=False,
+                payload_is_list=pl_list,
+                return_is_list=rt_list,
             )
             if triplet is None:
                 continue

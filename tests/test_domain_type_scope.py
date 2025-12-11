@@ -32,7 +32,10 @@ async def test_domain_type_scope_filters_views_via_context(db_session, populated
     }
     res1 = await berry_schema.execute(create_mut, variable_values=variables, context_value={"db_session": db_session})
     assert res1.errors is None, res1.errors
-    created = res1.data["merge_posts"]
+    created_list = res1.data["merge_posts"]
+    assert isinstance(created_list, list)
+    assert len(created_list) == 1
+    created = created_list[0]
     assert created["title"] == title
     assert isinstance(created.get("views"), list)
     # Both views should be present before filtering

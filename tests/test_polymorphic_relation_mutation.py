@@ -27,7 +27,7 @@ async def test_polymorphic_post_views_mutation_defaults_entity_type(db_session, 
     }
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, f"Errors: {res.errors}"
-    data = res.data["merge_posts"]
+    data = res.data["merge_posts"][0]
     assert data["id"] is not None
     assert data["views"] and len(data["views"]) == 1
     v = data["views"][0]

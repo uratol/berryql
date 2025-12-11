@@ -39,7 +39,7 @@ async def test_domain_mutation_scope_async_guard(db_session, populated_db):
             context_value={"db_session": db_session},
         )
         assert res2.errors is None, res2.errors
-        data = res2.data["blogDomain"]["merge_posts"]
+        data = res2.data["blogDomain"]["merge_posts"][0]
         assert int(data["author_id"]) == 1
     finally:
         # Restore guard
@@ -123,7 +123,7 @@ async def test_nested_mutation_scope_allows_in_scope_like(db_session, populated_
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
     assert res.data is not None, "No data returned from mutation"
-    post = res.data["merge_posts"]
+    post = res.data["merge_posts"][0]
     pcs = post["post_comments"]
     assert isinstance(pcs, list) and len(pcs) == 1
     likes = pcs[0]["admin_likes"]
@@ -167,7 +167,7 @@ async def test_nested_mutation_scope_update_rejected(db_session, populated_db):
     res1 = await schema.execute(create_m, variable_values=create_vars, context_value={"db_session": db_session})
     assert res1.errors is None, res1.errors
     assert res1.data is not None, "No data returned from mutation"
-    post = res1.data["merge_posts"]
+    post = res1.data["merge_posts"][0]
     pc = post["post_comments"][0]
     like_id = int(pc["admin_likes"][0]["id"])
 

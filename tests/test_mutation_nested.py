@@ -48,7 +48,10 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
     }
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    post = res.data["merge_posts"]
+    post_list = res.data["merge_posts"]
+    assert isinstance(post_list, list)
+    assert len(post_list) == 1
+    post = post_list[0]
     assert post["title"] == "Nested Create"
     assert int(post["author_id"]) == int(u1.id)
     pcs = post["post_comments"]
@@ -104,5 +107,8 @@ async def test_mutation_domain_upsert_posts(db_session, populated_db):
     }
     res = await schema.execute(m, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    data = res.data["blogDomain"]["merge_posts"]
+    data_list = res.data["blogDomain"]["merge_posts"]
+    assert isinstance(data_list, list)
+    assert len(data_list) == 1
+    data = data_list[0]
     assert data["title"] == "Domain Upsert"

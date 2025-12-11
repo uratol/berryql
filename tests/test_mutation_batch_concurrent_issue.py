@@ -103,8 +103,8 @@ async def test_sequential_mutations_with_hooks_same_session(db_session, populate
     
     # If we get here, the mutations succeeded
     assert res.data is not None
-    assert res.data["first"]["author_id"] == 1  # alice
-    assert res.data["second"]["author_id"] == 2  # bob
+    assert res.data["first"][0]["author_id"] == 1  # alice
+    assert res.data["second"][0]["author_id"] == 2  # bob
 
 
 async def test_batch_mutations_with_enabled_callbacks(db_session, populated_db):
@@ -150,7 +150,7 @@ async def test_batch_mutations_with_enabled_callbacks(db_session, populated_db):
     if res.data:
         # Verify callbacks ran (they should add [hpre][pre] and [post][hpost] to titles)
         if res.data.get("m1"):
-            title = res.data["m1"].get("title", "")
+            title = res.data["m1"][0].get("title", "")
             # Check if any hook markers are present
             assert any(marker in title for marker in ["[pre]", "[hpre]", "[post]", "[hpost]"])
 
@@ -196,9 +196,9 @@ async def test_batch_mutations_three_in_sequence(db_session, populated_db):
             pytest.fail(f"Unexpected error: {res.errors}")
     
     assert res.data is not None
-    assert res.data["m1"]["author_id"] == 1
-    assert res.data["m2"]["author_id"] == 2
-    assert res.data["m3"]["author_id"] == 3
+    assert res.data["m1"][0]["author_id"] == 1
+    assert res.data["m2"][0]["author_id"] == 2
+    assert res.data["m3"][0]["author_id"] == 3
 
 
 async def test_batch_mutations_with_nested_relations(db_session, populated_db):
@@ -253,8 +253,8 @@ async def test_batch_mutations_with_nested_relations(db_session, populated_db):
             pytest.fail(f"Unexpected error: {res.errors}")
     
     assert res.data is not None
-    assert res.data["first"]["author"]["name"] == "Alice Johnson"
-    assert res.data["second"]["author"]["name"] == "Bob Smith"
+    assert res.data["first"][0]["author"]["name"] == "Alice Johnson"
+    assert res.data["second"][0]["author"]["name"] == "Bob Smith"
 
 
 async def test_batch_mutations_with_updates(db_session, populated_db):
@@ -321,9 +321,9 @@ async def test_batch_mutations_with_updates(db_session, populated_db):
     
     # Verify updates succeeded
     assert res.data is not None
-    assert res.data["u1"]["title"] == "Updated Title 1"
-    assert res.data["u2"]["title"] == "Updated Title 2"
-    assert res.data["u3"]["title"] == "Updated Title 3"
+    assert res.data["u1"][0]["title"] == "Updated Title 1"
+    assert res.data["u2"][0]["title"] == "Updated Title 2"
+    assert res.data["u3"][0]["title"] == "Updated Title 3"
 
 
 async def test_mixed_creates_and_updates(db_session, populated_db):
@@ -355,9 +355,9 @@ async def test_mixed_creates_and_updates(db_session, populated_db):
             pytest.fail(f"Unexpected error: {res.errors}")
     
     assert res.data is not None
-    assert res.data["create1"]["title"] == "New Post 1"
-    assert res.data["update1"]["title"] == "Updated Post"
-    assert res.data["create2"]["title"] == "New Post 2"
+    assert res.data["create1"][0]["title"] == "New Post 1"
+    assert res.data["update1"][0]["title"] == "Updated Post"
+    assert res.data["create2"][0]["title"] == "New Post 2"
 
 
 async def test_domain_mutations_parallel(db_session, populated_db):
@@ -425,10 +425,10 @@ async def test_domain_mutations_parallel(db_session, populated_db):
     assert res.data is not None
     assert res.data["blogDomain"]["mergePost1"] is not None
     assert res.data["blogDomain"]["mergePost2"] is not None
-    assert res.data["blogDomain"]["mergePost1"]["title"] == "Updated Domain Post 1"
-    assert res.data["blogDomain"]["mergePost2"]["title"] == "Updated Domain Post 2"
-    assert res.data["blogDomain"]["mergePost1"]["author_id"] == 1  # alice
-    assert res.data["blogDomain"]["mergePost2"]["author_id"] == 2  # bob
+    assert res.data["blogDomain"]["mergePost1"][0]["title"] == "Updated Domain Post 1"
+    assert res.data["blogDomain"]["mergePost2"][0]["title"] == "Updated Domain Post 2"
+    assert res.data["blogDomain"]["mergePost1"][0]["author_id"] == 1  # alice
+    assert res.data["blogDomain"]["mergePost2"][0]["author_id"] == 2  # bob
 
 
 async def test_mixed_root_and_domain_mutations(db_session, populated_db):
@@ -497,6 +497,6 @@ async def test_mixed_root_and_domain_mutations(db_session, populated_db):
             pytest.fail(f"Unexpected error: {res.errors}")
     
     assert res.data is not None
-    assert res.data["root1"]["title"] == "Root Post 1"
-    assert res.data["domain1"]["merge_posts"]["title"] == "Domain Post 1"
-    assert res.data["root2"]["title"] == "Root Post 2"
+    assert res.data["root1"][0]["title"] == "Root Post 1"
+    assert res.data["domain1"]["merge_posts"][0]["title"] == "Domain Post 1"
+    assert res.data["root2"][0]["title"] == "Root Post 2"

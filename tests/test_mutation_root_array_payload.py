@@ -22,5 +22,7 @@ async def test_root_merge_posts_accepts_array_payload(db_session, populated_db):
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
     obj = res.data["merge_posts"]
-    assert isinstance(obj, dict)
-    assert obj["title"] in ("A1", "A2")
+    assert isinstance(obj, list)
+    assert len(obj) == 2
+    titles = {o["title"] for o in obj}
+    assert titles == {"A1", "A2"}

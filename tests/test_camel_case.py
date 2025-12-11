@@ -75,7 +75,10 @@ async def test_camel_case_root_mutations(db_session, populated_db):
 	res = await schema.execute(mutation, variable_values=vars, context_value={"db_session": db_session})
 	assert res.errors is None, res.errors
 	assert res.data and "mergePosts" in res.data
-	post = res.data["mergePosts"]
+	post_list = res.data["mergePosts"]
+	assert isinstance(post_list, list)
+	assert len(post_list) == 1
+	post = post_list[0]
 	assert isinstance(post, dict) and {"id", "title", "authorId"} <= set(post)
 	assert post["id"] is not None
 	assert post["title"] is not None
@@ -115,7 +118,10 @@ async def test_camel_case_domain_mutations(db_session, populated_db):
 	res = await schema.execute(mutation, variable_values=vars, context_value={"db_session": db_session})
 	assert res.errors is None, res.errors
 	assert res.data and "blogDomain" in res.data
-	data = res.data["blogDomain"]["mergePosts"]
+	data_list = res.data["blogDomain"]["mergePosts"]
+	assert isinstance(data_list, list)
+	assert len(data_list) == 1
+	data = data_list[0]
 	assert isinstance(data, dict) and {"id", "title", "authorId"} <= set(data)
 	assert data["id"] is not None
 	assert data["title"] is not None

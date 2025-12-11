@@ -2183,7 +2183,11 @@ class BerrySchema:
                 return pre_value
             parent_model = getattr(self, '_model', None)
             if parent_model is None:
-                return None
+                # Fallback: if self looks like a model instance (has __table__), use it directly
+                if hasattr(self, '__table__'):
+                    parent_model = self
+                else:
+                    return None
             session = _get_db(info)
             if session is None:
                 return None
@@ -2246,7 +2250,7 @@ class BerrySchema:
             return result_obj
         return custom_resolver
 
-    def _create_custom_obj_resolver(self, fname_local: str):
+    def _create_custom_obj_resolver(self, fname_local: str, meta_copy: Optional[Dict[str, Any]] = None):
         async def _resolver(self, info: StrawberryInfo):  # noqa: D401
             # Prefer pre-hydrated values; no N+1 fallback
             pre_json = getattr(self, f"_{fname_local}_prefetched", None)
@@ -2255,6 +2259,97 @@ class BerrySchema:
             pre_v = getattr(self, f"_{fname_local}_data", None)
             if pre_v is not None:
                 return pre_v
+            
+            # Fallback: execute query if builder is present
+            if meta_copy and meta_copy.get('builder'):
+                parent_model = getattr(self, '_model', None)
+                if parent_model is None:
+                    if hasattr(self, '__table__'):
+                        parent_model = self
+                    else:
+                        return None
+                
+                session = _get_db(info)
+                if session is None:
+                    return None
+                
+                builder = meta_copy.get('builder')
+                import inspect, asyncio, json as _json
+                try:
+                    model_cls_for_builder = type(parent_model)
+                    if len(inspect.signature(builder).parameters) == 1:
+                        result_obj = builder(model_cls_for_builder)
+                    else:
+                        result_obj = builder(model_cls_for_builder, session)
+                except Exception:
+                    try:
+                        result_obj = builder(model_cls_for_builder)
+                    except Exception:
+                        return None
+                
+                if asyncio.iscoroutine(result_obj):
+                    result_obj = await result_obj
+                
+                try:
+                    from sqlalchemy.sql import Select as _Select
+                except Exception:
+                    _Select = None
+                
+                if _Select is not None and isinstance(result_obj, _Select):
+                    try:
+                        from sqlalchemy.inspection import inspect as _sa_inspect
+                        pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
+                        if pk_cols:
+                            pk_col = pk_cols[0]
+                            pk_val = getattr(parent_model, getattr(pk_col, 'key', 'id'), None)
+                            if pk_val is not None:
+                                try:
+                                    result_obj = result_obj.where(pk_col == pk_val)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    
+                    exec_result = await session.execute(result_obj)
+                    row = exec_result.first()
+                    if not row:
+                        return None
+                    try:
+                        mv = row._mapping
+                        if len(mv) == 1:
+                            result_obj = list(mv.values())[0]
+                        else:
+                            result_obj = dict(mv)
+                    except Exception:
+                        result_obj = row[0]
+                
+                if isinstance(result_obj, str):
+                    try:
+                        result_obj = _json.loads(result_obj)
+                    except Exception:
+                        pass
+                
+                # If result is a dict and we have a nested type, instantiate it
+                if isinstance(result_obj, dict):
+                    nested_type = meta_copy.get('_nested_type')
+                    if nested_type:
+                        try:
+                            # Instantiate the type
+                            try:
+                                inst = nested_type(**result_obj)
+                            except Exception:
+                                inst = nested_type()
+                                for k, v in result_obj.items():
+                                    try:
+                                        setattr(inst, k, v)
+                                    except Exception:
+                                        pass
+                            return inst
+                        except Exception:
+                            pass
+
+                return result_obj
+
             return None
         return _resolver
     def to_strawberry(self, *, strawberry_config: Optional[StrawberryConfig] = None):
@@ -3799,9 +3894,9 @@ class BerrySchema:
                     except Exception:
                         co_comment = None
                     if co_comment:
-                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname), description=str(co_comment)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname, meta_copy), description=str(co_comment)))
                     else:
-                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname, meta_copy)))
             # Merge in any user-declared strawberry fields that are not part of Berry field defs.
             # Strategy:
             # 1) Copy attributes explicitly annotated on the BerryType subclass (classic dataclass-like fields).

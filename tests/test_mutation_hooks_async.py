@@ -23,7 +23,10 @@ async def test_merge_hooks_async(db_session, populated_db):
     assert res.errors is None, res.errors
     edge = res.data.get("asyncDomain")
     assert isinstance(edge, dict)
-    post = edge["merge_posts"]
+    post_list = edge["merge_posts"]
+    assert isinstance(post_list, list)
+    assert len(post_list) == 1
+    post = post_list[0]
     # Title should have async pre and post markers from decorator-declared async hooks
     assert post["title"].startswith("[apre]Async")
     assert post["title"].endswith("[apost]")

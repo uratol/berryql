@@ -34,7 +34,7 @@ async def test_write_only_input_resolves_author_email(db_session, populated_db):
     vars = {"p": [{"title": "ByEmail", "content": "X", "author_email": email}]}
     res = await schema.execute(m, variable_values=vars, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    data = res.data["merge_posts"]
+    data = res.data["merge_posts"][0]
     assert data["title"] == "ByEmail"
     # author_id should reflect the resolved id
     assert str(data.get("author_id")) == str(getattr(u, 'id'))
@@ -67,6 +67,6 @@ async def test_write_only_on_nested_comment(db_session, populated_db):
     }
     res = await schema.execute(m, variable_values=vars, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
-    pcs = res.data["merge_posts"]["post_comments"]
+    pcs = res.data["merge_posts"][0]["post_comments"]
     assert isinstance(pcs, list) and len(pcs) == 1
     assert str(pcs[0]["author_id"]) == str(getattr(u, 'id'))

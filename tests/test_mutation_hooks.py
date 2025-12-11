@@ -23,7 +23,10 @@ async def test_merge_hooks_create(db_session, populated_db):
         context_value={"db_session": db_session, "test_callbacks": True},
     )
     assert res.errors is None, res.errors
-    post = res.data["merge_posts"]
+    post_list = res.data["merge_posts"]
+    assert isinstance(post_list, list)
+    assert len(post_list) == 1
+    post = post_list[0]
     # Both decorator and descriptor hooks should have fired. Check presence and relative positions.
     title = post["title"]
     assert all(tag in title for tag in ("[pre]", "[hpre]", "[post]", "[hpost]", "[h2post]"))
@@ -57,7 +60,7 @@ async def test_merge_hooks_update(db_session, populated_db):
         context_value={"db_session": db_session, "test_callbacks": True},
     )
     assert res1.errors is None, res1.errors
-    pid = int(res1.data["merge_posts"]["id"])
+    pid = int(res1.data["merge_posts"][0]["id"])
 
     # Update: title change only
     upd = "mutation($p: [PostQLInput!]!) { merge_posts(payload: $p) { id title } }"
@@ -68,7 +71,7 @@ async def test_merge_hooks_update(db_session, populated_db):
         context_value={"db_session": db_session, "test_callbacks": True},
     )
     assert res2.errors is None, res2.errors
-    title = res2.data["merge_posts"]["title"]
+    title = res2.data["merge_posts"][0]["title"]
     # Should have both pre and post markers from decorators and descriptors (two descriptor hooks)
     assert all(tag in title for tag in ("[pre]", "[hpre]", "[post]", "[hpost]", "[h2post]"))
     base_ix = title.find("Twice")
@@ -109,7 +112,10 @@ async def test_merge_hooks_nested_relation(db_session, populated_db):
     )
     assert res.errors is None, res.errors
 
-    user = res.data["merge_users"]
+    user_list = res.data["merge_users"]
+    assert isinstance(user_list, list)
+    assert len(user_list) == 1
+    user = user_list[0]
     assert user["id"] == str(uid) or user["id"] == uid
     posts = user.get("posts") or []
     assert isinstance(posts, list) and len(posts) >= 1

@@ -40,7 +40,7 @@ async def test_root_mutation_scope_allows_in_scope_create(db_session, populated_
         context_value={"db_session": db_session},
     )
     assert res.errors is None, res.errors
-    assert int(res.data["merge_posts_scoped"]["author_id"]) == u1_id
+    assert int(res.data["merge_posts_scoped"][0]["author_id"]) == u1_id
 
 
 @pytest.mark.asyncio
@@ -61,7 +61,7 @@ async def test_root_mutation_scope_rejects_update_out_of_scope(db_session, popul
         context_value={"db_session": db_session},
     )
     assert res1.errors is None, res1.errors
-    pid = int(res1.data["merge_posts_scoped"]["id"])
+    pid = int(res1.data["merge_posts_scoped"][0]["id"])
     # Try to update author_id to 2 (out-of-scope)
     m_upd = (
         """
@@ -96,7 +96,7 @@ async def test_root_mutation_scope_rejects_delete_out_of_scope(db_session, popul
         context_value={"db_session": db_session},
     )
     assert res1.errors is None, res1.errors
-    pid = int(res1.data["merge_posts_scoped"]["id"])
+    pid = int(res1.data["merge_posts_scoped"][0]["id"])
     # deletion is also checked against scope; since author_id is 1 and scope is author_id==1, delete should pass
     # To exercise rejection, attempt delete through the unscoped mutation but expect internal scope to reject
     m_del = (
@@ -143,4 +143,4 @@ async def test_domain_mutation_scope_descriptor_and_guard(db_session, populated_
         context_value={"db_session": db_session},
     )
     assert res2.errors is None, res2.errors
-    assert int(res2.data["blogDomain"]["merge_posts_scoped"]["author_id"]) == u1_id
+    assert int(res2.data["blogDomain"]["merge_posts_scoped"][0]["author_id"]) == u1_id

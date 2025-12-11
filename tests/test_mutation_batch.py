@@ -39,8 +39,8 @@ async def test_batch_mutations_two_merge_posts(db_session, populated_db):
     assert res.data is not None
     
     # Verify both mutations executed successfully
-    mutation1_result = res.data["mutation1"]
-    mutation2_result = res.data["mutation2"]
+    mutation1_result = res.data["mutation1"][0]
+    mutation2_result = res.data["mutation2"][0]
     
     assert mutation1_result is not None
     assert mutation2_result is not None
@@ -76,8 +76,8 @@ async def test_batch_mutations_different_operations(db_session, populated_db):
     assert res.data is not None
     
     # Verify both operations completed
-    post_result = res.data["createPost"]
-    user_result = res.data["createUser"]
+    post_result = res.data["createPost"][0]
+    user_result = res.data["createUser"][0]
     
     assert post_result is not None
     assert post_result["title"] == "New Post"
@@ -113,8 +113,8 @@ async def test_batch_mutations_with_variables(db_session, populated_db):
     assert res.errors is None, res.errors
     assert res.data is not None
     
-    first_result = res.data["first"]
-    second_result = res.data["second"]
+    first_result = res.data["first"][0]
+    second_result = res.data["second"][0]
     
     assert first_result["title"] == "Variable Post 1"
     assert second_result["title"] == "Variable Post 2"
@@ -177,7 +177,7 @@ async def test_batch_mutations_single_and_array_payload(db_session, populated_db
     assert res.data is not None
     
     single_result = res.data["singlePost"]
-    array_result = res.data["arrayPosts"]
+    array_result = res.data["arrayPosts"][0]
     
     assert single_result is not None
     assert single_result["title"] == "Single"
@@ -242,12 +242,12 @@ async def test_batch_mutations_with_hooks_concurrent_operations(db_session, popu
     else:
         # If no error, the batch succeeded - verify the results
         assert res.data is not None
-        assert res.data["post1"] is not None
-        assert res.data["post2"] is not None
+        assert res.data["post1"][0] is not None
+        assert res.data["post2"][0] is not None
         
         # Both posts should have resolved the author_id from the email
-        assert res.data["post1"]["author_id"] == 1
-        assert res.data["post2"]["author_id"] == 1
+        assert res.data["post1"][0]["author_id"] == 1
+        assert res.data["post2"][0]["author_id"] == 1
 
 
 async def test_batch_mutations_multiple_with_query_hooks(db_session, populated_db):
@@ -285,8 +285,8 @@ async def test_batch_mutations_multiple_with_query_hooks(db_session, populated_d
         # Success case - all mutations completed
         assert res.data is not None
         for key in ["m1", "m2", "m3", "m4"]:
-            assert res.data[key] is not None
-            assert res.data[key]["author_id"] in [1, 2]  # alice or bob
+            assert res.data[key][0] is not None
+            assert res.data[key][0]["author_id"] in [1, 2]  # alice or bob
 
 
 async def test_batch_mutations_sequential_with_session_queries(db_session, populated_db):
@@ -359,10 +359,10 @@ async def test_batch_mutations_sequential_with_session_queries(db_session, popul
     else:
         # Success - verify the results
         assert res.data is not None
-        assert res.data["first"] is not None
-        assert res.data["second"] is not None
-        assert res.data["first"]["author"]["name"] == "Alice Johnson"
-        assert res.data["second"]["author"]["name"] == "Bob Smith"
+        assert res.data["first"][0] is not None
+        assert res.data["second"][0] is not None
+        assert res.data["first"][0]["author"]["name"] == "Alice Johnson"
+        assert res.data["second"][0]["author"]["name"] == "Bob Smith"
         print("\n✓ Batch mutations with hooks completed successfully without concurrent operations error")
 
 
@@ -441,8 +441,8 @@ async def test_batch_mutations_with_post_hooks_and_queries(db_session, populated
     
     # If we got here without errors or with non-concurrent errors, verify data
     if res.data:
-        assert res.data["post1"] is not None
-        assert res.data["post2"] is not None
+        assert res.data["post1"][0] is not None
+        assert res.data["post2"][0] is not None
         print("\n✓ Batch mutations with post-hooks completed successfully")
 
 
@@ -541,4 +541,4 @@ async def test_batch_mutations_stress_concurrent_operations(db_session, populate
     if res.data:
         print("\n✓ Stress test completed successfully without concurrent operations error")
         # Verify at least some data came back
-        assert res.data.get("m1") is not None or res.data.get("m2") is not None
+        assert res.data.get("m1")[0] is not None or res.data.get("m2")[0] is not None
