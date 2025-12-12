@@ -6,6 +6,10 @@ All notable changes to this project will be documented here.
 ### Changed
 - **BREAKING**: Mutations that accept a list payload (default behavior or `single=False`) now return a list of objects (`[Type]`) instead of a single object (`Type`). Previously, it returned the last modified object.
 
+## [0.1.7] - 2025-12-12
+### Fixed
+- Fixed evaluation of `builder`-based `custom` / `custom_object` fields on mutation responses when the builder relies on SQLAlchemy correlation (e.g. `.correlate(M)`), ensuring results are scoped to the parent instance.
+
 ## [0.1.5] - 2025-12-04
 ### Fixed
 - Fixed relation resolution when the parent object is a raw SQLAlchemy model instance (e.g. returned from a native Strawberry field) instead of a BerryQL type instance.

@@ -2195,17 +2195,30 @@ class BerrySchema:
             if builder is None:
                 return None
             import inspect, asyncio, json as _json
-            # Try builder(model_cls) for robust evaluation; scope by PK when possible
+            parent_alias_for_builder = None
+            # Try builder(parent_alias) and evaluate it in a correlated context.
+            #
+            # Why: when resolving custom/custom_object fields on mutation responses,
+            # BerryQL uses schema.from_model(...) and then falls back to executing
+            # the builder as a standalone SELECT. If the builder relies on
+            # `.correlate(M)` (typical pushdown pattern), executing it standalone
+            # without an outer FROM for M breaks correlation and can return rows
+            # unrelated to the parent instance.
             try:
-                # Determine model class for the parent
                 model_cls_for_builder = type(parent_model)
+                try:
+                    from sqlalchemy.orm import aliased as _aliased  # type: ignore
+                except Exception:  # pragma: no cover
+                    _aliased = None  # type: ignore
+
+                parent_alias_for_builder = _aliased(model_cls_for_builder) if _aliased is not None else model_cls_for_builder
                 if len(inspect.signature(builder).parameters) == 1:
-                    result_obj = builder(model_cls_for_builder)
+                    result_obj = builder(parent_alias_for_builder)
                 else:
-                    result_obj = builder(model_cls_for_builder, session)
+                    result_obj = builder(parent_alias_for_builder, session)
             except Exception:
                 try:
-                    result_obj = builder(model_cls_for_builder)
+                    result_obj = builder(type(parent_model))
                 except Exception:
                     return None
             if asyncio.iscoroutine(result_obj):
@@ -2215,21 +2228,30 @@ class BerrySchema:
             except Exception:
                 _Select = None  # type: ignore
             if _Select is not None and isinstance(result_obj, _Select):
-                # If possible, constrain the SELECT to this instance by primary key
+                # Evaluate the builder select in a context where the parent row
+                # is present in FROM. This preserves correlation semantics.
+                exec_stmt = result_obj
                 try:
                     from sqlalchemy.inspection import inspect as _sa_inspect  # type: ignore
                     pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
-                    if pk_cols:
-                        pk_col = pk_cols[0]
-                        pk_val = getattr(parent_model, getattr(pk_col, 'key', 'id'), None)
-                        if pk_val is not None:
-                            try:
-                                result_obj = result_obj.where(pk_col == pk_val)
-                            except Exception:
-                                pass
+                    pk_col = pk_cols[0] if pk_cols else None
+                    pk_key = getattr(pk_col, 'key', None) if pk_col is not None else None
+                    pk_key = pk_key or 'id'
+                    pk_val = getattr(parent_model, pk_key, None)
+                    if pk_val is not None:
+                        from sqlalchemy import select as _select, true as _true  # type: ignore
+                        parent_alias = parent_alias_for_builder or model_cls_for_builder
+
+                        inner_lat = exec_stmt.lateral()
+                        # Select all columns from the lateral subquery.
+                        stmt = _select(*[inner_lat.c[k] for k in inner_lat.c.keys()]).select_from(parent_alias)
+                        stmt = stmt.join(inner_lat, _true())
+                        stmt = stmt.where(getattr(parent_alias, pk_key) == pk_val)
+                        exec_result = await session.execute(stmt)
+                    else:
+                        exec_result = await session.execute(exec_stmt)
                 except Exception:
-                    pass
-                exec_result = await session.execute(result_obj)
+                    exec_result = await session.execute(exec_stmt)
                 row = exec_result.first()
                 if not row:
                     return None
@@ -2275,15 +2297,21 @@ class BerrySchema:
                 
                 builder = meta_copy.get('builder')
                 import inspect, asyncio, json as _json
+                parent_alias_for_builder = None
                 try:
                     model_cls_for_builder = type(parent_model)
+                    try:
+                        from sqlalchemy.orm import aliased as _aliased  # type: ignore
+                    except Exception:  # pragma: no cover
+                        _aliased = None  # type: ignore
+                    parent_alias_for_builder = _aliased(model_cls_for_builder) if _aliased is not None else model_cls_for_builder
                     if len(inspect.signature(builder).parameters) == 1:
-                        result_obj = builder(model_cls_for_builder)
+                        result_obj = builder(parent_alias_for_builder)
                     else:
-                        result_obj = builder(model_cls_for_builder, session)
+                        result_obj = builder(parent_alias_for_builder, session)
                 except Exception:
                     try:
-                        result_obj = builder(model_cls_for_builder)
+                        result_obj = builder(type(parent_model))
                     except Exception:
                         return None
                 
@@ -2296,21 +2324,26 @@ class BerrySchema:
                     _Select = None
                 
                 if _Select is not None and isinstance(result_obj, _Select):
+                    exec_stmt = result_obj
                     try:
                         from sqlalchemy.inspection import inspect as _sa_inspect
                         pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
-                        if pk_cols:
-                            pk_col = pk_cols[0]
-                            pk_val = getattr(parent_model, getattr(pk_col, 'key', 'id'), None)
-                            if pk_val is not None:
-                                try:
-                                    result_obj = result_obj.where(pk_col == pk_val)
-                                except Exception:
-                                    pass
+                        pk_col = pk_cols[0] if pk_cols else None
+                        pk_key = getattr(pk_col, 'key', None) if pk_col is not None else None
+                        pk_key = pk_key or 'id'
+                        pk_val = getattr(parent_model, pk_key, None)
+                        if pk_val is not None:
+                            from sqlalchemy import select as _select, true as _true  # type: ignore
+                            parent_alias = parent_alias_for_builder or model_cls_for_builder
+                            inner_lat = exec_stmt.lateral()
+                            stmt = _select(*[inner_lat.c[k] for k in inner_lat.c.keys()]).select_from(parent_alias)
+                            stmt = stmt.join(inner_lat, _true())
+                            stmt = stmt.where(getattr(parent_alias, pk_key) == pk_val)
+                            exec_result = await session.execute(stmt)
+                        else:
+                            exec_result = await session.execute(exec_stmt)
                     except Exception:
-                        pass
-                    
-                    exec_result = await session.execute(result_obj)
+                        exec_result = await session.execute(exec_stmt)
                     row = exec_result.first()
                     if not row:
                         return None
