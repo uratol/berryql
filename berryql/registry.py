@@ -2191,6 +2191,31 @@ class BerrySchema:
             session = _get_db(info)
             if session is None:
                 return None
+            
+            # Acquire session lock to prevent concurrent operations during field resolution
+            import asyncio as _asyncio
+            _lock = None
+            try:
+                _info_dict = getattr(session, 'info', None)
+                if isinstance(_info_dict, dict):
+                    _lock = _info_dict.get('berryql_session_lock')
+                    if _lock is None:
+                        _lock = _asyncio.Lock()
+                        _info_dict['berryql_session_lock'] = _lock
+            except Exception:
+                _lock = None
+            if _lock is None:
+                try:
+                    _lock = getattr(session, '_berryql_session_lock', None)
+                except Exception:
+                    _lock = None
+                if _lock is None:
+                    _lock = _asyncio.Lock()
+                    try:
+                        setattr(session, '_berryql_session_lock', _lock)
+                    except Exception:
+                        pass
+
             builder = meta_copy.get('builder')
             if builder is None:
                 return None
@@ -2231,28 +2256,29 @@ class BerrySchema:
                 # Evaluate the builder select in a context where the parent row
                 # is present in FROM. This preserves correlation semantics.
                 exec_stmt = result_obj
-                try:
-                    from sqlalchemy.inspection import inspect as _sa_inspect  # type: ignore
-                    pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
-                    pk_col = pk_cols[0] if pk_cols else None
-                    pk_key = getattr(pk_col, 'key', None) if pk_col is not None else None
-                    pk_key = pk_key or 'id'
-                    pk_val = getattr(parent_model, pk_key, None)
-                    if pk_val is not None:
-                        from sqlalchemy import select as _select, true as _true  # type: ignore
-                        parent_alias = parent_alias_for_builder or model_cls_for_builder
+                async with (_lock or _asyncio.Lock()):
+                    try:
+                        from sqlalchemy.inspection import inspect as _sa_inspect  # type: ignore
+                        pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
+                        pk_col = pk_cols[0] if pk_cols else None
+                        pk_key = getattr(pk_col, 'key', None) if pk_col is not None else None
+                        pk_key = pk_key or 'id'
+                        pk_val = getattr(parent_model, pk_key, None)
+                        if pk_val is not None:
+                            from sqlalchemy import select as _select, true as _true  # type: ignore
+                            parent_alias = parent_alias_for_builder or model_cls_for_builder
 
-                        inner_lat = exec_stmt.lateral()
-                        # Select all columns from the lateral subquery.
-                        stmt = _select(*[inner_lat.c[k] for k in inner_lat.c.keys()]).select_from(parent_alias)
-                        stmt = stmt.join(inner_lat, _true())
-                        stmt = stmt.where(getattr(parent_alias, pk_key) == pk_val)
-                        exec_result = await session.execute(stmt)
-                    else:
+                            inner_lat = exec_stmt.lateral()
+                            # Select all columns from the lateral subquery.
+                            stmt = _select(*[inner_lat.c[k] for k in inner_lat.c.keys()]).select_from(parent_alias)
+                            stmt = stmt.join(inner_lat, _true())
+                            stmt = stmt.where(getattr(parent_alias, pk_key) == pk_val)
+                            exec_result = await session.execute(stmt)
+                        else:
+                            exec_result = await session.execute(exec_stmt)
+                    except Exception:
                         exec_result = await session.execute(exec_stmt)
-                except Exception:
-                    exec_result = await session.execute(exec_stmt)
-                row = exec_result.first()
+                    row = exec_result.first()
                 if not row:
                     return None
                 try:
@@ -2295,6 +2321,30 @@ class BerrySchema:
                 if session is None:
                     return None
                 
+                # Acquire session lock to prevent concurrent operations during field resolution
+                import asyncio as _asyncio
+                _lock = None
+                try:
+                    _info_dict = getattr(session, 'info', None)
+                    if isinstance(_info_dict, dict):
+                        _lock = _info_dict.get('berryql_session_lock')
+                        if _lock is None:
+                            _lock = _asyncio.Lock()
+                            _info_dict['berryql_session_lock'] = _lock
+                except Exception:
+                    _lock = None
+                if _lock is None:
+                    try:
+                        _lock = getattr(session, '_berryql_session_lock', None)
+                    except Exception:
+                        _lock = None
+                    if _lock is None:
+                        _lock = _asyncio.Lock()
+                        try:
+                            setattr(session, '_berryql_session_lock', _lock)
+                        except Exception:
+                            pass
+
                 builder = meta_copy.get('builder')
                 import inspect, asyncio, json as _json
                 parent_alias_for_builder = None
@@ -2325,26 +2375,27 @@ class BerrySchema:
                 
                 if _Select is not None and isinstance(result_obj, _Select):
                     exec_stmt = result_obj
-                    try:
-                        from sqlalchemy.inspection import inspect as _sa_inspect
-                        pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
-                        pk_col = pk_cols[0] if pk_cols else None
-                        pk_key = getattr(pk_col, 'key', None) if pk_col is not None else None
-                        pk_key = pk_key or 'id'
-                        pk_val = getattr(parent_model, pk_key, None)
-                        if pk_val is not None:
-                            from sqlalchemy import select as _select, true as _true  # type: ignore
-                            parent_alias = parent_alias_for_builder or model_cls_for_builder
-                            inner_lat = exec_stmt.lateral()
-                            stmt = _select(*[inner_lat.c[k] for k in inner_lat.c.keys()]).select_from(parent_alias)
-                            stmt = stmt.join(inner_lat, _true())
-                            stmt = stmt.where(getattr(parent_alias, pk_key) == pk_val)
-                            exec_result = await session.execute(stmt)
-                        else:
+                    async with (_lock or _asyncio.Lock()):
+                        try:
+                            from sqlalchemy.inspection import inspect as _sa_inspect
+                            pk_cols = list(getattr(_sa_inspect(model_cls_for_builder), 'primary_key', []) or [])
+                            pk_col = pk_cols[0] if pk_cols else None
+                            pk_key = getattr(pk_col, 'key', None) if pk_col is not None else None
+                            pk_key = pk_key or 'id'
+                            pk_val = getattr(parent_model, pk_key, None)
+                            if pk_val is not None:
+                                from sqlalchemy import select as _select, true as _true  # type: ignore
+                                parent_alias = parent_alias_for_builder or model_cls_for_builder
+                                inner_lat = exec_stmt.lateral()
+                                stmt = _select(*[inner_lat.c[k] for k in inner_lat.c.keys()]).select_from(parent_alias)
+                                stmt = stmt.join(inner_lat, _true())
+                                stmt = stmt.where(getattr(parent_alias, pk_key) == pk_val)
+                                exec_result = await session.execute(stmt)
+                            else:
+                                exec_result = await session.execute(exec_stmt)
+                        except Exception:
                             exec_result = await session.execute(exec_stmt)
-                    except Exception:
-                        exec_result = await session.execute(exec_stmt)
-                    row = exec_result.first()
+                        row = exec_result.first()
                     if not row:
                         return None
                     try:
