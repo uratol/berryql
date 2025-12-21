@@ -1243,7 +1243,7 @@ class BerrySchema:
             base_t = getattr(spec, 'arg_type', None) or str
             if base_t is str and spec.column and spec.column in col_type_map:
                 base_t = col_type_map[spec.column]
-            if spec.op in ('in','between'):
+            if spec.op in ('in', 'between', 'not_in', 'not_between'):
                 anns[a] = Optional[List[base_t]]  # type: ignore
             else:
                 anns[a] = Optional[base_t]
@@ -3782,7 +3782,7 @@ class BerrySchema:
                             base_t = getattr(spec, 'arg_type', None) or str
                             if base_t is str and spec.column and spec.column in col_type_map:
                                 base_t = col_type_map[spec.column]
-                            if spec.op in ('in','between'):
+                            if spec.op in ('in', 'between', 'not_in', 'not_between'):
                                 anns[a] = Optional[List[base_t]]  # type: ignore
                             else:
                                 anns[a] = Optional[base_t]
@@ -4130,7 +4130,7 @@ class BerrySchema:
                 base_type = getattr(f_spec, 'arg_type', None) or str
                 if base_type is str and f_spec.column and f_spec.column in col_py_types:
                     base_type = col_py_types[f_spec.column]
-                if f_spec.op in ('in', 'between'):
+                if f_spec.op in ('in', 'between', 'not_in', 'not_between'):
                     filter_arg_types[arg_name] = Optional[List[base_type]]  # type: ignore
                 else:
                     filter_arg_types[arg_name] = Optional[base_type]

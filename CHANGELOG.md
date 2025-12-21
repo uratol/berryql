@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented here.
 
+##[0.1.9] - 2025-12-21
+### Added
+- Added 'not_like', 'not_ilike', 'not_in', 'not_between' operators for query field arguments definition
+
 ## [0.1.8] - 2025-12-20
 ### Fixed
 - Fixed concurrency issues in `custom` and `custom_object` field resolvers by introducing a session-level lock during builder execution.

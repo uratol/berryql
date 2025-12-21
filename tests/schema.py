@@ -575,10 +575,23 @@ class Query:
             return {'id': {'eq': -1}}
     users = relation('UserQL', order_by='id', order_dir='asc', scope=_gate_users, arguments={
         'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
+        'name_not_like': {'column': 'name', 'op': 'not_like'},
+        'name_not_ilike': {'column': 'name', 'op': 'not_ilike'},
+        'name_not_in': {'column': 'name', 'op': 'not_in'},
         # Use column-based spec to expose proper GraphQL types (List[DateTime])
         'created_at_between': {
             'column': 'created_at',
             'op': 'between',
+            'transform': lambda v: (
+                [
+                    (datetime.fromisoformat(v[0]) if isinstance(v[0], str) else v[0]),
+                    (datetime.fromisoformat(v[1]) if isinstance(v[1], str) else v[1]),
+                ] if isinstance(v, (list, tuple)) and len(v) >= 2 else v
+            ),
+        },
+        'created_at_not_between': {
+            'column': 'created_at',
+            'op': 'not_between',
             'transform': lambda v: (
                 [
                     (datetime.fromisoformat(v[0]) if isinstance(v[0], str) else v[0]),
