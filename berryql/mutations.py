@@ -549,6 +549,26 @@ def build_merge_resolver_for_type(
                                 fk_col = None
                             if fk_col is None:
                                 continue
+                            
+                            # Check on_delete strategy from SQLAlchemy metadata
+                            on_delete_strategy = None
+                            try:
+                                if hasattr(fk_col, 'foreign_keys'):
+                                    for fk in fk_col.foreign_keys:
+                                        if fk.ondelete and fk.ondelete.upper() == 'SET NULL':
+                                            on_delete_strategy = 'SET NULL'
+                                            break
+                            except Exception:
+                                pass
+
+                            if on_delete_strategy == 'SET NULL':
+                                from sqlalchemy import update as _sa_update
+                                try:
+                                    await session.execute(_sa_update(child_model_cls).where(fk_col == parent_pk_val).values({fk_col.name: None}))
+                                except Exception:
+                                    pass
+                                continue
+
                             # Recurse to grandchildren first by selecting child PKs
                             try:
                                 child_pk_name = schema._get_pk_name(child_model_cls)
