@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented here.
 
-##[0.1.9] - 2025-12-21
+## [0.2.0] - 2025-12-24
+### Added
+- Implemented `on_delete` strategy for foreign key handling in merge resolver.
+
+## [0.1.9] - 2025-12-21
 ### Added
 - Added 'not_like', 'not_ilike', 'not_in', 'not_between' operators for query field arguments definition
 
