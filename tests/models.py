@@ -82,7 +82,7 @@ class User(Base):
     is_admin = Column(Boolean, default=False, nullable=False, comment='Administrative flag')
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
     
-    posts = relationship("Post", back_populates="author")
+    posts = relationship("Post", back_populates="author", foreign_keys="[Post.author_id]")
     post_comments = relationship("PostComment", back_populates="author")
 
 
@@ -124,7 +124,11 @@ class Post(Base):
     # Computed (read-only) column: length of content; uses SQL function for cross-dialect support
     content_length = column_property(func.length(content))
     
-    author = relationship("User", back_populates="posts")
+    # New: nullable FK for testing SET NULL cascade
+    reviewer_id = Column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True, comment='Reviewer FK to users.id (SET NULL)')
+
+    author = relationship("User", back_populates="posts", foreign_keys=[author_id])
+    reviewer = relationship("User", foreign_keys=[reviewer_id])
     post_comments = relationship("PostComment", back_populates="post")
 
 

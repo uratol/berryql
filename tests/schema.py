@@ -280,6 +280,8 @@ class PostQL(BerryType):
     status = field()
     # Read-only computed scalar mirroring SQLAlchemy column_property on Post
     content_length = field(read_only=True)
+    reviewer_id = field()
+    reviewer = relation('UserQL', single=True)
     author = relation('UserQL', single=True, arguments={
         'name_ilike': lambda M, info, v: M.name.ilike(f"%{v}%"),
         'created_at_between': lambda M, info, v: (M.created_at.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None),
@@ -417,6 +419,7 @@ class UserQL(BerryType):
         from sqlalchemy import exists, select
         return exists(select(PostComment.id).where(PostComment.post_id == model_cls.id))
     posts_have_comments = relation('PostQL', scope=_posts_have_comments_where)
+    reviewed_posts = relation('PostQL', fk_column_name='reviewer_id')
 
 # --- Domains: userDomain and blogDomain ---
 

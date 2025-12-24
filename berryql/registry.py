@@ -1000,20 +1000,27 @@ class BerrySchema:
         try:
             if child_model_cls is None or not hasattr(child_model_cls, '__table__'):
                 return None
+            
+            # 1. If explicit name provided, look for it specifically
+            if explicit_child_fk_name:
+                for col in child_model_cls.__table__.columns:
+                    if col.name == explicit_child_fk_name:
+                        return col
+                return None
+
             parent_table_name = None
             try:
                 parent_table_name = parent_model_cls.__table__.name if hasattr(parent_model_cls, '__table__') else None
             except Exception:
                 parent_table_name = None
+            
+            if not parent_table_name:
+                return None
+
             for col in child_model_cls.__table__.columns:
-                try:
-                    if explicit_child_fk_name and col.name == explicit_child_fk_name:
-                        return col
-                except Exception:
-                    pass
                 for fk in getattr(col, 'foreign_keys', []) or []:
                     try:
-                        if parent_table_name and fk.column.table.name == parent_table_name:
+                        if fk.column.table.name == parent_table_name:
                             return col
                     except Exception:
                         continue
