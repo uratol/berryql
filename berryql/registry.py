@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
 from .core.utils import _py_uuid
 from strawberry.scalars import JSON as ST_JSON
-from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, JSON as SA_JSON, Numeric as SANumeric
+from sqlalchemy.sql.sqltypes import Integer, String, Boolean, DateTime, JSON as SA_JSON, Numeric as SANumeric, BigInteger
 try:
     from sqlalchemy.dialects.postgresql import UUID as PG_UUID, ARRAY as PG_ARRAY, JSONB as PG_JSONB
 except Exception:  # pragma: no cover
@@ -823,6 +823,8 @@ class BerrySchema:
                         return enum_cls
             except Exception:
                 pass
+            if isinstance(sqlatype, BigInteger):
+                return float
             if isinstance(sqlatype, Integer):
                 return int
             if isinstance(sqlatype, Boolean):

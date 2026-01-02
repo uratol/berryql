@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented here.
 
+## [0.2.1] - 2026-01-02
+### Fixed
+- Fixed `BigInteger` column type mapping to use `Float` instead of `Int` to avoid overflow errors for large values.
+
 ## [0.2.0] - 2025-12-24
 ### Added
 - Implemented `on_delete` strategy for foreign key handling in merge resolver.

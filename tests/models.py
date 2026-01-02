@@ -1,7 +1,7 @@
 """Database models for BerryQL tests (shared)."""
 
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, JSON, func, CheckConstraint
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, JSON, func, CheckConstraint, BigInteger
 from sqlalchemy import Enum as SAEnum
 import enum
 from sqlalchemy.orm import DeclarativeBase, relationship, column_property
@@ -182,6 +182,6 @@ class GenericItem(Base):
     id = Column(SA_Uuid(as_uuid=True), primary_key=True, comment='UUID primary key')
     name = Column(String(100), nullable=False, comment='Item name')
     code = Column(String(50), nullable=False, default='', comment='Short code')
-    count = Column(Integer, nullable=False, default=0, comment='Numeric counter')
+    count = Column(BigInteger, nullable=False, default=0, comment='Numeric counter')
     active = Column(Boolean, nullable=False, default=True, comment='Active flag')
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), comment='Creation timestamp (UTC)')
