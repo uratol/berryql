@@ -36,9 +36,10 @@ async def test_mutation_posts_metadata_json_write_and_read(db_session, sample_us
     r = await schema.execute(m, variable_values=vars, context_value={"db_session": db_session})
     assert r.errors is None
     ps = r.data["merge_posts"]
-    # merge_posts returns the last merged object when payload is a list
-    assert isinstance(ps, dict)
-    got = ps
+    # merge_posts returns a list of merged objects
+    assert isinstance(ps, list)
+    assert len(ps) == 1
+    got = ps[0]
     assert got["metadata_json"] == {"a": 1, "b": [1,2,3]}
 
     # Query back
