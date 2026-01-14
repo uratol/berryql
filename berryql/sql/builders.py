@@ -333,9 +333,9 @@ class RelationSQLBuilders:
             sel,
             child_model_cls,
             allowed,
-            order_by=rel_cfg.get('order_by'),
-            order_dir=rel_cfg.get('order_dir'),
-            order_multi=self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
+            order_by=self._resolve_graphql_value(info, rel_cfg.get('order_by')),
+            order_dir=self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg)),
+            order_multi=self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []),
             dir_value_fn=dir_value,
             default_dir_for_multi='asc',
             fallback_id=True,
@@ -1236,7 +1236,7 @@ class RelationSQLBuilders:
                         allowed_fields.append(sf)
             except Exception:
                 allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
-            nmulti: List[str] = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or [])
+            nmulti: List[str] = self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or [])
             for spec in nmulti:
                 cn, _, dd = spec.partition(':')
                 # Default ASC for multi when direction not specified
@@ -1247,7 +1247,7 @@ class RelationSQLBuilders:
                         inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
                         ordered = True
             if not ordered:
-                ob_val = rel_cfg.get('order_by')
+                ob_val = self._resolve_graphql_value(info, rel_cfg.get('order_by'))
                 if ob_val is not None:
                     # Support callable or direct SQLAlchemy expression for ordering
                     expr = None
@@ -1263,10 +1263,10 @@ class RelationSQLBuilders:
                         expr = getattr(child_model_cls_i, ob_val, None)
                     if expr is not None:
                         try:
-                            eff_dir_top = self._effective_order_dir(rel_cfg)
+                            eff_dir_top = self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg))
                         except Exception:
                             eff_dir_top = None
-                        dd = (eff_dir_top or dir_value_fn(rel_cfg.get('order_dir')) or 'asc')
+                        dd = (eff_dir_top or dir_value_fn(self._resolve_graphql_value(info, rel_cfg.get('order_dir'))) or 'asc')
                         try:
                             inner_sel_i = inner_sel_i.order_by(expr.desc() if str(dd).lower() == 'desc' else expr.asc())
                             ordered = True
@@ -1443,7 +1443,10 @@ class RelationSQLBuilders:
                         n_order_by_mapped = _map_order_name(n_model_i, self._resolve_graphql_value(info, ncfg_i.get('order_by')))
                         n_order_multi_mapped: list[str] = []
                         try:
+                            # DEBUG PROBE
                             om_val = self._resolve_graphql_value(info, ncfg_i.get('order_multi'))
+                            if om_val:
+                                raise ValueError(f"DEBUG_OM_VAL: {om_val}")
                             for spec in (self.registry._normalize_order_multi_values(om_val or []) or []):
                                 cn, _, dd = str(spec).partition(':')
                                 mapped_cn = _map_order_name(n_model_i, cn)
