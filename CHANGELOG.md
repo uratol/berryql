@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.2.2] - 2026-01-14
+### Added
+- Added support for `orderBy`, `orderDir`, and `orderMulti` variables in GraphQL queries.
+- Added support for variables in `limit` and `offset` arguments.
+
 ## [0.2.1] - 2026-01-02
 ### Fixed
 - Fixed `BigInteger` column type mapping to use `Float` instead of `Int` to avoid overflow errors for large values.
