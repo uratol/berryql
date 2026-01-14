@@ -1432,7 +1432,7 @@ class RelationSQLBuilders:
                         except Exception:
                             n_fields_i = []
                         # order_dir default ASC if order_by explicit without dir
-                        n_effective_dir_i = self._effective_order_dir(ncfg_i)
+                        n_effective_dir_i = self._resolve_graphql_value(info, self._effective_order_dir(ncfg_i))
                         # Map order_by and order_multi to physical names
                         def _map_order_name(model_cls_local, name):
                             try:
@@ -1440,10 +1440,11 @@ class RelationSQLBuilders:
                                 return pairs[0][0] if pairs else name
                             except Exception:
                                 return name
-                        n_order_by_mapped = _map_order_name(n_model_i, ncfg_i.get('order_by'))
+                        n_order_by_mapped = _map_order_name(n_model_i, self._resolve_graphql_value(info, ncfg_i.get('order_by')))
                         n_order_multi_mapped: list[str] = []
                         try:
-                            for spec in (self.registry._normalize_order_multi_values(ncfg_i.get('order_multi') or []) or []):
+                            om_val = self._resolve_graphql_value(info, ncfg_i.get('order_multi'))
+                            for spec in (self.registry._normalize_order_multi_values(om_val or []) or []):
                                 cn, _, dd = str(spec).partition(':')
                                 mapped_cn = _map_order_name(n_model_i, cn)
                                 n_order_multi_mapped.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
@@ -1551,9 +1552,9 @@ class RelationSQLBuilders:
                     except Exception:
                         n_fields = []
                     # Determine effective order_dir for nested: ASC when order_by explicit and no explicit dir
-                    n_effective_dir = ncfg.get('order_dir')
+                    n_effective_dir = self._resolve_graphql_value(info, ncfg.get('order_dir'))
                     try:
-                        if ncfg.get('_has_explicit_order_by') and not ncfg.get('_has_explicit_order_dir'):
+                        if ncfg.get('_has_explicit_order_by') and not ncfg.get('_has_explicit_order_dir') and n_effective_dir is None:
                             n_effective_dir = 'asc'
                     except Exception:
                         pass
@@ -1564,10 +1565,11 @@ class RelationSQLBuilders:
                             return pairs[0][0] if pairs else name
                         except Exception:
                             return name
-                    n_order_by_mapped2 = _map_order_name2(n_model, ncfg.get('order_by'))
+                    n_order_by_mapped2 = _map_order_name2(n_model, self._resolve_graphql_value(info, ncfg.get('order_by')))
                     n_order_multi_mapped2: list[str] = []
                     try:
-                        for spec in (self.registry._normalize_order_multi_values(ncfg.get('order_multi') or []) or []):
+                        om_val2 = self._resolve_graphql_value(info, ncfg.get('order_multi'))
+                        for spec in (self.registry._normalize_order_multi_values(om_val2 or []) or []):
                             cn, _, dd = str(spec).partition(':')
                             mapped_cn = _map_order_name2(n_model, cn)
                             n_order_multi_mapped2.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
@@ -1599,7 +1601,7 @@ class RelationSQLBuilders:
                     nested_specs.append(spec_obj2)
                 # Build full JSON for the list relation, including nested arrays
                 # Compute effective top-level order_dir: ASC when order_by explicit without explicit dir
-                effective_order_dir = self._effective_order_dir(rel_cfg)
+                effective_order_dir = self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg))
                 # Resolve top-level type_default_where (callables/variables) before handing to adapter
                 def _resolve_type_where(raw_val, model_cls_local):
                     v = self._resolve_graphql_value(info, raw_val)
@@ -1667,7 +1669,7 @@ class RelationSQLBuilders:
                     order_multi=[
                         f"{(self._mssql_map_columns_pairs(child_model_cls, [spec.split(':',1)[0]]) or [(spec.split(':',1)[0], spec.split(':',1)[0])])[0][0]}:{spec.split(':',1)[1]}"
                         if ':' in spec else (self._mssql_map_columns_pairs(child_model_cls, [spec]) or [(spec, spec)])[0][0]
-                        for spec in (self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []) or [])
+                        for spec in (self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or [])
                     ],
                     nested=nested_specs,
                 )
@@ -1758,7 +1760,7 @@ class RelationSQLBuilders:
                 pass
             where_clause = ' AND '.join(where_parts_rel)
             # Respect explicit order_by without order_dir -> default ASC (override relation default)
-            effective_order_dir2 = self._effective_order_dir(rel_cfg)
+            effective_order_dir2 = self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg))
             # Resolve order_by: allow callable/SQLAlchemy expression for MSSQL simple path as well
             order_clause = None
             try:
@@ -1799,7 +1801,7 @@ class RelationSQLBuilders:
                     compiled2 = str(ob_resolved2)
                 expr_part = f"({compiled2}) {'DESC' if (str(effective_order_dir2).lower()=='desc') else 'ASC'}"
                 # Build order_multi parts manually to avoid unintended PK fallback
-                multi_specs = self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []) or []
+                multi_specs = self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or []
                 multi_parts: list[str] = []
                 try:
                     alias_ident3 = adapter.table_ident(child_model_cls)
@@ -1822,9 +1824,9 @@ class RelationSQLBuilders:
                 order_clause = adapter.build_order_clause(
                     child_model_cls,
                     child_model_cls,
-                    ob_resolved2 if isinstance(ob_resolved2, str) else rel_cfg.get('order_by'),
+                    ob_resolved2 if isinstance(ob_resolved2, str) else self._resolve_graphql_value(info, rel_cfg.get('order_by')),
                     effective_order_dir2,
-                    self.registry._normalize_order_multi_values(rel_cfg.get('order_multi') or []),
+                    self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []),
                 )
             return adapter.build_list_relation_json(
                 child_table=child_model_cls,
