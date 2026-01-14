@@ -1465,8 +1465,8 @@ class RelationSQLBuilders:
                             'order_by': n_order_by_mapped,
                             'order_dir': n_effective_dir_i,
                             'order_multi': n_order_multi_mapped,
-                            'limit': ncfg_i.get('limit'),
-                            'offset': ncfg_i.get('offset'),
+                            'limit': self._resolve_graphql_value(info, ncfg_i.get('limit')),
+                            'offset': self._resolve_graphql_value(info, ncfg_i.get('offset')),
                             'nested': child_specs_i or None,
                         }
                         # Preserve resolved type-level default scope for deeper application where supported
@@ -1584,8 +1584,8 @@ class RelationSQLBuilders:
                         'order_by': n_order_by_mapped2,
                         'order_dir': n_effective_dir,
                         'order_multi': n_order_multi_mapped2,
-                        'limit': ncfg.get('limit'),
-                        'offset': ncfg.get('offset'),
+                        'limit': self._resolve_graphql_value(info, ncfg.get('limit')),
+                        'offset': self._resolve_graphql_value(info, ncfg.get('offset')),
                         'nested': nested_children_specs or None,
                     }
                     if 'type_default_where' in ncfg:
@@ -1660,8 +1660,8 @@ class RelationSQLBuilders:
                     rel_where=self._resolve_graphql_value(info, rel_cfg.get('where')),
                     rel_default_where=rel_cfg.get('default_where'),
                     type_default_where=top_type_where,
-                    limit=rel_cfg.get('limit'),
-                    offset=rel_cfg.get('offset'),
+                    limit=self._resolve_graphql_value(info, rel_cfg.get('limit')),
+                    offset=self._resolve_graphql_value(info, rel_cfg.get('offset')),
                     order_by=order_by_param,
                     order_dir=effective_order_dir,
                     order_multi=[
@@ -1830,8 +1830,8 @@ class RelationSQLBuilders:
                 child_table=child_model_cls,
                 projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                 where_condition=where_clause,
-                limit=rel_cfg.get('limit'),
-                offset=rel_cfg.get('offset'),
+                limit=self._resolve_graphql_value(info, rel_cfg.get('limit')),
+                offset=self._resolve_graphql_value(info, rel_cfg.get('offset')),
                 order_by=order_clause,
                 nested_subqueries=None,
             )
