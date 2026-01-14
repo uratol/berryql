@@ -341,7 +341,9 @@ class RelationSQLBuilders:
             fallback_id=True,
         )
         # pagination
-        sel = self._apply_pagination_sqla(sel, rel_cfg.get('limit'), rel_cfg.get('offset'))
+        l_val = self._resolve_graphql_value(info, rel_cfg.get('limit'))
+        o_val = self._resolve_graphql_value(info, rel_cfg.get('offset'))
+        sel = self._apply_pagination_sqla(sel, l_val, o_val)
         return sel
     def _expand_arg_specs(self, arg_specs: Dict[str, Any] | None) -> Dict[str, Any]:
         """Normalize filter arg specs: expand ops to concrete names and honor aliases.
@@ -1002,9 +1004,11 @@ class RelationSQLBuilders:
                         # Pagination for nested
                         try:
                             if ncfg.get('offset') is not None:
-                                n_sel = n_sel.offset(int(ncfg.get('offset')) if isinstance(ncfg.get('offset'), (int, str)) else ncfg.get('offset'))
+                                o_val = self._resolve_graphql_value(info, ncfg.get('offset'))
+                                n_sel = n_sel.offset(int(o_val) if isinstance(o_val, (int, str)) else o_val)
                             if ncfg.get('limit') is not None:
-                                n_sel = n_sel.limit(int(ncfg.get('limit')) if isinstance(ncfg.get('limit'), (int, str)) else ncfg.get('limit'))
+                                l_val = self._resolve_graphql_value(info, ncfg.get('limit'))
+                                n_sel = n_sel.limit(int(l_val) if isinstance(l_val, (int, str)) else l_val)
                         except Exception:
                             pass
                         if is_single_nested:
@@ -1281,9 +1285,11 @@ class RelationSQLBuilders:
             # Pagination for child
             try:
                 if rel_cfg.get('offset') is not None:
-                    inner_sel_i = inner_sel_i.offset(int(rel_cfg.get('offset')) if isinstance(rel_cfg.get('offset'), (int, str)) else rel_cfg.get('offset'))
+                    o_val = self._resolve_graphql_value(info, rel_cfg.get('offset'))
+                    inner_sel_i = inner_sel_i.offset(int(o_val) if isinstance(o_val, (int, str)) else o_val)
                 if rel_cfg.get('limit') is not None:
-                    inner_sel_i = inner_sel_i.limit(int(rel_cfg.get('limit')) if isinstance(rel_cfg.get('limit'), (int, str)) else rel_cfg.get('limit'))
+                    l_val = self._resolve_graphql_value(info, rel_cfg.get('limit'))
+                    inner_sel_i = inner_sel_i.limit(int(l_val) if isinstance(l_val, (int, str)) else l_val)
             except Exception:
                 pass
             limited_subq_i = inner_sel_i.subquery()
