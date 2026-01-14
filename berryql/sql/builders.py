@@ -6,6 +6,7 @@ from ..core.naming import fields_map_for, from_camel
 # Centralized SQL builders. Keep registry thin and DRY.
 
 
+
 class RelationSQLBuilders:
     def __init__(self, registry):
         self.registry = registry
@@ -336,10 +337,8 @@ class RelationSQLBuilders:
             order_by=self._resolve_graphql_value(info, rel_cfg.get('order_by')),
             order_dir=self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg)),
             order_multi=self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []),
-            dir_value_fn=dir_value,
-            default_dir_for_multi='asc',
-            fallback_id=True,
         )
+
         # pagination
         l_val = self._resolve_graphql_value(info, rel_cfg.get('limit'))
         o_val = self._resolve_graphql_value(info, rel_cfg.get('offset'))
@@ -652,6 +651,16 @@ class RelationSQLBuilders:
 
     @staticmethod
     def _resolve_graphql_value(info, raw):
+        if isinstance(raw, list):
+            out = []
+            for x in raw:
+                r = RelationSQLBuilders._resolve_graphql_value(info, x)
+                if isinstance(r, list):
+                    out.extend(r)
+                else:
+                    out.append(r)
+            return out
+
         v = raw
         try:
             if not isinstance(v, (dict, str)) and hasattr(v, 'name'):
@@ -1443,10 +1452,7 @@ class RelationSQLBuilders:
                         n_order_by_mapped = _map_order_name(n_model_i, self._resolve_graphql_value(info, ncfg_i.get('order_by')))
                         n_order_multi_mapped: list[str] = []
                         try:
-                            # DEBUG PROBE
                             om_val = self._resolve_graphql_value(info, ncfg_i.get('order_multi'))
-                            if om_val:
-                                raise ValueError(f"DEBUG_OM_VAL: {om_val}")
                             for spec in (self.registry._normalize_order_multi_values(om_val or []) or []):
                                 cn, _, dd = str(spec).partition(':')
                                 mapped_cn = _map_order_name(n_model_i, cn)

@@ -196,7 +196,16 @@ def normalize_relation_cfg(cfg: Dict[str, Any]) -> None:
                     pass
             if not isinstance(om, list):
                 om = [om]
-            cfg['order_multi'] = [str(coerce_literal(x)) for x in (om or [])]
+            
+            def _safe_str(x):
+                c = coerce_literal(x)
+                # Preserve AST nodes (e.g. VariableNode) that have a name but aren't primitives,
+                # so they can be resolved later by builders.
+                if hasattr(c, 'name') and not isinstance(c, (str, dict)):
+                    return c
+                return str(c)
+
+            cfg['order_multi'] = [_safe_str(x) for x in (om or [])]
         except Exception:
             cfg['order_multi'] = [str(cfg.get('order_multi'))] if cfg.get('order_multi') is not None else []
     # fields

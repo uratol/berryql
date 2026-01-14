@@ -55,7 +55,7 @@ async def test_orderdir_variable(db_session, populated_db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(reason="Variable resolution for List types (order_multi) currently failing")
+# @pytest.mark.skip(reason="Variable resolution for List types (order_multi) currently failing")
 async def test_ordermulti_variable(db_session, populated_db):
     query = """
     query MyQuery($orderMulti: [String!]) {
