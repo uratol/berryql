@@ -40,3 +40,30 @@ async def test_post_comments_agg_obj_custom_object(db_session, populated_db):
     assert query_counter['count'] == 1, f"Expected 1 SQL query for posts root field, got {query_counter['count']}"
   finally:
     event.remove(engine, "before_cursor_execute", before_cursor_execute)
+
+
+@pytest.mark.asyncio
+async def test_custom_and_custom_object_receive_context(db_session, populated_db):
+  query = """
+  query {
+    posts(limit: 1) {
+      title
+      title_len_custom_context
+      post_comments_ctx_obj { flag comments_count }
+    }
+  }
+  """
+  ctx = {
+    "db_session": db_session,
+    "custom_add": 5,
+    "custom_obj_flag": 7,
+  }
+  res = await schema.execute(query, context_value=ctx)
+  assert res.errors is None, res.errors
+  posts = res.data["posts"]
+  assert len(posts) == 1
+  post = posts[0]
+  assert post["title_len_custom_context"] == len(post["title"]) + 5
+  obj = post["post_comments_ctx_obj"]
+  assert obj["flag"] == 7
+  assert isinstance(obj["comments_count"], int)

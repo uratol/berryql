@@ -4,7 +4,7 @@ Not functionally equivalent yet: purely structural placeholder to evolve tests a
 """
 from typing import Optional, List, Any, AsyncGenerator, Annotated
 from datetime import datetime
-from sqlalchemy import select, func, exists
+from sqlalchemy import select, func, exists, literal
 import strawberry
 from strawberry.types import Info
 from berryql import BerrySchema, BerryType, BerryDomain, field, relation, count, custom, custom_object, domain, mutation, hooks, scope
@@ -308,6 +308,15 @@ class PostQL(BerryType):
     comment_text_len = custom(_comment_text_len_builder, returns=int)
     # Writable custom field for tests: length of title, allowed in inputs
     title_len_custom_input = custom(lambda M: select(func.length(M.title)), returns=int, read_only=False)
+    # Context-aware custom scalar: add ctx.custom_add to title length
+    def _title_len_with_context_builder(model_cls, info: Info):
+        try:
+            ctx = getattr(info, 'context', None) or {}
+            add = ctx.get('custom_add', 0)
+        except Exception:
+            add = 0
+        return select((func.length(model_cls.title) + literal(add)).label('ctx_title_len'))
+    title_len_custom_context = custom(_title_len_with_context_builder, returns=int)
     # Multi-column aggregate object (min_created_at, comments_count)
     post_comments_agg_obj = custom_object(
         lambda model_cls: (
@@ -317,6 +326,23 @@ class PostQL(BerryType):
             ).select_from(PostComment).where(PostComment.post_id == model_cls.id)
         ),
         returns={'min_created_at': datetime, 'comments_count': int}
+    )
+    # Context-aware custom object: exposes a ctx flag plus comments_count
+    def _post_comments_ctx_obj_builder(model_cls, info: Info):
+        try:
+            ctx = getattr(info, 'context', None) or {}
+            flag = ctx.get('custom_obj_flag', 0)
+        except Exception:
+            flag = 0
+        return (
+            select(
+                literal(flag).label('flag'),
+                func.count(PostComment.id).label('comments_count')
+            ).select_from(PostComment).where(PostComment.post_id == model_cls.id)
+        )
+    post_comments_ctx_obj = custom_object(
+        _post_comments_ctx_obj_builder,
+        returns={'flag': int, 'comments_count': int}
     )
     # Polymorphic views for posts
     views = relation('ViewQL', fk_column_name='entity_id', scope='{"entity_type": {"eq": "post"}}')

@@ -1875,6 +1875,7 @@ class RelationSQLBuilders:
         model_cls,
         field_name: str,
         builder: Any,
+        info,
     ) -> Any | None:
             """Attempt to build a pushdown SQL expression for a @custom field.
 
@@ -1886,9 +1887,16 @@ class RelationSQLBuilders:
                 return None
             import inspect
             try:
-                # Only support builder(model_cls) to avoid needing a session in pushdown phase
-                if len(inspect.signature(builder).parameters) == 1:
+                sig = inspect.signature(builder)
+                params = list(sig.parameters.values())
+                if len(params) == 1:
                     expr = builder(model_cls)
+                elif len(params) == 2:
+                    second = params[1].name
+                    if second in ('info', 'ctx', 'context'):
+                        expr = builder(model_cls, info)
+                    else:
+                        return None
                 else:
                     return None
             except Exception:
@@ -1934,10 +1942,18 @@ class RelationSQLBuilders:
                 return None
             import inspect
             try:
-                if len(inspect.signature(builder).parameters) == 1:
+                sig = inspect.signature(builder)
+                params = list(sig.parameters.values())
+                if len(params) == 1:
                     expr_sel = builder(model_cls)
+                elif len(params) == 2:
+                    second = params[1].name
+                    if second in ('info', 'ctx', 'context'):
+                        expr_sel = builder(model_cls, info)
+                    else:
+                        return None
                 else:
-                    return None  # skip builders that need session/info
+                    return None  # skip builders that need session
             except Exception:
                 return None
             if expr_sel is None:

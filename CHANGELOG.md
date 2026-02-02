@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented here.
 
+## [0.2.3] - 2026-02-02
+### Added
+- Allow `custom` and `custom_object` builders to receive Strawberry `Info` (context) when declared with `(model_cls, info)` signature.
+
 ## [0.2.2] - 2026-01-14
 ### Added
 - Added support for `orderBy`, `orderDir`, and `orderMulti` variables in GraphQL queries.

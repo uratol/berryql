@@ -2246,13 +2246,48 @@ class BerrySchema:
                     _aliased = None  # type: ignore
 
                 parent_alias_for_builder = _aliased(model_cls_for_builder) if _aliased is not None else model_cls_for_builder
-                if len(inspect.signature(builder).parameters) == 1:
+                sig = inspect.signature(builder)
+                params = list(sig.parameters.values())
+                if len(params) == 1:
                     result_obj = builder(parent_alias_for_builder)
+                elif len(params) == 2:
+                    second = params[1].name
+                    if second in ('info', 'ctx', 'context'):
+                        result_obj = builder(parent_alias_for_builder, info)
+                    elif second in ('session', 'db', 'db_session'):
+                        result_obj = builder(parent_alias_for_builder, session)
+                    else:
+                        try:
+                            result_obj = builder(parent_alias_for_builder, info)
+                        except Exception:
+                            result_obj = builder(parent_alias_for_builder, session)
                 else:
-                    result_obj = builder(parent_alias_for_builder, session)
+                    try:
+                        result_obj = builder(parent_alias_for_builder, info, session)
+                    except Exception:
+                        result_obj = builder(parent_alias_for_builder, session, info)
             except Exception:
                 try:
-                    result_obj = builder(type(parent_model))
+                    sig = inspect.signature(builder)
+                    params = list(sig.parameters.values())
+                    if len(params) == 1:
+                        result_obj = builder(type(parent_model))
+                    elif len(params) == 2:
+                        second = params[1].name
+                        if second in ('info', 'ctx', 'context'):
+                            result_obj = builder(type(parent_model), info)
+                        elif second in ('session', 'db', 'db_session'):
+                            result_obj = builder(type(parent_model), session)
+                        else:
+                            try:
+                                result_obj = builder(type(parent_model), info)
+                            except Exception:
+                                result_obj = builder(type(parent_model), session)
+                    else:
+                        try:
+                            result_obj = builder(type(parent_model), info, session)
+                        except Exception:
+                            result_obj = builder(type(parent_model), session, info)
                 except Exception:
                     return None
             if asyncio.iscoroutine(result_obj):
@@ -2364,13 +2399,48 @@ class BerrySchema:
                     except Exception:  # pragma: no cover
                         _aliased = None  # type: ignore
                     parent_alias_for_builder = _aliased(model_cls_for_builder) if _aliased is not None else model_cls_for_builder
-                    if len(inspect.signature(builder).parameters) == 1:
+                    sig = inspect.signature(builder)
+                    params = list(sig.parameters.values())
+                    if len(params) == 1:
                         result_obj = builder(parent_alias_for_builder)
+                    elif len(params) == 2:
+                        second = params[1].name
+                        if second in ('info', 'ctx', 'context'):
+                            result_obj = builder(parent_alias_for_builder, info)
+                        elif second in ('session', 'db', 'db_session'):
+                            result_obj = builder(parent_alias_for_builder, session)
+                        else:
+                            try:
+                                result_obj = builder(parent_alias_for_builder, info)
+                            except Exception:
+                                result_obj = builder(parent_alias_for_builder, session)
                     else:
-                        result_obj = builder(parent_alias_for_builder, session)
+                        try:
+                            result_obj = builder(parent_alias_for_builder, info, session)
+                        except Exception:
+                            result_obj = builder(parent_alias_for_builder, session, info)
                 except Exception:
                     try:
-                        result_obj = builder(type(parent_model))
+                        sig = inspect.signature(builder)
+                        params = list(sig.parameters.values())
+                        if len(params) == 1:
+                            result_obj = builder(type(parent_model))
+                        elif len(params) == 2:
+                            second = params[1].name
+                            if second in ('info', 'ctx', 'context'):
+                                result_obj = builder(type(parent_model), info)
+                            elif second in ('session', 'db', 'db_session'):
+                                result_obj = builder(type(parent_model), session)
+                            else:
+                                try:
+                                    result_obj = builder(type(parent_model), info)
+                                except Exception:
+                                    result_obj = builder(type(parent_model), session)
+                        else:
+                            try:
+                                result_obj = builder(type(parent_model), info, session)
+                            except Exception:
+                                result_obj = builder(type(parent_model), session, info)
                     except Exception:
                         return None
                 
@@ -4194,7 +4264,8 @@ class BerrySchema:
                         expr = RelationSQLBuilders(self).build_custom_scalar_pushdown(
                             model_cls=model_cls,
                             field_name=cf_name,
-                            builder=cf_def.meta.get('builder')
+                            builder=cf_def.meta.get('builder'),
+                            info=info,
                         )
                         if expr is None:
                             continue
