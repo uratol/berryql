@@ -180,7 +180,8 @@ class Hydrator:
             for fk in (required_fk_parent_cols or set()):
                 needed.add(fk)
             for name in needed:
-                if getattr(inst, name, None) is None:
+                _cur = getattr(inst, name, None)
+                if _cur is None or callable(_cur):
                     try:
                         v2 = mapping.get(name)
                         if v2 is None:

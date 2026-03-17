@@ -1303,6 +1303,11 @@ class BerrySchema:
                     candidate_fk_val = getattr(root_self, explicit_fk_name, None)
                 else:
                     candidate_fk_val = getattr(root_self, f"{fname_local}_id", None)
+                # Guard: if getattr returned a class-level descriptor/resolver instead of
+                # an actual FK value (e.g. because the scalar wasn't hydrated into __dict__),
+                # treat it as missing.
+                if callable(candidate_fk_val):
+                    candidate_fk_val = None
             except Exception:
                 candidate_fk_val = None
             try:
@@ -2939,6 +2944,11 @@ class BerrySchema:
                                         candidate_fk_val = getattr(self, explicit_fk_name, None)
                                     else:
                                         candidate_fk_val = getattr(self, f"{fname_local}_id", None)
+                                    # Guard: if getattr returned a class-level descriptor/resolver instead of
+                                    # an actual FK value (e.g. because the scalar wasn't hydrated into __dict__),
+                                    # treat it as missing.
+                                    if callable(candidate_fk_val):
+                                        candidate_fk_val = None
                                 except Exception:
                                     candidate_fk_val = None
                                 # Record parent id for potential child->parent fallback
