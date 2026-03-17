@@ -1475,6 +1475,16 @@ class BerrySchema:
                         )
                 except Exception:
                     pass
+                # Defensive guard before building select
+                if callable(candidate_fk_val):
+                    _logger.error(
+                        "berryql: candidate_fk_val is callable before select for relation '%s' on %r — skipping. "
+                        "self.__dict__=%r, parent_model=%r",
+                        fname_local, type(root_self).__name__,
+                        {k: type(v).__name__ for k, v in getattr(root_self, '__dict__', {}).items()},
+                        parent_model,
+                    )
+                    return None
                 try:
                     pk_col_child = self._get_pk_column(child_model_cls)
                     stmt = _select(child_model_cls).where(pk_col_child == candidate_fk_val)
@@ -1578,6 +1588,16 @@ class BerrySchema:
                         )
                 except Exception:
                     pass
+                # Final defensive guard: reject callable FK values
+                if callable(candidate_fk_val):
+                    _logger.error(
+                        "berryql: candidate_fk_val is callable for relation '%s' on %r — skipping session.get. "
+                        "self.__dict__=%r, parent_model=%r",
+                        fname_local, type(root_self).__name__,
+                        {k: type(v).__name__ for k, v in getattr(root_self, '__dict__', {}).items()},
+                        parent_model,
+                    )
+                    return None
                 async with lock:
                     row = await session.get(child_model_cls, candidate_fk_val)
             if not row:
@@ -2079,6 +2099,13 @@ class BerrySchema:
                         setattr(inst, k, v)
                     except Exception:
                         pass
+            # DEBUG: log instance dict for relation FK investigation
+            _logger.debug(
+                "berryql list-path: created %s inst with __dict__ keys=%s, init_kwargs keys=%s",
+                getattr(target_cls_i, '__name__', '?'),
+                list(getattr(inst, '__dict__', {}).keys()),
+                list(init_kwargs.keys()),
+            )
             try:
                 setattr(inst, '_model', None)
             except Exception:
@@ -3132,6 +3159,16 @@ class BerrySchema:
                                             )
                                     except Exception:
                                         pass
+                                    # Defensive guard before building select
+                                    if callable(candidate_fk_val):
+                                        _logger.error(
+                                            "berryql: candidate_fk_val is callable before select for relation '%s' on %r — skipping. "
+                                            "self.__dict__=%r, parent_model=%r",
+                                            fname_local, type(self).__name__,
+                                            {k: type(v).__name__ for k, v in getattr(self, '__dict__', {}).items()},
+                                            parent_model,
+                                        )
+                                        return None
                                     try:
                                         pk_col_child = schema_instance._get_pk_column(child_model_cls)
                                         stmt = _select(child_model_cls).where(pk_col_child == candidate_fk_val)
@@ -3242,6 +3279,16 @@ class BerrySchema:
                                             )
                                     except Exception:
                                         pass
+                                    # Final defensive guard: reject callable FK values
+                                    if callable(candidate_fk_val):
+                                        _logger.error(
+                                            "berryql: candidate_fk_val is callable for relation '%s' on %r — skipping session.get. "
+                                            "self.__dict__=%r, parent_model=%r",
+                                            fname_local, type(self).__name__,
+                                            {k: type(v).__name__ for k, v in getattr(self, '__dict__', {}).items()},
+                                            parent_model,
+                                        )
+                                        return None
                                     async with lock:
                                         row = await session.get(child_model_cls, candidate_fk_val)
                                 if not row:

@@ -392,9 +392,10 @@ class Hydrator:
                         built_value = tmp_list
                 else:
                     built_value = parsed_value
-                # cache prefetched value unless single None
-                if not (bool(is_single) and built_value is None):
-                    setattr(inst, f"_{rel_name}_prefetched", built_value)
+                # Always cache prefetched value (including single None) so the
+                # relation resolver short-circuits instead of falling through to
+                # the per-parent DB path where callable FK descriptors can leak.
+                setattr(inst, f"_{rel_name}_prefetched", built_value)
                 # record pushdown meta
                 try:
                     meta_map = getattr(inst, '_pushdown_meta', None)
