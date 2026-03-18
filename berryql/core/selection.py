@@ -24,6 +24,22 @@ def _children_ast(node: Any) -> list[Any]:
         pass
     return []
 
+def _resolve_ast_fragments(nodes: list[Any], fragments: dict) -> list[Any]:
+    """Expand FragmentSpreadNode and InlineFragmentNode into their field selections."""
+    result: list[Any] = []
+    for node in nodes:
+        kind_s = str(getattr(node, 'kind', '') or '')
+        if 'fragment_spread' in kind_s or 'FragmentSpread' in kind_s:
+            frag_name = _name_ast(node)
+            frag_def = (fragments or {}).get(frag_name)
+            if frag_def:
+                result.extend(_resolve_ast_fragments(_children_ast(frag_def), fragments))
+        elif 'inline_fragment' in kind_s or 'InlineFragment' in kind_s:
+            result.extend(_resolve_ast_fragments(_children_ast(node), fragments))
+        else:
+            result.append(node)
+    return result
+
 def _name_ast(node: Any) -> Optional[str]:
     try:
         n = getattr(node, 'name', None)
@@ -184,6 +200,11 @@ class RelationSelectionExtractor:
             # Infer the btype from cfg when available; fallback to scanning by names at runtime
             # We accept that fields list is filled as we walk
             for sub in sub_children:
+                # Handle Strawberry FragmentSpread / InlineFragment wrappers
+                if hasattr(sub, 'type_condition'):
+                    fake = type('_FragSel', (), {'selections': getattr(sub, 'selections', [])})()
+                    _collect_nested(fake, parent_btype, cfg)
+                    continue
                 sub_name = getattr(getattr(sub, 'name', None), 'value', None) or getattr(sub, 'name', None)
                 if not sub_name or str(sub_name).startswith('__'):
                     continue
@@ -214,6 +235,11 @@ class RelationSelectionExtractor:
                     # recurse deeper
                     _collect_nested(sub, ncfg.get('target') and self.registry.types.get(ncfg.get('target')), ncfg)
         for child in self._children(sel):
+            # Handle Strawberry FragmentSpread / InlineFragment wrappers
+            if hasattr(child, 'type_condition'):
+                fake = type('_FragSel', (), {'selections': getattr(child, 'selections', [])})()
+                self._walk_selected(fake, btype, out)
+                continue
             name = getattr(getattr(child, 'name', None), 'value', None) or getattr(child, 'name', None)
             if not name or name.startswith('__'):
                 continue
@@ -303,8 +329,9 @@ class RelationSelectionExtractor:
                             tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
                         except Exception:
                             tgt_b = None
+                        ast_fragments = getattr(raw_info, 'fragments', None) or {}
                         try:
-                            for sub in _children_ast(rel_node):
+                            for sub in _resolve_ast_fragments(_children_ast(rel_node), ast_fragments):
                                 sub_name = _name_ast(sub)
                                 if not sub_name or sub_name.startswith('__'):
                                     continue
@@ -321,7 +348,7 @@ class RelationSelectionExtractor:
                         tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
                         # Recursive AST nested collection
                         def _collect_nested_ast(parent_node: Any, parent_b: Any, parent_cfg: Dict[str, Any]):
-                            for sub in _children_ast(parent_node):
+                            for sub in _resolve_ast_fragments(_children_ast(parent_node), ast_fragments):
                                 sub_name = _name_ast(sub)
                                 if not sub_name or sub_name.startswith('__'):
                                     continue

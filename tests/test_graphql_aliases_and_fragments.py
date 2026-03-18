@@ -4,6 +4,15 @@ from sqlalchemy import event
 from tests.schema import schema as berry_schema
 
 
+def _mentions_table(sql: str, table: str) -> bool:
+  s = sql.lower()
+  return (
+    f" from {table}" in s
+    or f' from "{table}"' in s
+    or f" from [{table}]" in s
+  )
+
+
 @pytest.mark.asyncio
 async def test_aliases_on_scalars_and_relations(db_session, populated_db):
     q = """
@@ -107,3 +116,141 @@ async def test_inline_fragments(db_session, populated_db):
     posts = users[0].get("posts") or []
     if posts:
         assert set(["id", "title"]).issubset(set(posts[0].keys()))
+
+
+@pytest.mark.asyncio
+async def test_named_fragment_projection_on_nested_relation(db_session, populated_db):
+    engine = db_session.get_bind()
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        try:
+            if str(statement).lstrip().upper().startswith("SELECT"):
+                statements.append(str(statement))
+        except Exception:
+            pass
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        q = """
+        query {
+          users(limit: 1) {
+            id
+            posts(limit: 1) {
+              ...PostFields
+            }
+          }
+        }
+
+        fragment PostFields on PostQL {
+          id
+          title
+        }
+        """
+        res = await berry_schema.execute(q, context_value={"db_session": db_session})
+        assert res.errors is None, res.errors
+        users = res.data["users"]
+        assert users and "posts" in users[0]
+        posts = users[0]["posts"] or []
+        if posts:
+            assert set(["id", "title"]).issubset(set(posts[0].keys()))
+
+        lowered = [" ".join(s.lower().split()) for s in statements]
+        posts_selects = [s for s in lowered if _mentions_table(s, "posts")]
+        assert posts_selects, f"No posts SELECT captured. Statements: {statements}"
+
+        assert any(
+            " posts.title" in sql
+            or ' "posts".title' in sql
+            or " [posts].title" in sql
+            or "select title" in sql
+            for sql in posts_selects
+        ), posts_selects
+
+        forbidden_tokens = [
+            " posts.content",
+            ' "posts".content',
+            " [posts].content",
+            " posts.metadata_json",
+            ' "posts".metadata_json',
+            " [posts].metadata_json",
+            " posts.binary_blob",
+            ' "posts".binary_blob',
+            " [posts].binary_blob",
+        ]
+        for sql in posts_selects:
+            for token in forbidden_tokens:
+                assert token not in sql, f"Unexpected column in SQL: {token} -> {sql}"
+    finally:
+        try:
+            event.remove(engine, "before_cursor_execute", _capture)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_inline_fragment_projection_on_nested_single_relation(db_session, populated_db):
+    engine = db_session.get_bind()
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        try:
+            if str(statement).lstrip().upper().startswith("SELECT"):
+                statements.append(str(statement))
+        except Exception:
+            pass
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        q = """
+        query {
+          posts(limit: 1) {
+            id
+            author {
+              ... on UserQL {
+                id
+                name
+              }
+            }
+          }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={"db_session": db_session})
+        assert res.errors is None, res.errors
+        posts = res.data["posts"]
+        assert posts and "author" in posts[0]
+        author = posts[0]["author"]
+        assert author is not None
+        assert set(["id", "name"]).issubset(set(author.keys()))
+
+        lowered = [" ".join(s.lower().split()) for s in statements]
+        user_selects = [s for s in lowered if _mentions_table(s, "users")]
+        assert user_selects, f"No users SELECT captured. Statements: {statements}"
+
+        assert any(
+            " users.name" in sql
+            or ' "users".name' in sql
+            or " [users].name" in sql
+            or "select name" in sql
+            for sql in user_selects
+        ), user_selects
+
+        forbidden_tokens = [
+            " users.email",
+            ' "users".email',
+            " [users].email",
+            " users.is_admin",
+            ' "users".is_admin',
+            " [users].is_admin",
+            " users.created_at",
+            ' "users".created_at',
+            " [users].created_at",
+        ]
+        for sql in user_selects:
+            for token in forbidden_tokens:
+                assert token not in sql, f"Unexpected column in SQL: {token} -> {sql}"
+    finally:
+        try:
+            event.remove(engine, "before_cursor_execute", _capture)
+        except Exception:
+            pass
