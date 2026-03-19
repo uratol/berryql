@@ -2,11 +2,13 @@ from __future__ import annotations
 import inspect
 import logging
 import uuid
+from datetime import date as _date, datetime as _datetime
 from typing import Any, Dict, Optional, Type, List, get_args, get_origin
 import strawberry
 from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
 from sqlalchemy import select
+from sqlalchemy.types import Date as _SADate, DateTime as _SADateTime
 from .sql.builders import RelationSQLBuilders
 from .core.enum_utils import get_model_enum_cls, coerce_input_to_storage_value, normalize_instance_enums
 
@@ -897,6 +899,15 @@ def build_merge_resolver_for_type(
                         enum_cls = get_model_enum_cls(model_cls_local, k)
                         if enum_cls is not None:
                             v = coerce_input_to_storage_value(enum_cls, v)
+                        # Coerce ISO date/datetime strings to native Python objects for asyncpg
+                        elif isinstance(v, str) and v:
+                            try:
+                                if isinstance(col.type, _SADate) and not isinstance(col.type, _SADateTime):
+                                    v = _date.fromisoformat(v)
+                                elif isinstance(col.type, _SADateTime):
+                                    v = _datetime.fromisoformat(v)
+                            except (ValueError, TypeError):
+                                pass
                     setattr(instance, k, v)
                 except Exception:
                     try:
