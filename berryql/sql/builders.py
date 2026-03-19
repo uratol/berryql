@@ -562,6 +562,198 @@ class RelationSQLBuilders:
             args.extend([_text(f"'{c}'"), getattr(subq.c, c)])
         return args
 
+    def _build_nested_json_args(
+        self,
+        current_subq,
+        current_model_cls,
+        nested_cfg: Dict[str, Any],
+        json_object_fn,
+        json_array_agg_fn,
+        json_array_coalesce_fn,
+        to_where_dict,
+        expr_from_where_dict,
+        info,
+    ) -> List[Any]:
+        """Build JSON key/value pairs for nested relations within a parent subquery.
+
+        Recursively handles arbitrarily deep nested relations (single and list).
+        Returns a list of alternating [key_text, value_expr, ...] suitable for
+        extending a json_object_fn call.
+        """
+        out_json_args: List[Any] = []
+        for nname, ncfg in (nested_cfg or {}).items():
+            try:
+                n_target = ncfg.get('target')
+                nb = self.registry.types.get(n_target)
+                if not nb or not nb.model:
+                    continue
+                grand_model = nb.model
+                try:
+                    is_single_nested = bool(ncfg.get('single') or False)
+                except Exception:
+                    is_single_nested = False
+
+                if is_single_nested:
+                    try:
+                        explicit_parent_fk = ncfg.get('fk_column_name')
+                    except Exception:
+                        explicit_parent_fk = None
+                    try:
+                        child_fk_to_nested_name = (
+                            explicit_parent_fk
+                            or self.registry._find_parent_fk_column_name(current_model_cls, grand_model, nname)
+                            or f"{nname}_id"
+                        )
+                    except Exception:
+                        child_fk_to_nested_name = f"{nname}_id"
+                    try:
+                        if not hasattr(current_subq.c, child_fk_to_nested_name):
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    g_fk = None
+                    try:
+                        explicit_child_fk = ncfg.get('fk_column_name')
+                    except Exception:
+                        explicit_child_fk = None
+                    if explicit_child_fk:
+                        try:
+                            for c in grand_model.__table__.columns:
+                                if c.name == explicit_child_fk:
+                                    g_fk = c
+                                    break
+                        except Exception:
+                            g_fk = None
+                    if g_fk is None:
+                        for c in grand_model.__table__.columns:
+                            for fk in c.foreign_keys:
+                                if fk.column.table.name == current_model_cls.__table__.name:
+                                    g_fk = c
+                                    break
+                            if g_fk is not None:
+                                break
+                    if g_fk is None:
+                        continue
+
+                # Projected scalar fields for nested
+                n_cols = list(ncfg.get('fields') or [])
+                if n_cols:
+                    try:
+                        n_cols = [sf for sf in n_cols if getattr(grand_model.__table__.c, sf, None) is not None or sf in grand_model.__table__.columns]
+                    except Exception:
+                        pass
+                if not n_cols:
+                    for sf2, sd2 in nb.__berry_fields__.items():
+                        if sd2.kind == 'scalar':
+                            try:
+                                if (getattr(sd2, 'meta', {}) or {}).get('write_only'):
+                                    continue
+                            except Exception:
+                                pass
+                            n_cols.append(sf2)
+                # Ensure FK helper columns for deeper nested single relations
+                try:
+                    nested_map_local = ncfg.get('nested') or {}
+                    if nested_map_local:
+                        n_cols = self._ensure_helper_fk_for_single_nested(n_cols, grand_model, nb, nested_map_local)
+                except Exception:
+                    pass
+
+                if is_single_nested:
+                    n_sel = (
+                        select(*self._project_columns(grand_model, n_cols or []))
+                        .select_from(grand_model)
+                        .where(self._pk_col(grand_model) == getattr(current_subq.c, child_fk_to_nested_name))
+                        .correlate(current_subq)
+                    )
+                else:
+                    n_sel = (
+                        select(*self._project_columns(grand_model, n_cols or []))
+                        .select_from(grand_model)
+                        .where(g_fk == getattr(current_subq.c, self._pk_name(current_model_cls)))
+                        .correlate(current_subq)
+                    )
+
+                # Apply nested where/default_where
+                rr2 = ncfg.get('where')
+                if rr2 is not None:
+                    n_sel = self._apply_where_sqla(n_sel, grand_model, rr2, strict=True, to_where_dict=to_where_dict, expr_from_where_dict=expr_from_where_dict, info=info)
+                dr2 = ncfg.get('default_where')
+                if dr2 is not None:
+                    n_sel = self._apply_where_sqla(n_sel, grand_model, dr2, strict=True, to_where_dict=to_where_dict, expr_from_where_dict=expr_from_where_dict, info=info)
+                try:
+                    t_where_n = ncfg.get('type_default_where')
+                except Exception:
+                    t_where_n = None
+                if t_where_n is not None:
+                    n_sel = self._apply_where_sqla(n_sel, grand_model, t_where_n, strict=True, to_where_dict=to_where_dict, expr_from_where_dict=expr_from_where_dict, info=info)
+
+                # Ordering
+                try:
+                    n_sel = n_sel.order_by(self._pk_col(grand_model).asc())
+                except Exception:
+                    pass
+
+                if is_single_nested:
+                    n_sel_single = n_sel.limit(1)
+                    n_subq = n_sel_single.subquery()
+                    n_row_args: List[Any] = []
+                    use_cols = n_cols or [self._pk_name(grand_model)]
+                    for sf2 in use_cols:
+                        n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
+                    # Recurse for deeper nested
+                    try:
+                        deeper_nested = ncfg.get('nested') or {}
+                        if deeper_nested:
+                            deeper_args = self._build_nested_json_args(
+                                n_subq, grand_model, deeper_nested,
+                                json_object_fn, json_array_agg_fn, json_array_coalesce_fn,
+                                to_where_dict, expr_from_where_dict, info,
+                            )
+                            if deeper_args:
+                                n_row_args.extend(deeper_args)
+                    except Exception:
+                        pass
+                    n_row_json = json_object_fn(*n_row_args)
+                    n_single_select = select(n_row_json).select_from(n_subq).correlate(current_subq)
+                    try:
+                        n_json_scalar = n_single_select.scalar_subquery()
+                    except Exception:
+                        n_json_scalar = n_single_select
+                    out_json_args.extend([_text(f"'{nname}'"), n_json_scalar])
+                else:
+                    n_subq = n_sel.subquery()
+                    n_row_args: List[Any] = []
+                    use_cols = n_cols or [self._pk_name(grand_model)]
+                    for sf2 in use_cols:
+                        n_row_args.extend([_text(f"'{sf2}'"), getattr(n_subq.c, sf2)])
+                    try:
+                        deeper_nested = ncfg.get('nested') or {}
+                        if deeper_nested:
+                            deeper_args = self._build_nested_json_args(
+                                n_subq, grand_model, deeper_nested,
+                                json_object_fn, json_array_agg_fn, json_array_coalesce_fn,
+                                to_where_dict, expr_from_where_dict, info,
+                            )
+                            if deeper_args:
+                                n_row_args.extend(deeper_args)
+                    except Exception:
+                        pass
+                    n_row_json = json_object_fn(*n_row_args)
+                    n_agg = json_array_agg_fn(n_row_json)
+                    if n_agg is None:
+                        continue
+                    n_json_array = select(json_array_coalesce_fn(n_agg)).select_from(n_subq).correlate(current_subq)
+                    try:
+                        n_json_scalar = n_json_array.scalar_subquery()
+                    except Exception:
+                        n_json_scalar = n_json_array
+                    out_json_args.extend([_text(f"'{nname}'"), n_json_scalar])
+            except Exception:
+                continue
+        return out_json_args
+
     @staticmethod
     def _ensure_helper_fk_for_single_nested(requested: List[str], child_model_cls, target_b, nested_map: Dict[str, Any]) -> List[str]:
         out = list(requested or [])
@@ -697,6 +889,8 @@ class RelationSQLBuilders:
         type_default_where: Any,
         filter_args: Dict[str, Any] | None,
         arg_specs: Dict[str, Any] | None,
+        nested_cfg: Dict[str, Any] | None = None,
+        json_array_agg_fn=None,
     ):
         # If we don't know how to correlate parent->child (no FK on parent), skip pushdown.
         # Also skip when rel_name suggests a private/virtual relation used only for computed wrappers.
@@ -793,7 +987,20 @@ class RelationSQLBuilders:
                 info=info,
             )
         limited = inner_sel.subquery()
-        obj_expr = json_object_fn(*self._json_row_args_from_subq(limited, cols))
+        json_args = list(self._json_row_args_from_subq(limited, cols))
+        # Handle nested relations within this single relation
+        if nested_cfg:
+            try:
+                nested_json_args = self._build_nested_json_args(
+                    limited, child_model_cls, nested_cfg,
+                    json_object_fn, json_array_agg_fn, json_array_coalesce_fn,
+                    to_where_dict, expr_from_where_dict, info,
+                )
+                if nested_json_args:
+                    json_args.extend(nested_json_args)
+            except Exception:
+                pass
+        obj_expr = json_object_fn(*json_args)
         query = select(obj_expr).select_from(limited).correlate(parent_model_cls)
         try:
             return query.scalar_subquery()

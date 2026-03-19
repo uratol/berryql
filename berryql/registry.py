@@ -4469,6 +4469,14 @@ class BerrySchema:
                         for sf in requested_scalar:
                             if sf in child_model_cls.__table__.columns:
                                 proj_cols.append(sf)
+                        # Include FK helper columns for nested single relations
+                        try:
+                            nested_map = rel_cfg.get('nested') or {}
+                            if nested_map:
+                                proj_cols = RelationSQLBuilders._ensure_helper_fk_for_single_nested(
+                                    proj_cols, child_model_cls, target_b, nested_map)
+                        except Exception:
+                            pass
                         # Determine FK helper name for correlation
                         # For single relation, allow explicit parent FK override
                         parent_fk_col_name = rel_cfg.get('fk_column_name') or self._find_parent_fk_column_name(model_cls, child_model_cls, rel_name)
@@ -4490,6 +4498,8 @@ class BerrySchema:
                             type_default_where=rel_cfg.get('type_default_where'),
                             filter_args=rel_cfg.get('filter_args') or {},
                             arg_specs=rel_cfg.get('arg_specs') or {},
+                            nested_cfg=rel_cfg.get('nested') or None,
+                            json_array_agg_fn=_json_array_agg,
                         )
                         if rel_expr_core is None:
                             try:
