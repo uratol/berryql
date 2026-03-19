@@ -83,6 +83,103 @@ async def test_upsert_post_with_nested_comments_and_likes(db_session, populated_
 
 
 @pytest.mark.asyncio
+async def test_nested_comment_merge_coerces_iso_datetime_strings(db_session, populated_db):
+    u1 = populated_db["users"][0]
+    u2 = populated_db["users"][1]
+    created_iso = "2026-03-19T12:34:56"
+    updated_iso = "2026-03-20T08:09:10"
+
+    create_mutation = """
+        mutation Upsert($payload: PostQLInput!) {
+            merge_post(payload: $payload) {
+                id
+                post_comments(order_by: "id") {
+                    id
+                    content
+                    created_at
+                }
+            }
+        }
+    """
+    create_variables = {
+        "payload": {
+            "title": "Datetime Nested Create",
+            "content": "Body",
+            "author_id": int(u1.id),
+            "post_comments": [
+                {
+                    "content": "dt comment",
+                    "author_id": int(u2.id),
+                    "created_at": created_iso,
+                }
+            ],
+        }
+    }
+    res1 = await schema.execute(create_mutation, variable_values=create_variables, context_value={"db_session": db_session})
+    assert res1.errors is None, res1.errors
+    post = res1.data["merge_post"]
+    comment = next((row for row in post["post_comments"] if row["content"] == "dt comment"), None)
+    assert comment is not None
+    assert str(comment["created_at"]).startswith(created_iso)
+
+    post_id = int(post["id"])
+    comment_id = int(comment["id"])
+
+    update_mutation = """
+        mutation Upsert($payload: PostQLInput!) {
+            merge_post(payload: $payload) {
+                id
+                post_comments(order_by: "id") {
+                    id
+                    content
+                    created_at
+                }
+            }
+        }
+    """
+    update_variables = {
+        "payload": {
+            "id": post_id,
+            "post_comments": [
+                {
+                    "id": comment_id,
+                    "content": "dt comment updated",
+                    "created_at": updated_iso,
+                }
+            ],
+        }
+    }
+    res2 = await schema.execute(update_mutation, variable_values=update_variables, context_value={"db_session": db_session})
+    assert res2.errors is None, res2.errors
+    updated_comment = next((row for row in res2.data["merge_post"]["post_comments"] if int(row["id"]) == comment_id), None)
+    assert updated_comment is not None
+    assert updated_comment["content"] == "dt comment updated"
+    assert str(updated_comment["created_at"]).startswith(updated_iso)
+
+    query = """
+    query {
+      posts(where: "{\\\"id\\\": {\\\"eq\\\": %d}}") {
+        id
+        post_comments(order_by: \"id\") {
+          id
+          content
+          created_at
+        }
+      }
+    }
+    """ % post_id
+    res3 = await schema.execute(query, context_value={"db_session": db_session})
+    assert res3.errors is None, res3.errors
+    persisted_comment = next(
+        (row for row in res3.data["posts"][0]["post_comments"] if int(row["id"]) == comment_id),
+        None,
+    )
+    assert persisted_comment is not None
+    assert persisted_comment["content"] == "dt comment updated"
+    assert str(persisted_comment["created_at"]).startswith(updated_iso)
+
+
+@pytest.mark.asyncio
 async def test_mutation_domain_upsert_posts(db_session, populated_db):
     # Upsert via domain-scoped mutation under blogDomain
     u1 = populated_db['users'][0]
