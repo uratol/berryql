@@ -2116,10 +2116,29 @@ class RelationSQLBuilders:
                 _Select = None  # type: ignore
             try:
                 if _Select is not None and isinstance(expr, _Select):
-                    # Use scalar_subquery when single column select
+                    # For simple parent-row expressions like SELECT length(model.title),
+                    # emit the selected expression directly so it stays correlated to the
+                    # outer row instead of becoming an unbounded scalar subquery.
                     try:
                         if len(expr.selected_columns) == 1:  # type: ignore[attr-defined]
-                            expr = expr.scalar_subquery()
+                            final_froms = list(expr.get_final_froms())  # type: ignore[attr-defined]
+                            parent_table = getattr(model_cls, '__table__', None)
+                            where_criteria = list(getattr(expr, '_where_criteria', []))  # type: ignore[attr-defined]
+                            group_by_clauses = list(getattr(expr, '_group_by_clauses', []) or [])  # type: ignore[attr-defined]
+                            order_by_clauses = list(getattr(expr, '_order_by_clauses', []) or [])  # type: ignore[attr-defined]
+                            if (
+                                parent_table is not None
+                                and final_froms
+                                and all(f is parent_table for f in final_froms)
+                                and not where_criteria
+                                and not group_by_clauses
+                                and not order_by_clauses
+                                and getattr(expr, '_limit_clause', None) is None  # type: ignore[attr-defined]
+                                and getattr(expr, '_offset_clause', None) is None  # type: ignore[attr-defined]
+                            ):
+                                expr = list(expr.selected_columns)[0]  # type: ignore[attr-defined]
+                            else:
+                                expr = expr.scalar_subquery()
                     except Exception:
                         pass
                 # Ensure label for mapping access
@@ -2194,6 +2213,10 @@ class RelationSQLBuilders:
                         pass
                     for _w in getattr(expr_sel, '_where_criteria', []):  # type: ignore[attr-defined]
                         subq = subq.where(_w)
+                    try:
+                        subq = subq.limit(1)
+                    except Exception:
+                        pass
                     subq_expr = subq.scalar_subquery() if hasattr(subq, 'scalar_subquery') else subq
                     key_exprs.append((col_name, subq_expr))
                 except Exception:

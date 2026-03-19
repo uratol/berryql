@@ -13,6 +13,16 @@ def _mentions_table(sql: str, table: str) -> bool:
   )
 
 
+def _mentions_column(sql: str, table: str, column: str) -> bool:
+    s = sql.lower()
+    return (
+        f" {table}.{column}" in s
+        or f' "{table}".{column}' in s
+        or f" [{table}].[{column}]" in s
+        or f"select {column}" in s
+    )
+
+
 @pytest.mark.asyncio
 async def test_aliases_on_scalars_and_relations(db_session, populated_db):
     q = """
@@ -159,28 +169,16 @@ async def test_named_fragment_projection_on_nested_relation(db_session, populate
         posts_selects = [s for s in lowered if _mentions_table(s, "posts")]
         assert posts_selects, f"No posts SELECT captured. Statements: {statements}"
 
-        assert any(
-            " posts.title" in sql
-            or ' "posts".title' in sql
-            or " [posts].title" in sql
-            or "select title" in sql
-            for sql in posts_selects
-        ), posts_selects
+        assert any(_mentions_column(sql, "posts", "title") for sql in posts_selects), posts_selects
 
-        forbidden_tokens = [
-            " posts.content",
-            ' "posts".content',
-            " [posts].content",
-            " posts.metadata_json",
-            ' "posts".metadata_json',
-            " [posts].metadata_json",
-            " posts.binary_blob",
-            ' "posts".binary_blob',
-            " [posts].binary_blob",
+        forbidden_columns = [
+          "content",
+          "metadata_json",
+          "binary_blob",
         ]
         for sql in posts_selects:
-            for token in forbidden_tokens:
-                assert token not in sql, f"Unexpected column in SQL: {token} -> {sql}"
+          for column in forbidden_columns:
+            assert not _mentions_column(sql, "posts", column), f"Unexpected column in SQL: {column} -> {sql}"
     finally:
         try:
             event.remove(engine, "before_cursor_execute", _capture)
@@ -227,28 +225,16 @@ async def test_inline_fragment_projection_on_nested_single_relation(db_session, 
         user_selects = [s for s in lowered if _mentions_table(s, "users")]
         assert user_selects, f"No users SELECT captured. Statements: {statements}"
 
-        assert any(
-            " users.name" in sql
-            or ' "users".name' in sql
-            or " [users].name" in sql
-            or "select name" in sql
-            for sql in user_selects
-        ), user_selects
+        assert any(_mentions_column(sql, "users", "name") for sql in user_selects), user_selects
 
-        forbidden_tokens = [
-            " users.email",
-            ' "users".email',
-            " [users].email",
-            " users.is_admin",
-            ' "users".is_admin',
-            " [users].is_admin",
-            " users.created_at",
-            ' "users".created_at',
-            " [users].created_at",
+        forbidden_columns = [
+          "email",
+          "is_admin",
+          "created_at",
         ]
         for sql in user_selects:
-            for token in forbidden_tokens:
-                assert token not in sql, f"Unexpected column in SQL: {token} -> {sql}"
+          for column in forbidden_columns:
+            assert not _mentions_column(sql, "users", column), f"Unexpected column in SQL: {column} -> {sql}"
     finally:
         try:
             event.remove(engine, "before_cursor_execute", _capture)
