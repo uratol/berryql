@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import select, text as _text, literal_column, func
+from sqlalchemy.orm import aliased
 from ..core.naming import fields_map_for, from_camel
 
 # Centralized SQL builders. Keep registry thin and DRY.
@@ -121,6 +122,114 @@ class RelationSQLBuilders:
                 out.append((src, name))
         return out
 
+    def _resolve_order_expr_for_model(self, model_cls, order_name):
+        """Resolve a direct field or dotted single-relation path for ordering."""
+        btype = self._get_btype_for_model(model_cls)
+        if btype is None:
+            return None
+        return self.registry._resolve_order_expression(model_cls, btype, order_name)
+
+    def _resolve_scalar_expr_for_entity(self, model_entity, model_cls, btype_cls, field_name):
+        """Resolve a scalar field against a mapped class or SQLAlchemy alias."""
+        if model_cls is None or btype_cls is None or not isinstance(field_name, str) or not field_name:
+            return None
+        try:
+            fdefs = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            fdefs = {}
+        try:
+            fdef = fdefs.get(field_name)
+        except Exception:
+            fdef = None
+        source_name = field_name
+        if fdef is not None:
+            try:
+                if getattr(fdef, 'kind', None) != 'scalar':
+                    return None
+            except Exception:
+                return None
+            try:
+                source_name = (getattr(fdef, 'meta', {}) or {}).get('column') or field_name
+            except Exception:
+                source_name = field_name
+        expr = getattr(model_entity, source_name, None)
+        if expr is not None:
+            return expr
+        return getattr(model_entity, field_name, None)
+
+    def _resolve_join_order_expr_sqla(self, sel, model_cls, order_name, *, join_cache: Dict[str, Any] | None = None):
+        """Resolve direct parent->single-relation order paths using LEFT JOINs."""
+        btype = self._get_btype_for_model(model_cls)
+        if btype is None:
+            return sel, None
+        normalized = self.registry._normalize_order_path(btype, order_name)
+        if not normalized:
+            return sel, None
+        parts = normalized.split('.')
+        if not parts:
+            return sel, None
+        if join_cache is None:
+            join_cache = {}
+
+        current_model = model_cls
+        current_btype = btype
+        current_entity = model_cls
+        traversed_parts: List[str] = []
+
+        for rel_name in parts[:-1]:
+            try:
+                fields = getattr(current_btype, '__berry_fields__', {}) or {}
+            except Exception:
+                return sel, None
+            fdef = fields.get(rel_name)
+            if fdef is None:
+                return sel, None
+            meta = getattr(fdef, 'meta', {}) or {}
+            target_name = meta.get('target')
+            target_btype = self.registry.types.get(target_name) if target_name else None
+            target_model = getattr(target_btype, 'model', None) if target_btype is not None else None
+            if target_model is None:
+                return sel, None
+            parent_fk_name = self.registry._find_parent_fk_column_name(current_model, target_model, rel_name)
+            if not parent_fk_name:
+                return sel, None
+
+            traversed_parts.append(rel_name)
+            path_key = '.'.join(traversed_parts)
+            target_entity = join_cache.get(path_key)
+            if target_entity is None:
+                target_entity = aliased(target_model, name=f"berryql_ord_{len(join_cache) + 1}_{'_'.join(traversed_parts)}")
+                parent_fk_col = getattr(current_entity, parent_fk_name, None)
+                target_pk_col = getattr(target_entity, self._pk_name(target_model), None)
+                if parent_fk_col is None or target_pk_col is None:
+                    return sel, None
+                sel = sel.outerjoin(target_entity, target_pk_col == parent_fk_col)
+                join_cache[path_key] = target_entity
+
+            current_entity = target_entity
+            current_model = target_model
+            current_btype = target_btype
+
+        expr = self._resolve_scalar_expr_for_entity(current_entity, current_model, current_btype, parts[-1])
+        return sel, expr
+
+    def _mssql_order_term(self, model_cls, order_name):
+        """Map an order token to a physical MSSQL column or compiled SQL expression."""
+        if not isinstance(order_name, str) or not order_name:
+            return order_name
+        if '.' not in order_name:
+            pairs = self._mssql_map_columns_pairs(model_cls, [order_name]) or [(order_name, order_name)]
+            return pairs[0][0]
+        expr = self._resolve_order_expr_for_model(model_cls, order_name)
+        if expr is None:
+            return order_name
+        try:
+            from sqlalchemy.dialects import mssql as _sa_mssql  # type: ignore
+            compiled = str(expr.compile(dialect=_sa_mssql.dialect(), compile_kwargs={"literal_binds": True}))
+        except Exception:
+            compiled = str(expr)
+        return f"({compiled})"
+
     def _prepare_requested_scalar_fields(
         self,
         *,
@@ -211,18 +320,25 @@ class RelationSQLBuilders:
         expr_from_where_dict,
         info,
     ):
-        """Build a correlated SA select for a single relation (parent has FK to child).
+        """Build a correlated SA select for a single relation using a parent->child JOIN.
 
     Applies where/default_where, filter args, ordering fallback to id, and limit 1.
     """
         cols = projected_columns or []
         child_id_col = self._pk_col(child_model_cls)
-        parent_fk_col = getattr(parent_model_cls, pfk_col_name)
+        parent_alias = aliased(
+            parent_model_cls,
+            name=f"berryql_parent_{getattr(parent_model_cls, '__tablename__', 'parent')}_{pfk_col_name}",
+        )
+        parent_pk_outer = self._pk_col(parent_model_cls)
+        parent_pk_inner = getattr(parent_alias, self._pk_name(parent_model_cls))
+        parent_fk_col = getattr(parent_alias, pfk_col_name)
         inner_cols = self._project_columns(child_model_cls, cols)
         sel = (
             select(*inner_cols)
-            .select_from(child_model_cls)
-            .where(child_id_col == parent_fk_col)
+            .select_from(parent_alias)
+            .join(child_model_cls, child_id_col == parent_fk_col)
+            .where(parent_pk_inner == parent_pk_outer)
             .correlate(parent_model_cls)
             .limit(1)
         )
@@ -319,21 +435,10 @@ class RelationSQLBuilders:
         expanded_specs = self._expand_arg_specs(rel_cfg.get('arg_specs') or {})
         sel = self._apply_filter_args_sqla(sel, child_model_cls, info, rel_cfg.get('filter_args') or {}, expanded_specs)
         # ordering
-        try:
-            allowed = [
-                sf for sf, sd in self.registry.types[rel_cfg.get('target')].__berry_fields__.items() if sd.kind == 'scalar'
-            ] if rel_cfg.get('target') in self.registry.types else []
-        except Exception:
-            allowed = []
-        try:
-            from ..core.utils import dir_value
-        except Exception:
-            def _dir_value(x):
-                return (x or 'asc')
         sel = self._apply_ordering_sqla(
             sel,
             child_model_cls,
-            allowed,
+            None,
             order_by=self._resolve_graphql_value(info, rel_cfg.get('order_by')),
             order_dir=self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg)),
             order_multi=self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []),
@@ -788,16 +893,23 @@ class RelationSQLBuilders:
         default_dir_for_multi: str = 'asc',
         fallback_id: bool = True,
     ):
+        btype = self._get_btype_for_model(model_cls)
         ordered = False
+        join_cache: Dict[str, Any] = {}
         for spec in (order_multi or []):
             cn, _, dd = spec.partition(':')
             dd = (dd or default_dir_for_multi).lower()
-            if not allowed_fields or cn in allowed_fields:
-                col = getattr(model_cls, cn, None)
-                if col is not None:
-                    sel = sel.order_by(col.desc() if dd == 'desc' else col.asc())
-                    ordered = True
-        if not ordered and (not allowed_fields or order_by in (allowed_fields or [])):
+            expr = None
+            if btype is not None and isinstance(cn, str):
+                sel, expr = self._resolve_join_order_expr_sqla(sel, model_cls, cn, join_cache=join_cache)
+                if expr is None:
+                    expr = self.registry._resolve_order_expression(model_cls, btype, cn)
+            if expr is None and (not allowed_fields or cn in (allowed_fields or [])):
+                expr = getattr(model_cls, cn, None)
+            if expr is not None:
+                sel = sel.order_by(expr.desc() if dd == 'desc' else expr.asc())
+                ordered = True
+        if not ordered:
             if order_by:
                 dd = None
                 try:
@@ -805,9 +917,18 @@ class RelationSQLBuilders:
                 except Exception:
                     dd = (order_dir or 'asc')
                 dd = dd.lower()
-                col = getattr(model_cls, order_by, None)
-                if col is not None:
-                    sel = sel.order_by(col.desc() if dd == 'desc' else col.asc())
+                expr = None
+                if btype is not None and isinstance(order_by, str):
+                    sel, expr = self._resolve_join_order_expr_sqla(sel, model_cls, order_by, join_cache=join_cache)
+                    if expr is None:
+                        expr = self.registry._resolve_order_expression(model_cls, btype, order_by)
+                    if expr is None:
+                        allowed = self.registry._get_allowed_order_fields(btype)
+                        raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed}")
+                elif not allowed_fields or order_by in (allowed_fields or []):
+                    expr = getattr(model_cls, order_by, None)
+                if expr is not None:
+                    sel = sel.order_by(expr.desc() if dd == 'desc' else expr.asc())
                     ordered = True
         if fallback_id and not ordered:
             try:
@@ -1188,19 +1309,17 @@ class RelationSQLBuilders:
                             )
                         # Ordering for nested
                         ordered2 = False
-                        n_allowed = [sf for sf, sd in nb.__berry_fields__.items() if sd.kind == 'scalar']
                         nmulti_raw = ncfg.get('order_multi') or []
                         nmulti: List[str] = self.registry._normalize_order_multi_values(nmulti_raw)
                         for spec in nmulti:
                             cn, _, dd = spec.partition(':')
                             # Default ASC for multi when direction not specified
                             dd = (dd or 'asc').lower()
-                            if cn in n_allowed:
-                                col2 = getattr(grand_model, cn, None)
-                                if col2 is not None:
-                                    n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
-                                    ordered2 = True
-                        if not ordered2 and ncfg.get('order_by') in n_allowed:
+                            expr_multi = self.registry._resolve_order_expression(grand_model, nb, cn)
+                            if expr_multi is not None:
+                                n_sel = n_sel.order_by(expr_multi.desc() if dd == 'desc' else expr_multi.asc())
+                                ordered2 = True
+                        if not ordered2 and ncfg.get('order_by'):
                             cn = ncfg.get('order_by')
                             # When explicit order_by provided without explicit dir, default to ASC
                             try:
@@ -1208,7 +1327,7 @@ class RelationSQLBuilders:
                             except Exception:
                                 eff_dir = None
                             dd = (eff_dir or dir_value_fn(ncfg.get('order_dir'))).lower()
-                            col2 = getattr(grand_model, cn, None)
+                            col2 = self.registry._resolve_order_expression(grand_model, nb, cn)
                             if col2 is not None:
                                 n_sel = n_sel.order_by(col2.desc() if dd == 'desc' else col2.asc())
                                 ordered2 = True
@@ -1439,29 +1558,15 @@ class RelationSQLBuilders:
                         inner_sel_i = inner_sel_i.where(expr)
             # Ordering for child (order_multi -> order_by -> id)
             ordered = False
-            # Allowed ordering fields: scalars excluding write-only helpers
-            allowed_fields = []
-            try:
-                for sf, sd in target_b_i.__berry_fields__.items():
-                    if sd.kind == 'scalar':
-                        try:
-                            if (getattr(sd, 'meta', {}) or {}).get('write_only'):
-                                continue
-                        except Exception:
-                            pass
-                        allowed_fields.append(sf)
-            except Exception:
-                allowed_fields = [sf for sf, sd in target_b_i.__berry_fields__.items() if sd.kind == 'scalar']
             nmulti: List[str] = self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or [])
             for spec in nmulti:
                 cn, _, dd = spec.partition(':')
                 # Default ASC for multi when direction not specified
                 dd = (dd or 'asc').lower()
-                if cn in allowed_fields:
-                    col = getattr(child_model_cls_i, cn, None)
-                    if col is not None:
-                        inner_sel_i = inner_sel_i.order_by(col.desc() if dd == 'desc' else col.asc())
-                        ordered = True
+                expr_multi = self.registry._resolve_order_expression(child_model_cls_i, target_b_i, cn)
+                if expr_multi is not None:
+                    inner_sel_i = inner_sel_i.order_by(expr_multi.desc() if dd == 'desc' else expr_multi.asc())
+                    ordered = True
             if not ordered:
                 ob_val = self._resolve_graphql_value(info, rel_cfg.get('order_by'))
                 if ob_val is not None:
@@ -1474,9 +1579,8 @@ class RelationSQLBuilders:
                             expr = None
                     elif hasattr(ob_val, 'desc') or hasattr(ob_val, 'asc'):
                         expr = ob_val
-                    # Fallback: string column name (allowed_fields guard)
-                    if expr is None and ob_val in allowed_fields:
-                        expr = getattr(child_model_cls_i, ob_val, None)
+                    if expr is None and isinstance(ob_val, str):
+                        expr = self.registry._resolve_order_expression(child_model_cls_i, target_b_i, ob_val)
                     if expr is not None:
                         try:
                             eff_dir_top = self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg))
@@ -1651,11 +1755,7 @@ class RelationSQLBuilders:
                         n_effective_dir_i = self._resolve_graphql_value(info, self._effective_order_dir(ncfg_i))
                         # Map order_by and order_multi to physical names
                         def _map_order_name(model_cls_local, name):
-                            try:
-                                pairs = self._mssql_map_columns_pairs(model_cls_local, [name] if name else [])
-                                return pairs[0][0] if pairs else name
-                            except Exception:
-                                return name
+                            return self._mssql_order_term(model_cls_local, name)
                         n_order_by_mapped = _map_order_name(n_model_i, self._resolve_graphql_value(info, ncfg_i.get('order_by')))
                         n_order_multi_mapped: list[str] = []
                         try:
@@ -1776,11 +1876,7 @@ class RelationSQLBuilders:
                         pass
                     # Map order_by/order_multi for this nested level
                     def _map_order_name2(model_cls_local, name):
-                        try:
-                            pairs = self._mssql_map_columns_pairs(model_cls_local, [name] if name else [])
-                            return pairs[0][0] if pairs else name
-                        except Exception:
-                            return name
+                        return self._mssql_order_term(model_cls_local, name)
                     n_order_by_mapped2 = _map_order_name2(n_model, self._resolve_graphql_value(info, ncfg.get('order_by')))
                     n_order_multi_mapped2: list[str] = []
                     try:
@@ -1865,8 +1961,7 @@ class RelationSQLBuilders:
                                 compiled = str(ob_resolved)
                             order_by_param = f"({compiled})"
                         elif isinstance(ob_resolved, str):
-                            mapped_pairs = self._mssql_map_columns_pairs(child_model_cls, [ob_resolved]) or [(ob_resolved, ob_resolved)]
-                            order_by_param = mapped_pairs[0][0]
+                            order_by_param = self._mssql_order_term(child_model_cls, ob_resolved)
                     except Exception:
                         order_by_param = None
                 return adapter.build_relation_list_json_full(
@@ -1883,8 +1978,8 @@ class RelationSQLBuilders:
                     order_by=order_by_param,
                     order_dir=effective_order_dir,
                     order_multi=[
-                        f"{(self._mssql_map_columns_pairs(child_model_cls, [spec.split(':',1)[0]]) or [(spec.split(':',1)[0], spec.split(':',1)[0])])[0][0]}:{spec.split(':',1)[1]}"
-                        if ':' in spec else (self._mssql_map_columns_pairs(child_model_cls, [spec]) or [(spec, spec)])[0][0]
+                        f"{self._mssql_order_term(child_model_cls, spec.split(':',1)[0])}:{spec.split(':',1)[1]}"
+                        if ':' in spec else self._mssql_order_term(child_model_cls, spec)
                         for spec in (self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or [])
                     ],
                     nested=nested_specs,

@@ -60,6 +60,110 @@ async def test_relation_ordering_multi(db_session, populated_db):
 
 
 @pytest.mark.asyncio
+async def test_relation_ordering_by_single_relation_model_field(db_session, populated_db):
+        alice = populated_db['users'][0]
+        bob = populated_db['users'][1]
+        charlie = populated_db['users'][2]
+        first_post = populated_db['posts'][0]
+        second_post = populated_db['posts'][1]
+
+        first_post.reviewer_id = bob.id
+        second_post.reviewer_id = charlie.id
+        await db_session.commit()
+
+        q = """
+        query {
+            users(name_ilike: "Alice") {
+                id
+                posts(order_by: "reviewer.id", order_dir: desc) {
+                    id
+                    reviewer { id }
+                }
+            }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={'db_session': db_session})
+        assert res.errors is None, res.errors
+        posts = res.data['users'][0]['posts']
+        reviewer_ids = [post['reviewer']['id'] for post in posts if post['reviewer'] is not None]
+        assert reviewer_ids == [charlie.id, bob.id]
+
+
+@pytest.mark.asyncio
+async def test_relation_ordering_by_single_relation_scalar(db_session, populated_db):
+        q = """
+        query {
+            posts(limit: 1, order_by: "id") {
+                id
+                post_comments(order_by: "author.id", order_dir: desc) {
+                    id
+                    author { id }
+                }
+            }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={'db_session': db_session})
+        assert res.errors is None, res.errors
+        comments = res.data['posts'][0]['post_comments']
+        author_ids = [comment['author']['id'] for comment in comments]
+        assert author_ids == sorted(author_ids, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_relation_ordering_multi_by_hierarchical_single_relation_path(db_session, populated_db):
+        q = """
+        query {
+            users(name_ilike: "Charlie") {
+                id
+                post_comments(order_multi: ["post.author.id:desc", "id:asc"]) {
+                    id
+                    post {
+                        id
+                        author { id }
+                    }
+                }
+            }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={'db_session': db_session})
+        assert res.errors is None, res.errors
+        comments = res.data['users'][0]['post_comments']
+        sort_keys = [(comment['post']['author']['id'], comment['id']) for comment in comments]
+        assert sort_keys == sorted(sort_keys, key=lambda item: (-item[0], item[1]))
+
+
+@pytest.mark.asyncio
+async def test_relation_ordering_multi_by_hierarchical_single_relation_model_field(db_session, populated_db):
+        charlie = populated_db['users'][2]
+        third_post = populated_db['posts'][2]
+        fourth_post = populated_db['posts'][3]
+
+        third_post.reviewer_id = charlie.id
+        fourth_post.reviewer_id = charlie.id
+        await db_session.commit()
+
+        q = """
+        query {
+            users(name_ilike: "Alice") {
+                id
+                post_comments(order_multi: ["post.reviewer.id:desc", "id:asc"]) {
+                    id
+                    post {
+                        id
+                        reviewer { id }
+                    }
+                }
+            }
+        }
+        """
+        res = await berry_schema.execute(q, context_value={'db_session': db_session})
+        assert res.errors is None, res.errors
+        comments = res.data['users'][0]['post_comments']
+        sort_keys = [(comment['post']['reviewer']['id'], comment['id']) for comment in comments]
+        assert sort_keys == [(charlie.id, 4), (charlie.id, 6)]
+
+
+@pytest.mark.asyncio
 async def test_relation_ordering_multi_prefetched(db_session, populated_db):
         # Force a user with multiple posts; order by two columns and confirm stable ordering in-memory as well
         q = """

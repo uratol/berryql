@@ -10,6 +10,9 @@ def _mentions_table(sql: str, table: str) -> bool:
     f" from {table}" in s
     or f' from "{table}"' in s
     or f" from [{table}]" in s
+    or f" join {table}" in s
+    or f' join "{table}"' in s
+    or f" join [{table}]" in s
   )
 
 

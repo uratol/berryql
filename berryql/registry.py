@@ -955,12 +955,323 @@ class BerrySchema:
         """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
         return _norm_order_multi(multi)
 
+    def _normalize_order_segment(self, btype_cls: Any, segment: str) -> str:
+        """Normalize an order path segment, honoring auto-camel-case when enabled."""
+        if not isinstance(segment, str) or not segment:
+            return segment
+        try:
+            fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            fields = {}
+        if segment in fields:
+            return segment
+        try:
+            ac = bool(getattr(self, '_auto_camel_case', False))
+        except Exception:
+            ac = False
+        if not ac:
+            return segment
+        try:
+            from inflection import underscore as _underscore
+            candidate = segment if '_' in segment else _underscore(segment)
+        except Exception:
+            return segment
+        return candidate if candidate in fields else segment
+
+    def _normalize_order_path(self, btype_cls: Any, order_name: str, *, max_depth: int = 5) -> Optional[str]:
+        """Normalize a dotted order path and verify that it only traverses single relations."""
+        if not isinstance(order_name, str) or not order_name:
+            return None
+        parts = [part for part in order_name.split('.') if part]
+        if not parts or len(parts) > max_depth:
+            return None
+        current_btype = btype_cls
+        normalized_parts: List[str] = []
+        for index, part in enumerate(parts):
+            if current_btype is None:
+                return None
+            try:
+                fields = getattr(current_btype, '__berry_fields__', {}) or {}
+            except Exception:
+                return None
+            norm_part = self._normalize_order_segment(current_btype, part)
+            fdef = fields.get(norm_part)
+            if fdef is None:
+                return None
+            kind = getattr(fdef, 'kind', None)
+            meta = getattr(fdef, 'meta', {}) or {}
+            if index == len(parts) - 1:
+                if kind != 'scalar':
+                    return None
+                try:
+                    if meta.get('write_only'):
+                        return None
+                except Exception:
+                    pass
+                normalized_parts.append(norm_part)
+                break
+            if kind != 'relation':
+                return None
+            if not (meta.get('single') or meta.get('mode') == 'single'):
+                return None
+            normalized_parts.append(norm_part)
+            target_name = meta.get('target')
+            current_btype = self.types.get(target_name) if target_name else None
+        return '.'.join(normalized_parts)
+
+    def _get_allowed_order_fields(self, btype_cls: Any, *, max_depth: int = 5, _seen: Optional[set[int]] = None) -> List[str]:
+        """Return direct scalar and nested single-relation scalar paths allowed for ordering."""
+        if btype_cls is None:
+            return []
+        declared = getattr(btype_cls, '__ordering__', None)
+        if declared is not None:
+            out: List[str] = []
+            for item in declared:
+                if isinstance(item, str):
+                    out.append(item)
+            return out
+        if max_depth <= 0:
+            return []
+        if _seen is None:
+            _seen = set()
+        marker = id(btype_cls)
+        if marker in _seen:
+            return []
+        _seen = set(_seen)
+        _seen.add(marker)
+        out: List[str] = []
+        try:
+            fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            fields = {}
+        for name, fdef in fields.items():
+            kind = getattr(fdef, 'kind', None)
+            meta = getattr(fdef, 'meta', {}) or {}
+            if kind == 'scalar':
+                try:
+                    if meta.get('write_only'):
+                        continue
+                except Exception:
+                    pass
+                out.append(name)
+                continue
+            if kind != 'relation' or not (meta.get('single') or meta.get('mode') == 'single'):
+                continue
+            target_name = meta.get('target')
+            target_btype = self.types.get(target_name) if target_name else None
+            for nested in self._get_allowed_order_fields(target_btype, max_depth=max_depth - 1, _seen=_seen):
+                out.append(f"{name}.{nested}")
+        return out
+
+    def _resolve_order_expression(self, model_cls: Any, btype_cls: Any, order_name: Any, *, max_depth: int = 5):
+        """Resolve a direct or dotted order field path to a SQLAlchemy expression."""
+        normalized = self._normalize_order_path(btype_cls, order_name, max_depth=max_depth)
+        if not normalized:
+            return None
+        declared = getattr(btype_cls, '__ordering__', None)
+        if declared is not None and normalized not in declared:
+            return None
+        parts = normalized.split('.')
+        return self._resolve_order_expression_parts(model_cls, btype_cls, parts, max_depth=max_depth)
+
+    def _resolve_order_expression_parts(self, model_cls: Any, btype_cls: Any, parts: List[str], *, max_depth: int = 5):
+        if not parts or btype_cls is None or model_cls is None or max_depth <= 0:
+            return None
+        try:
+            fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            return None
+        current = parts[0]
+        fdef = fields.get(current)
+        if fdef is None:
+            return None
+        kind = getattr(fdef, 'kind', None)
+        meta = getattr(fdef, 'meta', {}) or {}
+        if len(parts) == 1:
+            if kind != 'scalar':
+                return None
+            try:
+                source_name = meta.get('column') or current
+            except Exception:
+                source_name = current
+            try:
+                col = model_cls.__table__.c.get(source_name)
+            except Exception:
+                col = None
+            if col is None:
+                col = getattr(model_cls, source_name, None)
+            return col
+        if kind != 'relation' or not (meta.get('single') or meta.get('mode') == 'single'):
+            return None
+        target_name = meta.get('target')
+        target_btype = self.types.get(target_name) if target_name else None
+        target_model = getattr(target_btype, 'model', None) if target_btype is not None else None
+        if target_model is None:
+            return None
+        nested_expr = self._resolve_order_expression_parts(target_model, target_btype, parts[1:], max_depth=max_depth - 1)
+        if nested_expr is None:
+            return None
+        parent_fk_name = self._find_parent_fk_column_name(model_cls, target_model, current)
+        if parent_fk_name:
+            try:
+                parent_fk_col = model_cls.__table__.c.get(parent_fk_name)
+            except Exception:
+                parent_fk_col = getattr(model_cls, parent_fk_name, None)
+            if parent_fk_col is not None:
+                try:
+                    return (
+                        select(nested_expr)
+                        .select_from(target_model)
+                        .where(self._get_pk_column(target_model) == parent_fk_col)
+                        .correlate(model_cls)
+                        .scalar_subquery()
+                    )
+                except Exception:
+                    pass
+        child_fk_col = self._find_child_fk_column(model_cls, target_model, meta.get('fk_column_name'))
+        if child_fk_col is not None:
+            try:
+                return (
+                    select(nested_expr)
+                    .select_from(target_model)
+                    .where(child_fk_col == self._get_pk_column(model_cls))
+                    .order_by(self._get_pk_column(target_model).asc())
+                    .limit(1)
+                    .correlate(model_cls)
+                    .scalar_subquery()
+                )
+            except Exception:
+                return None
+        return None
+
+    def _value_from_order_container(self, container: Any, name: str, source_name: Optional[str] = None):
+        if container is None:
+            return None
+        keys = [k for k in [name, source_name] if k]
+        try:
+            mapping = getattr(container, '_mapping', None) or container
+        except Exception:
+            mapping = container
+        if isinstance(mapping, dict):
+            for key in keys:
+                if key in mapping:
+                    return mapping.get(key)
+        for key in keys:
+            try:
+                return getattr(container, key)
+            except Exception:
+                continue
+        try:
+            model_obj = getattr(container, '_model', None)
+        except Exception:
+            model_obj = None
+        if model_obj is not None:
+            for key in keys:
+                try:
+                    return getattr(model_obj, key)
+                except Exception:
+                    continue
+        return None
+
+    async def _resolve_order_value(self, session: Any, lock: Any, container: Any, model_cls: Any, btype_cls: Any, order_name: str, *, max_depth: int = 5):
+        normalized = self._normalize_order_path(btype_cls, order_name, max_depth=max_depth)
+        if not normalized:
+            return None
+        parts = normalized.split('.')
+        current_container = container
+        current_model = model_cls
+        current_btype = btype_cls
+        for index, part in enumerate(parts):
+            try:
+                fields = getattr(current_btype, '__berry_fields__', {}) or {}
+            except Exception:
+                return None
+            fdef = fields.get(part)
+            if fdef is None:
+                return None
+            kind = getattr(fdef, 'kind', None)
+            meta = getattr(fdef, 'meta', {}) or {}
+            if index == len(parts) - 1:
+                source_name = meta.get('column') or part
+                return self._value_from_order_container(current_container, part, source_name)
+            if kind != 'relation' or not (meta.get('single') or meta.get('mode') == 'single'):
+                return None
+            target_name = meta.get('target')
+            target_btype = self.types.get(target_name) if target_name else None
+            target_model = getattr(target_btype, 'model', None) if target_btype is not None else None
+            if target_model is None:
+                return None
+            parent_fk_name = self._find_parent_fk_column_name(current_model, target_model, part)
+            related_obj = None
+            if parent_fk_name:
+                fk_val = self._value_from_order_container(current_container, parent_fk_name)
+                if fk_val is None:
+                    return None
+                async with lock:
+                    related_obj = await session.get(target_model, fk_val)
+            else:
+                child_fk_col = self._find_child_fk_column(current_model, target_model, meta.get('fk_column_name'))
+                if child_fk_col is None:
+                    return None
+                pk_name = self._get_pk_name(current_model)
+                parent_id = self._value_from_order_container(current_container, pk_name)
+                if parent_id is None:
+                    return None
+                stmt = select(target_model).where(child_fk_col == parent_id).order_by(self._get_pk_column(target_model).asc()).limit(1)
+                async with lock:
+                    rel_result = await session.execute(stmt)
+                related_obj = rel_result.scalar_one_or_none()
+            if related_obj is None:
+                return None
+            current_container = related_obj
+            current_model = target_model
+            current_btype = target_btype
+        return None
+
+    async def _apply_python_relation_ordering(self, items: List[Any], session: Any, lock: Any, model_cls: Any, btype_cls: Any, order_by: Any, order_dir: Any, order_multi: Any):
+        if not items:
+            return items
+        specs: List[tuple[str, str]] = []
+        if order_multi:
+            norm_specs = self._normalize_order_multi_values(order_multi)
+            has_dotted = any('.' in str(spec).partition(':')[0] for spec in norm_specs)
+            for spec in norm_specs:
+                name, _, direction = str(spec).partition(':')
+                if has_dotted and isinstance(name, str) and name:
+                    specs.append((name, (direction or 'asc').lower()))
+        elif isinstance(order_by, str) and '.' in order_by:
+            specs.append((order_by, (_dir_value(order_dir) if order_dir is not None else 'asc')))
+        if not specs:
+            return items
+        ordered_items = list(items)
+        for name, direction in reversed(specs):
+            keyed: List[tuple[Any, Any]] = []
+            for item in ordered_items:
+                keyed.append((await self._resolve_order_value(session, lock, item, model_cls, btype_cls, name), item))
+            keyed.sort(key=lambda pair: (pair[0] is None, pair[0]), reverse=(direction == 'desc'))
+            ordered_items = [item for _, item in keyed]
+        return ordered_items
+
     def _find_parent_fk_column_name(self, parent_model_cls: Any, child_model_cls: Any, rel_name: str) -> Optional[str]:
         """Return the name of the FK column on parent that references child, or a conventional '<rel>_id' fallback.
 
         Tries model metadata first (parent __table__ foreign_keys targeting child's table).
         Falls back to '<rel>_id' when present. Returns None when not found.
         """
+        # Prefer the conventional '<relation>_id' column for the specific relation name.
+        fallback = f"{rel_name}_id"
+        try:
+            if parent_model_cls is not None:
+                if hasattr(parent_model_cls, '__table__'):
+                    try:
+                        if any(c.name == fallback for c in parent_model_cls.__table__.columns):
+                            return fallback
+                    except Exception:
+                        pass
+                if hasattr(parent_model_cls, fallback):
+                    return fallback
+        except Exception:
+            pass
         # Prefer model metadata foreign key discovery
         try:
             if parent_model_cls is not None and hasattr(parent_model_cls, '__table__') and \
@@ -972,22 +1283,6 @@ class BerrySchema:
                                 return pc.name
                         except Exception:
                             continue
-        except Exception:
-            pass
-        # Conventional fallback: '<relation>_id'
-        fallback = f"{rel_name}_id"
-        try:
-            if parent_model_cls is not None:
-                # check via table columns when possible
-                if hasattr(parent_model_cls, '__table__'):
-                    try:
-                        if any(c.name == fallback for c in parent_model_cls.__table__.columns):
-                            return fallback
-                    except Exception:
-                        pass
-                # lenient: hasattr on ORM class attribute
-                if hasattr(parent_model_cls, fallback):
-                    return fallback
         except Exception:
             pass
         return None
@@ -1890,51 +2185,21 @@ class BerrySchema:
                     expr_t3 = frag3(child_model_cls, info)
                     if expr_t3 is not None:
                         stmt = stmt.where(expr_t3)
-        allowed_order = getattr(target_cls_i, '__ordering__', None)
-        if allowed_order is None:
-            allowed_order = [sf for sf, sd in self.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
-        try:
-            ac = bool(getattr(self, '_auto_camel_case', False))
-        except Exception:
-            ac = False
-        if ac:
-            from inflection import underscore as _underscore
-            try:
-                allowed_order_snake = [
-                    (s if '_' in s else _underscore(s)) for s in allowed_order
-                ]
-            except Exception:
-                allowed_order_snake = allowed_order
-        else:
-            allowed_order_snake = allowed_order
+        allowed_order = self._get_allowed_order_fields(target_cls_i)
         applied_any = False
         if order_by and isinstance(order_by, str):
-            ob_key = order_by
-            if ac:
-                try:
-                    from inflection import underscore as _underscore
-                    ob_key = ob_key if '_' in ob_key else _underscore(ob_key)
-                except Exception:
-                    ob_key = order_by
-            if ob_key not in allowed_order_snake:
+            expr_check = self._resolve_order_expression(child_model_cls, target_cls_i, order_by)
+            if expr_check is None:
                 raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
         if order_multi:
             for spec in order_multi:
                 try:
                     col_name, _, dir_part = spec.partition(':')
                     dir_part = dir_part or 'asc'
-                    col_key = col_name
-                    if ac:
-                        try:
-                            from inflection import underscore as _underscore
-                            col_key = col_key if '_' in col_key else _underscore(col_key)
-                        except Exception:
-                            col_key = col_name
-                    if col_key in allowed_order_snake:
-                        col_obj = child_model_cls.__table__.c.get(col_name)
-                        if col_obj is not None:
-                            stmt = stmt.order_by(col_obj.desc() if dir_part.lower()=='desc' else col_obj.asc())
-                            applied_any = True
+                    expr_multi = self._resolve_order_expression(child_model_cls, target_cls_i, col_name)
+                    if expr_multi is not None:
+                        stmt = stmt.order_by(expr_multi.desc() if dir_part.lower()=='desc' else expr_multi.asc())
+                        applied_any = True
                 except Exception:
                     raise
         if not applied_any and order_by:
@@ -1947,18 +2212,7 @@ class BerrySchema:
             elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
                 expr = order_by
             elif isinstance(order_by, str):
-                ob_key2 = order_by
-                if ac:
-                    try:
-                        from inflection import underscore as _underscore
-                        ob_key2 = ob_key2 if '_' in ob_key2 else _underscore(ob_key2)
-                    except Exception:
-                        ob_key2 = order_by
-                if ob_key2 in allowed_order_snake:
-                    try:
-                        expr = child_model_cls.__table__.c.get(order_by)
-                    except Exception:
-                        expr = None
+                expr = self._resolve_order_expression(child_model_cls, target_cls_i, order_by)
             if expr is not None:
                 descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
                 try:
@@ -1976,9 +2230,9 @@ class BerrySchema:
                     for spec in meta_copy.get('order_multi') or []:
                         cn, _, dd = str(spec).partition(':')
                         dd = dd or def_dir
-                        col = child_model_cls.__table__.c.get(cn)
-                        if col is not None:
-                            stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
+                        expr_multi = self._resolve_order_expression(child_model_cls, target_cls_i, cn)
+                        if expr_multi is not None:
+                            stmt = stmt.order_by(expr_multi.desc() if dd=='desc' else expr_multi.asc())
                             applied_any = True
                 elif meta_copy.get('order_by'):
                     cn = meta_copy.get('order_by')
@@ -1992,8 +2246,7 @@ class BerrySchema:
                     elif hasattr(cn, 'desc') or hasattr(cn, 'asc'):
                         expr2 = cn
                     else:
-                        col = child_model_cls.__table__.c.get(cn)
-                        expr2 = col
+                        expr2 = self._resolve_order_expression(child_model_cls, target_cls_i, cn)
                     if expr2 is not None:
                         try:
                             if hasattr(expr2, 'desc') and hasattr(expr2, 'asc'):
@@ -2012,12 +2265,12 @@ class BerrySchema:
                 f_spec = target_filters.get(arg_name)
                 if not f_spec:
                     raise ValueError(f"Unknown filter argument: {arg_name}")
+                expr = None
                 if f_spec.transform:
                     try:
                         val = f_spec.transform(val)
                     except Exception as e:
                         raise ValueError(f"Filter transform failed for {arg_name}: {e}")
-                expr = None
                 if f_spec.builder:
                     try:
                         expr = f_spec.builder(child_model_cls, info, val)
@@ -3363,6 +3616,7 @@ class BerrySchema:
                                 return []
                             # Determine requested scalar fields for this relation, prefer extractor meta from root if present
                             requested_fields: list[str] = []
+                            requested_nested_relations: set[str] = set()
                             try:
                                 meta_map0 = getattr(self, '_pushdown_meta', None)
                                 if isinstance(meta_map0, dict):
@@ -3370,6 +3624,9 @@ class BerrySchema:
                                     req = cfg.get('fields') or []
                                     if isinstance(req, (list, tuple)):
                                         requested_fields = [str(x) for x in req]
+                                    nested_cfg0 = cfg.get('nested') or {}
+                                    if isinstance(nested_cfg0, dict):
+                                        requested_nested_relations = {str(k) for k in nested_cfg0.keys()}
                             except Exception:
                                 requested_fields = []
                             if not requested_fields:
@@ -3392,6 +3649,11 @@ class BerrySchema:
                                                 nm = None
                                             if nm and not str(nm).startswith('__'):
                                                 requested_fields.append(str(nm))
+                                                try:
+                                                    if getattr(s, 'selection_set', None) is not None:
+                                                        requested_nested_relations.add(str(nm))
+                                                except Exception:
+                                                    pass
                                 except Exception:
                                     requested_fields = []
                             # Build minimal column list: always include id for downstream nested resolvers; plus requested scalars if any
@@ -3502,7 +3764,7 @@ class BerrySchema:
                                 rel_fields_on_target = {}
                             for rf_name, rf_def in rel_fields_on_target.items():
                                 # Only if relation is requested directly under this selection
-                                if rf_name not in requested_fields:
+                                if rf_name not in requested_fields and rf_name not in requested_nested_relations:
                                     continue
                                 # Only for single relations (need <rel>_id)
                                 try:
@@ -3622,54 +3884,23 @@ class BerrySchema:
                                             stmt = stmt.where(expr_t3)
                             # Ad-hoc JSON where for relation list if present on selection (not used; keep future hook comment)
                             # Ordering (multi then single) if column whitelist permits
-                            allowed_order = getattr(target_cls_i, '__ordering__', None)
-                            if allowed_order is None:
-                                # derive from scalar fields
-                                allowed_order = [sf for sf, sd in schema_instance.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
-                            # When auto-camel-case is enabled, accept camelCase order_by/columns
-                            try:
-                                ac = bool(getattr(self, '_auto_camel_case', False))
-                            except Exception:
-                                ac = False
-                            if ac:
-                                from inflection import underscore as _underscore
-                                try:
-                                    allowed_order_snake = [
-                                        (s if '_' in s else _underscore(s)) for s in allowed_order
-                                    ]
-                                except Exception:
-                                    allowed_order_snake = allowed_order
-                            else:
-                                allowed_order_snake = allowed_order
+                            target_b_for_order = schema_instance.types.get(target_name_i)
+                            allowed_order = schema_instance._get_allowed_order_fields(target_b_for_order)
                             applied_any = False
                             # Validate invalid order_by up front (honoring auto-camel-case)
                             if order_by and isinstance(order_by, str):
-                                ob_key = order_by
-                                if ac:
-                                    try:
-                                        from inflection import underscore as _underscore
-                                        ob_key = ob_key if '_' in ob_key else _underscore(ob_key)
-                                    except Exception:
-                                        ob_key = order_by
-                                if ob_key not in allowed_order_snake:
+                                expr_check = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, order_by)
+                                if expr_check is None:
                                     raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
                             if order_multi:
                                 for spec in order_multi:
                                     try:
                                         col_name, _, dir_part = spec.partition(':')
                                         dir_part = dir_part or 'asc'
-                                        col_key = col_name
-                                        if ac:
-                                            try:
-                                                from inflection import underscore as _underscore
-                                                col_key = col_key if '_' in col_key else _underscore(col_key)
-                                            except Exception:
-                                                col_key = col_name
-                                        if col_key in allowed_order_snake:
-                                            col_obj = child_model_cls.__table__.c.get(col_name)
-                                            if col_obj is not None:
-                                                stmt = stmt.order_by(col_obj.desc() if dir_part.lower()=='desc' else col_obj.asc())
-                                                applied_any = True
+                                        expr_multi = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, col_name)
+                                        if expr_multi is not None:
+                                            stmt = stmt.order_by(expr_multi.desc() if dir_part.lower()=='desc' else expr_multi.asc())
+                                            applied_any = True
                                     except Exception:
                                         raise
                             if not applied_any and order_by:
@@ -3683,18 +3914,7 @@ class BerrySchema:
                                 elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
                                     expr = order_by
                                 elif isinstance(order_by, str):
-                                    ob_key2 = order_by
-                                    if ac:
-                                        try:
-                                            from inflection import underscore as _underscore
-                                            ob_key2 = ob_key2 if '_' in ob_key2 else _underscore(ob_key2)
-                                        except Exception:
-                                            ob_key2 = order_by
-                                    if ob_key2 in allowed_order_snake:
-                                        try:
-                                            expr = child_model_cls.__table__.c.get(order_by)
-                                        except Exception:
-                                            expr = None
+                                    expr = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, order_by)
                                 if expr is not None:
                                     descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
                                     try:
@@ -3714,9 +3934,9 @@ class BerrySchema:
                                         for spec in meta_copy.get('order_multi') or []:
                                             cn, _, dd = str(spec).partition(':')
                                             dd = dd or def_dir
-                                            col = child_model_cls.__table__.c.get(cn)
-                                            if col is not None:
-                                                stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
+                                            expr_multi = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, cn)
+                                            if expr_multi is not None:
+                                                stmt = stmt.order_by(expr_multi.desc() if dd=='desc' else expr_multi.asc())
                                                 applied_any = True
                                     elif meta_copy.get('order_by'):
                                         cn = meta_copy.get('order_by')
@@ -3731,8 +3951,7 @@ class BerrySchema:
                                         elif hasattr(cn, 'desc') or hasattr(cn, 'asc'):
                                             expr2 = cn
                                         else:
-                                            col = child_model_cls.__table__.c.get(cn)
-                                            expr2 = col
+                                            expr2 = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, cn)
                                         if expr2 is not None:
                                             try:
                                                 if hasattr(expr2, 'desc') and hasattr(expr2, 'asc'):
@@ -4390,38 +4609,29 @@ class BerrySchema:
                             pass
                         continue
                     # Early validation of relation order_by for pushdown path
-                    try:
-                        allowed_fields_rel = [sf for sf, sd in target_b.__berry_fields__.items() if sd.kind == 'scalar']
-                    except Exception:
-                        allowed_fields_rel = []
-                    # When auto-camel-case is enabled, also accept camelCase order_by names
-                    try:
-                        ac_rel = bool(getattr(self, '_auto_camel_case', False))
-                    except Exception:
-                        ac_rel = False
-                    if ac_rel:
-                        try:
-                            from inflection import underscore as _underscore
-                            allowed_fields_rel_snake = [
-                                (s if '_' in s else _underscore(s)) for s in allowed_fields_rel
-                            ]
-                        except Exception:
-                            allowed_fields_rel_snake = allowed_fields_rel
-                    else:
-                        allowed_fields_rel_snake = allowed_fields_rel
+                    allowed_fields_rel = self._get_allowed_order_fields(target_b)
                     ob_rel = rel_cfg.get('order_by')
                     # Only validate against allowed field names when order_by is a string.
                     # Callables and SQLAlchemy expressions are allowed and handled later.
                     if isinstance(ob_rel, str) and ob_rel:
-                        ob_key_rel = ob_rel
-                        if ac_rel:
-                            try:
-                                from inflection import underscore as _underscore
-                                ob_key_rel = ob_key_rel if '_' in ob_key_rel else _underscore(ob_key_rel)
-                            except Exception:
-                                ob_key_rel = ob_rel
-                        if ob_key_rel not in allowed_fields_rel_snake:
+                        if self._resolve_order_expression(target_b.model, target_b, ob_rel) is None:
                             raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
+                    try:
+                        has_nested_relation_order = isinstance(ob_rel, str) and '.' in ob_rel
+                        if not has_nested_relation_order:
+                            for spec in self._normalize_order_multi_values(rel_cfg.get('order_multi') or []):
+                                cn, _, _ = str(spec).partition(':')
+                                if '.' in cn:
+                                    has_nested_relation_order = True
+                                    break
+                    except Exception:
+                        has_nested_relation_order = False
+                    if mssql_mode and has_nested_relation_order:
+                        try:
+                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'mssql nested relation order fallback'})
+                        except Exception:
+                            pass
+                        continue
                     child_model_cls = target_b.model
                     # Determine FK from child->parent, allow explicit override via relation meta
                     try:
@@ -4441,16 +4651,12 @@ class BerrySchema:
                                     parent_fk_found = True
                             except Exception:
                                 pass
-                        
                         if not parent_fk_found:
                             try:
                                 rel_push_status[rel_name].update({'pushed': False, 'reason': 'no FK child->parent'})
                             except Exception:
                                 pass
                             continue
-                    # Determine projected scalar fields
-                    requested_scalar = rel_cfg.get('fields') or []
-                    if rel_cfg.get('single'):
                         # If this single relation is a computed wrapper over another relation (source),
                         # skip pushdown here and let the resolver reuse the source's prefetched value.
                         try:
@@ -4459,16 +4665,11 @@ class BerrySchema:
                                 continue
                         except Exception:
                             pass
-                        # Single relation: build json object
-                        # Projected columns
-                        proj_cols: list[str] = []
-                        if not requested_scalar:
-                            for sf, sdef in target_b.__berry_fields__.items():
-                                if sdef.kind == 'scalar':
-                                    requested_scalar.append(sf)
-                        for sf in requested_scalar:
-                            if sf in child_model_cls.__table__.columns:
-                                proj_cols.append(sf)
+                        proj_cols = RelationSQLBuilders(self)._prepare_requested_scalar_fields(
+                            target_btype=target_b,
+                            child_model_cls=child_model_cls,
+                            rel_cfg=rel_cfg,
+                        )
                         # Include FK helper columns for nested single relations
                         try:
                             nested_map = rel_cfg.get('nested') or {}

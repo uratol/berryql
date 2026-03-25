@@ -196,6 +196,12 @@ class MSSQLAdapter(BaseAdapter):
                 dd = (dd or od_str).lower()
                 if cn in model_cls.__table__.columns:
                     parts.append(f"{alias_ident}.[{cn}] {'DESC' if dd=='desc' else 'ASC'}")
+                else:
+                    raw = str(cn).strip()
+                    if raw:
+                        low = raw.lower()
+                        expr_with_dir = raw if (low.endswith(' asc') or low.endswith(' desc')) else f"{raw} {'DESC' if dd=='desc' else 'ASC'}"
+                        parts.append(expr_with_dir)
             except Exception:
                 continue
         # Primary order_by can be a column name or a raw SQL expression
