@@ -2185,79 +2185,17 @@ class BerrySchema:
                     expr_t3 = frag3(child_model_cls, info)
                     if expr_t3 is not None:
                         stmt = stmt.where(expr_t3)
-        allowed_order = self._get_allowed_order_fields(target_cls_i)
-        applied_any = False
-        if order_by and isinstance(order_by, str):
-            expr_check = self._resolve_order_expression(child_model_cls, target_cls_i, order_by)
-            if expr_check is None:
-                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
-        if order_multi:
-            for spec in order_multi:
-                try:
-                    col_name, _, dir_part = spec.partition(':')
-                    dir_part = dir_part or 'asc'
-                    expr_multi = self._resolve_order_expression(child_model_cls, target_cls_i, col_name)
-                    if expr_multi is not None:
-                        stmt = stmt.order_by(expr_multi.desc() if dir_part.lower()=='desc' else expr_multi.asc())
-                        applied_any = True
-                except Exception:
-                    raise
-        if not applied_any and order_by:
-            expr = None
-            if callable(order_by):
-                try:
-                    expr = order_by(child_model_cls, info)
-                except Exception:
-                    expr = None
-            elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
-                expr = order_by
-            elif isinstance(order_by, str):
-                expr = self._resolve_order_expression(child_model_cls, target_cls_i, order_by)
-            if expr is not None:
-                descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
-                try:
-                    if hasattr(expr, 'desc') and hasattr(expr, 'asc'):
-                        stmt = stmt.order_by(expr.desc() if descending else expr.asc())
-                    else:
-                        stmt = stmt.order_by(expr)
-                    applied_any = True
-                except Exception:
-                    pass
-        if not applied_any and (not order_by) and (meta_copy.get('order_by') or meta_copy.get('order_multi')):
-            try:
-                def_dir = _dir_value(meta_copy.get('order_dir'))
-                if meta_copy.get('order_multi'):
-                    for spec in meta_copy.get('order_multi') or []:
-                        cn, _, dd = str(spec).partition(':')
-                        dd = dd or def_dir
-                        expr_multi = self._resolve_order_expression(child_model_cls, target_cls_i, cn)
-                        if expr_multi is not None:
-                            stmt = stmt.order_by(expr_multi.desc() if dd=='desc' else expr_multi.asc())
-                            applied_any = True
-                elif meta_copy.get('order_by'):
-                    cn = meta_copy.get('order_by')
-                    dd = def_dir
-                    expr2 = None
-                    if callable(cn):
-                        try:
-                            expr2 = cn(child_model_cls, info)
-                        except Exception:
-                            expr2 = None
-                    elif hasattr(cn, 'desc') or hasattr(cn, 'asc'):
-                        expr2 = cn
-                    else:
-                        expr2 = self._resolve_order_expression(child_model_cls, target_cls_i, cn)
-                    if expr2 is not None:
-                        try:
-                            if hasattr(expr2, 'desc') and hasattr(expr2, 'asc'):
-                                stmt = stmt.order_by(expr2.desc() if dd=='desc' else expr2.asc())
-                            else:
-                                stmt = stmt.order_by(expr2)
-                            applied_any = True
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        effective_order_by = order_by if order_by is not None else meta_copy.get('order_by')
+        effective_order_dir = order_dir if order_dir is not None else meta_copy.get('order_dir')
+        effective_order_multi = order_multi if order_multi is not None else meta_copy.get('order_multi')
+        stmt = RootSQLBuilders(self).apply_ordering(
+            stmt,
+            model_cls=child_model_cls,
+            btype_cls=tgt_b_for_type3,
+            order_by=effective_order_by,
+            order_dir=effective_order_dir,
+            order_multi=effective_order_multi,
+        )
         if target_filters:
             for arg_name, val in _filter_args.items():
                 if val is None:
@@ -3885,84 +3823,17 @@ class BerrySchema:
                             # Ad-hoc JSON where for relation list if present on selection (not used; keep future hook comment)
                             # Ordering (multi then single) if column whitelist permits
                             target_b_for_order = schema_instance.types.get(target_name_i)
-                            allowed_order = schema_instance._get_allowed_order_fields(target_b_for_order)
-                            applied_any = False
-                            # Validate invalid order_by up front (honoring auto-camel-case)
-                            if order_by and isinstance(order_by, str):
-                                expr_check = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, order_by)
-                                if expr_check is None:
-                                    raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order}")
-                            if order_multi:
-                                for spec in order_multi:
-                                    try:
-                                        col_name, _, dir_part = spec.partition(':')
-                                        dir_part = dir_part or 'asc'
-                                        expr_multi = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, col_name)
-                                        if expr_multi is not None:
-                                            stmt = stmt.order_by(expr_multi.desc() if dir_part.lower()=='desc' else expr_multi.asc())
-                                            applied_any = True
-                                    except Exception:
-                                        raise
-                            if not applied_any and order_by:
-                                # Accept callable (lambda M, info -> expr) or direct SA expression
-                                expr = None
-                                if callable(order_by):
-                                    try:
-                                        expr = order_by(child_model_cls, info)
-                                    except Exception:
-                                        expr = None
-                                elif hasattr(order_by, 'desc') or hasattr(order_by, 'asc'):
-                                    expr = order_by
-                                elif isinstance(order_by, str):
-                                    expr = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, order_by)
-                                if expr is not None:
-                                    descending = _dir_value(order_dir) == 'desc' if order_dir is not None else False
-                                    try:
-                                        # Prefer calling .desc/.asc when available
-                                        if hasattr(expr, 'desc') and hasattr(expr, 'asc'):
-                                            stmt = stmt.order_by(expr.desc() if descending else expr.asc())
-                                        else:
-                                            stmt = stmt.order_by(expr)
-                                        applied_any = True
-                                    except Exception:
-                                        pass
-                            # Apply default ordering from schema meta if still no order applied
-                            if not applied_any and (not order_by) and (meta_copy.get('order_by') or meta_copy.get('order_multi')):
-                                try:
-                                    def_dir = _dir_value(meta_copy.get('order_dir'))
-                                    if meta_copy.get('order_multi'):
-                                        for spec in meta_copy.get('order_multi') or []:
-                                            cn, _, dd = str(spec).partition(':')
-                                            dd = dd or def_dir
-                                            expr_multi = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, cn)
-                                            if expr_multi is not None:
-                                                stmt = stmt.order_by(expr_multi.desc() if dd=='desc' else expr_multi.asc())
-                                                applied_any = True
-                                    elif meta_copy.get('order_by'):
-                                        cn = meta_copy.get('order_by')
-                                        dd = def_dir
-                                        expr2 = None
-                                        # Support callables and SA expressions in schema default too
-                                        if callable(cn):
-                                            try:
-                                                expr2 = cn(child_model_cls, info)
-                                            except Exception:
-                                                expr2 = None
-                                        elif hasattr(cn, 'desc') or hasattr(cn, 'asc'):
-                                            expr2 = cn
-                                        else:
-                                            expr2 = schema_instance._resolve_order_expression(child_model_cls, target_b_for_order, cn)
-                                        if expr2 is not None:
-                                            try:
-                                                if hasattr(expr2, 'desc') and hasattr(expr2, 'asc'):
-                                                    stmt = stmt.order_by(expr2.desc() if dd=='desc' else expr2.asc())
-                                                else:
-                                                    stmt = stmt.order_by(expr2)
-                                                applied_any = True
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
+                            effective_order_by = order_by if order_by is not None else meta_copy.get('order_by')
+                            effective_order_dir = order_dir if order_dir is not None else meta_copy.get('order_dir')
+                            effective_order_multi = order_multi if order_multi is not None else meta_copy.get('order_multi')
+                            stmt = RootSQLBuilders(schema_instance).apply_ordering(
+                                stmt,
+                                model_cls=child_model_cls,
+                                btype_cls=target_b_for_order,
+                                order_by=effective_order_by,
+                                order_dir=effective_order_dir,
+                                order_multi=effective_order_multi,
+                            )
                             # Apply filters
                             if target_filters:
                                 for arg_name, val in _filter_args.items():

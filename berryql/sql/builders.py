@@ -2884,101 +2884,32 @@ class RootSQLBuilders:
 
     def apply_ordering(self, stmt, *, model_cls, btype_cls, order_by, order_dir, order_multi):
         from ..core.utils import dir_value as _dir_value
-        # Determine auto-camel-case mode from BerrySchema/registry if attached
-        try:
-            ac = bool(getattr(self.registry, '_auto_camel_case', False))
-        except Exception:
-            ac = False
+        allowed_order_fields = self.registry._get_allowed_order_fields(btype_cls)
+        effective_order_multi = self.registry._normalize_order_multi_values(order_multi) if order_multi else None
+        effective_order_by = order_by
+        effective_order_dir = order_dir
 
-        def _normalize_name(name: str, allowed: list[str]) -> str:
-            """Normalize order field respecting auto-camel-case.
+        if not effective_order_multi and not effective_order_by:
+            effective_order_multi = self.registry._normalize_order_multi_values(
+                getattr(btype_cls, '__default_order_multi__', None) or []
+            ) or None
+            if not effective_order_multi:
+                effective_order_by = getattr(btype_cls, '__default_order_by__', None)
+            effective_order_dir = getattr(btype_cls, '__default_order_dir__', None)
 
-            When auto-camel-case is enabled, accept camelCase names by comparing
-            their snake_case form against the allowed field list.
-            """
-            if not isinstance(name, str):
-                return name
-            if not ac:
-                return name
-            try:
-                from inflection import underscore as _underscore
-            except Exception:
-                return name
-            if '_' in name:
-                return name
-            try:
-                cand = _underscore(name)
-            except Exception:
-                return name
-            return cand if cand in allowed else name
+        relation_builders = RelationSQLBuilders(self.registry)
 
-        # multi first
-        if order_multi:
-            allowed_order_fields = getattr(btype_cls, '__ordering__', None)
-            if allowed_order_fields is None:
-                allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-            for spec in (order_multi or []):
-                try:
-                    cn, _, dd = str(spec).partition(':')
-                    dd = (dd or 'asc').lower()
-                    norm_cn = _normalize_name(cn, allowed_order_fields)
-                    if norm_cn not in allowed_order_fields:
-                        continue
-                    col = model_cls.__table__.c.get(norm_cn)
-                    if col is None:
-                        continue
-                    stmt = stmt.order_by(col.desc() if dd=='desc' else col.asc())
-                except Exception:
-                    pass
-            return stmt
-        # single order_by
-        if order_by:
-            allowed_order_fields = getattr(btype_cls, '__ordering__', None)
-            if allowed_order_fields is None:
-                allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-            norm_ob = _normalize_name(order_by, allowed_order_fields)
-            if norm_ob not in allowed_order_fields:
-                raise ValueError(f"Invalid order_by '{order_by}'. Allowed: {allowed_order_fields}")
-            try:
-                col = model_cls.__table__.c.get(norm_ob)
-            except Exception:
-                col = None
-            if col is None:
-                raise ValueError(f"Unknown order_by column: {norm_ob}")
-            dv = _dir_value(order_dir)
-            if dv not in ('asc','desc'):
-                raise ValueError(f"Invalid order_dir '{order_dir}'. Use asc or desc")
-            try:
-                stmt = stmt.order_by(col.desc() if dv=='desc' else col.asc())
-            except Exception:
-                pass
-            return stmt
-        # defaults
-        allowed_order_fields = getattr(btype_cls, '__ordering__', None)
-        if allowed_order_fields is None:
-            allowed_order_fields = [fname for fname, fdef in btype_cls.__berry_fields__.items() if fdef.kind == 'scalar']
-        def_dir = _dir_value(getattr(btype_cls, '__default_order_dir__', None))
-        default_multi = getattr(btype_cls, '__default_order_multi__', None) or []
-        default_by = getattr(btype_cls, '__default_order_by__', None)
-        try:
-            if default_multi:
-                for spec in default_multi:
-                    cn, _, dd = str(spec).partition(':')
-                    dd = dd or def_dir
-                    norm_cn = _normalize_name(cn, allowed_order_fields)
-                    if norm_cn in allowed_order_fields:
-                        col = model_cls.__table__.c.get(norm_cn)
-                        if col is not None:
-                            stmt = stmt.order_by(col.desc() if (dd=='desc') else col.asc())
-            elif default_by:
-                norm_db = _normalize_name(default_by, allowed_order_fields)
-                if norm_db in allowed_order_fields:
-                    col = model_cls.__table__.c.get(norm_db)
-                    if col is not None:
-                        stmt = stmt.order_by(col.desc() if def_dir=='desc' else col.asc())
-        except Exception:
-            pass
-        return stmt
+        return relation_builders._apply_ordering_sqla(
+            stmt,
+            model_cls,
+            allowed_order_fields,
+            order_by=effective_order_by,
+            order_dir=effective_order_dir,
+            order_multi=effective_order_multi,
+            dir_value_fn=_dir_value,
+            default_dir_for_multi=_dir_value(getattr(btype_cls, '__default_order_dir__', None)) or 'asc',
+            fallback_id=not bool(effective_order_multi or effective_order_by),
+        )
 
     def apply_pagination(self, stmt, *, limit, offset):
         if offset is not None:
