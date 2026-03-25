@@ -4626,12 +4626,6 @@ class BerrySchema:
                                     break
                     except Exception:
                         has_nested_relation_order = False
-                    if mssql_mode and has_nested_relation_order:
-                        try:
-                            rel_push_status[rel_name].update({'pushed': False, 'reason': 'mssql nested relation order fallback'})
-                        except Exception:
-                            pass
-                        continue
                     child_model_cls = target_b.model
                     # Determine FK from child->parent, allow explicit override via relation meta
                     try:

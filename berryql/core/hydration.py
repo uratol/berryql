@@ -372,6 +372,12 @@ class Hydrator:
                     if is_single:
                         if isinstance(parsed_value, dict):
                             built_value = self._hydrate_object(target_b, target_st, parsed_value)
+                            try:
+                                parent_meta = (requested_relations.get(rel_name) or {})
+                                nested_meta_map = (parent_meta.get('nested') or {})
+                                self._hydrate_deeper_nested(built_value, target_b, parsed_value, nested_meta_map)
+                            except Exception:
+                                pass
                         else:
                             built_value = None
                     else:
@@ -456,6 +462,11 @@ class Hydrator:
             if ndef_i.meta.get('single'):
                 if isinstance(parsed_nested_i, dict):
                     ni = self._hydrate_object(n_target_b, n_st, parsed_nested_i)
+                    deeper_meta = (nested_meta_src_map.get(nname_i) or {}).get('nested') if isinstance(nested_meta_src_map, dict) else None
+                    try:
+                        self._hydrate_deeper_nested(ni, n_target_b, parsed_nested_i, deeper_meta or {})
+                    except Exception:
+                        pass
                     setattr(parent_inst, nname_i, ni)
                     setattr(parent_inst, f"_{nname_i}_prefetched", ni)
                 else:

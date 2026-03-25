@@ -230,7 +230,7 @@ class MSSQLAdapter(BaseAdapter):
                 parts.append(f"{alias_ident}.[{pk_col}] ASC")
         return ', '.join(parts) if parts else None
 
-    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, child_pk_name: str, fields: list[str] | list[tuple[str, str]] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None, nested_children: list[dict] | None = None) -> str:
+    def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, child_pk_name: str, fields: list[str] | list[tuple[str, str]] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None, nested_children: list[dict] | None = None, join_clauses: list[str] | None = None) -> str:
         n_cols = list(fields or [])
         if not n_cols:
             for c in grand_model.__table__.columns:
@@ -380,6 +380,7 @@ class MSSQLAdapter(BaseAdapter):
                                         offset=sn.get('offset'),
                                         extra_where_sql=None,
                                         nested_children=sn.get('nested') or None,
+                                        join_clauses=sn.get('order_joins') or None,
                                     )
                                     sub_parts.append(f"ISNULL(({nsql2}), '[]') AS [{s_alias}]")
                             if sub_parts:
@@ -440,9 +441,12 @@ class MSSQLAdapter(BaseAdapter):
                 pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
         elif n_order:
             pag_clause = f" ORDER BY {n_order}"
-        return f"SELECT {n_col_select}{nested_cols} FROM {self.table_ident(grand_model)} WHERE {n_where}{pag_clause} FOR JSON PATH"
+        from_clause = self.table_ident(grand_model)
+        if join_clauses:
+            from_clause += ' ' + ' '.join([str(j) for j in join_clauses if j])
+        return f"SELECT {n_col_select}{nested_cols} FROM {from_clause} WHERE {n_where}{pag_clause} FOR JSON PATH"
 
-    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, type_default_where: dict | str | None = None, limit: int | None = None, offset: int | None = None, order_by: str | None = None, order_dir: str | None = None, order_multi: list[str] | None = None, nested: list[dict] | None = None) -> Any:
+    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, type_default_where: dict | str | None = None, limit: int | None = None, offset: int | None = None, order_by: str | None = None, order_dir: str | None = None, order_multi: list[str] | None = None, nested: list[dict] | None = None, join_clauses: list[str] | None = None) -> Any:
         """Assemble full MSSQL JSON aggregation for a to-many relation with optional nested arrays.
 
         nested: list of dicts, each with keys: alias, model, fk_col_name, fields, where, default_where, order_by, order_dir, order_multi, limit
@@ -565,6 +569,7 @@ class MSSQLAdapter(BaseAdapter):
                                     offset=sn.get('offset'),
                                     extra_where_sql=n_extra or None,
                                     nested_children=sn.get('nested') or None,
+                                    join_clauses=sn.get('order_joins') or None,
                                 )
                                 sub_parts.append(f"ISNULL(({nsql}), '[]') AS [{s_alias}]")
                         if sub_parts:
@@ -619,6 +624,7 @@ class MSSQLAdapter(BaseAdapter):
                     offset=n.get('offset'),
                     extra_where_sql=n_extra2 or None,
                     nested_children=n_children or None,
+                    join_clauses=n.get('order_joins') or None,
                 )
                 nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
             nested_cols = ', ' + ', '.join(nested_parts) if nested_parts else ''
@@ -638,18 +644,21 @@ class MSSQLAdapter(BaseAdapter):
                 pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
         elif order_clause:
             pag_clause = f" ORDER BY {order_clause}"
+        from_clause = self.table_ident(child_model)
+        if join_clauses:
+            from_clause += ' ' + ' '.join([str(j) for j in join_clauses if j])
         raw = (
-            f"ISNULL((SELECT {select_cols}{nested_cols} FROM {self.table_ident(child_model)} WHERE {where_clause}{pag_clause} FOR JSON PATH),'[]')"
+            f"ISNULL((SELECT {select_cols}{nested_cols} FROM {from_clause} WHERE {where_clause}{pag_clause} FOR JSON PATH),'[]')"
         )
         return _text(raw)
 
-    def build_single_relation_json(self, *, child_table: str, projected_columns: list[str], join_condition: str) -> Any:
+    def build_single_relation_json(self, *, child_table: str, projected_columns: list[str], join_condition: str | None, parent_table: Any | None = None, parent_pk_name: str | None = None, parent_fk_name: str | None = None, child_pk_name: str | None = None, nested: list[dict] | None = None) -> Any:
         """Build a FOR JSON PATH sub-select for a single related object.
 
         Parameters:
             child_table: table name of related entity
             projected_columns: list of column names to include
-            join_condition: raw SQL condition joining related row(s) to parent
+            join_condition: raw SQL condition applied inside the correlated sub-select
         Returns a TextClause producing a JSON object string or 'null'.
         """
         cols = projected_columns or ['id']
@@ -658,13 +667,106 @@ class MSSQLAdapter(BaseAdapter):
             col_list = ', '.join([f"{self.table_ident(child_table)}.[{src}] AS [{alias}]" for src, alias in cols])  # type: ignore
         else:
             col_list = ', '.join([f"{self.table_ident(child_table)}.[{c}]" for c in cols])  # type: ignore
-        raw = (
-            f"ISNULL((SELECT TOP 1 {col_list} FROM {self.table_ident(child_table)} WHERE {join_condition} "
-            f"FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
-        )
+        nested_cols = ''
+        if nested:
+            import json as _json
+            def _as_dict(maybe):
+                if isinstance(maybe, dict):
+                    return maybe
+                if isinstance(maybe, str):
+                    try:
+                        v = _json.loads(maybe)
+                        return v if isinstance(v, dict) else None
+                    except Exception:
+                        return None
+                return None
+            nested_parts = []
+            for n in nested:
+                alias = n.get('alias')
+                gm = n.get('model')
+                mode = n.get('mode') or 'list'
+                if gm is None or not alias:
+                    continue
+                if mode == 'single':
+                    child_fk_name = n.get('child_fk_name')
+                    if not child_fk_name:
+                        continue
+                    try:
+                        gm_pk = next(iter(gm.__table__.primary_key.columns)).name
+                    except Exception:
+                        gm_pk = 'id'
+                    where_parts = [f"{self.table_ident(child_table)}.[{child_fk_name}] = {self.table_ident(gm)}.[{gm_pk}]"]
+                    wdict = _as_dict(n.get('where'))
+                    if wdict:
+                        where_parts.extend(self.where_from_dict(gm, wdict))
+                    dwdict = _as_dict(n.get('default_where'))
+                    if dwdict:
+                        where_parts.extend(self.where_from_dict(gm, dwdict))
+                    tdict = _as_dict(n.get('type_default_where'))
+                    if tdict:
+                        where_parts.extend(self.where_from_dict(gm, tdict))
+                    join_cond = ' AND '.join(where_parts)
+                    cols_pairs = n.get('fields') or [(c.name, c.name) for c in gm.__table__.columns]
+                    s_sub = self.build_single_relation_json(
+                        child_table=gm,
+                        projected_columns=cols_pairs,
+                        join_condition=join_cond,
+                        nested=n.get('nested') or None,
+                    )
+                    nested_parts.append(f"ISNULL(({str(s_sub).strip()}), 'null') AS [{alias}]")
+                else:
+                    gfk = n.get('fk_col_name')
+                    if not gfk:
+                        continue
+                    try:
+                        child_pk_for_nested = next(iter(child_table.__table__.primary_key.columns)).name
+                    except Exception:
+                        child_pk_for_nested = 'id'
+                    extra_where = []
+                    tdict2 = _as_dict(n.get('type_default_where'))
+                    if tdict2:
+                        extra_where.extend(self.where_from_dict(gm, tdict2))
+                    nsql = self.build_nested_list_sql(
+                        alias=alias,
+                        grand_model=gm,
+                        child_table=child_table,
+                        g_fk_col_name=gfk,
+                        child_pk_name=child_pk_for_nested,
+                        fields=n.get('fields'),
+                        where_dict=_as_dict(n.get('where')),
+                        default_where=_as_dict(n.get('default_where')),
+                        order_by=n.get('order_by'),
+                        order_dir=n.get('order_dir'),
+                        order_multi=n.get('order_multi'),
+                        limit=n.get('limit'),
+                        offset=n.get('offset'),
+                        extra_where_sql=extra_where or None,
+                        nested_children=n.get('nested') or None,
+                        join_clauses=n.get('order_joins') or None,
+                    )
+                    nested_parts.append(f"ISNULL(({nsql}), '[]') AS [{alias}]")
+            if nested_parts:
+                nested_cols = ', ' + ', '.join(nested_parts)
+        if parent_table is not None and parent_pk_name and parent_fk_name and child_pk_name:
+            parent_table_name = getattr(getattr(parent_table, '__table__', None), 'name', None) or getattr(parent_table, '__tablename__', 'parent')
+            parent_alias_ident = f"[berryql_parent_{parent_table_name}_{parent_fk_name}]"
+            predicates = [f"{parent_alias_ident}.[{parent_pk_name}] = {self.table_ident(parent_table)}.[{parent_pk_name}]"]
+            if join_condition:
+                predicates.append(join_condition)
+            where_sql = ' AND '.join(predicates)
+            raw = (
+                f"ISNULL((SELECT TOP 1 {col_list}{nested_cols} FROM {self.table_ident(parent_table)} AS {parent_alias_ident} "
+                f"JOIN {self.table_ident(child_table)} ON {self.table_ident(child_table)}.[{child_pk_name}] = {parent_alias_ident}.[{parent_fk_name}] "
+                f"WHERE {where_sql} FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
+            )
+        else:
+            raw = (
+                f"ISNULL((SELECT TOP 1 {col_list}{nested_cols} FROM {self.table_ident(child_table)} WHERE {join_condition} "
+                f"FOR JSON PATH, WITHOUT_ARRAY_WRAPPER), 'null')"
+            )
         return _text(raw)
 
-    def build_list_relation_json(self, *, child_table: str, projected_columns: list[str], where_condition: str, limit: int | None, offset: int | None, order_by: str | None, nested_subqueries: list[tuple[str, str]] | None = None) -> Any:
+    def build_list_relation_json(self, *, child_table: str, projected_columns: list[str], where_condition: str, limit: int | None, offset: int | None, order_by: str | None, nested_subqueries: list[tuple[str, str]] | None = None, join_clauses: list[str] | None = None) -> Any:
         """Build a FOR JSON PATH list aggregation for a to-many relation.
 
         nested_subqueries: list of (alias, subquery_sql producing JSON array string), each will be selected
@@ -697,8 +799,11 @@ class MSSQLAdapter(BaseAdapter):
                 pag_clause += f" FETCH NEXT {self._as_int(limit)} ROWS ONLY"
         elif order_by:
             pag_clause = f" ORDER BY {order_by}"
+        from_clause = self.table_ident(child_table)
+        if join_clauses:
+            from_clause += ' ' + ' '.join([str(j) for j in join_clauses if j])
         raw = (
-            f"ISNULL((SELECT {select_cols}{nested_cols} FROM {self.table_ident(child_table)} WHERE {where_condition}{pag_clause} FOR JSON PATH),'[]')"
+            f"ISNULL((SELECT {select_cols}{nested_cols} FROM {from_clause} WHERE {where_condition}{pag_clause} FOR JSON PATH),'[]')"
         )
         return _text(raw)
 

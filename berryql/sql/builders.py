@@ -129,6 +129,35 @@ class RelationSQLBuilders:
             return None
         return self.registry._resolve_order_expression(model_cls, btype, order_name)
 
+    def _resolve_scalar_source_name(self, model_cls, btype_cls, field_name):
+        """Resolve the physical column name for a scalar Berry field."""
+        if model_cls is None or btype_cls is None or not isinstance(field_name, str) or not field_name:
+            return None
+        try:
+            fdefs = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            fdefs = {}
+        try:
+            fdef = fdefs.get(field_name)
+        except Exception:
+            fdef = None
+        if fdef is not None:
+            try:
+                if getattr(fdef, 'kind', None) != 'scalar':
+                    return None
+            except Exception:
+                return None
+            try:
+                return (getattr(fdef, 'meta', {}) or {}).get('column') or field_name
+            except Exception:
+                return field_name
+        try:
+            if field_name in getattr(model_cls, '__table__').columns:  # type: ignore[attr-defined]
+                return field_name
+        except Exception:
+            pass
+        return field_name if hasattr(model_cls, field_name) else None
+
     def _resolve_scalar_expr_for_entity(self, model_entity, model_cls, btype_cls, field_name):
         """Resolve a scalar field against a mapped class or SQLAlchemy alias."""
         if model_cls is None or btype_cls is None or not isinstance(field_name, str) or not field_name:
@@ -212,6 +241,95 @@ class RelationSQLBuilders:
 
         expr = self._resolve_scalar_expr_for_entity(current_entity, current_model, current_btype, parts[-1])
         return sel, expr
+
+    def _resolve_mssql_join_order_expr(
+        self,
+        adapter,
+        model_cls,
+        order_name,
+        *,
+        join_cache: Dict[str, Any] | None = None,
+        join_clauses: List[str] | None = None,
+        base_ident: str | None = None,
+    ):
+        """Resolve dotted single-relation MSSQL order paths using LEFT JOIN clauses."""
+        if getattr(adapter, 'name', '') != 'mssql':
+            return None
+        btype = self._get_btype_for_model(model_cls)
+        if btype is None:
+            return None
+        normalized = self.registry._normalize_order_path(btype, order_name)
+        if not normalized or '.' not in normalized:
+            return None
+        if join_cache is None:
+            join_cache = {}
+        current_model = model_cls
+        current_btype = btype
+        current_ident = base_ident or adapter.table_ident(model_cls)
+        traversed_parts: List[str] = []
+        parts = normalized.split('.')
+
+        for rel_name in parts[:-1]:
+            try:
+                fields = getattr(current_btype, '__berry_fields__', {}) or {}
+            except Exception:
+                return None
+            fdef = fields.get(rel_name)
+            if fdef is None:
+                return None
+            meta = getattr(fdef, 'meta', {}) or {}
+            target_name = meta.get('target')
+            target_btype = self.registry.types.get(target_name) if target_name else None
+            target_model = getattr(target_btype, 'model', None) if target_btype is not None else None
+            if target_model is None:
+                return None
+            parent_fk_name = self.registry._find_parent_fk_column_name(current_model, target_model, rel_name)
+            if not parent_fk_name:
+                return None
+
+            traversed_parts.append(rel_name)
+            path_key = '.'.join(traversed_parts)
+            cached = join_cache.get(path_key)
+            if cached is None:
+                alias_name = f"berryql_ord_{len(join_cache) + 1}_{'_'.join(traversed_parts)}"
+                alias_ident = f"[{alias_name}]"
+                target_ident = adapter.table_ident(target_model)
+                target_pk_name = self._pk_name(target_model)
+                join_sql = (
+                    f"LEFT JOIN {target_ident} AS {alias_ident} "
+                    f"ON {alias_ident}.[{target_pk_name}] = {current_ident}.[{parent_fk_name}]"
+                )
+                cached = {
+                    'ident': alias_ident,
+                    'model': target_model,
+                    'btype': target_btype,
+                }
+                join_cache[path_key] = cached
+                if join_clauses is not None:
+                    join_clauses.append(join_sql)
+
+            current_ident = cached['ident']
+            current_model = cached['model']
+            current_btype = cached['btype']
+
+        source_name = self._resolve_scalar_source_name(current_model, current_btype, parts[-1])
+        if not source_name:
+            return None
+        return f"{current_ident}.[{source_name}]"
+
+    def _mssql_map_order_name(self, adapter, model_cls, name, *, join_cache=None, join_clauses=None, base_ident: str | None = None):
+        """Map an MSSQL order token to either a join-based expression or the legacy fallback."""
+        mapped = None
+        if isinstance(name, str):
+            mapped = self._resolve_mssql_join_order_expr(
+                adapter,
+                model_cls,
+                name,
+                join_cache=join_cache,
+                join_clauses=join_clauses,
+                base_ident=base_ident,
+            )
+        return mapped if mapped is not None else self._mssql_order_term(model_cls, name)
 
     def _mssql_order_term(self, model_cls, order_name):
         """Map an order token to a physical MSSQL column or compiled SQL expression."""
@@ -660,6 +778,124 @@ class RelationSQLBuilders:
                 where_parts.extend(adapter.where_from_dict(model_cls, wdict))
         return where_parts
 
+    def _build_mssql_nested_specs(self, adapter, parent_model_cls, nested_cfg_map: Dict[str, Any] | None, info) -> List[dict]:
+        """Build nested relation specs for MSSQL JSON builders."""
+        specs: List[dict] = []
+        for nname, ncfg in (nested_cfg_map or {}).items():
+            try:
+                n_target = ncfg.get('target')
+                n_b = self.registry.types.get(n_target) if n_target else None
+                n_model = n_b.model if n_b and getattr(n_b, 'model', None) is not None else None
+            except Exception:
+                n_model = None
+                n_b = None
+            if not n_model or n_b is None:
+                continue
+
+            is_single_nested = bool(ncfg.get('single'))
+            g_fk_col_name: str | None = None
+            child_fk_to_nested: str | None = None
+            if is_single_nested:
+                try:
+                    explicit_parent_fk = ncfg.get('fk_column_name')
+                except Exception:
+                    explicit_parent_fk = None
+                try:
+                    child_fk_to_nested = (
+                        explicit_parent_fk
+                        or self.registry._find_parent_fk_column_name(parent_model_cls, n_model, nname)
+                        or f"{nname}_id"
+                    )
+                    if hasattr(parent_model_cls, '__table__') and not any(c.name == child_fk_to_nested for c in parent_model_cls.__table__.columns):
+                        child_fk_to_nested = None
+                except Exception:
+                    child_fk_to_nested = None
+                if not child_fk_to_nested:
+                    continue
+            else:
+                try:
+                    explicit_child_fk = ncfg.get('fk_column_name')
+                except Exception:
+                    explicit_child_fk = None
+                try:
+                    fk_col = self.registry._find_child_fk_column(parent_model_cls, n_model, explicit_child_fk)
+                    g_fk_col_name = getattr(fk_col, 'name', None) if fk_col is not None else None
+                except Exception:
+                    g_fk_col_name = None
+                if not g_fk_col_name:
+                    continue
+
+            try:
+                requested_fields = self._prepare_requested_scalar_fields(
+                    target_btype=n_b,
+                    child_model_cls=n_model,
+                    rel_cfg=ncfg,
+                    include_helper_fk_for_single_nested=True,
+                )
+            except Exception:
+                requested_fields = list(ncfg.get('fields') or [])
+            try:
+                n_fields = self._mssql_map_columns_pairs(n_model, requested_fields) if requested_fields else []
+            except Exception:
+                n_fields = []
+
+            nested_order_joins: list[str] = []
+            nested_join_cache: dict[str, Any] = {}
+            def _map_order_name(model_cls_local, name):
+                return self._mssql_map_order_name(
+                    adapter,
+                    model_cls_local,
+                    name,
+                    join_cache=nested_join_cache,
+                    join_clauses=nested_order_joins,
+                )
+
+            n_effective_dir = self._resolve_graphql_value(info, self._effective_order_dir(ncfg))
+            n_order_by_mapped = _map_order_name(n_model, self._resolve_graphql_value(info, ncfg.get('order_by')))
+            n_order_multi_mapped: list[str] = []
+            try:
+                om_val = self._resolve_graphql_value(info, ncfg.get('order_multi'))
+                for spec in (self.registry._normalize_order_multi_values(om_val or []) or []):
+                    cn, _, dd = str(spec).partition(':')
+                    mapped_cn = _map_order_name(n_model, cn)
+                    n_order_multi_mapped.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
+            except Exception:
+                n_order_multi_mapped = []
+
+            child_specs = self._build_mssql_nested_specs(adapter, n_model, ncfg.get('nested') or {}, info)
+
+            type_default_where = self._resolve_graphql_value(info, ncfg.get('type_default_where'))
+            try:
+                if callable(type_default_where):
+                    type_default_where = type_default_where(n_model, info)
+            except Exception:
+                pass
+
+            spec_obj = {
+                'alias': nname,
+                'model': n_model,
+                'fields': n_fields or None,
+                'where': self._resolve_graphql_value(info, ncfg.get('where')),
+                'default_where': ncfg.get('default_where'),
+                'order_by': n_order_by_mapped,
+                'order_dir': n_effective_dir,
+                'order_multi': n_order_multi_mapped,
+                'order_joins': nested_order_joins or None,
+                'limit': self._resolve_graphql_value(info, ncfg.get('limit')),
+                'offset': self._resolve_graphql_value(info, ncfg.get('offset')),
+                'nested': child_specs or None,
+            }
+            if type_default_where is not None:
+                spec_obj['type_default_where'] = type_default_where
+            if is_single_nested:
+                spec_obj['mode'] = 'single'
+                spec_obj['child_fk_name'] = child_fk_to_nested
+            else:
+                spec_obj['mode'] = 'list'
+                spec_obj['fk_col_name'] = g_fk_col_name
+            specs.append(spec_obj)
+        return specs
+
     def _json_row_args_from_subq(self, subq, columns: List[str] | None) -> List[Any]:
         args: List[Any] = []
         cols = columns or []
@@ -1022,18 +1258,11 @@ class RelationSQLBuilders:
         # Determine parent FK name for correlation (parent has FK to child)
         pfk = parent_fk_col_name or f"{rel_name}_id"
         if mssql_mode:
-            # Compose WHERE join + relation filters, then let adapter emit FOR JSON PATH
+            # Compose child filters, then let adapter emit a join-based FOR JSON PATH query.
             child_table = child_model_cls  # pass model for schema-aware identifier
             parent_table = parent_model_cls
-            # child's PK equals parent's FK
             child_pk_name = self._pk_name(child_model_cls)
-            try:
-                ct_ident = adapter.table_ident(child_table)
-                pt_ident = adapter.table_ident(parent_table)
-            except Exception:
-                ct_ident = f"[{getattr(child_model_cls,'__tablename__','')}]"
-                pt_ident = f"[{getattr(parent_model_cls,'__tablename__','')}]"
-            where_parts: list[str] = [f"{ct_ident}.[{child_pk_name}] = {pt_ident}.[{pfk}]"]
+            where_parts: list[str] = []
             # Apply relation where/default_where fragments
             where_parts = self._mssql_where_from_value(
                 where_parts,
@@ -1077,10 +1306,16 @@ class RelationSQLBuilders:
             # Use adapter helper for a single object
             # On MSSQL, pass (source, alias) pairs so JSON keys remain GraphQL names
             cols_pairs = self._mssql_map_columns_pairs(child_model_cls, cols)
+            nested_specs = self._build_mssql_nested_specs(adapter, child_model_cls, nested_cfg or {}, info) if nested_cfg else None
             return adapter.build_single_relation_json(
                 child_table=child_table,
                 projected_columns=cols_pairs or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
-                join_condition=where_sql,
+                join_condition=where_sql or None,
+                parent_table=parent_table,
+                parent_pk_name=self._pk_name(parent_model_cls),
+                parent_fk_name=pfk,
+                child_pk_name=child_pk_name,
+                nested=nested_specs,
             )
         # Non-MSSQL: correlated select limited to 1, return JSON object or null
         inner_sel = self._build_single_child_select_sqla(
@@ -1754,9 +1989,17 @@ class RelationSQLBuilders:
                         # order_dir default ASC if order_by explicit without dir
                         n_effective_dir_i = self._resolve_graphql_value(info, self._effective_order_dir(ncfg_i))
                         # Map order_by and order_multi to physical names
+                        nested_order_joins_i: list[str] = []
+                        nested_join_cache_i: dict[str, Any] = {}
                         def _map_order_name(model_cls_local, name):
-                            return self._mssql_order_term(model_cls_local, name)
-                        n_order_by_mapped = _map_order_name(n_model_i, self._resolve_graphql_value(info, ncfg_i.get('order_by')))
+                            return self._mssql_map_order_name(
+                                adapter,
+                                model_cls_local,
+                                name,
+                                join_cache=nested_join_cache_i,
+                                join_clauses=nested_order_joins_i,
+                            )
+                        n_order_by_mapped = _map_order_name(model_cls_local=n_model_i, name=self._resolve_graphql_value(info, ncfg_i.get('order_by')))
                         n_order_multi_mapped: list[str] = []
                         try:
                             om_val = self._resolve_graphql_value(info, ncfg_i.get('order_multi'))
@@ -1782,6 +2025,7 @@ class RelationSQLBuilders:
                             'order_by': n_order_by_mapped,
                             'order_dir': n_effective_dir_i,
                             'order_multi': n_order_multi_mapped,
+                            'order_joins': nested_order_joins_i or None,
                             'limit': self._resolve_graphql_value(info, ncfg_i.get('limit')),
                             'offset': self._resolve_graphql_value(info, ncfg_i.get('offset')),
                             'nested': child_specs_i or None,
@@ -1875,8 +2119,16 @@ class RelationSQLBuilders:
                     except Exception:
                         pass
                     # Map order_by/order_multi for this nested level
+                    nested_order_joins2: list[str] = []
+                    nested_join_cache2: dict[str, Any] = {}
                     def _map_order_name2(model_cls_local, name):
-                        return self._mssql_order_term(model_cls_local, name)
+                        return self._mssql_map_order_name(
+                            adapter,
+                            model_cls_local,
+                            name,
+                            join_cache=nested_join_cache2,
+                            join_clauses=nested_order_joins2,
+                        )
                     n_order_by_mapped2 = _map_order_name2(n_model, self._resolve_graphql_value(info, ncfg.get('order_by')))
                     n_order_multi_mapped2: list[str] = []
                     try:
@@ -1898,6 +2150,7 @@ class RelationSQLBuilders:
                         'order_by': n_order_by_mapped2,
                         'order_dir': n_effective_dir,
                         'order_multi': n_order_multi_mapped2,
+                        'order_joins': nested_order_joins2 or None,
                         'limit': self._resolve_graphql_value(info, ncfg.get('limit')),
                         'offset': self._resolve_graphql_value(info, ncfg.get('offset')),
                         'nested': nested_children_specs or None,
@@ -1926,6 +2179,8 @@ class RelationSQLBuilders:
                 top_type_where = _resolve_type_where(rel_cfg.get('type_default_where'), child_model_cls)
                 # Resolve order_by which may be a callable or a SQLAlchemy expression
                 order_by_param = None
+                mssql_order_joins: list[str] = []
+                mssql_join_cache: dict[str, Any] = {}
                 from sqlalchemy.sql.elements import ClauseElement  # type: ignore
                 try:
                     ob_raw = rel_cfg.get('order_by')
@@ -1961,9 +2216,26 @@ class RelationSQLBuilders:
                                 compiled = str(ob_resolved)
                             order_by_param = f"({compiled})"
                         elif isinstance(ob_resolved, str):
-                            order_by_param = self._mssql_order_term(child_model_cls, ob_resolved)
+                            order_by_param = self._mssql_map_order_name(
+                                adapter,
+                                child_model_cls,
+                                ob_resolved,
+                                join_cache=mssql_join_cache,
+                                join_clauses=mssql_order_joins,
+                            )
                     except Exception:
                         order_by_param = None
+                mapped_order_multi = []
+                for spec in (self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or []):
+                    cn, _, dd = str(spec).partition(':')
+                    mapped_cn = self._mssql_map_order_name(
+                        adapter,
+                        child_model_cls,
+                        cn,
+                        join_cache=mssql_join_cache,
+                        join_clauses=mssql_order_joins,
+                    )
+                    mapped_order_multi.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
                 return adapter.build_relation_list_json_full(
                     parent_table=parent_table,
                     parent_pk_name=parent_pk_name,
@@ -1977,11 +2249,8 @@ class RelationSQLBuilders:
                     offset=self._resolve_graphql_value(info, rel_cfg.get('offset')),
                     order_by=order_by_param,
                     order_dir=effective_order_dir,
-                    order_multi=[
-                        f"{self._mssql_order_term(child_model_cls, spec.split(':',1)[0])}:{spec.split(':',1)[1]}"
-                        if ':' in spec else self._mssql_order_term(child_model_cls, spec)
-                        for spec in (self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or [])
-                    ],
+                    order_multi=mapped_order_multi,
+                    join_clauses=mssql_order_joins or None,
                     nested=nested_specs,
                 )
             # No nested relations: use simple JSON list builder with optional filters/order
@@ -2074,6 +2343,8 @@ class RelationSQLBuilders:
             effective_order_dir2 = self._resolve_graphql_value(info, self._effective_order_dir(rel_cfg))
             # Resolve order_by: allow callable/SQLAlchemy expression for MSSQL simple path as well
             order_clause = None
+            mssql_order_joins2: list[str] = []
+            mssql_join_cache2: dict[str, Any] = {}
             try:
                 from sqlalchemy.sql.elements import ClauseElement  # type: ignore
             except Exception:
@@ -2103,42 +2374,50 @@ class RelationSQLBuilders:
                         pass
             except Exception:
                 pass
+            mapped_order_by2 = None
             if ob_resolved2 is not None and isinstance(ob_resolved2, ClauseElement):
-                # Compile the SQLAlchemy expression to MSSQL SQL and combine with order_multi if present
                 try:
                     from sqlalchemy.dialects import mssql as _sa_mssql  # type: ignore
                     compiled2 = str(ob_resolved2.compile(dialect=_sa_mssql.dialect(), compile_kwargs={"literal_binds": True}))
                 except Exception:
                     compiled2 = str(ob_resolved2)
-                expr_part = f"({compiled2}) {'DESC' if (str(effective_order_dir2).lower()=='desc') else 'ASC'}"
-                # Build order_multi parts manually to avoid unintended PK fallback
-                multi_specs = self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or []
-                multi_parts: list[str] = []
-                try:
-                    alias_ident3 = adapter.table_ident(child_model_cls)
-                except Exception:
-                    alias_ident3 = f"[{getattr(child_model_cls,'__tablename__','')}]"
-                try:
-                    cols = getattr(child_model_cls, '__table__').columns  # type: ignore
-                except Exception:
-                    cols = {}
-                for spec in multi_specs:
-                    try:
-                        cn, _, dd = str(spec).partition(':')
-                        if cn and cn in cols:
-                            multi_parts.append(f"{alias_ident3}.[{cn}] {'DESC' if (dd or '').lower()=='desc' else 'ASC'}")
-                    except Exception:
-                        continue
-                order_clause = expr_part if not multi_parts else f"{expr_part}, {', '.join(multi_parts)}"
-            else:
-                # Fall back to adapter's standard column-based order builder
-                order_clause = adapter.build_order_clause(
+                mapped_order_by2 = f"({compiled2})"
+            elif isinstance(ob_resolved2, str):
+                mapped_order_by2 = self._mssql_map_order_name(
+                    adapter,
                     child_model_cls,
-                    child_model_cls,
-                    ob_resolved2 if isinstance(ob_resolved2, str) else self._resolve_graphql_value(info, rel_cfg.get('order_by')),
-                    effective_order_dir2,
-                    self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []),
+                    ob_resolved2,
+                    join_cache=mssql_join_cache2,
+                    join_clauses=mssql_order_joins2,
                 )
+            else:
+                raw_order_name2 = self._resolve_graphql_value(info, rel_cfg.get('order_by'))
+                if isinstance(raw_order_name2, str):
+                    mapped_order_by2 = self._mssql_map_order_name(
+                        adapter,
+                        child_model_cls,
+                        raw_order_name2,
+                        join_cache=mssql_join_cache2,
+                        join_clauses=mssql_order_joins2,
+                    )
+            mapped_order_multi2: list[str] = []
+            for spec in (self.registry._normalize_order_multi_values(self._resolve_graphql_value(info, rel_cfg.get('order_multi')) or []) or []):
+                cn, _, dd = str(spec).partition(':')
+                mapped_cn = self._mssql_map_order_name(
+                    adapter,
+                    child_model_cls,
+                    cn,
+                    join_cache=mssql_join_cache2,
+                    join_clauses=mssql_order_joins2,
+                )
+                mapped_order_multi2.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
+            order_clause = adapter.build_order_clause(
+                child_model_cls,
+                child_model_cls,
+                mapped_order_by2,
+                effective_order_dir2,
+                mapped_order_multi2,
+            )
             return adapter.build_list_relation_json(
                 child_table=child_model_cls,
                 projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
@@ -2146,6 +2425,7 @@ class RelationSQLBuilders:
                 limit=self._resolve_graphql_value(info, rel_cfg.get('limit')),
                 offset=self._resolve_graphql_value(info, rel_cfg.get('offset')),
                 order_by=order_clause,
+                join_clauses=mssql_order_joins2 or None,
                 nested_subqueries=None,
             )
         # Non-MSSQL: correlated aggregation
