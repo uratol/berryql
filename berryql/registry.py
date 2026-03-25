@@ -560,14 +560,15 @@ class BerrySchema:
                 target_b = self.types.get(target_name)
                 if not target_b:
                     continue
-                # If this relation points to an ancestor in the current build stack, include a slim input
-                # that only allows identifying fields (pk and simple direct FKs) instead of full recursion.
-                # IMPORTANT: Apply slimming only for single (to-one) relations to break cycles, but allow
-                # full inputs for list (to-many) relations so nested payloads can include writable FK fields.
+                # If this relation points to an ancestor in the current build stack, we can still
+                # reuse the in-progress canonical input type from the cache. Placeholder caching at
+                # the start of _ensure_input_type already breaks Python recursion, and preserving the
+                # canonical input avoids freezing a slim RefInput into the shared cache when a type is
+                # first discovered through another mutation payload.
                 use_slim = False
                 try:
                     if (target_name in _stack) and is_single:
-                        use_slim = True
+                        use_slim = self._st_types.get(f"{target_name}Input") is None
                 except Exception:
                     use_slim = False
                 # Use a slim "RefInput" when the target type is an ancestor in the build stack

@@ -742,7 +742,19 @@ def build_merge_resolver_for_type(
                         has_substantial = any(v is not None for v in child_data.values())
                     if not has_substantial:
                         continue
-                    child_inst = await _merge_single(child_model, child_btype, child_data)
+                    child_inst = await _merge_single(
+                        child_model,
+                        child_btype,
+                        child_data,
+                        parent_ctx={
+                            'parent_model': model_cls_local,
+                            'parent_inst': None,
+                            'parent_ctx': parent_ctx,
+                            'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
+                            'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else None),
+                        },
+                        rel_name_from_parent=rel_key,
+                    )
                     try:
                         child_pk = schema._get_pk_name(child_model)
                     except Exception:
