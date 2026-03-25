@@ -10,6 +10,7 @@ import strawberry
 from sqlalchemy.sql.sqltypes import Integer, Boolean, DateTime, Float, Numeric
 from sqlalchemy import and_ as _and
 from .filters import OPERATOR_REGISTRY
+from .naming import from_camel
 
 # Try to import UUID types
 try:
@@ -231,7 +232,36 @@ def normalize_relation_cfg(cfg: Dict[str, Any]) -> None:
     for n in list((cfg.get('nested') or {}).values()):
         normalize_relation_cfg(n)
 
-def expr_from_where_dict(model_cls, wdict: Dict[str, Any], *, strict: bool = True):
+
+def _normalize_where_column_name(model_cls, col_name: Any, *, auto_camel_case: bool = False) -> Any:
+    if not isinstance(col_name, str) or not col_name:
+        return col_name
+    try:
+        if model_cls is not None and model_cls.__table__.c.get(col_name) is not None:
+            return col_name
+    except Exception:
+        pass
+    if not auto_camel_case and col_name.lower() == col_name:
+        return col_name
+    try:
+        candidate = from_camel(col_name)
+    except Exception:
+        return col_name
+    try:
+        if model_cls is not None and model_cls.__table__.c.get(candidate) is not None:
+            return candidate
+    except Exception:
+        pass
+    return candidate
+
+
+def _normalize_where_dict_keys(model_cls, wdict: Dict[str, Any], *, auto_camel_case: bool = False) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for col_name, op_map in (wdict or {}).items():
+        out[_normalize_where_column_name(model_cls, col_name, auto_camel_case=auto_camel_case)] = op_map
+    return out
+
+def expr_from_where_dict(model_cls, wdict: Dict[str, Any], *, strict: bool = True, auto_camel_case: bool = False):
     """Build a SQLAlchemy conjunction from simple where dict: {col: {op: val}}.
 
     Args:
@@ -240,7 +270,8 @@ def expr_from_where_dict(model_cls, wdict: Dict[str, Any], *, strict: bool = Tru
         strict: when False, unknown columns/operators are ignored instead of raising.
     """
     exprs: List[Any] = []
-    for col_name, op_map in (wdict or {}).items():
+    normalized_wdict = _normalize_where_dict_keys(model_cls, wdict, auto_camel_case=auto_camel_case)
+    for col_name, op_map in (normalized_wdict or {}).items():
         try:
             col = model_cls.__table__.c.get(col_name)
         except Exception:
@@ -267,7 +298,7 @@ def expr_from_where_dict(model_cls, wdict: Dict[str, Any], *, strict: bool = Tru
         return None
     return _and(*exprs)
 
-def to_where_dict(val: Any, *, strict: bool = True) -> Optional[Dict[str, Any]]:
+def to_where_dict(val: Any, *, strict: bool = True, model_cls=None, auto_camel_case: bool = False) -> Optional[Dict[str, Any]]:
     """Parse a where value into a dict.
 
     - Accepts dict directly.
@@ -278,7 +309,7 @@ def to_where_dict(val: Any, *, strict: bool = True) -> Optional[Dict[str, Any]]:
     if val is None:
         return None
     if isinstance(val, dict):
-        return val
+        return _normalize_where_dict_keys(model_cls, val, auto_camel_case=auto_camel_case)
     if isinstance(val, str):
         s = val.strip()
         try:
@@ -291,7 +322,7 @@ def to_where_dict(val: Any, *, strict: bool = True) -> Optional[Dict[str, Any]]:
             if strict:
                 raise ValueError("where must be a JSON object")
             return None
-        return parsed
+        return _normalize_where_dict_keys(model_cls, parsed, auto_camel_case=auto_camel_case)
     if strict:
         raise ValueError("where must be a JSON object or JSON string")
     return None

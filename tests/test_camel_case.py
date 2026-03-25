@@ -256,3 +256,70 @@ async def test_camel_case_order_by_root_and_relation(db_session, populated_db):
 	assert res_rel.errors is None, res_rel.errors
 	assert res_rel.data is not None and "users" in res_rel.data
 
+
+@pytest.mark.asyncio
+async def test_camel_case_order_by_nested_single_relation_path(db_session, populated_db):
+	from tests.schema import berry_schema
+	try:
+		from strawberry.schema.config import StrawberryConfig
+	except Exception:
+		pytest.skip("StrawberryConfig not available in this Strawberry version")
+	schema = berry_schema.to_strawberry(strawberry_config=StrawberryConfig(auto_camel_case=True))
+
+	query = '''
+	query {
+		users(nameIlike: "Alice") {
+			posts(orderMulti: ["createdAt:desc", "id:asc"]) {
+				id
+				createdAt
+			}
+		}
+	}
+	'''
+	res = await schema.execute(query, context_value={"db_session": db_session})
+	assert res.errors is None, res.errors
+	users = res.data.get("users") or []
+	assert len(users) == 1
+	posts = users[0].get("posts") or []
+	created = [post["createdAt"] for post in posts]
+	assert created == sorted(created, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_camel_case_where_root_and_relation(db_session, populated_db):
+	from tests.schema import berry_schema
+	try:
+		from strawberry.schema.config import StrawberryConfig
+	except Exception:
+		pytest.skip("StrawberryConfig not available in this Strawberry version")
+	schema = berry_schema.to_strawberry(strawberry_config=StrawberryConfig(auto_camel_case=True))
+
+	query_root = '''
+	query {
+		posts(where: "{\\"createdAt\\": {\\"gt\\": \\\"1900-01-01T00:00:00\\\"}}", orderBy: "id") {
+			id
+			createdAt
+		}
+	}
+	'''
+	res_root = await schema.execute(query_root, context_value={"db_session": db_session})
+	assert res_root.errors is None, res_root.errors
+	assert len(res_root.data.get("posts") or []) >= 1
+
+	query_rel = '''
+	query {
+		users(where: "{\\"isAdmin\\": {\\"eq\\": true}}", orderBy: "id") {
+			id
+			posts(where: "{\\"createdAt\\": {\\"gt\\": \\\"1900-01-01T00:00:00\\\"}}", orderBy: "id") {
+				id
+				createdAt
+			}
+		}
+	}
+	'''
+	res_rel = await schema.execute(query_rel, context_value={"db_session": db_session})
+	assert res_rel.errors is None, res_rel.errors
+	users = res_rel.data.get("users") or []
+	assert len(users) == 1
+	assert users[0]["id"] is not None
+

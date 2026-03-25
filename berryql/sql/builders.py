@@ -104,9 +104,15 @@ class RelationSQLBuilders:
         btype = self._get_btype_for_model(model_cls)
         fdefs = fields_map_for(btype) if btype is not None else {}
         for name in cols:
+            normalized_name = name
+            if btype is not None:
+                try:
+                    normalized_name = self.registry._normalize_order_segment(btype, name)
+                except Exception:
+                    normalized_name = name
             src = None
             try:
-                fd = fdefs.get(name)
+                fd = fdefs.get(normalized_name)
                 if fd and getattr(fd, 'kind', None) == 'scalar':
                     src = (getattr(fd, 'meta', {}) or {}).get('column')
             except Exception:
@@ -114,10 +120,10 @@ class RelationSQLBuilders:
             if not src:
                 # ensure the column exists on the table
                 try:
-                    if name in model_cls.__table__.columns:
-                        src = name
+                    if normalized_name in model_cls.__table__.columns:
+                        src = normalized_name
                 except Exception:
-                    src = name if hasattr(model_cls, name) else None
+                    src = normalized_name if hasattr(model_cls, normalized_name) else None
             if src:
                 out.append((src, name))
         return out
@@ -133,6 +139,10 @@ class RelationSQLBuilders:
         """Resolve the physical column name for a scalar Berry field."""
         if model_cls is None or btype_cls is None or not isinstance(field_name, str) or not field_name:
             return None
+        try:
+            field_name = self.registry._normalize_order_segment(btype_cls, field_name)
+        except Exception:
+            pass
         try:
             fdefs = getattr(btype_cls, '__berry_fields__', {}) or {}
         except Exception:
