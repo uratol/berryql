@@ -77,13 +77,14 @@ class RelationSelectionExtractor:
         )
 
     def _init_rel_cfg(self, fdef: Any) -> Dict[str, Any]:
-        single = bool(fdef.meta.get('single') or (fdef.meta.get('mode') == 'single'))
-        target = fdef.meta.get('target')
-        fk_col_name = fdef.meta.get('fk_column_name')
+        meta = fdef.meta
+        single = bool(meta.get('single') or (meta.get('mode') == 'single'))
+        target = meta.get('target')
+        fk_col_name = meta.get('fk_column_name')
         # Default ordering values come from relation field meta; query args will override later in extract
-        def_ob = fdef.meta.get('order_by') if fdef.meta.get('order_by') is not None else None
-        def_od = fdef.meta.get('order_dir') if fdef.meta.get('order_dir') is not None else None
-        def_om = fdef.meta.get('order_multi') if fdef.meta.get('order_multi') is not None else []
+        def_ob = meta.get('order_by')
+        def_od = meta.get('order_dir')
+        def_om = meta.get('order_multi') or []
         # Type-level scope (on target BerryType) is combined with relation-level scope
         type_default_where = None
         try:
@@ -115,11 +116,11 @@ class RelationSelectionExtractor:
             'fields': [], 'limit': None, 'offset': None,
             'order_by': def_ob, 'order_dir': def_od, 'order_multi': list(def_om) if isinstance(def_om, (list, tuple)) else ([def_om] if def_om else []),
             'where': None,
-            'default_where': fdef.meta.get('scope') if fdef.meta.get('scope') is not None else None,
+            'default_where': meta.get('scope'),
             'type_default_where': type_default_where,
             'single': single, 'target': target, 'nested': {}, 'skip_pushdown': False,
             'fk_column_name': fk_col_name,
-            'filter_args': {}, 'arg_specs': fdef.meta.get('arguments') if fdef.meta.get('arguments') is not None else None,
+            'filter_args': {}, 'arg_specs': meta.get('arguments'),
             # Flags to distinguish explicit args from defaults (used for precedence rules)
             '_has_explicit_order_by': False,
             '_has_explicit_order_dir': False,

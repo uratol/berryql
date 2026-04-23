@@ -1068,13 +1068,10 @@ class BerrySchema:
             fields = {}
         for name, fdef in fields.items():
             kind = getattr(fdef, 'kind', None)
-            meta = getattr(fdef, 'meta', {}) or {}
+            meta = getattr(fdef, 'meta', None) or {}
             if kind == 'scalar':
-                try:
-                    if meta.get('write_only'):
-                        continue
-                except Exception:
-                    pass
+                if meta.get('write_only'):
+                    continue
                 out.append(name)
                 continue
             if kind != 'relation' or not (meta.get('single') or meta.get('mode') == 'single'):
