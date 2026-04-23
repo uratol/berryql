@@ -211,6 +211,11 @@ class BerrySchema:
         # Names of domains explicitly attached to Query via DomainDescriptor
         # This ensures we expose only intended domains on Query (and not mutation-only domains)
         self._domains_exposed_on_query = set()
+        # --- Internal memoization caches (pure functions of their inputs) ---
+        # Keyed by id(model_cls) or id(btype_cls); safe because Berry types and
+        # SQLAlchemy models are declared once at import time and never re-created.
+        self._col_type_map_cache: Dict[int, Dict[str, Any]] = {}
+        self._order_segment_cache: Dict[tuple, str] = {}
 
     # No external registration of callbacks; only type decorators are supported.
 
@@ -916,14 +921,21 @@ class BerrySchema:
 
     def _build_column_type_map(self, model_cls: Any) -> Dict[str, Any]:
         """Return a mapping of column name -> Python type for the given ORM model."""
+        if model_cls is None:
+            return {}
+        cache_key = id(model_cls)
+        cached = self._col_type_map_cache.get(cache_key)
+        if cached is not None:
+            return cached
         out: Dict[str, Any] = {}
         try:
-            if model_cls is not None and hasattr(model_cls, '__table__'):
+            if hasattr(model_cls, '__table__'):
                 for col in model_cls.__table__.columns:
                     # Pass the Column itself so _sa_python_type can inspect Column.info for enum hints
                     out[col.name] = self._sa_python_type(col)
         except Exception:
             pass
+        self._col_type_map_cache[cache_key] = out
         return out
 
     def _expand_filter_args(self, arg_spec: Optional[Dict[str, Any]]) -> Dict[str, 'FilterSpec']:
@@ -960,24 +972,33 @@ class BerrySchema:
         """Normalize an order path segment, honoring auto-camel-case when enabled."""
         if not isinstance(segment, str) or not segment:
             return segment
+        cache_key = (id(btype_cls), segment)
+        cached = self._order_segment_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             fields = getattr(btype_cls, '__berry_fields__', {}) or {}
         except Exception:
             fields = {}
         if segment in fields:
+            self._order_segment_cache[cache_key] = segment
             return segment
         try:
             ac = bool(getattr(self, '_auto_camel_case', False))
         except Exception:
             ac = False
         if not ac:
+            self._order_segment_cache[cache_key] = segment
             return segment
         try:
             from inflection import underscore as _underscore
             candidate = segment if '_' in segment else _underscore(segment)
         except Exception:
+            self._order_segment_cache[cache_key] = segment
             return segment
-        return candidate if candidate in fields else segment
+        result = candidate if candidate in fields else segment
+        self._order_segment_cache[cache_key] = result
+        return result
 
     def _normalize_order_path(self, btype_cls: Any, order_name: str, *, max_depth: int = 5) -> Optional[str]:
         """Normalize a dotted order path and verify that it only traverses single relations."""

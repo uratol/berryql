@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Any, Callable, Dict, Iterable, Optional, Set, List, Union
 
 NameConverter = Optional[Callable[[str], str]]
@@ -17,21 +18,35 @@ __all__ = [
 
 _camel_to_snake_pattern = re.compile(r'(?<!^)(?=[A-Z])')
 
+
+@lru_cache(maxsize=4096)
+def _from_camel_cached(name: str) -> str:
+    return _camel_to_snake_pattern.sub('_', name).lower()
+
+
+@lru_cache(maxsize=4096)
+def _to_camel_cached(name: str) -> str:
+    parts = name.split('_')
+    if not parts:
+        return name
+    return parts[0] + ''.join(p.capitalize() for p in parts[1:])
+
+
 def from_camel(name: str) -> str:
     """Convert lower/upper camelCase to snake_case."""
     if not name:
         return name
-    return _camel_to_snake_pattern.sub('_', str(name)).lower()
+    # Cache only hashable strings; coerce non-str to str once.
+    s = name if isinstance(name, str) else str(name)
+    return _from_camel_cached(s)
 
 
 def to_camel(name: str) -> str:
     """Convert snake_case to lowerCamelCase."""
     if not name:
         return name
-    parts = str(name).split('_')
-    if not parts:
-        return name
-    return parts[0] + ''.join(p.capitalize() for p in parts[1:])
+    s = name if isinstance(name, str) else str(name)
+    return _to_camel_cached(s)
 
 
 def map_graphql_to_python(
