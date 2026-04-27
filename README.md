@@ -263,6 +263,18 @@ Ordering and pagination
 
 Invalid order_by values raise a GraphQL error with the allowed fields.
 
+Applications can opt into server-side list bounds when creating the schema:
+
+```python
+from berryql import BerrySchema, PaginationConfig
+
+berry_schema = BerrySchema(
+    pagination=PaginationConfig(default_limit=100, max_limit=200),
+)
+```
+
+When configured, generated list resolvers apply `default_limit` if the caller omits `limit`, cap oversized explicit limits to `max_limit`, and continue to honor `offset` for next-page reads. Leaving pagination unconfigured preserves BerryQL's historical unbounded behavior.
+
 
 JSON where
 ----------

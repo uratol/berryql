@@ -6,7 +6,7 @@ BerryQL utilities (e.g., enum helpers).
 
 Exposes:
 - get_active_schema, set_active_schema (without importing registry eagerly)
-- Lazy attributes: BerrySchema, BerryType, BerryDomain, StrawberryConfig
+- Lazy attributes: BerrySchema, BerryType, BerryDomain, PaginationConfig, StrawberryConfig
 - Lazy functions: field, relation, aggregate, count, custom, custom_object, domain, mutation
 - enum_column (resolved lazily from .sql.enum_helpers)
 """
@@ -36,7 +36,7 @@ def __getattr__(name: str):  # PEP 562 lazy exports
         return _importlib.import_module(__name__ + '.registry')
     if name == 'mutations':
         return _importlib.import_module(__name__ + '.mutations')
-    if name in {'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig'}:
+    if name in {'BerrySchema', 'BerryType', 'BerryDomain', 'PaginationConfig', 'StrawberryConfig'}:
         _registry = _importlib.import_module(__name__ + '.registry')
         return getattr(_registry, name)
     if name in {'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks', 'scope'}:
@@ -53,7 +53,7 @@ def __getattr__(name: str):  # PEP 562 lazy exports
 
 
 __all__ = [
-    'BerrySchema', 'BerryType', 'BerryDomain', 'StrawberryConfig',
+    'BerrySchema', 'BerryType', 'BerryDomain', 'PaginationConfig', 'StrawberryConfig',
     'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks', 'scope',
     'enum_column',
     'get_active_schema', 'set_active_schema', 'registry', 'mutations',

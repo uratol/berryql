@@ -130,7 +130,7 @@ class HooksDescriptor:
         except Exception:
             pass
 
-__all__ = ['BerrySchema', 'BerryType', 'BerryDomain']
+__all__ = ['BerrySchema', 'BerryType', 'BerryDomain', 'PaginationConfig']
 
 UNSET = getattr(strawberry, 'UNSET')
 
@@ -193,12 +193,49 @@ class BerryDomain:
         """
         pass
 
+class PaginationConfig:
+    """Pagination bounds for generated BerryQL list resolvers.
+
+    By default BerryQL preserves its historical behavior and does not add a
+    limit when the caller omits one. Applications can opt in by passing a
+    ``PaginationConfig`` to ``BerrySchema``.
+    """
+    def __init__(self, default_limit: Optional[int] = None, max_limit: Optional[int] = None):
+        self.default_limit = self._coerce_optional_non_negative_int(default_limit, "default_limit")
+        self.max_limit = self._coerce_optional_non_negative_int(max_limit, "max_limit")
+
+    def normalize(self, limit: Any, offset: Any) -> tuple[Optional[int], Optional[int]]:
+        normalized_limit = self.default_limit if limit is None else self._coerce_optional_non_negative_int(limit, "limit")
+        normalized_offset = None if offset is None else self._coerce_optional_non_negative_int(offset, "offset")
+
+        if normalized_limit is not None and self.max_limit is not None:
+            normalized_limit = min(normalized_limit, self.max_limit)
+
+        return normalized_limit, normalized_offset
+
+    @staticmethod
+    def _coerce_optional_non_negative_int(value: Any, name: str) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            normalized = int(value)
+        except Exception as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if normalized < 0:
+            raise ValueError(f"{name} must be non-negative")
+        return normalized
+
 class BerrySchema:
     """Registry + dynamic Strawberry schema builder.
     """
-    def __init__(self):
+    def __init__(self, *, pagination: Optional[PaginationConfig] = None, default_limit: Optional[int] = None, max_limit: Optional[int] = None):
         self.types: Dict[str, Type[BerryType]] = {}
         self._st_types: Dict[str, Any] = {}
+        self.pagination = self._coerce_pagination_config(
+            pagination,
+            default_limit=default_limit,
+            max_limit=max_limit,
+        )
         # Optional: user-defined root Query fields (via @berry_schema.query)
         self._root_query_fields = None
         # Keep reference to user-declared Query class to copy @strawberry.field methods
@@ -216,6 +253,29 @@ class BerrySchema:
         # SQLAlchemy models are declared once at import time and never re-created.
         self._col_type_map_cache: Dict[int, Dict[str, Any]] = {}
         self._order_segment_cache: Dict[tuple, str] = {}
+
+    @staticmethod
+    def _coerce_pagination_config(
+        pagination: Optional[PaginationConfig],
+        *,
+        default_limit: Optional[int],
+        max_limit: Optional[int],
+    ) -> PaginationConfig:
+        if pagination is not None and (default_limit is not None or max_limit is not None):
+            raise ValueError("Pass either pagination or default_limit/max_limit, not both")
+        if pagination is None:
+            return PaginationConfig(default_limit=default_limit, max_limit=max_limit)
+        if isinstance(pagination, PaginationConfig):
+            return pagination
+        if isinstance(pagination, dict):
+            return PaginationConfig(
+                default_limit=pagination.get('default_limit'),
+                max_limit=pagination.get('max_limit'),
+            )
+        raise TypeError("pagination must be a PaginationConfig or dict")
+
+    def normalize_pagination(self, limit: Any, offset: Any) -> tuple[Optional[int], Optional[int]]:
+        return self.pagination.normalize(limit, offset)
 
     # No external registration of callbacks; only type decorators are supported.
 
@@ -2250,23 +2310,7 @@ class BerrySchema:
                         raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                 if expr is not None:
                     stmt = stmt.where(expr)
-        if offset is not None:
-            try:
-                o = int(offset)
-            except Exception:
-                raise ValueError("offset must be an integer")
-            if o < 0:
-                raise ValueError("offset must be non-negative")
-            if o:
-                stmt = stmt.offset(o)
-        if limit is not None:
-            try:
-                l = int(limit)
-            except Exception:
-                raise ValueError("limit must be an integer")
-            if l < 0:
-                raise ValueError("limit must be non-negative")
-            stmt = stmt.limit(l)
+        stmt = RootSQLBuilders(self).apply_pagination(stmt, limit=limit, offset=offset)
         async with lock:
             result = await session.execute(stmt)
         rows = []
@@ -3889,23 +3933,7 @@ class BerrySchema:
                                             raise ValueError(f"Filter operation failed for {arg_name}: {e}")
                                     if expr is not None:
                                         stmt = stmt.where(expr)
-                            if offset is not None:
-                                try:
-                                    o = int(offset)
-                                except Exception:
-                                    raise ValueError("offset must be an integer")
-                                if o < 0:
-                                    raise ValueError("offset must be non-negative")
-                                if o:
-                                    stmt = stmt.offset(o)
-                            if limit is not None:
-                                try:
-                                    l = int(limit)
-                                except Exception:
-                                    raise ValueError("limit must be an integer")
-                                if l < 0:
-                                    raise ValueError("limit must be non-negative")
-                                stmt = stmt.limit(l)
+                            stmt = RootSQLBuilders(schema_instance).apply_pagination(stmt, limit=limit, offset=offset)
                             async with lock:
                                 result = await session.execute(stmt)
                             rows = []

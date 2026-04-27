@@ -573,8 +573,7 @@ class RelationSQLBuilders:
         )
 
         # pagination
-        l_val = self._resolve_graphql_value(info, rel_cfg.get('limit'))
-        o_val = self._resolve_graphql_value(info, rel_cfg.get('offset'))
+        l_val, o_val = self._resolve_pagination_values(info, rel_cfg)
         sel = self._apply_pagination_sqla(sel, l_val, o_val)
         return sel
     def _expand_arg_specs(self, arg_specs: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -881,6 +880,7 @@ class RelationSQLBuilders:
             except Exception:
                 pass
 
+            n_limit, n_offset = self._resolve_pagination_values(info, ncfg)
             spec_obj = {
                 'alias': nname,
                 'model': n_model,
@@ -891,8 +891,8 @@ class RelationSQLBuilders:
                 'order_dir': n_effective_dir,
                 'order_multi': n_order_multi_mapped,
                 'order_joins': nested_order_joins or None,
-                'limit': self._resolve_graphql_value(info, ncfg.get('limit')),
-                'offset': self._resolve_graphql_value(info, ncfg.get('offset')),
+                'limit': n_limit,
+                'offset': n_offset,
                 'nested': child_specs or None,
             }
             if type_default_where is not None:
@@ -1194,8 +1194,14 @@ class RelationSQLBuilders:
             pass
         return cfg.get('order_dir')
 
-    @staticmethod
-    def _apply_pagination_sqla(sel, limit, offset):
+    def _resolve_pagination_values(self, info, cfg: dict | None):
+        cfg = cfg or {}
+        limit = self._resolve_graphql_value(info, cfg.get('limit'))
+        offset = self._resolve_graphql_value(info, cfg.get('offset'))
+        return self.registry.normalize_pagination(limit, offset)
+
+    def _apply_pagination_sqla(self, sel, limit, offset):
+        limit, offset = self.registry.normalize_pagination(limit, offset)
         try:
             if offset is not None:
                 o = offset
@@ -1583,11 +1589,10 @@ class RelationSQLBuilders:
                                 pass
                         # Pagination for nested
                         try:
-                            if ncfg.get('offset') is not None:
-                                o_val = self._resolve_graphql_value(info, ncfg.get('offset'))
+                            l_val, o_val = self._resolve_pagination_values(info, ncfg)
+                            if o_val is not None:
                                 n_sel = n_sel.offset(int(o_val) if isinstance(o_val, (int, str)) else o_val)
-                            if ncfg.get('limit') is not None:
-                                l_val = self._resolve_graphql_value(info, ncfg.get('limit'))
+                            if l_val is not None:
                                 n_sel = n_sel.limit(int(l_val) if isinstance(l_val, (int, str)) else l_val)
                         except Exception:
                             pass
@@ -1849,11 +1854,10 @@ class RelationSQLBuilders:
                     pass
             # Pagination for child
             try:
-                if rel_cfg.get('offset') is not None:
-                    o_val = self._resolve_graphql_value(info, rel_cfg.get('offset'))
+                l_val, o_val = self._resolve_pagination_values(info, rel_cfg)
+                if o_val is not None:
                     inner_sel_i = inner_sel_i.offset(int(o_val) if isinstance(o_val, (int, str)) else o_val)
-                if rel_cfg.get('limit') is not None:
-                    l_val = self._resolve_graphql_value(info, rel_cfg.get('limit'))
+                if l_val is not None:
                     inner_sel_i = inner_sel_i.limit(int(l_val) if isinstance(l_val, (int, str)) else l_val)
             except Exception:
                 pass
@@ -2026,6 +2030,7 @@ class RelationSQLBuilders:
                                 child_specs_i = _mk_nested_specs(n_model_i, n_target_i, ncfg_i.get('nested') or {})
                         except Exception:
                             child_specs_i = []
+                        n_limit_i, n_offset_i = self._resolve_pagination_values(info, ncfg_i)
                         spec_obj = {
                             'alias': nname_i,
                             'model': n_model_i,
@@ -2036,8 +2041,8 @@ class RelationSQLBuilders:
                             'order_dir': n_effective_dir_i,
                             'order_multi': n_order_multi_mapped,
                             'order_joins': nested_order_joins_i or None,
-                            'limit': self._resolve_graphql_value(info, ncfg_i.get('limit')),
-                            'offset': self._resolve_graphql_value(info, ncfg_i.get('offset')),
+                            'limit': n_limit_i,
+                            'offset': n_offset_i,
                             'nested': child_specs_i or None,
                         }
                         # Preserve resolved type-level default scope for deeper application where supported
@@ -2151,6 +2156,7 @@ class RelationSQLBuilders:
                         n_order_multi_mapped2 = []
                     # Build deeper nested children under this nested node
                     nested_children_specs = _mk_nested_specs(n_model, n_target, ncfg.get('nested') or {}) if (ncfg.get('nested') or {}) else []
+                    n_limit2, n_offset2 = self._resolve_pagination_values(info, ncfg)
                     spec_obj2 = {
                         'alias': nname,
                         'model': n_model,
@@ -2161,8 +2167,8 @@ class RelationSQLBuilders:
                         'order_dir': n_effective_dir,
                         'order_multi': n_order_multi_mapped2,
                         'order_joins': nested_order_joins2 or None,
-                        'limit': self._resolve_graphql_value(info, ncfg.get('limit')),
-                        'offset': self._resolve_graphql_value(info, ncfg.get('offset')),
+                        'limit': n_limit2,
+                        'offset': n_offset2,
                         'nested': nested_children_specs or None,
                     }
                     if 'type_default_where' in ncfg:
@@ -2246,6 +2252,7 @@ class RelationSQLBuilders:
                         join_clauses=mssql_order_joins,
                     )
                     mapped_order_multi.append(f"{mapped_cn}:{dd}" if dd else mapped_cn)
+                rel_limit, rel_offset = self._resolve_pagination_values(info, rel_cfg)
                 return adapter.build_relation_list_json_full(
                     parent_table=parent_table,
                     parent_pk_name=parent_pk_name,
@@ -2255,8 +2262,8 @@ class RelationSQLBuilders:
                     rel_where=self._resolve_graphql_value(info, rel_cfg.get('where')),
                     rel_default_where=rel_cfg.get('default_where'),
                     type_default_where=top_type_where,
-                    limit=self._resolve_graphql_value(info, rel_cfg.get('limit')),
-                    offset=self._resolve_graphql_value(info, rel_cfg.get('offset')),
+                    limit=rel_limit,
+                    offset=rel_offset,
                     order_by=order_by_param,
                     order_dir=effective_order_dir,
                     order_multi=mapped_order_multi,
@@ -2428,12 +2435,13 @@ class RelationSQLBuilders:
                 effective_order_dir2,
                 mapped_order_multi2,
             )
+            rel_limit2, rel_offset2 = self._resolve_pagination_values(info, rel_cfg)
             return adapter.build_list_relation_json(
                 child_table=child_model_cls,
                 projected_columns=self._mssql_map_columns_pairs(child_model_cls, requested_scalar_local) or [(self._pk_name(child_model_cls), self._pk_name(child_model_cls))],
                 where_condition=where_clause,
-                limit=self._resolve_graphql_value(info, rel_cfg.get('limit')),
-                offset=self._resolve_graphql_value(info, rel_cfg.get('offset')),
+                limit=rel_limit2,
+                offset=rel_offset2,
                 order_by=order_clause,
                 join_clauses=mssql_order_joins2 or None,
                 nested_subqueries=None,
@@ -2912,6 +2920,7 @@ class RootSQLBuilders:
         )
 
     def apply_pagination(self, stmt, *, limit, offset):
+        limit, offset = self.registry.normalize_pagination(limit, offset)
         if offset is not None:
             try:
                 o = int(offset)
