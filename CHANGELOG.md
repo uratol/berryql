@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.4] - 2026-05-27
+### Fixed
+- Allow `orderBy` to target regular Strawberry fields when they mirror a real model column name, including fields that are not declared as Berry scalars via `field()`.
+
+## [0.3.3] - 2026-04-27
+### Added
+- Added default pagination configuration support to `BerrySchema`.
+
+## [0.3.2] - 2026-04-23
+### Changed
+- Added memoization for column type mapping and order-segment normalization to reduce repeated schema work.
+- Simplified relation meta retrieval in ordering and selection paths for better readability and maintainability.
+
+## [0.3.1] - 2026-03-25
+### Added
+- Merge resolver child instances now receive parent context and relation name metadata.
+
+## [0.3.0] - 2026-03-25
+### Changed
+- Refactored ordering logic in `BerrySchema` and `RootSQLBuilders` for clearer order resolution and maintenance.
+
+## [0.2.9] - 2026-03-25
+### Added
+- Added normalization for where-clause SQL expression handling, including camelCase coverage in tests.
+
+## [0.2.8] - 2026-03-25
+### Added
+- Enhanced relation SQL ordering support.
+- Improved MSSQL adapter join handling for nested relations and order expressions.
+
+## [0.2.7] - 2026-03-19
+### Added
+- Added JSON pushdown support for nested single relations.
+- Enhanced `RelationSQLBuilders` SQL expression handling and added context-aware tests for custom scalar fields.
+
+## [0.2.6] - 2026-03-19
+### Added
+- Merge resolver now coerces ISO date and datetime strings to native Python objects, including nested comment merge paths.
+
+## [0.2.5] - 2026-03-18
+### Added
+- Added fragment resolution in AST processing, with tests covering fragment-based projections.
+
 ## [0.2.3] - 2026-02-02
 ### Added
 - Allow `custom` and `custom_object` builders to receive Strawberry `Info` (context) when declared with `(model_cls, info)` signature.
@@ -17,11 +60,12 @@ All notable changes to this project will be documented here.
 
 ## [0.2.0] - 2025-12-24
 ### Added
-- Implemented `on_delete` strategy for foreign key handling in merge resolver.
+- Added nullable reviewer foreign-key coverage and cascade delete tests.
 
 ## [0.1.9] - 2025-12-21
 ### Added
 - Added 'not_like', 'not_ilike', 'not_in', 'not_between' operators for query field arguments definition
+- Implemented `on_delete` strategy for foreign key handling in merge resolver.
 
 ## [0.1.8] - 2025-12-20
 ### Fixed
