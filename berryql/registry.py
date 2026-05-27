@@ -1060,6 +1060,67 @@ class BerrySchema:
         self._order_segment_cache[cache_key] = result
         return result
 
+    def _resolve_direct_order_column(self, model_cls: Any, btype_cls: Any, name: str):
+        """Resolve a direct model column for order_by even when it is not a Berry scalar.
+
+        This covers the case where a type intentionally replaces a Berry scalar with a
+        regular Strawberry field that still mirrors a real model column name.
+        """
+        if model_cls is None or btype_cls is None or not isinstance(name, str) or not name:
+            return None
+        try:
+            fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            fields = {}
+        if name in fields:
+            return None
+        try:
+            if not hasattr(btype_cls, name):
+                return None
+        except Exception:
+            return None
+        try:
+            col = model_cls.__table__.c.get(name)
+        except Exception:
+            col = None
+        if col is None:
+            col = getattr(model_cls, name, None)
+        return col
+
+    def _get_direct_allowed_order_fields(self, btype_cls: Any) -> List[str]:
+        """Return direct orderable names, including Strawberry-only field mirrors.
+
+        Berry scalar fields remain the primary source of truth. In addition, direct
+        Strawberry fields that share a model column name are also allowed so order
+        validation matches the SQL expression resolution path.
+        """
+        if btype_cls is None:
+            return []
+        out: List[str] = []
+        try:
+            fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+        except Exception:
+            fields = {}
+        for name, fdef in fields.items():
+            kind = getattr(fdef, 'kind', None)
+            meta = getattr(fdef, 'meta', None) or {}
+            if kind != 'scalar' or meta.get('write_only'):
+                continue
+            out.append(name)
+        model_cls = getattr(btype_cls, 'model', None)
+        if model_cls is None:
+            return out
+        try:
+            column_names = list(model_cls.__table__.c.keys())
+        except Exception:
+            column_names = []
+        for column_name in column_names:
+            if not isinstance(column_name, str) or column_name.startswith('_') or column_name in out:
+                continue
+            if self._resolve_direct_order_column(model_cls, btype_cls, column_name) is not None:
+                out.append(column_name)
+        return out
+
     def _normalize_order_path(self, btype_cls: Any, order_name: str, *, max_depth: int = 5) -> Optional[str]:
         """Normalize a dotted order path and verify that it only traverses single relations."""
         if not isinstance(order_name, str) or not order_name:
@@ -1079,6 +1140,13 @@ class BerrySchema:
             norm_part = self._normalize_order_segment(current_btype, part)
             fdef = fields.get(norm_part)
             if fdef is None:
+                # Allow the terminal path segment to refer to a direct Strawberry field
+                # when it still mirrors a concrete model column name.
+                if index == len(parts) - 1:
+                    model_cls = getattr(current_btype, 'model', None)
+                    if self._resolve_direct_order_column(model_cls, current_btype, norm_part) is not None:
+                        normalized_parts.append(norm_part)
+                        break
                 return None
             kind = getattr(fdef, 'kind', None)
             meta = getattr(fdef, 'meta', {}) or {}
@@ -1121,7 +1189,7 @@ class BerrySchema:
             return []
         _seen = set(_seen)
         _seen.add(marker)
-        out: List[str] = []
+        out: List[str] = list(self._get_direct_allowed_order_fields(btype_cls))
         try:
             fields = getattr(btype_cls, '__berry_fields__', {}) or {}
         except Exception:
@@ -1130,9 +1198,6 @@ class BerrySchema:
             kind = getattr(fdef, 'kind', None)
             meta = getattr(fdef, 'meta', None) or {}
             if kind == 'scalar':
-                if meta.get('write_only'):
-                    continue
-                out.append(name)
                 continue
             if kind != 'relation' or not (meta.get('single') or meta.get('mode') == 'single'):
                 continue
@@ -1163,6 +1228,8 @@ class BerrySchema:
         current = parts[0]
         fdef = fields.get(current)
         if fdef is None:
+            if len(parts) == 1:
+                return self._resolve_direct_order_column(model_cls, btype_cls, current)
             return None
         kind = getattr(fdef, 'kind', None)
         meta = getattr(fdef, 'meta', {}) or {}
