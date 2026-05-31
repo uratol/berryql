@@ -4475,7 +4475,7 @@ class BerrySchema:
                 else:
                     filter_arg_types[arg_name] = Optional[base_type]
 
-            async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], _passed_filter_args: Dict[str, Any], raw_where: Optional[Any] = None):
+            async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], _passed_filter_args: Dict[str, Any], raw_where: Optional[Any] = None, scope_where: Optional[Any] = None):
                 out = []
                 session = _get_db(info)
                 if session is None:
@@ -4821,6 +4821,7 @@ class BerrySchema:
                         btype_cls=btype_cls,
                         info=info,
                         raw_where=raw_where,
+                        scope_where=scope_where,
                         declared_filters=declared_filters,
                         passed_filter_args=_passed_filter_args,
                     )
@@ -4896,17 +4897,21 @@ class BerrySchema:
                   f"    _fa = {{}}\n"
             for a in declared_filters.keys():
                 src += f"    _fa['{a}'] = {a} if '{a}' in locals() else None\n"
-            # Apply defaults for declared roots if provided
-            src += "    _rw = where if where is not None else (_defaults.get('where') if _defaults is not None else None)\n"
+            # The caller-supplied `where` argument is a user filter; the relation/domain
+            # `scope` (stored in _defaults['where']) is a security/visibility guard. These
+            # must be applied TOGETHER (ANDed), never one instead of the other. Passing a
+            # `where` argument must not bypass the scope guard.
+            src += "    _rw = where\n"
+            src += "    _sw = _defaults.get('where') if _defaults is not None else None\n"
             if is_single:
                 # No order/offset/limit args for single roots; enforce limit 1 internally
-                src += "    _rows = await _base_impl(info, 1, None, None, None, None, _fa, _rw)\n"
+                src += "    _rows = await _base_impl(info, 1, None, None, None, None, _fa, _rw, _sw)\n"
             else:
                 src += "    _ob = order_by if order_by is not None else (_defaults.get('order_by') if _defaults is not None else None)\n"
                 src += "    _od = order_dir if order_dir is not None else (_defaults.get('order_dir') if _defaults is not None else None)\n"
                 src += "    _om = order_multi if order_multi is not None else (_defaults.get('order_multi') if _defaults is not None else None)\n"
                 src += "    _lim = limit\n"
-                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw)\n"
+                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw, _sw)\n"
             src += "    return (_rows[0] if _rows else None) if _is_single else _rows\n"
             ns: Dict[str, Any] = {'_base_impl': _base_impl, '_defaults': relation_defaults, '_is_single': bool(is_single)}
             ns.update({'Optional': Optional, 'List': List, 'datetime': datetime})

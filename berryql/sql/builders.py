@@ -2796,16 +2796,25 @@ class RootSQLBuilders:
                 pass
         return base_root_cols
 
-    async def apply_root_filters(self, stmt, *, model_cls, btype_cls, info, raw_where, declared_filters: Dict[str, Any], passed_filter_args: Dict[str, Any]):
+    async def apply_root_filters(self, stmt, *, model_cls, btype_cls, info, raw_where, declared_filters: Dict[str, Any], passed_filter_args: Dict[str, Any], scope_where: Any = None):
         from ..core.utils import to_where_dict as _to_where_dict, expr_from_where_dict as _expr_from_where_dict
         import inspect
         where_clauses = []
-        # raw where
-        if raw_where is not None:
-            wdict = raw_where(model_cls, info) if callable(raw_where) else raw_where
+
+        async def _apply_where_value(value):
+            """Resolve and append a single where value (dict/str/callable/expr/async).
+
+            Used for both the caller-supplied `where` argument and the relation/domain
+            `scope` guard. Both are applied (ANDed) so a `where` argument can never
+            bypass the scope guard.
+            """
+            if value is None:
+                return
+            wdict = value(model_cls, info) if callable(value) else value
             if inspect.isawaitable(wdict):
                 wdict = await wdict
-            # Apply via common path to preserve identical behavior
+            if wdict is None:
+                return
             try:
                 tmp = select(model_cls)
                 tmp = RelationSQLBuilders(self.registry)._apply_where_common(
@@ -2825,6 +2834,12 @@ class RootSQLBuilders:
                         raise
                     raise ValueError(f"Invalid where JSON: {e}")
                 raise
+
+        # caller-supplied `where` argument (user filter)
+        await _apply_where_value(raw_where)
+        # relation/domain scope guard — always enforced, even when a `where` argument is present
+        await _apply_where_value(scope_where)
+
         # type-level scope (BerryType.scope or __type_scope__) must always be enforced at root
         try:
             t_scope = getattr(btype_cls, '__type_scope__', None)

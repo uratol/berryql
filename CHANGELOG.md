@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.5] - 2026-06-01
+### Fixed
+- Ensure a caller-supplied root/domain list `where` filter is ANDed with the relation/domain `scope` guard instead of replacing it, so scoped rows cannot leak when `where` is provided.
+
+### Added
+- Added regression coverage for scoped root and domain list queries with caller-provided `where` filters.
+
 ## [0.3.4] - 2026-05-27
 ### Fixed
 - Allow `orderBy` to target regular Strawberry fields when they mirror a real model column name, including fields that are not declared as Berry scalars via `field()`.
