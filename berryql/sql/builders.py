@@ -1529,6 +1529,11 @@ class RelationSQLBuilders:
                                         n_sel = n_sel.where(expr2)
                             else:
                                 expr2 = rr2(grand_model, info) if callable(rr2) else rr2
+                                # Callable scopes may legitimately return a dict/str (valid scope form);
+                                # convert it to a SQL expression before .where().
+                                if isinstance(expr2, (dict, str)):
+                                    _wdict2 = to_where_dict(expr2, strict=True)
+                                    expr2 = expr_from_where_dict(grand_model, _wdict2, strict=True) if _wdict2 else None
                                 if expr2 is not None:
                                     n_sel = n_sel.where(expr2)
                         dr2 = ncfg.get('default_where')
@@ -1541,6 +1546,11 @@ class RelationSQLBuilders:
                                         n_sel = n_sel.where(expr2)
                             else:
                                 expr2 = dr2(grand_model, info) if callable(dr2) else dr2
+                                # Callable scopes may legitimately return a dict/str (valid scope form);
+                                # convert it to a SQL expression before .where().
+                                if isinstance(expr2, (dict, str)):
+                                    _wdict2 = to_where_dict(expr2, strict=True)
+                                    expr2 = expr_from_where_dict(grand_model, _wdict2, strict=True) if _wdict2 else None
                                 if expr2 is not None:
                                     n_sel = n_sel.where(expr2)
                         # Also apply type-level scope for the nested target
@@ -1789,6 +1799,11 @@ class RelationSQLBuilders:
                         expr = rr(child_model_cls_i, info) if callable(rr) else rr
                     except Exception:
                         expr = None
+                    # Callable scopes may legitimately return a dict/str (valid scope form);
+                    # convert it to a SQL expression before .where().
+                    if isinstance(expr, (dict, str)):
+                        _wdict = to_where_dict(expr, strict=True)
+                        expr = expr_from_where_dict(child_model_cls_i, _wdict, strict=True) if _wdict else None
                     if expr is not None:
                         inner_sel_i = inner_sel_i.where(expr)
             dr = rel_cfg.get('default_where')
@@ -1804,6 +1819,11 @@ class RelationSQLBuilders:
                         expr = dr(child_model_cls_i, info) if callable(dr) else dr
                     except Exception:
                         expr = None
+                    # Callable scopes may legitimately return a dict/str (valid scope form);
+                    # convert it to a SQL expression before .where().
+                    if isinstance(expr, (dict, str)):
+                        _wdict = to_where_dict(expr, strict=True)
+                        expr = expr_from_where_dict(child_model_cls_i, _wdict, strict=True) if _wdict else None
                     if expr is not None:
                         inner_sel_i = inner_sel_i.where(expr)
             # Ordering for child (order_multi -> order_by -> id)

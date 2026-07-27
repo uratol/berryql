@@ -327,6 +327,58 @@ def to_where_dict(val: Any, *, strict: bool = True, model_cls=None, auto_camel_c
         raise ValueError("where must be a JSON object or JSON string")
     return None
 
+
+def scope_to_sql_expr(
+    model_cls,
+    value: Any,
+    info: Any = None,
+    *,
+    strict: bool = True,
+    auto_camel_case: bool = False,
+) -> Any:
+    """Normalize a relation/type scope value into a SQLAlchemy boolean expression.
+
+    A ``scope`` may be any of (see ``relation(..., scope=...)`` docs):
+      - ``None``                              -> returns None (no filter)
+      - a ``dict`` / JSON ``str``             -> parsed via ``to_where_dict`` -> ``expr_from_where_dict``
+      - a ``callable(model_cls, info)``       -> invoked; its return value is then
+        normalized recursively (so a callable may itself return a dict/str OR a
+        raw SQLAlchemy expression)
+      - a SQLAlchemy ``ColumnElement``        -> returned as-is
+
+    This exists because the per-parent relation fallback paths used to pass a
+    callable scope's return value straight to ``Select.where()`` without
+    conversion, which raised
+    ``ArgumentError: SQL expression for WHERE/HAVING role expected`` whenever a
+    callable scope returned a dict (a documented, valid scope form).
+
+    Returns the SQL expression, or ``None`` when the scope produces no clause.
+    """
+    if value is None:
+        return None
+    # Callable scope: invoke with (model_cls, info), then normalize the result.
+    if callable(value):
+        try:
+            value = value(model_cls, info)
+        except TypeError:
+            # Allow scopes declared as single-arg (model_cls only) or no-arg callables.
+            try:
+                value = value(model_cls)
+            except TypeError:
+                value = value()
+        return scope_to_sql_expr(
+            model_cls, value, info, strict=strict, auto_camel_case=auto_camel_case
+        )
+    # dict / JSON string scope -> SQL expression
+    if isinstance(value, (dict, str)):
+        wdict = to_where_dict(value, strict=strict, model_cls=model_cls, auto_camel_case=auto_camel_case)
+        if not wdict:
+            return None
+        return expr_from_where_dict(model_cls, wdict, strict=strict, auto_camel_case=auto_camel_case)
+    # Assume anything else is already a SQLAlchemy boolean expression.
+    return value
+
+
 def normalize_order_multi_values(multi: Any) -> List[str]:
     """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
     norm: List[str] = []

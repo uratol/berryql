@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.6] - 2026-07-27
+### Fixed
+- Fixed `ArgumentError: SQL expression for WHERE/HAVING role expected, got {...}` raised when a relation/type `scope` defined as a **callable returning a dict** (or JSON string) was resolved on the per-parent fallback path (e.g. polymorphic relations declared with `fk_column_name='entity_id'`, which cannot use LATERAL JSON pushdown). The fallback previously passed the callable's return value straight to `Select.where()` without converting dict/str forms to a SQL expression. A new shared `scope_to_sql_expr` helper now normalizes `None`/dict/JSON-str/callable/SQL-expression scope values consistently across the registry and SQL builders.
+
+### Added
+- Added `scope_to_sql_expr` helper in `berryql.core.utils` for uniform scope-value normalization.
+- Added regression coverage (`tests/test_callable_scope_dict_fallback.py`) for callable scopes returning a dict on a polymorphic relation, plus dispatch unit tests for the helper.
+
 ## [0.3.5] - 2026-06-01
 ### Fixed
 - Ensure a caller-supplied root/domain list `where` filter is ANDed with the relation/domain `scope` guard instead of replacing it, so scoped rows cannot leak when `where` is provided.

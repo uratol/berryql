@@ -58,6 +58,7 @@ from .core.utils import (
     coerce_where_value as _coerce_where_value,
     expr_from_where_dict as _expr_from_where_dict,
     to_where_dict as _to_where_dict,
+    scope_to_sql_expr as _scope_to_sql_expr,
     normalize_order_multi_values as _norm_order_multi,
 )
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
@@ -1812,7 +1813,7 @@ class BerrySchema:
                                     if expr is not None:
                                         stmt = stmt.where(expr)
                             elif callable(dwhere):
-                                expr = dwhere(child_model_cls, info)
+                                expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
                                 if expr is not None:
                                     stmt = stmt.where(expr)
                     try:
@@ -1832,7 +1833,7 @@ class BerrySchema:
                                     if expr_t is not None:
                                         stmt = stmt.where(expr_t)
                             elif callable(frag):
-                                expr_t = frag(child_model_cls, info)
+                                expr_t = _scope_to_sql_expr(child_model_cls, frag(child_model_cls, info), info, strict=True)
                                 if expr_t is not None:
                                     stmt = stmt.where(expr_t)
                     try:
@@ -1947,7 +1948,7 @@ class BerrySchema:
                                 if expr is not None:
                                     stmt = stmt.where(expr)
                         elif callable(dwhere):
-                            expr = dwhere(child_model_cls, info)
+                            expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
                             if expr is not None:
                                 stmt = stmt.where(expr)
                 try:
@@ -1967,7 +1968,7 @@ class BerrySchema:
                                 if expr_t2 is not None:
                                     stmt = stmt.where(expr_t2)
                         elif callable(frag2):
-                            expr_t2 = frag2(child_model_cls, info)
+                            expr_t2 = _scope_to_sql_expr(child_model_cls, frag2(child_model_cls, info), info, strict=True)
                             if expr_t2 is not None:
                                 stmt = stmt.where(expr_t2)
                 for arg_name, val in _filter_args.items():
@@ -2308,7 +2309,7 @@ class BerrySchema:
                         if expr is not None:
                             stmt = stmt.where(expr)
                 elif callable(dwhere):
-                    expr = dwhere(child_model_cls, info)
+                    expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
                     if expr is not None:
                         stmt = stmt.where(expr)
         try:
@@ -2328,7 +2329,7 @@ class BerrySchema:
                         if expr_t3 is not None:
                             stmt = stmt.where(expr_t3)
                 elif callable(frag3):
-                    expr_t3 = frag3(child_model_cls, info)
+                    expr_t3 = _scope_to_sql_expr(child_model_cls, frag3(child_model_cls, info), info, strict=True)
                     if expr_t3 is not None:
                         stmt = stmt.where(expr_t3)
         effective_order_by = order_by if order_by is not None else meta_copy.get('order_by')
@@ -3371,7 +3372,7 @@ class BerrySchema:
                                                         if expr is not None:
                                                             stmt = stmt.where(expr)
                                                 elif callable(dwhere):
-                                                    expr = dwhere(child_model_cls, info)
+                                                    expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
                                                     if expr is not None:
                                                         stmt = stmt.where(expr)
                                         # Also apply type-level scope when present
@@ -3392,7 +3393,7 @@ class BerrySchema:
                                                         if expr_t is not None:
                                                             stmt = stmt.where(expr_t)
                                                 elif callable(frag):
-                                                    expr_t = frag(child_model_cls, info)
+                                                    expr_t = _scope_to_sql_expr(child_model_cls, frag(child_model_cls, info), info, strict=True)
                                                     if expr_t is not None:
                                                         stmt = stmt.where(expr_t)
                                         # Ordering: honor order_by/order_multi if provided; default by id
@@ -3514,7 +3515,7 @@ class BerrySchema:
                                                     if expr is not None:
                                                         stmt = stmt.where(expr)
                                             elif callable(dwhere):
-                                                expr = dwhere(child_model_cls, info)
+                                                expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
                                                 if expr is not None:
                                                     stmt = stmt.where(expr)
                                     # Also apply type-level scope when present
@@ -3535,7 +3536,7 @@ class BerrySchema:
                                                     if expr_t2 is not None:
                                                         stmt = stmt.where(expr_t2)
                                             elif callable(frag2):
-                                                expr_t2 = frag2(child_model_cls, info)
+                                                expr_t2 = _scope_to_sql_expr(child_model_cls, frag2(child_model_cls, info), info, strict=True)
                                                 if expr_t2 is not None:
                                                     stmt = stmt.where(expr_t2)
                                     # Add filter where clauses
@@ -3926,7 +3927,7 @@ class BerrySchema:
                                             if expr is not None:
                                                 stmt = stmt.where(expr)
                                     elif callable(dwhere):
-                                        expr = dwhere(child_model_cls, info)
+                                        expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
                                         if expr is not None:
                                             stmt = stmt.where(expr)
                             # Combine with type-level default scope for list fallback
@@ -3947,7 +3948,7 @@ class BerrySchema:
                                             if expr_t3 is not None:
                                                 stmt = stmt.where(expr_t3)
                                     elif callable(frag3):
-                                        expr_t3 = frag3(child_model_cls, info)
+                                        expr_t3 = _scope_to_sql_expr(child_model_cls, frag3(child_model_cls, info), info, strict=True)
                                         if expr_t3 is not None:
                                             stmt = stmt.where(expr_t3)
                             # Ad-hoc JSON where for relation list if present on selection (not used; keep future hook comment)
