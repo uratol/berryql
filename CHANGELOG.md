@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.7] - 2026-07-28
+### Added
+- Added the `_Replace` control flag on mutation input payloads for **replace-semantics** on nested list relations. When `_Replace: ["<relation>"]` is set, the mutation upserts the listed child items and deletes every other child belonging to that parent (matching the relation `scope`/FK) whose PK is not in the payload. The delete runs **before** the upsert loop to avoid unique-constraint collisions between new inserts and soon-to-be-deleted rows. Grandchildren are cascade-deleted first for MSSQL FK safety. Entries are validated (unknown relation names and single relations raise before any DB work).
+- Added the `_Insert` control flag on mutation input payloads to force insertion of a new row even when a PK is provided. When `_Insert: true`, the update-lookup is skipped and a new row is inserted **with the provided PK value** (explicit-PK insert). If the PK already exists, the DB raises a duplicate-key error (caller's responsibility).
+
+### Fixed
+- Fixed MSSQL duplicate-PK failure in `tests/test_callable_scope_dict_fallback.py`: the test's separate `DeclarativeBase` tables are now dropped before `create_all` to ensure a clean slate on persistent backends.
+
 ## [0.3.6] - 2026-07-27
 ### Fixed
 - Fixed `ArgumentError: SQL expression for WHERE/HAVING role expected, got {...}` raised when a relation/type `scope` defined as a **callable returning a dict** (or JSON string) was resolved on the per-parent fallback path (e.g. polymorphic relations declared with `fk_column_name='entity_id'`, which cannot use LATERAL JSON pushdown). The fallback previously passed the callable's return value straight to `Select.where()` without converting dict/str forms to a SQL expression. A new shared `scope_to_sql_expr` helper now normalizes `None`/dict/JSON-str/callable/SQL-expression scope values consistently across the registry and SQL builders.

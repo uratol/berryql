@@ -815,9 +815,10 @@ def build_merge_resolver_for_type(
             instance = None
             pk_val = scalar_vals.get(pk_name) or (data_local.get(pk_name) if isinstance(data_local, dict) else None)
             # _Insert flag forces creation of a new row even when a PK is provided.
-            # When set, the provided PK is ignored entirely (not used for lookup nor
-            # assigned to the new instance) so a fresh auto-generated PK is inserted,
-            # avoiding unique-constraint conflicts with an already-existing row.
+            # The provided PK is KEPT and used in the INSERT (explicit-PK insert);
+            # only the update-lookup is skipped so we always create a new instance.
+            # If the provided PK already exists, the DB will raise a duplicate-key
+            # error, which is the caller's responsibility.
             _insert_flag = False
             try:
                 if isinstance(data_local, dict):
@@ -826,9 +827,6 @@ def build_merge_resolver_for_type(
                     _insert_flag = bool(scalar_vals.get('_Insert'))
             except Exception:
                 _insert_flag = False
-            if _insert_flag:
-                pk_val = None
-                scalar_vals.pop(pk_name, None)
             if pk_val is not None and not _insert_flag:
                 try:
                     instance = await session.get(model_cls_local, pk_val)

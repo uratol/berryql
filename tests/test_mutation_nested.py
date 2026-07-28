@@ -499,8 +499,8 @@ async def test_replace_does_not_affect_other_relations(db_session, populated_db)
 
 
 @pytest.mark.asyncio
-async def test_insert_flag_creates_new_row_despite_pk(db_session, populated_db):
-    """_Insert: true should create a new row even when a PK is provided."""
+async def test_insert_flag_inserts_with_provided_pk(db_session, populated_db):
+    """_Insert: true should insert a NEW row using the provided PK value, not update."""
     from tests.models import Post
     from sqlalchemy import select
     u1 = populated_db['users'][0]
@@ -521,11 +521,12 @@ async def test_insert_flag_creates_new_row_despite_pk(db_session, populated_db):
         }
     }
     """
-    # Pass the SAME PK but with _Insert: true -> should create a new row, not update
+    # Pass a DIFFERENT (non-existing) PK with _Insert: true -> new row inserted with that exact PK
+    new_pk = existing_pk + 1000
     variables = {
         "payload": [{
-            "id": existing_pk,
-            "title": "Inserted Copy",
+            "id": new_pk,
+            "title": "Inserted With PK",
             "content": "new body",
             "author_id": int(u1.id),
             "_Insert": True,
@@ -534,23 +535,51 @@ async def test_insert_flag_creates_new_row_despite_pk(db_session, populated_db):
     res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
     assert res.errors is None, res.errors
     created = res.data["merge_posts"][0]
-    new_pk = int(created["id"])
-    # A new row was created (different PK from the existing one)
-    assert new_pk != existing_pk, "expected a new row, but the existing PK was reused"
-    assert created["title"] == "Inserted Copy"
+    # The new row carries the exact provided PK
+    assert int(created["id"]) == new_pk, "expected the provided PK to be used in the insert"
+    assert created["title"] == "Inserted With PK"
 
-    # The original row must be untouched
+    # The original row must be untouched (no update happened)
     orig = await db_session.get(Post, existing_pk)
     assert orig is not None
     assert orig.title == "Original"
     assert orig.content == "orig"
 
-    # Confirm two distinct rows exist with those PKs
+    # Confirm both rows exist
     rows = (await db_session.execute(
         select(Post).where(Post.id.in_([existing_pk, new_pk])).order_by(Post.id)
     )).scalars().all()
-    assert len(rows) == 2
     assert {int(r.id) for r in rows} == {existing_pk, new_pk}
+
+
+@pytest.mark.asyncio
+async def test_insert_flag_with_existing_pk_raises(db_session, populated_db):
+    """_Insert: true with an ALREADY-EXISTING PK should error (duplicate key)."""
+    from tests.models import Post
+    u1 = populated_db['users'][0]
+
+    existing = Post(title="Original", content="orig", author_id=int(u1.id))
+    db_session.add(existing)
+    await db_session.flush()
+    await db_session.commit()
+    existing_pk = int(existing.id)
+
+    mutation = """
+    mutation Upsert($payload: [PostQLInput!]!) {
+        merge_posts(payload: $payload) { id }
+    }
+    """
+    # Pass the SAME existing PK with _Insert: true -> DB-level duplicate-key error
+    variables = {
+        "payload": [{
+            "id": existing_pk,
+            "title": "Dup",
+            "author_id": int(u1.id),
+            "_Insert": True,
+        }]
+    }
+    res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is not None, "expected a duplicate-key error"
 
 
 @pytest.mark.asyncio
@@ -621,8 +650,8 @@ async def test_insert_flag_false_falls_back_to_update(db_session, populated_db):
 
 
 @pytest.mark.asyncio
-async def test_insert_flag_on_nested_child(db_session, populated_db):
-    """_Insert: true on a nested child forces a new child row despite a provided PK."""
+async def test_insert_flag_on_nested_child_uses_provided_pk(db_session, populated_db):
+    """_Insert: true on a nested child inserts a new child row with the provided PK."""
     from tests.models import Post, PostComment
     from sqlalchemy import select
     u1 = populated_db['users'][0]
@@ -646,12 +675,13 @@ async def test_insert_flag_on_nested_child(db_session, populated_db):
         }
     }
     """
-    # Nested child passes the existing comment's PK but with _Insert: true
+    # Nested child uses a FRESH PK with _Insert: true -> new child row with that PK
+    new_child_pk = existing_comment_pk + 1000
     variables = {
         "payload": [{
             "id": int(post.id),
             "post_comments": [
-                {"id": existing_comment_pk, "content": "new comment", "author_id": int(u2.id), "_Insert": True},
+                {"id": new_child_pk, "content": "new comment", "author_id": int(u2.id), "_Insert": True},
             ],
         }]
     }
@@ -662,7 +692,8 @@ async def test_insert_flag_on_nested_child(db_session, populated_db):
     assert len(pcs) == 2, pcs
     new_pc = next((pc for pc in pcs if pc["content"] == "new comment"), None)
     assert new_pc is not None
-    assert int(new_pc["id"]) != existing_comment_pk, "expected a new child row, not an update"
+    # The new child carries the exact provided PK
+    assert int(new_pc["id"]) == new_child_pk, "expected the provided child PK to be used in the insert"
     # Original comment untouched
     orig_pc = next((pc for pc in pcs if int(pc["id"]) == existing_comment_pk), None)
     assert orig_pc is not None

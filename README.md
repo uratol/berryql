@@ -411,6 +411,34 @@ class Mutation:
 
 Merge mutations accept `payload` arguments inferred from the Berry type’s fields (including write-only helpers such as `author_email`) and return BerryQL objects that include read-only fields.
 
+### Mutation payload control flags
+
+Every generated input type carries optional control flags (underscore-prefixed) to tweak merge behavior:
+
+- `_Delete: Boolean` — when true on a payload item, deletes that row (by its provided PK) instead of upserting.
+- `_Insert: Boolean` — when true, forces insertion of a new row even if a PK is provided. The update-lookup is skipped and the row is inserted **with the provided PK** (explicit-PK insert); a duplicate PK errors at the DB level.
+- `_Replace: [String]` — lists relation field names on the current item to operate in **replace mode**: upsert the listed children, then delete every other child of that parent not present in the payload (by PK). The delete runs before the upsert to avoid unique-constraint collisions; unknown relation names and single relations are rejected.
+
+Example — replace a post's comments (keep/update the listed ones, delete the rest):
+
+```graphql
+mutation {
+  merge_posts(payload: [{
+    id: 10,
+    post_comments: [{ id: 123, content: "bar" }, { content: "new" }],
+    _Replace: ["post_comments"]
+  }]) { id post_comments { id content } }
+}
+```
+
+Example — force a fresh insert despite passing an existing PK:
+
+```graphql
+mutation {
+  merge_posts(payload: [{ id: 10, title: "Copy", _Insert: true }]) { id }
+}
+```
+
 
 Domains
 -------
