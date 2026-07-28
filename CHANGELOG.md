@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.9] - 2026-07-28
+### Fixed
+- Fixed `_Replace` mutation argument validation failing under `autoCamelCase` (Strawberry `StrawberryConfig(auto_camel_case=True)`). Relation names listed in `_Replace` are now resolved in **both** snake_case (python field name) and camelCase (GraphQL field name) forms. Previously `_Replace: ["postComments"]` raised `_Replace references unknown relation 'postComments'` because only the snake_case key (`post_comments`) was recognized; the string values inside `_Replace` are not remapped by Strawberry the way input field names are.
+
 ## [0.3.8] - 2026-07-28
 ### Added
 - Added **nested relation re-parenting** support in merge mutations. When a child record nested under a parent's relation specifies a foreign key pointing to a DIFFERENT parent (e.g. `merge_posts(payload: [{ id: 10, post_comments: [{ id: 123, content: "bar", post_id: 11 }] }])`), the input value now wins: the child is edited AND moved onto the target parent identified by its own FK. Previously such a move was either silently ignored or blocked by the parent-ownership guard.

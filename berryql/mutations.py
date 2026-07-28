@@ -1065,20 +1065,34 @@ def build_merge_resolver_for_type(
                                 f"_Replace must be a list of relation field names; got {type(_raw_replace).__name__}"
                             )
                         bfields_local = getattr(btype_local, '__berry_fields__', {}) or {}
-                        for _rk in _raw_replace:
-                            if not isinstance(_rk, str) or not _rk:
+                        # Resolve naming config so _Replace entries can be supplied in either
+                        # snake_case (python field name) or camelCase (GraphQL field name when
+                        # autoCamelCase is enabled). String *values* inside _Replace are not
+                        # remapped by Strawberry the way input field names are, so we normalize
+                        # them ourselves against the berry field map.
+                        _ac = bool(getattr(schema, '_auto_camel_case', False))
+                        _nc = getattr(schema, '_name_converter', None)
+                        from .core.naming import map_graphql_to_python
+                        for _rk_raw in _raw_replace:
+                            if not isinstance(_rk_raw, str) or not _rk_raw:
                                 raise ValueError(
-                                    f"_Replace entries must be non-empty strings; got {_rk!r}"
+                                    f"_Replace entries must be non-empty strings; got {_rk_raw!r}"
                                 )
+                            _rk = map_graphql_to_python(
+                                _rk_raw,
+                                bfields_local,
+                                auto_camel=_ac,
+                                name_converter=_nc,
+                            )
                             _rdef = bfields_local.get(_rk)
                             if _rdef is None or getattr(_rdef, 'kind', None) != 'relation':
                                 raise ValueError(
-                                    f"_Replace references unknown relation '{_rk}' on {getattr(btype_local, '__name__', type_name)}"
+                                    f"_Replace references unknown relation '{_rk_raw}' on {getattr(btype_local, '__name__', type_name)}"
                                 )
                             _rmeta = getattr(_rdef, 'meta', {}) or {}
                             if bool(_rmeta.get('single')):
                                 raise ValueError(
-                                    f"_Replace cannot target single relation '{_rk}' on {getattr(btype_local, '__name__', type_name)}; only list relations are supported"
+                                    f"_Replace cannot target single relation '{_rk_raw}' on {getattr(btype_local, '__name__', type_name)}; only list relations are supported"
                                 )
                             if _rk not in relation_vals:
                                 # The relation wasn't provided in the payload. Treat an explicit

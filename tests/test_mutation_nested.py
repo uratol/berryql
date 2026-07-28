@@ -499,6 +499,91 @@ async def test_replace_does_not_affect_other_relations(db_session, populated_db)
 
 
 @pytest.mark.asyncio
+async def test_replace_relation_camel_case(db_session, populated_db):
+    """_Replace should accept camelCase relation names when autoCamelCase is enabled."""
+    from tests.models import PostComment
+    from tests.schema import berry_schema
+    try:
+        from strawberry.schema.config import StrawberryConfig
+    except Exception:
+        pytest.skip("StrawberryConfig not available in this Strawberry version")
+
+    u1 = populated_db['users'][0]
+    u2 = populated_db['users'][1]
+
+    post = Post(title="Camel Replace", content="c", author_id=int(u1.id))
+    db_session.add(post)
+    await db_session.flush()
+    c1 = PostComment(content="update-me", post_id=post.id, author_id=int(u2.id))
+    c2 = PostComment(content="delete-me", post_id=post.id, author_id=int(u2.id))
+    db_session.add_all([c1, c2])
+    await db_session.flush()
+    await db_session.commit()
+
+    # Build a schema with autoCamelCase enabled; save/restore registry naming state
+    # to avoid leaking auto_camel_case=True into other tests sharing berry_schema.
+    # The flag must stay True during execution (as in real usage), so restore only
+    # at the very end of the test.
+    _prev_ac = getattr(berry_schema, '_auto_camel_case', False)
+    _prev_nc = getattr(berry_schema, '_name_converter', None)
+    try:
+        camel_schema = berry_schema.to_strawberry(strawberry_config=StrawberryConfig(auto_camel_case=True))
+
+        mutation = """
+        mutation Upsert($payload: [PostQLInput!]!) {
+            mergePosts(payload: $payload) {
+                id
+                postComments(orderBy: "id") { id content }
+            }
+        }
+        """
+        # NOTE: _Replace references the relation by its camelCase GraphQL name
+        variables = {
+            "payload": [{
+                "id": int(post.id),
+                "postComments": [
+                    {"id": int(c1.id), "content": "updated"},   # update existing
+                ],
+                "_Replace": ["postComments"],
+            }]
+        }
+        res = await camel_schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
+        assert res.errors is None, res.errors
+        pcs = res.data["mergePosts"][0]["postComments"]
+        contents = sorted(pc["content"] for pc in pcs)
+        # c1 updated; c2 deleted (replace semantics)
+        assert contents == ["updated"], contents
+
+        # Also assert the snake_case form still works under the same camelCase schema
+        post2 = Post(title="Camel Replace Snake", content="c", author_id=int(u1.id))
+        db_session.add(post2)
+        await db_session.flush()
+        c3 = PostComment(content="update-me-2", post_id=post2.id, author_id=int(u2.id))
+        c4 = PostComment(content="delete-me-2", post_id=post2.id, author_id=int(u2.id))
+        db_session.add_all([c3, c4])
+        await db_session.flush()
+        await db_session.commit()
+
+        variables2 = {
+            "payload": [{
+                "id": int(post2.id),
+                "postComments": [
+                    {"id": int(c3.id), "content": "updated-2"},
+                ],
+                "_Replace": ["post_comments"],
+            }]
+        }
+        res2 = await camel_schema.execute(mutation, variable_values=variables2, context_value={"db_session": db_session})
+        assert res2.errors is None, res2.errors
+        pcs2 = res2.data["mergePosts"][0]["postComments"]
+        contents2 = sorted(pc["content"] for pc in pcs2)
+        assert contents2 == ["updated-2"], contents2
+    finally:
+        berry_schema._auto_camel_case = _prev_ac
+        berry_schema._name_converter = _prev_nc
+
+
+@pytest.mark.asyncio
 async def test_insert_flag_inserts_with_provided_pk(db_session, populated_db):
     """_Insert: true should insert a NEW row using the provided PK value, not update."""
     from tests.models import Post

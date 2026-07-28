@@ -417,7 +417,7 @@ Every generated input type carries optional control flags (underscore-prefixed) 
 
 - `_Delete: Boolean` — when true on a payload item, deletes that row (by its provided PK) instead of upserting.
 - `_Insert: Boolean` — when true, forces insertion of a new row even if a PK is provided. The update-lookup is skipped and the row is inserted **with the provided PK** (explicit-PK insert); a duplicate PK errors at the DB level.
-- `_Replace: [String]` — lists relation field names on the current item to operate in **replace mode**: upsert the listed children, then delete every other child of that parent not present in the payload (by PK). The delete runs before the upsert to avoid unique-constraint collisions; unknown relation names and single relations are rejected.
+- `_Replace: [String]` — lists relation field names on the current item to operate in **replace mode**: upsert the listed children, then delete every other child of that parent not present in the payload (by PK). The delete runs before the upsert to avoid unique-constraint collisions; unknown relation names and single relations are rejected. Relation names are matched in **both** snake_case and camelCase, so this works whether or not Strawberry `autoCamelCase` is enabled (e.g. `_Replace: ["postComments"]` and `_Replace: ["post_comments"]` are equivalent).
 
 Example — replace a post's comments (keep/update the listed ones, delete the rest):
 
