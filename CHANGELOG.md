@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.8] - 2026-07-28
+### Added
+- Added **nested relation re-parenting** support in merge mutations. When a child record nested under a parent's relation specifies a foreign key pointing to a DIFFERENT parent (e.g. `merge_posts(payload: [{ id: 10, post_comments: [{ id: 123, content: "bar", post_id: 11 }] }])`), the input value now wins: the child is edited AND moved onto the target parent identified by its own FK. Previously such a move was either silently ignored or blocked by the parent-ownership guard.
+- Enforces the merge/relation security scope against BOTH the **origin parent** (where the child currently lives) and the **target parent** (where the child is being moved to) during re-parenting. A move across a scope boundary is rejected with `Mutation out of scope for re-parent`.
+
+### Changed
+- Relaxed the parent-ownership guard (`Mutation out of scope for update; child does not belong to parent`) for scope-validated re-parents, so a legitimate cross-parent move is no longer blocked once both parents pass the scope check.
+
 ## [0.3.7] - 2026-07-28
 ### Added
 - Added the `_Replace` control flag on mutation input payloads for **replace-semantics** on nested list relations. When `_Replace: ["<relation>"]` is set, the mutation upserts the listed child items and deletes every other child belonging to that parent (matching the relation `scope`/FK) whose PK is not in the payload. The delete runs **before** the upsert loop to avoid unique-constraint collisions between new inserts and soon-to-be-deleted rows. Grandchildren are cascade-deleted first for MSSQL FK safety. Entries are validated (unknown relation names and single relations raise before any DB work).

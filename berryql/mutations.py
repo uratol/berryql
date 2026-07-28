@@ -851,7 +851,11 @@ def build_merge_resolver_for_type(
                     except Exception:
                         _child_fk_val_ctx = None
                     if _parent_pk_val_ctx is not None and _child_fk_val_ctx is not None and str(_child_fk_val_ctx) != str(_parent_pk_val_ctx):
-                        raise PermissionError("Mutation out of scope for update; child does not belong to parent")
+                        # A scope-validated re-parent (origin + target parents checked against
+                        # the merge/relation scope before this point) is allowed to move a
+                        # child whose current parent differs from the nesting parent.
+                        if not (isinstance(parent_ctx, dict) and parent_ctx.get('reparent_in_progress')):
+                            raise PermissionError("Mutation out of scope for update; child does not belong to parent")
             # Enforce relation scope before update
             if pk_val is not None and instance is not None and eff_scope is not None:
                 if parent_ctx is not None and eff_scope_inherited_from_parent:
@@ -893,7 +897,10 @@ def build_merge_resolver_for_type(
                             _parent_pk_val_ctx = None
                         if _parent_pk_val_ctx is not None and scalar_vals.get(_fk_name_ctx) not in (None, 0):
                             if str(scalar_vals.get(_fk_name_ctx)) != str(_parent_pk_val_ctx):
-                                raise PermissionError("Mutation out of scope for create; child does not belong to parent")
+                                # Allow a scope-validated re-parent where the child is created
+                                # directly under a different (in-scope) parent.
+                                if not (isinstance(parent_ctx, dict) and parent_ctx.get('reparent_in_progress')):
+                                    raise PermissionError("Mutation out of scope for create; child does not belong to parent")
                 try:
                     current_pk = getattr(instance, pk_name, None)
                 except Exception:
@@ -1263,10 +1270,82 @@ def build_merge_resolver_for_type(
                     if parent_pk_val is None:
                         parent_pk_val = await _get_pk_value(instance, model_cls_local)
                     for item in items:
+                        _reparent_in_progress = False
                         if child_fk_col_name and parent_pk_val is not None:
                             item = dict(item or {})
-                            if item.get(child_fk_col_name) in (None, 0):
+                            # Resolve the effective target FK for this child: the input value
+                            # wins when provided, otherwise default to the nesting parent.
+                            _reparent_target_fk = item.get(child_fk_col_name)
+                            if _reparent_target_fk in (None, 0):
                                 item[child_fk_col_name] = parent_pk_val
+                                _reparent_target_fk = parent_pk_val
+                            # Determine the child's CURRENT parent (origin) from the DB so we can
+                            # detect re-parenting in either direction:
+                            #   * moving a child away from a parent it currently belongs to, or
+                            #   * pulling in a child that currently belongs to another parent.
+                            try:
+                                _child_pk_name_r = schema._get_pk_name(child_model)
+                            except Exception:
+                                _child_pk_name_r = 'id'
+                            _child_pk_val_r = item.get(_child_pk_name_r)
+                            _origin_fk_val = None
+                            if _child_pk_val_r not in (None, 0, ''):
+                                _existing_child = await session.get(child_model, _child_pk_val_r)
+                                if _existing_child is not None:
+                                    try:
+                                        _origin_fk_val = getattr(_existing_child, child_fk_col_name, None)
+                                    except Exception:
+                                        _origin_fk_val = None
+                            # A re-parent is any case where the child ends up on a parent that
+                            # differs from where it currently is, OR where its current parent
+                            # differs from the nesting parent (cross-origin pull-in).
+                            _target_differs = str(_reparent_target_fk) != str(parent_pk_val)
+                            _origin_differs = (
+                                _origin_fk_val not in (None, 0)
+                                and str(_origin_fk_val) != str(parent_pk_val)
+                            )
+                            _origin_moving = (
+                                _origin_fk_val not in (None, 0)
+                                and str(_origin_fk_val) != str(_reparent_target_fk)
+                            )
+                            _is_reparent = bool(_target_differs or _origin_moving or _origin_differs)
+                            # Security guard for re-parenting: the merge/relation scope must be
+                            # satisfied by BOTH the ORIGIN parent (where the child currently lives)
+                            # and the TARGET parent (where the child is being moved to). This
+                            # prevents moving a record across scope boundaries. Only enforce when a
+                            # scope is configured; without a scope, re-parenting is unconstrained.
+                            if _is_reparent and eff_scope is not None:
+                                # Origin parent (skip when it coincides with the nesting parent,
+                                # which is already validated by the nesting-parent scope check).
+                                if _origin_moving and _origin_fk_val not in (None, 0):
+                                    _origin_parent_inst = await session.get(model_cls_local, _origin_fk_val)
+                                    if _origin_parent_inst is None:
+                                        raise PermissionError(
+                                            f"Re-parent origin {getattr(model_cls_local,'__name__',model_cls_local)} "
+                                            f"with pk={_origin_fk_val} not found"
+                                        )
+                                    _ok_origin = await _enforce_scope(model_cls_local, _origin_parent_inst, eff_scope, parent_ctx)
+                                    if not _ok_origin:
+                                        raise PermissionError(
+                                            "Mutation out of scope for re-parent; origin parent not within scope"
+                                        )
+                                # Target parent (skip when it coincides with the nesting parent).
+                                if _target_differs:
+                                    _target_parent_inst = await session.get(model_cls_local, _reparent_target_fk)
+                                    if _target_parent_inst is None:
+                                        raise PermissionError(
+                                            f"Re-parent target {getattr(model_cls_local,'__name__',model_cls_local)} "
+                                            f"with pk={_reparent_target_fk} not found"
+                                        )
+                                    _ok_target = await _enforce_scope(model_cls_local, _target_parent_inst, eff_scope, parent_ctx)
+                                    if not _ok_target:
+                                        raise PermissionError(
+                                            "Mutation out of scope for re-parent; target parent not within scope"
+                                        )
+                                # Mark that this child update is a scope-validated re-parent so
+                                # the parent-ownership guard inside _merge_single does not reject
+                                # a legitimate cross-parent move.
+                                _reparent_in_progress = True
                         await _merge_single(
                             child_model,
                             child_btype,
@@ -1277,6 +1356,7 @@ def build_merge_resolver_for_type(
                                 'child_fk_col_name': child_fk_col_name,
                                 'parent_scope': eff_scope,
                                 'parent_ctx': parent_ctx,
+                                'reparent_in_progress': _reparent_in_progress,
                                 # Establish/propagate scope root for inherited domain scopes
                                 'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
                                 'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
