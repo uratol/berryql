@@ -149,6 +149,11 @@ async def test_callable_dict_scope_polymorphic_relation_fallback(engine):
     unit tests above pin the helper used by the fallback path directly.
     """
     async with engine.begin() as conn:
+        # Drop first to ensure a clean slate on persistent backends (e.g. MSSQL),
+        # where the shared `engine` fixture only resets the main tests.models.Base
+        # metadata. The idempotent create_all alone would leave stale rows that
+        # collide with the explicit PKs inserted below (duplicate PK violation).
+        await conn.run_sync(_RegBase.metadata.drop_all)
         await conn.run_sync(_RegBase.metadata.create_all)
 
     from sqlalchemy.ext.asyncio import async_sessionmaker

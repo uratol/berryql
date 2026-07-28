@@ -772,6 +772,19 @@ class BerrySchema:
             except Exception:
                 pass
 
+        # Special control flag: force insertion of a new row even when a PK is provided
+        # in the payload. When true, the provided PK is ignored (not used for lookup nor
+        # assigned) and a fresh auto-generated PK is inserted, avoiding conflicts with
+        # any already-existing row carrying that PK.
+        try:
+            anns['_Insert'] = Optional[bool]
+            setattr(InPlain, '_Insert', UNSET)
+        except Exception:
+            try:
+                setattr(InPlain, '_Insert', None)
+            except Exception:
+                pass
+
         # Now attach annotations and decorate as strawberry input
         setattr(InPlain, '__annotations__', anns)
         try:

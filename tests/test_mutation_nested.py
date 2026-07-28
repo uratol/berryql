@@ -496,3 +496,180 @@ async def test_replace_does_not_affect_other_relations(db_session, populated_db)
     contents = sorted(pc["content"] for pc in pcs)
     # Both survive: c1 updated, c2 untouched (merge semantics)
     assert contents == ["gone", "kept-updated"], contents
+
+
+@pytest.mark.asyncio
+async def test_insert_flag_creates_new_row_despite_pk(db_session, populated_db):
+    """_Insert: true should create a new row even when a PK is provided."""
+    from tests.models import Post
+    from sqlalchemy import select
+    u1 = populated_db['users'][0]
+
+    # Seed an existing post with a known PK
+    existing = Post(title="Original", content="orig", author_id=int(u1.id))
+    db_session.add(existing)
+    await db_session.flush()
+    await db_session.commit()
+    existing_pk = int(existing.id)
+
+    mutation = """
+    mutation Upsert($payload: [PostQLInput!]!) {
+        merge_posts(payload: $payload) {
+            id
+            title
+            content
+        }
+    }
+    """
+    # Pass the SAME PK but with _Insert: true -> should create a new row, not update
+    variables = {
+        "payload": [{
+            "id": existing_pk,
+            "title": "Inserted Copy",
+            "content": "new body",
+            "author_id": int(u1.id),
+            "_Insert": True,
+        }]
+    }
+    res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    created = res.data["merge_posts"][0]
+    new_pk = int(created["id"])
+    # A new row was created (different PK from the existing one)
+    assert new_pk != existing_pk, "expected a new row, but the existing PK was reused"
+    assert created["title"] == "Inserted Copy"
+
+    # The original row must be untouched
+    orig = await db_session.get(Post, existing_pk)
+    assert orig is not None
+    assert orig.title == "Original"
+    assert orig.content == "orig"
+
+    # Confirm two distinct rows exist with those PKs
+    rows = (await db_session.execute(
+        select(Post).where(Post.id.in_([existing_pk, new_pk])).order_by(Post.id)
+    )).scalars().all()
+    assert len(rows) == 2
+    assert {int(r.id) for r in rows} == {existing_pk, new_pk}
+
+
+@pytest.mark.asyncio
+async def test_insert_flag_without_pk_behaves_like_create(db_session, populated_db):
+    """_Insert: true without a PK behaves like a normal create (auto PK)."""
+    from tests.models import Post
+    u1 = populated_db['users'][0]
+
+    mutation = """
+    mutation Upsert($payload: [PostQLInput!]!) {
+        merge_posts(payload: $payload) {
+            id
+            title
+        }
+    }
+    """
+    variables = {
+        "payload": [{
+            "title": "No PK Insert",
+            "content": "body",
+            "author_id": int(u1.id),
+            "_Insert": True,
+        }]
+    }
+    res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    created = res.data["merge_posts"][0]
+    assert created["title"] == "No PK Insert"
+    assert int(created["id"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_insert_flag_false_falls_back_to_update(db_session, populated_db):
+    """_Insert: false (or absent) should still update an existing row matched by PK."""
+    from tests.models import Post
+    u1 = populated_db['users'][0]
+
+    existing = Post(title="Before", content="c", author_id=int(u1.id))
+    db_session.add(existing)
+    await db_session.flush()
+    await db_session.commit()
+    existing_pk = int(existing.id)
+
+    mutation = """
+    mutation Upsert($payload: [PostQLInput!]!) {
+        merge_posts(payload: $payload) { id title }
+    }
+    """
+    # Explicit _Insert: false -> normal update semantics
+    variables = {
+        "payload": [{
+            "id": existing_pk,
+            "title": "After",
+            "_Insert": False,
+        }]
+    }
+    res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    updated = res.data["merge_posts"][0]
+    # Same PK, title updated -> it was an update, not an insert
+    assert int(updated["id"]) == existing_pk
+    assert updated["title"] == "After"
+
+    # Ensure no extra row was created
+    from sqlalchemy import select, func
+    count = (await db_session.execute(select(func.count()).select_from(Post).where(Post.id == existing_pk))).scalar()
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_insert_flag_on_nested_child(db_session, populated_db):
+    """_Insert: true on a nested child forces a new child row despite a provided PK."""
+    from tests.models import Post, PostComment
+    from sqlalchemy import select
+    u1 = populated_db['users'][0]
+    u2 = populated_db['users'][1]
+
+    post = Post(title="Parent", content="c", author_id=int(u1.id))
+    db_session.add(post)
+    await db_session.flush()
+    # Seed an existing comment under this post
+    existing_comment = PostComment(content="orig comment", post_id=post.id, author_id=int(u2.id))
+    db_session.add(existing_comment)
+    await db_session.flush()
+    await db_session.commit()
+    existing_comment_pk = int(existing_comment.id)
+
+    mutation = """
+    mutation Upsert($payload: [PostQLInput!]!) {
+        merge_posts(payload: $payload) {
+            id
+            post_comments(order_by: "id") { id content }
+        }
+    }
+    """
+    # Nested child passes the existing comment's PK but with _Insert: true
+    variables = {
+        "payload": [{
+            "id": int(post.id),
+            "post_comments": [
+                {"id": existing_comment_pk, "content": "new comment", "author_id": int(u2.id), "_Insert": True},
+            ],
+        }]
+    }
+    res = await schema.execute(mutation, variable_values=variables, context_value={"db_session": db_session})
+    assert res.errors is None, res.errors
+    pcs = res.data["merge_posts"][0]["post_comments"]
+    # Now there should be TWO comments: the original untouched + the newly inserted one
+    assert len(pcs) == 2, pcs
+    new_pc = next((pc for pc in pcs if pc["content"] == "new comment"), None)
+    assert new_pc is not None
+    assert int(new_pc["id"]) != existing_comment_pk, "expected a new child row, not an update"
+    # Original comment untouched
+    orig_pc = next((pc for pc in pcs if int(pc["id"]) == existing_comment_pk), None)
+    assert orig_pc is not None
+    assert orig_pc["content"] == "orig comment"
+
+    # Confirm two distinct comment rows in DB
+    rows = (await db_session.execute(
+        select(PostComment).where(PostComment.post_id == int(post.id)).order_by(PostComment.id)
+    )).scalars().all()
+    assert len(rows) == 2
