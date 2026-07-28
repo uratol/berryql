@@ -436,6 +436,88 @@ def build_merge_resolver_for_type(
                 if parent_ctx is not None and relation_scope is not None:
                     eff_scope_inherited_from_parent = True
 
+            # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints).
+            # Defined at _merge_single scope so both single-row _Delete and _Replace (relation
+            # replace-semantics) paths can reuse it.
+            from sqlalchemy import select as _sa_select, delete as _sa_delete_cascade
+            async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
+                try:
+                    bfields = getattr(parent_btype_cls, '__berry_fields__', {}) or {}
+                except Exception:
+                    bfields = {}
+                for rname, rdef in bfields.items():
+                    try:
+                        if getattr(rdef, 'kind', None) != 'relation':
+                            continue
+                        meta_r = getattr(rdef, 'meta', {}) or {}
+                        target_name = meta_r.get('target')
+                        if not target_name:
+                            continue
+                        child_btype = schema.types.get(target_name)
+                        child_model_cls = getattr(child_btype, 'model', None) if child_btype is not None else None
+                        if child_model_cls is None:
+                            continue
+                        explicit_child_fk_name = meta_r.get('fk_column_name')
+                        # Find FK on child referencing parent
+                        try:
+                            fk_col = schema._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)  # type: ignore[attr-defined]
+                        except Exception:
+                            fk_col = None
+                        if fk_col is None:
+                            continue
+
+                        # Check on_delete strategy from SQLAlchemy metadata
+                        on_delete_strategy = None
+                        try:
+                            if hasattr(fk_col, 'foreign_keys'):
+                                for fk in fk_col.foreign_keys:
+                                    if fk.ondelete and fk.ondelete.upper() == 'SET NULL':
+                                        on_delete_strategy = 'SET NULL'
+                                        break
+                        except Exception:
+                            pass
+
+                        if on_delete_strategy == 'SET NULL':
+                            from sqlalchemy import update as _sa_update
+                            try:
+                                await session.execute(_sa_update(child_model_cls).where(fk_col == parent_pk_val).values({fk_col.name: None}))
+                            except Exception:
+                                pass
+                            continue
+
+                        # Recurse to grandchildren first by selecting child PKs
+                        try:
+                            child_pk_name = schema._get_pk_name(child_model_cls)
+                        except Exception:
+                            child_pk_name = 'id'
+                        try:
+                            child_pk_col = getattr(getattr(child_model_cls, '__table__', None).c, child_pk_name)
+                        except Exception:
+                            child_pk_col = None
+                        # Fetch child ids to recurse
+                        try:
+                            if child_pk_col is not None:
+                                ids_res = await session.execute(_sa_select(child_pk_col).where(fk_col == parent_pk_val))
+                                child_ids = [row[0] for row in ids_res.fetchall()]
+                            else:
+                                ids_res = await session.execute(_sa_select(getattr(child_model_cls, child_pk_name)).where(fk_col == parent_pk_val))
+                                child_ids = [row[0] for row in ids_res.fetchall()]
+                        except Exception:
+                            child_ids = []
+                        for cid in child_ids:
+                            await _cascade_delete_children(child_model_cls, child_btype, cid)
+                        # Delete children referencing the parent
+                        try:
+                            await session.execute(_sa_delete_cascade(child_model_cls).where(fk_col == parent_pk_val))
+                        except Exception:
+                            # Fall back to ORM delete one-by-one
+                            for cid in child_ids:
+                                inst_c = await session.get(child_model_cls, cid)
+                                if inst_c is not None:
+                                    await session.delete(inst_c)
+                    except Exception:
+                        continue
+
             # Early delete handling
             try:
                 if isinstance(data_local, dict):
@@ -525,84 +607,7 @@ def build_merge_resolver_for_type(
                 )
 
                 # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints)
-                from sqlalchemy import select as _sa_select
-                async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
-                    try:
-                        bfields = getattr(parent_btype_cls, '__berry_fields__', {}) or {}
-                    except Exception:
-                        bfields = {}
-                    for rname, rdef in bfields.items():
-                        try:
-                            if getattr(rdef, 'kind', None) != 'relation':
-                                continue
-                            meta_r = getattr(rdef, 'meta', {}) or {}
-                            target_name = meta_r.get('target')
-                            if not target_name:
-                                continue
-                            child_btype = schema.types.get(target_name)
-                            child_model_cls = getattr(child_btype, 'model', None) if child_btype is not None else None
-                            if child_model_cls is None:
-                                continue
-                            explicit_child_fk_name = meta_r.get('fk_column_name')
-                            # Find FK on child referencing parent
-                            try:
-                                fk_col = schema._find_child_fk_column(parent_model_cls, child_model_cls, explicit_child_fk_name)  # type: ignore[attr-defined]
-                            except Exception:
-                                fk_col = None
-                            if fk_col is None:
-                                continue
-                            
-                            # Check on_delete strategy from SQLAlchemy metadata
-                            on_delete_strategy = None
-                            try:
-                                if hasattr(fk_col, 'foreign_keys'):
-                                    for fk in fk_col.foreign_keys:
-                                        if fk.ondelete and fk.ondelete.upper() == 'SET NULL':
-                                            on_delete_strategy = 'SET NULL'
-                                            break
-                            except Exception:
-                                pass
-
-                            if on_delete_strategy == 'SET NULL':
-                                from sqlalchemy import update as _sa_update
-                                try:
-                                    await session.execute(_sa_update(child_model_cls).where(fk_col == parent_pk_val).values({fk_col.name: None}))
-                                except Exception:
-                                    pass
-                                continue
-
-                            # Recurse to grandchildren first by selecting child PKs
-                            try:
-                                child_pk_name = schema._get_pk_name(child_model_cls)
-                            except Exception:
-                                child_pk_name = 'id'
-                            try:
-                                child_pk_col = getattr(getattr(child_model_cls, '__table__', None).c, child_pk_name)
-                            except Exception:
-                                child_pk_col = None
-                            # Fetch child ids to recurse
-                            try:
-                                if child_pk_col is not None:
-                                    ids_res = await session.execute(_sa_select(child_pk_col).where(fk_col == parent_pk_val))
-                                    child_ids = [row[0] for row in ids_res.fetchall()]
-                                else:
-                                    ids_res = await session.execute(_sa_select(getattr(child_model_cls, child_pk_name)).where(fk_col == parent_pk_val))
-                                    child_ids = [row[0] for row in ids_res.fetchall()]
-                            except Exception:
-                                child_ids = []
-                            for cid in child_ids:
-                                await _cascade_delete_children(child_model_cls, child_btype, cid)
-                            # Delete children referencing the parent
-                            try:
-                                await session.execute(_sa_delete(child_model_cls).where(fk_col == parent_pk_val))
-                            except Exception:
-                                # Fall back to ORM delete one-by-one
-                                for cid in child_ids:
-                                    inst_c = await session.get(child_model_cls, cid)
-                                    if inst_c is not None:
-                                        await session.delete(inst_c)
-                        except Exception:
-                            continue
+                # (_cascade_delete_children is defined at _merge_single scope above and reused here.)
                 await _cascade_delete_children(model_cls_local, btype_local, pk_val_local)
                 # Use bulk DELETE to avoid ORM trying to NULL-out child FKs (which may be NOT NULL)
                 try:
@@ -1024,6 +1029,166 @@ def build_merge_resolver_for_type(
                         raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
 
             # Process relations
+            # --- _Replace: replace-semantics for nested list relations ---
+            # Validate and collect relation keys that opt into "replace" mode.
+            replace_keys: List[str] = []
+            try:
+                if isinstance(data_local, dict):
+                    _raw_replace = data_local.get('_Replace')
+                    if _raw_replace is None:
+                        _raw_replace = scalar_vals.get('_Replace')
+                    if _raw_replace:
+                        if isinstance(_raw_replace, str):
+                            _raw_replace = [_raw_replace]
+                        if not isinstance(_raw_replace, (list, tuple)):
+                            raise ValueError(
+                                f"_Replace must be a list of relation field names; got {type(_raw_replace).__name__}"
+                            )
+                        bfields_local = getattr(btype_local, '__berry_fields__', {}) or {}
+                        for _rk in _raw_replace:
+                            if not isinstance(_rk, str) or not _rk:
+                                raise ValueError(
+                                    f"_Replace entries must be non-empty strings; got {_rk!r}"
+                                )
+                            _rdef = bfields_local.get(_rk)
+                            if _rdef is None or getattr(_rdef, 'kind', None) != 'relation':
+                                raise ValueError(
+                                    f"_Replace references unknown relation '{_rk}' on {getattr(btype_local, '__name__', type_name)}"
+                                )
+                            _rmeta = getattr(_rdef, 'meta', {}) or {}
+                            if bool(_rmeta.get('single')):
+                                raise ValueError(
+                                    f"_Replace cannot target single relation '{_rk}' on {getattr(btype_local, '__name__', type_name)}; only list relations are supported"
+                                )
+                            if _rk not in relation_vals:
+                                # The relation wasn't provided in the payload. Treat an explicit
+                                # _Replace with no items as "delete all children of that relation".
+                                replace_keys.append(_rk)
+                            else:
+                                replace_keys.append(_rk)
+            except ValueError:
+                raise
+            except Exception:
+                replace_keys = []
+
+            # DELETE-first: for each replace relation, remove children belonging to this
+            # parent whose PK is not among the PKs explicitly provided in the payload items.
+            # Doing this before the upsert loop avoids unique-constraint collisions between
+            # new inserts and soon-to-be-deleted rows.
+            for rel_key in replace_keys:
+                try:
+                    rel_def = btype_local.__berry_fields__.get(rel_key)
+                    if rel_def is None or getattr(rel_def, 'kind', None) != 'relation':
+                        continue
+                    _rmeta = getattr(rel_def, 'meta', {}) or {}
+                    _target_name = _rmeta.get('target')
+                    if not _target_name:
+                        continue
+                    child_btype_r = schema.types.get(_target_name)
+                    child_model_r = getattr(child_btype_r, 'model', None) if child_btype_r else None
+                    if child_btype_r is None or child_model_r is None:
+                        continue
+                    try:
+                        child_pk_name_r = schema._get_pk_name(child_model_r)
+                    except Exception:
+                        child_pk_name_r = 'id'
+                    # Child FK column referencing this parent (override > inspection > conventional)
+                    child_fk_col_name_r = _detect_child_fk_column(model_cls_local, child_model_r, _rmeta.get('fk_column_name'))
+                    if not child_fk_col_name_r:
+                        continue
+                    # Parent PK value (this instance)
+                    try:
+                        parent_pk_name_r = schema._get_pk_name(model_cls_local)
+                    except Exception:
+                        parent_pk_name_r = 'id'
+                    parent_pk_val_r = getattr(instance, parent_pk_name_r, None)
+                    if parent_pk_val_r is None:
+                        parent_pk_val_r = await _get_pk_value(instance, model_cls_local)
+                    if parent_pk_val_r is None:
+                        continue
+                    # Collect kept PKs from payload items for this relation
+                    kept_pks: List[Any] = []
+                    _rv = relation_vals.get(rel_key)
+                    if _rv is not None:
+                        _items_r = schema._input_to_dict(_rv)
+                        if not isinstance(_items_r, list):
+                            _items_r = [_items_r]
+                        for _it in _items_r:
+                            if not isinstance(_it, dict):
+                                continue
+                            _pk_it = _it.get(child_pk_name_r)
+                            if _pk_it not in (None, 0, ''):
+                                kept_pks.append(_pk_it)
+                    # Build base delete: children where FK == parent PK
+                    try:
+                        child_fk_col_obj = getattr(getattr(child_model_r, '__table__', None).c, child_fk_col_name_r)
+                    except Exception:
+                        child_fk_col_obj = None
+                    if child_fk_col_obj is None:
+                        continue
+                    from sqlalchemy import delete as _sa_delete_r
+                    del_stmt = _sa_delete_r(child_model_r).where(child_fk_col_obj == parent_pk_val_r)
+                    # Exclude kept rows
+                    if kept_pks:
+                        try:
+                            child_pk_col_obj = getattr(getattr(child_model_r, '__table__', None).c, child_pk_name_r)
+                            if child_pk_col_obj is not None:
+                                del_stmt = del_stmt.where(child_pk_col_obj.notin_(kept_pks))
+                        except Exception:
+                            pass
+                    # Apply relation-level scope predicate (same builder as queries/deletes)
+                    _rel_scope = _rmeta.get('scope')
+                    if _rel_scope is not None:
+                        _rv_scope = _resolve_scope_value(_rel_scope)
+                        if callable(_rv_scope):
+                            try:
+                                _rv_scope_res = _rv_scope(child_model_r, info)
+                                if inspect.isawaitable(_rv_scope_res):
+                                    _rv_scope_res = await _rv_scope_res  # type: ignore
+                                _rv_scope = _rv_scope_res
+                            except Exception:
+                                _rv_scope = None
+                        if _rel_scope is not None:
+                            try:
+                                _builder_r = RelationSQLBuilders(schema)
+                                del_stmt = _builder_r._apply_where_common(
+                                    del_stmt,
+                                    child_model_r,
+                                    _rel_scope,
+                                    strict=True,
+                                    to_where_dict=_to_where_dict,
+                                    expr_from_where_dict=_expr_from_where_dict,
+                                    info=info,
+                                )
+                            except Exception:
+                                pass
+                    # Application-level cascade for grandchildren first (MSSQL FK safety)
+                    try:
+                        # Select PKs of children that WILL be deleted, then cascade their children
+                        _sel_del = select(getattr(getattr(child_model_r, '__table__', None).c, child_pk_name_r)).where(child_fk_col_obj == parent_pk_val_r)
+                        if kept_pks:
+                            try:
+                                child_pk_col_obj_s = getattr(getattr(child_model_r, '__table__', None).c, child_pk_name_r)
+                                if child_pk_col_obj_s is not None:
+                                    _sel_del = _sel_del.where(child_pk_col_obj_s.notin_(kept_pks))
+                            except Exception:
+                                pass
+                        _ids_res = await session.execute(_sel_del)
+                        _to_delete_ids = [row[0] for row in _ids_res.fetchall()]
+                    except Exception:
+                        _to_delete_ids = []
+                    for _cid in _to_delete_ids:
+                        try:
+                            await _cascade_delete_children(child_model_r, child_btype_r, _cid)
+                        except Exception:
+                            pass
+                    await session.execute(del_stmt)
+                    await session.flush()
+                except Exception:
+                    # Best-effort: a failure here should not silently swallow validation errors,
+                    # but defensive guard keeps a single relation issue from corrupting the txn.
+                    raise
+
             for rel_key, rel_value in list(relation_vals.items()):
                 if rel_value is None:
                     continue

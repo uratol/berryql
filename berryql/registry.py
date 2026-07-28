@@ -759,6 +759,19 @@ class BerrySchema:
             except Exception:
                 pass
 
+        # Special control flag: replace-semantics for nested list relations.
+        # Lists relation field names on this type whose children should be replaced
+        # (i.e. upsert listed items, delete every other child belonging to this parent
+        # that is not in the listed PK set). Validated against this type's relations.
+        try:
+            anns['_Replace'] = Optional[List[str]]
+            setattr(InPlain, '_Replace', UNSET)
+        except Exception:
+            try:
+                setattr(InPlain, '_Replace', None)
+            except Exception:
+                pass
+
         # Now attach annotations and decorate as strawberry input
         setattr(InPlain, '__annotations__', anns)
         try:
