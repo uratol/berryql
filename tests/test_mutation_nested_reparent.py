@@ -147,6 +147,9 @@ async def test_nested_comment_reparent_scoped_target_blocked(db_session, populat
     comment = populated_db["post_comments"][0]
     assert int(post1.author_id) == 1
     assert int(post3.author_id) == 2  # out of scope
+    post1_id = int(post1.id)
+    post3_id = int(post3.id)
+    comment_id = int(comment.id)
 
     mutation = (
         """
@@ -161,12 +164,12 @@ async def test_nested_comment_reparent_scoped_target_blocked(db_session, populat
     variables = {
         "payload": [
             {
-                "id": int(post1.id),
+                "id": post1_id,
                 "post_comments": [
                     {
-                        "id": int(comment.id),
+                        "id": comment_id,
                         "content": "should-not-move",
-                        "post_id": int(post3.id),
+                        "post_id": post3_id,
                     }
                 ],
             }
@@ -182,8 +185,8 @@ async def test_nested_comment_reparent_scoped_target_blocked(db_session, populat
     assert "out of scope" in msg.lower(), msg
 
     # Confirm the comment did NOT move (still on post1, content unchanged)
-    new_post_id, new_content = await _fetch_comment_post_id(db_session, comment.id)
-    assert new_post_id == int(post1.id), f"comment must remain on post {post1.id}, got {new_post_id}"
+    new_post_id, new_content = await _fetch_comment_post_id(db_session, comment_id)
+    assert new_post_id == post1_id, f"comment must remain on post {post1_id}, got {new_post_id}"
     assert new_content != "should-not-move"
 
 
@@ -248,6 +251,10 @@ async def test_nested_comment_reparent_origin_out_of_scope_blocked(db_session, p
     assert int(comment.post_id) == int(post3.id)
     assert int(post3.author_id) == 2  # origin out of scope
     assert int(post2.author_id) == 1  # target in scope
+    post1_id = int(post1.id)
+    post2_id = int(post2.id)
+    post3_id = int(post3.id)
+    comment_id = int(comment.id)
 
     mutation = (
         """
@@ -262,12 +269,12 @@ async def test_nested_comment_reparent_origin_out_of_scope_blocked(db_session, p
     variables = {
         "payload": [
             {
-                "id": int(post1.id),
+                "id": post1_id,
                 "post_comments": [
                     {
-                        "id": int(comment.id),
+                        "id": comment_id,
                         "content": "origin-oob",
-                        "post_id": int(post2.id),
+                        "post_id": post2_id,
                     }
                 ],
             }
@@ -283,6 +290,6 @@ async def test_nested_comment_reparent_origin_out_of_scope_blocked(db_session, p
     assert "out of scope" in msg.lower(), msg
 
     # Comment must remain on post3, unchanged
-    new_post_id, new_content = await _fetch_comment_post_id(db_session, comment.id)
-    assert new_post_id == int(post3.id), f"comment must remain on post {post3.id}, got {new_post_id}"
+    new_post_id, new_content = await _fetch_comment_post_id(db_session, comment_id)
+    assert new_post_id == post3_id, f"comment must remain on post {post3_id}, got {new_post_id}"
     assert new_content != "origin-oob"

@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4.0] - 2026-07-29
+### Added
+- Added deterministic sibling relation merging based on owning `BerryType`
+  declaration order, with normalized local `declaration_index` metadata and a
+  single ordering helper shared by precreation, `_Replace`, normal recursion,
+  and cascade traversal.
+- Added public `MergeOperationContext`, `MergeNodeContext`, and
+  `DeferredValidation` APIs. All recursive nodes and list items share one
+  operation, which records touched model primary keys and shared application
+  state.
+- Added deduplicated sync/async deferred validators that run after the complete
+  graph and final flush but before commit.
+- Added incremental schema-level `before_merge`, `before_commit`,
+  `after_commit`, and `on_error` hooks through `BerrySchema.merge_hooks()`.
+
+### Changed
+- Centralized single and list merge transaction handling under the existing
+  AsyncSession lock. Merge, type-hook, validator, and before-commit failures
+  now explicitly roll back before `on_error`; an `on_error` failure cannot
+  mask the original exception.
+- Defined inherited declaration composition: bases retain relative order and
+  compose left-to-right, subclass fields append, and overrides move to their
+  subclass declaration position.
+- Documented explicit-PK `_Insert` references from earlier-declared relations
+  to later-declared sibling payloads.
+
 ## [0.3.9] - 2026-07-28
 ### Fixed
 - Fixed `_Replace` mutation argument validation failing under `autoCamelCase` (Strawberry `StrawberryConfig(auto_camel_case=True)`). Relation names listed in `_Replace` are now resolved in **both** snake_case (python field name) and camelCase (GraphQL field name) forms. Previously `_Replace: ["postComments"]` raised `_Replace references unknown relation 'postComments'` because only the snake_case key (`post_comments`) was recognized; the string values inside `_Replace` are not remapped by Strawberry the way input field names are.

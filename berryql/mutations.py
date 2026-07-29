@@ -3,10 +3,11 @@ import inspect
 import logging
 import uuid
 from datetime import date as _date, datetime as _datetime
-from typing import Any, Dict, Optional, Type, List, get_args, get_origin
+from typing import Any, Dict, Mapping, Optional, Type, List, get_args, get_origin
 import strawberry
 from typing import TYPE_CHECKING
 from .core.utils import get_db_session as _get_db
+from .context import MergeHookContext, MergeNodeContext, MergeOperationContext
 from sqlalchemy import select
 from sqlalchemy.types import Date as _SADate, DateTime as _SADateTime
 from .sql.builders import RelationSQLBuilders
@@ -25,6 +26,81 @@ else:
 _logger = logging.getLogger("berryql")
 
 # --- Shared helpers (module-level) ---------------------------------------
+
+def _ordered_relation_entries(
+    btype_cls: Type[Any],
+    values: Optional[Mapping[str, Any]] = None,
+):
+    """Return relation entries in normalized BerryType declaration order.
+
+    Payload/GraphQL/Strawberry ordering is intentionally ignored.  When
+    ``values`` is omitted, every declared relation is returned with ``None`` as
+    its value; otherwise only relation names present in the mapping are
+    returned.
+    """
+
+    fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+    entries = []
+    for fallback_index, (name, field_def) in enumerate(fields.items()):
+        if getattr(field_def, 'kind', None) != 'relation':
+            continue
+        if values is not None and name not in values:
+            continue
+        meta = getattr(field_def, 'meta', {}) or {}
+        declaration_index = meta.get('declaration_index', fallback_index)
+        entries.append(
+            (
+                declaration_index,
+                fallback_index,
+                name,
+                field_def,
+                None if values is None else values[name],
+            )
+        )
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    return [
+        (name, field_def, value)
+        for _, _, name, field_def, value in entries
+    ]
+
+
+async def _call_operation_hook(callback, info, operation, relevant):
+    """Call one global hook with lightweight backwards-friendly adaptation."""
+
+    try:
+        signature = inspect.signature(callback)
+        parameters = list(signature.parameters.values())
+    except (TypeError, ValueError):
+        parameters = []
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters):
+        result = callback(info, operation, relevant)
+    elif len(parameters) >= 3:
+        result = callback(info, operation, relevant)
+    elif len(parameters) == 2:
+        result = callback(info, operation)
+    elif len(parameters) == 1:
+        result = callback(operation)
+    else:
+        result = callback()
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _run_operation_hooks(schema, phase, info, operation, relevant):
+    for callback in (getattr(schema, '_merge_hooks', {}) or {}).get(phase, ()):
+        await _call_operation_hook(callback, info, operation, relevant)
+
+
+async def _run_on_error_hooks(schema, info, operation, exception):
+    for callback in (getattr(schema, '_merge_hooks', {}) or {}).get('on_error', ()):
+        try:
+            await _call_operation_hook(callback, info, operation, exception)
+        except BaseException:
+            _logger.exception(
+                "BerryQL on_error hook failed while handling %r", exception
+            )
+
 
 def compose_scope_with_guard(dom_cls: Any, desc_scope: Any):
     """Compose descriptor-level scope with domain guard into a single async callable.
@@ -85,6 +161,12 @@ def build_merge_resolver_for_type(
         if session is None:
             raise ValueError("No db_session in context")
         data = schema._input_to_dict(payload)
+        operation = MergeOperationContext(
+            root_model=model_cls,
+            root_berry_type=btype_cls,
+            payload_is_list=bool(payload_is_list),
+            session=session,
+        )
 
         # Serialize access to a shared AsyncSession across parallel GraphQL resolvers.
         # GraphQL executes sibling fields concurrently; without a guard, multiple
@@ -383,6 +465,42 @@ def build_merge_resolver_for_type(
             return bool(row)
 
         async def _merge_single(model_cls_local, btype_local, data_local, parent_ctx=None, rel_name_from_parent: Optional[str] = None):
+            parent_node = (
+                parent_ctx.get('_node')
+                if isinstance(parent_ctx, dict)
+                else None
+            )
+            node_context = MergeNodeContext(
+                operation=operation,
+                parent=parent_node,
+                parent_model=(
+                    parent_ctx.get('parent_model')
+                    if isinstance(parent_ctx, dict)
+                    else None
+                ),
+                parent_inst=(
+                    parent_ctx.get('parent_inst')
+                    if isinstance(parent_ctx, dict)
+                    else None
+                ),
+                relation=rel_name_from_parent,
+                reparent_in_progress=bool(
+                    parent_ctx.get('reparent_in_progress')
+                    if isinstance(parent_ctx, dict)
+                    else False
+                ),
+            )
+
+            def _hook_context(*, delete: bool = False):
+                node_context.delete = delete
+                return MergeHookContext({
+                    'operation': operation,
+                    'node': node_context,
+                    'parent': parent_ctx,
+                    'relation': rel_name_from_parent,
+                    'delete': delete,
+                })
+
             # Compute effective callbacks: combine optional explicit ones with type-level decorators
             eff_pre_cbs: List[Any] = []
             eff_post_cbs: List[Any] = []
@@ -441,11 +559,9 @@ def build_merge_resolver_for_type(
             # replace-semantics) paths can reuse it.
             from sqlalchemy import select as _sa_select, delete as _sa_delete_cascade
             async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
-                try:
-                    bfields = getattr(parent_btype_cls, '__berry_fields__', {}) or {}
-                except Exception:
-                    bfields = {}
-                for rname, rdef in bfields.items():
+                for rname, rdef, _ in _ordered_relation_entries(
+                    parent_btype_cls
+                ):
                     try:
                         if getattr(rdef, 'kind', None) != 'relation':
                             continue
@@ -603,7 +719,7 @@ def build_merge_resolver_for_type(
                     model_cls_local,
                     info,
                     data_local,
-                    {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True}
+                    _hook_context(delete=True)
                 )
 
                 # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints)
@@ -625,11 +741,25 @@ def build_merge_resolver_for_type(
                     # As a last resort, perform ORM delete
                     await session.delete(instance_for_delete)
                 await session.flush()
-                await _maybe_call_post_many(local_type_post_cbs, model_cls_local, info, instance_for_delete, False, {'parent': parent_ctx, 'relation': rel_name_from_parent, 'delete': True})
+                operation.record_touched(model_cls_local, pk_val_local)
+                await _maybe_call_post_many(
+                    local_type_post_cbs,
+                    model_cls_local,
+                    info,
+                    instance_for_delete,
+                    False,
+                    _hook_context(delete=True),
+                )
                 return instance_for_delete
 
             # Call pre-callbacks before any processing
-            data_local = await _maybe_call_pre_many(local_type_pre_cbs, model_cls_local, info, data_local, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            data_local = await _maybe_call_pre_many(
+                local_type_pre_cbs,
+                model_cls_local,
+                info,
+                data_local,
+                _hook_context(),
+            )
 
             # Split scalars and relations
             scalar_vals: Dict[str, Any] = {}
@@ -701,9 +831,10 @@ def build_merge_resolver_for_type(
 
             # Pre-create single child relations when FK is on parent
             precreated_children: Dict[str, Any] = {}
-            for rel_key, rel_value in list(relation_vals.items()):
+            for rel_key, rel_def, rel_value in _ordered_relation_entries(
+                btype_local, relation_vals
+            ):
                 try:
-                    rel_def = btype_local.__berry_fields__.get(rel_key)
                     if rel_def is None or getattr(rel_def, 'kind', None) != 'relation':
                         continue
                     meta = getattr(rel_def, 'meta', {}) or {}
@@ -755,6 +886,7 @@ def build_merge_resolver_for_type(
                             'parent_model': model_cls_local,
                             'parent_inst': None,
                             'parent_ctx': parent_ctx,
+                            '_node': node_context,
                             'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
                             'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else None),
                         },
@@ -773,7 +905,9 @@ def build_merge_resolver_for_type(
                     precreated_children[rel_key] = child_inst
                     del relation_vals[rel_key]
                 except Exception:
-                    continue
+                    # A child merge failure belongs to the operation.  Let the
+                    # root transaction boundary roll back the complete graph.
+                    raise
 
             # Parent context: ensure child FK to parent is set on payload
             child_rel_to_parent_name: Optional[str] = None
@@ -1023,6 +1157,9 @@ def build_merge_resolver_for_type(
             except Exception:
                 pass
             await session.flush()
+            operation.record_touched(
+                model_cls_local, getattr(instance, pk_name_local, None)
+            )
 
             # Enforce scope AFTER changes
             if eff_scope is not None:
@@ -1032,18 +1169,10 @@ def build_merge_resolver_for_type(
                     if parent_model_cls_local is not None and parent_inst_local is not None:
                         ok2p = await _enforce_scope(parent_model_cls_local, parent_inst_local, parent_ctx.get('parent_scope'), parent_ctx)
                         if not ok2p:
-                            try:
-                                await session.rollback()
-                            except Exception:
-                                pass
                             raise PermissionError("Mutation out of scope; parent not within scope")
                 else:
                     ok2 = await _enforce_scope(model_cls_local, instance, eff_scope)
                     if not ok2:
-                        try:
-                            await session.rollback()
-                        except Exception:
-                            pass
                         _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
                         _attrs = _safe_attrs_dump(model_cls_local, instance)
                         raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
@@ -1109,9 +1238,13 @@ def build_merge_resolver_for_type(
             # parent whose PK is not among the PKs explicitly provided in the payload items.
             # Doing this before the upsert loop avoids unique-constraint collisions between
             # new inserts and soon-to-be-deleted rows.
-            for rel_key in replace_keys:
+            ordered_replace_values = {
+                key: relation_vals.get(key) for key in replace_keys
+            }
+            for rel_key, rel_def, _ in _ordered_relation_entries(
+                btype_local, ordered_replace_values
+            ):
                 try:
-                    rel_def = btype_local.__berry_fields__.get(rel_key)
                     if rel_def is None or getattr(rel_def, 'kind', None) != 'relation':
                         continue
                     _rmeta = getattr(rel_def, 'meta', {}) or {}
@@ -1223,10 +1356,11 @@ def build_merge_resolver_for_type(
                     # but defensive guard keeps a single relation issue from corrupting the txn.
                     raise
 
-            for rel_key, rel_value in list(relation_vals.items()):
+            for rel_key, rel_def, rel_value in _ordered_relation_entries(
+                btype_local, relation_vals
+            ):
                 if rel_value is None:
                     continue
-                rel_def = btype_local.__berry_fields__.get(rel_key)
                 if rel_def is None or rel_def.kind != 'relation':
                     continue
                 target_name = rel_def.meta.get('target') if isinstance(rel_def.meta, dict) else None
@@ -1251,6 +1385,7 @@ def build_merge_resolver_for_type(
                             'parent_model': model_cls_local,
                             'parent_inst': instance,
                             'parent_ctx': parent_ctx,
+                            '_node': node_context,
                             # Establish/propagate scope root for inherited domain scopes
                             'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
                             'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
@@ -1371,6 +1506,7 @@ def build_merge_resolver_for_type(
                                 'parent_scope': eff_scope,
                                 'parent_ctx': parent_ctx,
                                 'reparent_in_progress': _reparent_in_progress,
+                                '_node': node_context,
                                 # Establish/propagate scope root for inherited domain scopes
                                 'scope_root_model': (parent_ctx.get('scope_root_model') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_model') is not None else model_cls_local),
                                 'scope_root_inst': (parent_ctx.get('scope_root_inst') if isinstance(parent_ctx, dict) and parent_ctx.get('scope_root_inst') is not None else instance),
@@ -1385,30 +1521,84 @@ def build_merge_resolver_for_type(
             except Exception:
                 pass
             # Fire post-callbacks
-            await _maybe_call_post_many(eff_post_cbs, model_cls_local, info, instance, created_now, {'parent': parent_ctx, 'relation': rel_name_from_parent})
+            await _maybe_call_post_many(
+                eff_post_cbs,
+                model_cls_local,
+                info,
+                instance,
+                created_now,
+                _hook_context(),
+            )
             return instance
 
         # Execute the entire merge under the session-level lock
         async with (_lock or _asyncio.Lock()):
-            # Support list payloads when configured by caller
             pl_is_list = bool(payload_is_list)
             rt_is_list = bool(return_is_list)
+            try:
+                await _run_operation_hooks(
+                    schema, 'before_merge', info, operation, data
+                )
+                if pl_is_list:
+                    items = (
+                        data
+                        if isinstance(data, list)
+                        else ([data] if data is not None else [])
+                    )
+                    out_models = []
+                    for item in items:
+                        inst = await _merge_single(
+                            model_cls, btype_cls, item
+                        )
+                        out_models.append(inst)
+                    operation_result = out_models
+                else:
+                    operation_result = await _merge_single(
+                        model_cls, btype_cls, data
+                    )
+
+                await session.flush()
+                await operation.run_deferred_validators(info)
+                await _run_operation_hooks(
+                    schema,
+                    'before_commit',
+                    info,
+                    operation,
+                    operation_result,
+                )
+                await session.commit()
+                await _run_operation_hooks(
+                    schema,
+                    'after_commit',
+                    info,
+                    operation,
+                    operation_result,
+                )
+            except BaseException as exc:
+                try:
+                    await session.rollback()
+                except BaseException:
+                    _logger.exception(
+                        "BerryQL rollback failed while handling %r", exc
+                    )
+                await _run_on_error_hooks(
+                    schema, info, operation, exc
+                )
+                raise
+
             if pl_is_list:
-                items = data if isinstance(data, list) else ([data] if data is not None else [])
-                out_models = []
-                for item in items:
-                    inst = await _merge_single(model_cls, btype_cls, item)
-                    out_models.append(inst)
-                await session.commit()
                 if rt_is_list:
-                    return [schema.from_model(type_name, m) for m in out_models]
-                # Fallback: return last item if single return requested
-                last = out_models[-1] if out_models else None
-                return schema.from_model(type_name, last) if last is not None else None
-            else:
-                inst = await _merge_single(model_cls, btype_cls, data)
-                await session.commit()
-                return schema.from_model(type_name, inst)
+                    return [
+                        schema.from_model(type_name, model)
+                        for model in operation_result
+                    ]
+                last = operation_result[-1] if operation_result else None
+                return (
+                    schema.from_model(type_name, last)
+                    if last is not None
+                    else None
+                )
+            return schema.from_model(type_name, operation_result)
 
     fname = field_name or (f"merge_{type_name[:-2].lower()}" if type_name.endswith('QL') else f"merge_{type_name.lower()}")
     # Decide arg/return annotations (list vs single)

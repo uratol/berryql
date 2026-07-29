@@ -411,6 +411,106 @@ class Mutation:
 
 Merge mutations accept `payload` arguments inferred from the Berry type’s fields (including write-only helpers such as `author_email`) and return BerryQL objects that include read-only fields.
 
+### Merge order, operation context, and lifecycle
+
+Sibling relations are merged in their owning `BerryType` declaration order.
+GraphQL input objects are semantically unordered, so client textual field
+order, variable-dictionary insertion order, and Strawberry input/dataclass
+order do not control database execution.
+
+```python
+class SceneQL(BerryType):
+    shots = relation("ShotQL", order_by="sequence_number")
+    beats = relation("BeatQL", order_by="sequence_number")
+```
+
+Here `shots` always merges before `beats`. This rule also applies to
+single-relation precreation, `_Replace`, normal list/single merging, and
+cascade traversal. Inherited fields keep their base-class relative order,
+bases compose left-to-right, subclass fields append in declaration order, and
+an overridden field moves to its declaration position in the subclass.
+
+This makes explicit-primary-key cross-sibling references deterministic:
+
+```graphql
+scenes: [{
+  id: $sceneId
+  shots: [{
+    id: $clientGeneratedShotId
+    _Insert: true
+    title: "Shot 1"
+  }]
+  beats: [{
+    id: $beatId
+    lines: [{
+      id: $lineId
+      shotId: $clientGeneratedShotId
+    }]
+  }]
+}]
+```
+
+`_Insert` retains the supplied primary key, so the later relation can refer to
+it after the earlier relation is flushed. BerryQL does not infer arbitrary FK
+dependencies. A database-generated ID unknown to the client cannot be
+referenced by a sibling in the same payload.
+
+Every type-level pre/post hook receives the existing dictionary `ctx`. It now
+also contains:
+
+- `ctx["operation"]`: the shared `MergeOperationContext` for all descendants
+  and every item in a list mutation.
+- `ctx["node"]`: the current `MergeNodeContext`.
+- The existing `parent`, `relation`, and `delete` keys.
+
+The operation exposes shared `state`, touched primary keys grouped by model,
+the request `session`, and deduplicated deferred validation:
+
+```python
+def line_post(model_cls, info, line, created, ctx):
+    ctx.operation.defer_validation(
+        key=("shot-line-continuity", line.scene_id),
+        callback=validate_scene_shot_line_continuity,
+        scene_id=line.scene_id,
+    )
+```
+
+Re-registering a key is a no-op. Sync and async validators run in first
+registration order after the complete graph/list and a final flush, while all
+changes are still uncommitted. Validators may query that transaction but must
+not call `commit()` or `rollback()`.
+
+Schema-level hooks can be registered incrementally:
+
+```python
+berry_schema.merge_hooks(
+    before_merge=[audit_payload],
+    before_commit=[validate_operation],
+    after_commit=[publish_notifications],
+    on_error=[record_failure],
+)
+```
+
+Each global hook receives `(info, operation, relevant_value)`, where the last
+value is the converted payload, merge result, or original exception for that
+phase. The lifecycle is:
+
+```text
+before_merge
+  -> recursive type pre/post hooks
+  -> final flush
+  -> deferred validators
+  -> before_commit
+  -> commit
+  -> after_commit
+```
+
+Any exception before commit explicitly rolls back the full mutation, then runs
+`on_error` after rollback and re-raises the original exception. An `on_error`
+failure is logged without masking that original error. `after_commit` runs
+only after a successful commit and therefore must not be used for validation
+that depends on rollback.
+
 ### Mutation payload control flags
 
 Every generated input type carries optional control flags (underscore-prefixed) to tweak merge behavior:

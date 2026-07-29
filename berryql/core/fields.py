@@ -45,7 +45,10 @@ class FieldDescriptor:
         Returns:
             FieldDef: Normalized representation for this field.
         """
-        return FieldDef(name=self.name or '', kind=self.kind, meta=self.meta)
+        # Each owning BerryType receives independent normalized metadata.  A
+        # descriptor may be reused, so mutating the descriptor's metadata while
+        # normalizing one class must never affect another class.
+        return FieldDef(name=self.name or '', kind=self.kind, meta=dict(self.meta))
 
 def field(
     column: Optional[str] = None,

@@ -39,6 +39,9 @@ def __getattr__(name: str):  # PEP 562 lazy exports
     if name in {'BerrySchema', 'BerryType', 'BerryDomain', 'PaginationConfig', 'StrawberryConfig'}:
         _registry = _importlib.import_module(__name__ + '.registry')
         return getattr(_registry, name)
+    if name in {'MergeOperationContext', 'MergeNodeContext', 'DeferredValidation'}:
+        _context = _importlib.import_module(__name__ + '.context')
+        return getattr(_context, name)
     if name in {'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks', 'scope'}:
         from .core import fields as _fields
         if name not in {'hooks'}:
@@ -54,6 +57,7 @@ def __getattr__(name: str):  # PEP 562 lazy exports
 
 __all__ = [
     'BerrySchema', 'BerryType', 'BerryDomain', 'PaginationConfig', 'StrawberryConfig',
+    'MergeOperationContext', 'MergeNodeContext', 'DeferredValidation',
     'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks', 'scope',
     'enum_column',
     'get_active_schema', 'set_active_schema', 'registry', 'mutations',

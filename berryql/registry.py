@@ -156,11 +156,28 @@ UNSET = getattr(strawberry, 'UNSET')
 
 class BerryTypeMeta(type):
     def __new__(mcls, name, bases, namespace):
+        # Compose inherited fields first.  Base relative order is retained,
+        # bases compose left-to-right, subclass declarations append, and a
+        # subclass override moves to its position in the subclass namespace.
         fdefs: Dict[str, FieldDef] = {}
+        for base in bases:
+            for field_name, inherited in (
+                getattr(base, '__berry_fields__', {}) or {}
+            ).items():
+                if field_name not in fdefs:
+                    fdefs[field_name] = FieldDef(
+                        name=inherited.name,
+                        kind=inherited.kind,
+                        meta=dict(inherited.meta or {}),
+                    )
         for k, v in list(namespace.items()):
             if isinstance(v, FieldDescriptor):
                 v.__set_name__(None, k)
+                # An override occupies its subclass declaration position.
+                fdefs.pop(k, None)
                 fdefs[k] = v.build(name)
+        for declaration_index, fdef in enumerate(fdefs.values()):
+            fdef.meta['declaration_index'] = declaration_index
         namespace['__berry_fields__'] = fdefs
         # Pick methods tagged via decorators
         try:
@@ -254,6 +271,12 @@ class BerrySchema:
         # SQLAlchemy models are declared once at import time and never re-created.
         self._col_type_map_cache: Dict[int, Dict[str, Any]] = {}
         self._order_segment_cache: Dict[tuple, str] = {}
+        self._merge_hooks: Dict[str, List[Callable[..., Any]]] = {
+            'before_merge': [],
+            'before_commit': [],
+            'after_commit': [],
+            'on_error': [],
+        }
 
     @staticmethod
     def _coerce_pagination_config(
@@ -406,6 +429,36 @@ class BerrySchema:
                 hooks = berry_schema.hooks(pre=pre_fn, post=post_fn)
         """
         return HooksDescriptor(pre=pre, post=post)
+
+    def merge_hooks(
+        self,
+        *,
+        before_merge: Any | None = None,
+        before_commit: Any | None = None,
+        after_commit: Any | None = None,
+        on_error: Any | None = None,
+    ):
+        """Incrementally register schema-level hooks for every merge operation.
+
+        A hook value may be one callable or a list/tuple of callables. Hooks
+        preserve registration order and are not replaced by later calls.
+        """
+
+        supplied = {
+            'before_merge': before_merge,
+            'before_commit': before_commit,
+            'after_commit': after_commit,
+            'on_error': on_error,
+        }
+        for phase, value in supplied.items():
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for callback in values:
+                if callback is None:
+                    continue
+                if not callable(callback):
+                    raise TypeError(f"{phase} merge hook must be callable")
+                self._merge_hooks[phase].append(callback)
+        return self
 
 
     
