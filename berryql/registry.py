@@ -825,10 +825,10 @@ class BerrySchema:
             except Exception:
                 pass
 
-        # Special control flag: force insertion of a new row even when a PK is provided
-        # in the payload. When true, the provided PK is ignored (not used for lookup nor
-        # assigned) and a fresh auto-generated PK is inserted, avoiding conflicts with
-        # any already-existing row carrying that PK.
+        # Special merge control flag.  When true, force insertion of a new row
+        # even when a PK is supplied (an explicit-PK insert).  When false,
+        # require the supplied PK to resolve to an existing row, making the
+        # payload update-only.  When omitted, retain normal merge semantics.
         try:
             anns['_Insert'] = Optional[bool]
             setattr(InPlain, '_Insert', UNSET)

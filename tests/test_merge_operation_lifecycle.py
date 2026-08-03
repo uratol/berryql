@@ -361,6 +361,51 @@ async def test_explicit_pk_from_earlier_sibling_is_available_to_later_sibling(
 
 
 @pytest.mark.asyncio
+async def test_insert_false_requires_an_existing_row(db_session, populated_db):
+    existing_post = populated_db["posts"][0]
+    unknown_post_id = 90_003
+
+    update_result = await schema.execute(
+        """
+        mutation($payload: PostQLInput!) {
+          merge_post(payload: $payload) { id title }
+        }
+        """,
+        variable_values={
+            "payload": {
+                "id": existing_post.id,
+                "_Insert": False,
+                "title": "update-only",
+            }
+        },
+        context_value={"db_session": db_session},
+    )
+    assert update_result.errors is None, update_result.errors
+    assert update_result.data["merge_post"]["title"] == "update-only"
+
+    missing_result = await schema.execute(
+        """
+        mutation($payload: PostQLInput!) {
+          merge_post(payload: $payload) { id }
+        }
+        """,
+        variable_values={
+            "payload": {
+                "id": unknown_post_id,
+                "_Insert": False,
+                "title": "must-not-insert",
+            }
+        },
+        context_value={"db_session": db_session},
+    )
+    assert missing_result.errors
+    assert "_Insert: false requires an existing Post" in str(
+        missing_result.errors[0]
+    )
+    assert await db_session.get(Post, unknown_post_id) is None
+
+
+@pytest.mark.asyncio
 async def test_before_commit_failure_rolls_back_and_on_error_cannot_mask_it(
     db_session, populated_db, caplog
 ):

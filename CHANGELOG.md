@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4.1] - 2026-08-03
+### Fixed
+- Made `_Insert: false` an explicit update-only mode. It now requires a
+  primary key that resolves to an existing row instead of falling through to
+  normal merge behavior and inserting an unknown ID. `_Insert` omitted keeps
+  normal merge semantics; `_Insert: true` continues to force an explicit-PK
+  insert.
+
 ## [0.4.0] - 2026-07-29
 ### Added
 - Added deterministic sibling relation merging based on owning `BerryType`

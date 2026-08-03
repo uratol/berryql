@@ -948,24 +948,45 @@ def build_merge_resolver_for_type(
             # Determine instance (update or create)
             instance = None
             pk_val = scalar_vals.get(pk_name) or (data_local.get(pk_name) if isinstance(data_local, dict) else None)
-            # _Insert flag forces creation of a new row even when a PK is provided.
-            # The provided PK is KEPT and used in the INSERT (explicit-PK insert);
-            # only the update-lookup is skipped so we always create a new instance.
-            # If the provided PK already exists, the DB will raise a duplicate-key
-            # error, which is the caller's responsibility.
-            _insert_flag = False
+            # ``_Insert`` has three modes:
+            # - omitted: normal merge (update if the PK exists, otherwise create);
+            # - true: force an explicit-PK insert;
+            # - false: update only, requiring an existing PK.
+            #
+            # Do not use truthiness here: an explicit ``false`` is meaningful and
+            # must not fall through to the normal create-on-missing merge path.
+            _insert_mode = None
             try:
-                if isinstance(data_local, dict):
-                    _insert_flag = bool(data_local.get('_Insert'))
-                if not _insert_flag:
-                    _insert_flag = bool(scalar_vals.get('_Insert'))
+                for _control_values in (data_local, scalar_vals):
+                    if not isinstance(_control_values, dict):
+                        continue
+                    if '_Insert' not in _control_values:
+                        continue
+                    _control_value = _control_values['_Insert']
+                    if _control_value is strawberry.UNSET or _control_value is None:
+                        continue
+                    _insert_mode = bool(_control_value)
+                    break
             except Exception:
-                _insert_flag = False
-            if pk_val is not None and not _insert_flag:
+                _insert_mode = None
+
+            _force_insert = _insert_mode is True
+            _require_existing = _insert_mode is False
+            if _require_existing and pk_val is None:
+                raise ValueError("_Insert: false requires a primary-key value")
+
+            if pk_val is not None and not _force_insert:
                 try:
                     instance = await session.get(model_cls_local, pk_val)
                 except Exception:
                     instance = None
+
+            if _require_existing and instance is None:
+                _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
+                raise LookupError(
+                    f"_Insert: false requires an existing {_cls} with "
+                    f"{pk_name}={pk_val!r}"
+                )
 
             # Enforce parent ownership constraint for child update when invoked under a parent
             if pk_val is not None and instance is not None and parent_ctx is not None:
