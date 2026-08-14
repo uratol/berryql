@@ -176,11 +176,18 @@ class MSSQLAdapter(BaseAdapter):
                     parts.append(f"{tgt} BETWEEN {a} AND {b}")
         return parts
 
-    def build_order_clause(self, model_cls, table_alias: str, order_by: str | None, order_dir: str | None, order_multi: list[str] | None) -> str | None:
+    def build_order_clause(self, model_cls, table_alias: str, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, *, add_pk_tiebreaker: bool = False) -> str | None:
         """Public wrapper for MSSQL order clause generation (DRY)."""
-        return self._build_order_clause(model_cls, table_alias, order_by, order_dir, order_multi)
+        return self._build_order_clause(
+            model_cls,
+            table_alias,
+            order_by,
+            order_dir,
+            order_multi,
+            add_pk_tiebreaker=add_pk_tiebreaker,
+        )
 
-    def _build_order_clause(self, model_cls, table_alias: str, order_by: str | None, order_dir: str | None, order_multi: list[str] | None) -> str | None:
+    def _build_order_clause(self, model_cls, table_alias: str, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, *, add_pk_tiebreaker: bool = False) -> str | None:
         parts: list[str] = []
         multi = self._as_list_str(order_multi)
         ob_str = self._as_str(order_by)
@@ -228,6 +235,16 @@ class MSSQLAdapter(BaseAdapter):
                 pk_col = None
             if pk_col:
                 parts.append(f"{alias_ident}.[{pk_col}] ASC")
+        elif add_pk_tiebreaker:
+            try:
+                pk_col = next(iter(model_cls.__table__.primary_key.columns)).name
+            except Exception:
+                pk_col = None
+            pk_expression = f"{alias_ident}.[{pk_col}]" if pk_col else None
+            if pk_expression and not any(
+                pk_expression.lower() in part.lower() for part in parts
+            ):
+                parts.append(f"{pk_expression} ASC")
         return ', '.join(parts) if parts else None
 
     def build_nested_list_sql(self, *, alias: str, grand_model, child_table: str, g_fk_col_name: str, child_pk_name: str, fields: list[str] | list[tuple[str, str]] | None, where_dict: dict | str | None, default_where: dict | str | None, order_by: str | None, order_dir: str | None, order_multi: list[str] | None, limit: int | None, offset: int | None, extra_where_sql: list[str] | None = None, nested_children: list[dict] | None = None, join_clauses: list[str] | None = None) -> str:
@@ -307,6 +324,11 @@ class MSSQLAdapter(BaseAdapter):
                         dwdict_s = _as_dict2(nn.get('default_where'))
                         if dwdict_s:
                             where_parts_s.extend(self.where_from_dict(sub_model, dwdict_s))
+                        where_parts_s.extend(
+                            str(part)
+                            for part in (nn.get('extra_where_sql') or [])
+                            if part
+                        )
                         join_cond = ' AND '.join(where_parts_s)
                         # Base columns for sub_model
                         cols_pairs = nn.get('fields') or [(c.name, c.name) for c in sub_model.__table__.columns]
@@ -335,6 +357,11 @@ class MSSQLAdapter(BaseAdapter):
                                     dwdict_ss = _as_dict2(sn.get('default_where'))
                                     if dwdict_ss:
                                         s_where.extend(self.where_from_dict(s_model, dwdict_ss))
+                                    s_where.extend(
+                                        str(part)
+                                        for part in (sn.get('extra_where_sql') or [])
+                                        if part
+                                    )
                                     s_join = ' AND '.join(s_where)
                                     s_cols_pairs = sn.get('fields') or [(c.name, c.name) for c in s_model.__table__.columns]
                                     s_json = self.build_single_relation_json(
@@ -378,7 +405,7 @@ class MSSQLAdapter(BaseAdapter):
                                         order_multi=sn.get('order_multi'),
                                         limit=sn.get('limit'),
                                         offset=sn.get('offset'),
-                                        extra_where_sql=None,
+                                        extra_where_sql=sn.get('extra_where_sql') or None,
                                         nested_children=sn.get('nested') or None,
                                         join_clauses=sn.get('order_joins') or None,
                                     )
@@ -416,7 +443,7 @@ class MSSQLAdapter(BaseAdapter):
                             order_multi=sub_order_multi,
                             limit=sub_limit,
                             offset=sub_offset,
-                            extra_where_sql=None,
+                            extra_where_sql=nn.get('extra_where_sql') or None,
                             nested_children=None,
                         )
                         n_parts.append(f"ISNULL(({sub_sql}), '[]') AS [{sub_alias}]")
@@ -424,7 +451,14 @@ class MSSQLAdapter(BaseAdapter):
                     continue
             if n_parts:
                 nested_cols = ', ' + ', '.join(n_parts)
-        n_order = self._build_order_clause(grand_model, grand_model.__tablename__, order_by, order_dir, order_multi)
+        n_order = self._build_order_clause(
+            grand_model,
+            grand_model.__tablename__,
+            order_by,
+            order_dir,
+            order_multi,
+            add_pk_tiebreaker=(limit is not None or offset is not None),
+        )
         # Build pagination using ORDER BY ... OFFSET/FETCH to support offset reliably
         pag_clause = ''
         if limit is not None or offset is not None:
@@ -446,7 +480,7 @@ class MSSQLAdapter(BaseAdapter):
             from_clause += ' ' + ' '.join([str(j) for j in join_clauses if j])
         return f"SELECT {n_col_select}{nested_cols} FROM {from_clause} WHERE {n_where}{pag_clause} FOR JSON PATH"
 
-    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, type_default_where: dict | str | None = None, limit: int | None = None, offset: int | None = None, order_by: str | None = None, order_dir: str | None = None, order_multi: list[str] | None = None, nested: list[dict] | None = None, join_clauses: list[str] | None = None) -> Any:
+    def build_relation_list_json_full(self, *, parent_table: str, parent_pk_name: str, child_model, fk_col_name: str, projected_columns: list[str], rel_where: dict | str | None, rel_default_where: dict | str | None, type_default_where: dict | str | None = None, limit: int | None = None, offset: int | None = None, order_by: str | None = None, order_dir: str | None = None, order_multi: list[str] | None = None, nested: list[dict] | None = None, join_clauses: list[str] | None = None, extra_where_sql: list[str] | None = None) -> Any:
         """Assemble full MSSQL JSON aggregation for a to-many relation with optional nested arrays.
 
         nested: list of dicts, each with keys: alias, model, fk_col_name, fields, where, default_where, order_by, order_dir, order_multi, limit
@@ -486,9 +520,19 @@ class MSSQLAdapter(BaseAdapter):
         tdict = _as_dict(type_default_where)
         if tdict:
             where_parts_rel.extend(self.where_from_dict(child_model, tdict))
+        where_parts_rel.extend(
+            str(part) for part in (extra_where_sql or []) if part
+        )
         where_clause = ' AND '.join(where_parts_rel)
         # order clause
-        order_clause = self._build_order_clause(child_model, child_model.__tablename__, order_by, order_dir, order_multi)
+        order_clause = self._build_order_clause(
+            child_model,
+            child_model.__tablename__,
+            order_by,
+            order_dir,
+            order_multi,
+            add_pk_tiebreaker=(limit is not None or offset is not None),
+        )
         # nested
         nested_cols = ''
         if nested:
@@ -506,7 +550,15 @@ class MSSQLAdapter(BaseAdapter):
                         gm_pk = next(iter(gm.__table__.primary_key.columns)).name
                     except Exception:
                         gm_pk = 'id'
-                    join_cond = f"{self.table_ident(child_model)}.[{child_fk_name}] = {self.table_ident(gm)}.[{gm_pk}]"
+                    join_parts = [
+                        f"{self.table_ident(child_model)}.[{child_fk_name}] = {self.table_ident(gm)}.[{gm_pk}]"
+                    ]
+                    join_parts.extend(
+                        str(part)
+                        for part in (n.get('extra_where_sql') or [])
+                        if part
+                    )
+                    join_cond = ' AND '.join(join_parts)
                     cols_pairs = n.get('fields') or []
                     # When no explicit fields provided, select all columns from gm
                     if not cols_pairs:
@@ -531,7 +583,15 @@ class MSSQLAdapter(BaseAdapter):
                                     s_pk = next(iter(s_model.__table__.primary_key.columns)).name
                                 except Exception:
                                     s_pk = 'id'
-                                s_join = f"{self.table_ident(gm)}.[{s_child_fk}] = {self.table_ident(s_model)}.[{s_pk}]"
+                                s_join_parts = [
+                                    f"{self.table_ident(gm)}.[{s_child_fk}] = {self.table_ident(s_model)}.[{s_pk}]"
+                                ]
+                                s_join_parts.extend(
+                                    str(part)
+                                    for part in (sn.get('extra_where_sql') or [])
+                                    if part
+                                )
+                                s_join = ' AND '.join(s_join_parts)
                                 s_cols_pairs = sn.get('fields') or [(c.name, c.name) for c in s_model.__table__.columns]
                                 s_sub = self.build_single_relation_json(
                                     child_table=s_model,
@@ -553,6 +613,7 @@ class MSSQLAdapter(BaseAdapter):
                                 tdict_nested = _as_dict(sn.get('type_default_where'))
                                 if tdict_nested:
                                     n_extra.extend(self.where_from_dict(s_model, tdict_nested))
+                                n_extra.extend(sn.get('extra_where_sql') or [])
                                 nsql = self.build_nested_list_sql(
                                     alias=s_alias,
                                     grand_model=s_model,
@@ -608,6 +669,7 @@ class MSSQLAdapter(BaseAdapter):
                 tdict_nested2 = _as_dict(n.get('type_default_where'))
                 if tdict_nested2:
                     n_extra2.extend(self.where_from_dict(gm, tdict_nested2))
+                n_extra2.extend(n.get('extra_where_sql') or [])
                 nsql = self.build_nested_list_sql(
                     alias=alias,
                     grand_model=gm,
@@ -705,6 +767,11 @@ class MSSQLAdapter(BaseAdapter):
                     tdict = _as_dict(n.get('type_default_where'))
                     if tdict:
                         where_parts.extend(self.where_from_dict(gm, tdict))
+                    where_parts.extend(
+                        str(part)
+                        for part in (n.get('extra_where_sql') or [])
+                        if part
+                    )
                     join_cond = ' AND '.join(where_parts)
                     cols_pairs = n.get('fields') or [(c.name, c.name) for c in gm.__table__.columns]
                     s_sub = self.build_single_relation_json(
@@ -726,6 +793,7 @@ class MSSQLAdapter(BaseAdapter):
                     tdict2 = _as_dict(n.get('type_default_where'))
                     if tdict2:
                         extra_where.extend(self.where_from_dict(gm, tdict2))
+                    extra_where.extend(n.get('extra_where_sql') or [])
                     nsql = self.build_nested_list_sql(
                         alias=alias,
                         grand_model=gm,

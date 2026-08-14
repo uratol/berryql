@@ -354,29 +354,24 @@ def scope_to_sql_expr(
 
     Returns the SQL expression, or ``None`` when the scope produces no clause.
     """
-    if value is None:
-        return None
-    # Callable scope: invoke with (model_cls, info), then normalize the result.
-    if callable(value):
-        try:
-            value = value(model_cls, info)
-        except TypeError:
-            # Allow scopes declared as single-arg (model_cls only) or no-arg callables.
-            try:
-                value = value(model_cls)
-            except TypeError:
-                value = value()
-        return scope_to_sql_expr(
-            model_cls, value, info, strict=strict, auto_camel_case=auto_camel_case
-        )
-    # dict / JSON string scope -> SQL expression
-    if isinstance(value, (dict, str)):
-        wdict = to_where_dict(value, strict=strict, model_cls=model_cls, auto_camel_case=auto_camel_case)
-        if not wdict:
-            return None
-        return expr_from_where_dict(model_cls, wdict, strict=strict, auto_camel_case=auto_camel_case)
-    # Assume anything else is already a SQLAlchemy boolean expression.
-    return value
+    # Compatibility facade over the unified compiler.  This helper remains
+    # synchronous for existing internal callers; async providers must use
+    # PredicateCompiler.resolve/apply from an async planning path.
+    from types import SimpleNamespace
+
+    from .predicates import PredicateCompiler
+
+    compiler = PredicateCompiler(
+        SimpleNamespace(_auto_camel_case=auto_camel_case)
+    )
+    predicate = compiler.resolve_sync(
+        value,
+        model_cls,
+        info,
+        strict=strict,
+        trusted=True,
+    )
+    return compiler.compile_sqlalchemy(predicate, model_cls, strict=strict)
 
 
 def normalize_order_multi_values(multi: Any) -> List[str]:

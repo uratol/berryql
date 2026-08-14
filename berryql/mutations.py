@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.types import Date as _SADate, DateTime as _SADateTime
 from .sql.builders import RelationSQLBuilders
 from .core.enum_utils import get_model_enum_cls, coerce_input_to_storage_value, normalize_instance_enums
+from .core.naming import map_graphql_to_python
 
 if TYPE_CHECKING:  # pragma: no cover
     from .registry import BerrySchema, BerryType, BerryDomain
@@ -393,34 +394,23 @@ def build_merge_resolver_for_type(
                 pk_val_local = None
             if pk_val_local is None:
                 return True
-            # Resolve potential GraphQL variables/literals
-            v = _resolve_scope_value(scope_raw)
-            # Match query path: resolve async callables (like apply_root_filters does)
-            if callable(v):
-                try:
-                    v_res = v(model_cls_local, info)
-                    if inspect.isawaitable(v_res):
-                        v_res = await v_res  # type: ignore
-                    v = v_res
-                except Exception:
-                    # Do not suppress scope resolution errors
-                    raise
+            predicate = await schema._predicate_compiler.resolve(
+                scope_raw,
+                model_cls_local,
+                info,
+                strict=True,
+                trusted=True,
+            )
             # Base statement: select PK for this instance
             stmt = select(getattr(model_cls_local.__table__.c, pk_name_local)).select_from(model_cls_local).where(
                 getattr(model_cls_local.__table__.c, pk_name_local) == pk_val_local
             )
-            # Reuse common builder to apply where regardless of type (dict/str/expr)
-            builder = RelationSQLBuilders(schema)
             try:
-                stmt = builder._apply_where_common(
-                    stmt,
-                    model_cls_local,
-                    v,
-                    strict=True,
-                    to_where_dict=_to_where_dict,
-                    expr_from_where_dict=_expr_from_where_dict,
-                    info=info,
+                expression = schema._predicate_compiler.compile_sqlalchemy(
+                    predicate, model_cls_local, strict=True
                 )
+                if expression is not None:
+                    stmt = stmt.where(expression)
             except ValueError as e:
                 # Fallback: if scope refers to columns not present on the immediate model (e.g., episode_id on Beat/Line),
                 # and a scope root model/instance is available, enforce against the root instead.
@@ -446,15 +436,13 @@ def build_merge_resolver_for_type(
                         stmt = select(getattr(root_model.__table__.c, root_pk_name)).select_from(root_model).where(
                             getattr(root_model.__table__.c, root_pk_name) == root_pk_val
                         )
-                        stmt = builder._apply_where_common(
-                            stmt,
-                            root_model,
-                            v,
-                            strict=True,
-                            to_where_dict=_to_where_dict,
-                            expr_from_where_dict=_expr_from_where_dict,
-                            info=info,
+                        root_expression = (
+                            schema._predicate_compiler.compile_sqlalchemy(
+                                predicate, root_model, strict=True
+                            )
                         )
+                        if root_expression is not None:
+                            stmt = stmt.where(root_expression)
                         res = await session.execute(stmt)
                         row = res.first()
                         return bool(row)
@@ -495,29 +483,113 @@ def build_merge_resolver_for_type(
             # application pre-hook sees it. Hooks remain trusted server code
             # and may derive internal fields from the sanitized payload.
             ignored_write_values: Dict[str, Any] = {}
+            planned_operation = 'create'
             if isinstance(data_local, dict):
-                field_permissions = await schema._resolve_field_permissions(
-                    btype_local, info
-                )
                 try:
                     identity_name = schema._get_pk_name(model_cls_local)
                 except Exception:
                     identity_name = 'id'
                 declared_fields = getattr(btype_local, '__berry_fields__', {}) or {}
-                sanitized_data: Dict[str, Any] = {}
-                for input_name, input_value in data_local.items():
-                    field_def = declared_fields.get(input_name)
-                    is_control = input_name in {'_Delete', '_Replace', '_Insert'}
-                    is_identity = input_name == identity_name
-                    if (
-                        is_control
-                        or is_identity
-                        or field_def is None
-                        or field_permissions.write.allows(input_name)
-                    ):
-                        sanitized_data[input_name] = input_value
+                raw_pk_value = data_local.get(identity_name)
+                raw_insert_mode = data_local.get('_Insert')
+                if raw_insert_mode is strawberry.UNSET or raw_insert_mode is None:
+                    raw_insert_mode = None
+                raw_delete = bool(data_local.get('_Delete'))
+                if raw_delete:
+                    planned_operation = 'delete'
+                elif raw_insert_mode is True:
+                    planned_operation = 'create'
+                elif raw_insert_mode is False:
+                    planned_operation = 'update'
+                elif raw_pk_value not in (None, 0, ''):
+                    # Normal merge decides create/update from row existence.  Do
+                    # this before hooks so the caller payload is sanitized with
+                    # the correct capability mask before trusted code sees it.
+                    existing_for_policy = await session.get(
+                        model_cls_local, raw_pk_value
+                    )
+                    planned_operation = (
+                        'update' if existing_for_policy is not None else 'create'
+                    )
+                await schema._policy_engine.require_operation(
+                    btype_local, info, planned_operation
+                )
+                payload_capability = (
+                    'update' if planned_operation == 'delete' else planned_operation
+                )
+                sanitized_data, ignored_write_values = (
+                    await schema._policy_engine.sanitize_payload(
+                        btype_local,
+                        info,
+                        data_local,
+                        capability=payload_capability,
+                        identity_name=identity_name,
+                    )
+                )
+
+                # Normalize and authorize _Replace before hooks.  Denied
+                # relation payloads and denied targets are removed together;
+                # an omitted/filtered payload can never become delete-all.
+                raw_replace = sanitized_data.get('_Replace')
+                if raw_replace:
+                    await schema._policy_engine.require_operation(
+                        btype_local, info, 'replace'
+                    )
+                    if isinstance(raw_replace, str):
+                        raw_replace = [raw_replace]
+                    if not isinstance(raw_replace, (list, tuple)):
+                        raise ValueError(
+                            "_Replace must be a list of relation field names; "
+                            f"got {type(raw_replace).__name__}"
+                        )
+                    normalized_replace: List[str] = []
+                    permissions = await schema._policy_engine.resolve(
+                        btype_local, info
+                    )
+                    for raw_relation_name in raw_replace:
+                        if not isinstance(raw_relation_name, str) or not raw_relation_name:
+                            raise ValueError(
+                                "_Replace entries must be non-empty strings; "
+                                f"got {raw_relation_name!r}"
+                            )
+                        relation_name = map_graphql_to_python(
+                            raw_relation_name,
+                            declared_fields,
+                            auto_camel=bool(
+                                getattr(schema, '_auto_camel_case', False)
+                            ),
+                            name_converter=getattr(schema, '_name_converter', None),
+                        )
+                        relation_def = declared_fields.get(relation_name)
+                        if (
+                            relation_def is None
+                            or getattr(relation_def, 'kind', None) != 'relation'
+                        ):
+                            raise ValueError(
+                                f"_Replace references unknown relation "
+                                f"'{raw_relation_name}' on "
+                                f"{getattr(btype_local, '__name__', type_name)}"
+                            )
+                        if bool((getattr(relation_def, 'meta', {}) or {}).get('single')):
+                            raise ValueError(
+                                f"_Replace cannot target single relation "
+                                f"'{raw_relation_name}' on "
+                                f"{getattr(btype_local, '__name__', type_name)}; "
+                                "only list relations are supported"
+                            )
+                        if not schema._policy_engine.allows_resolved_field(
+                            btype_local,
+                            permissions,
+                            'update',
+                            relation_name,
+                        ):
+                            sanitized_data.pop(relation_name, None)
+                            continue
+                        normalized_replace.append(relation_name)
+                    if normalized_replace:
+                        sanitized_data['_Replace'] = normalized_replace
                     else:
-                        ignored_write_values[input_name] = input_value
+                        sanitized_data.pop('_Replace', None)
                 data_local = sanitized_data
 
             def _hook_context(*, delete: bool = False):
@@ -1005,10 +1077,14 @@ def build_merge_resolver_for_type(
                 raise ValueError("_Insert: false requires a primary-key value")
 
             if pk_val is not None and not _force_insert:
-                try:
-                    instance = await session.get(model_cls_local, pk_val)
-                except Exception:
-                    instance = None
+                instance = await session.get(model_cls_local, pk_val)
+
+            actual_operation = 'create' if instance is None else 'update'
+            if _force_insert:
+                actual_operation = 'create'
+            await schema._policy_engine.require_operation(
+                btype_local, info, actual_operation
+            )
 
             # Warn only when the normal mutation path has already loaded an
             # existing instance and the old scalar value is present in its
@@ -1289,7 +1365,6 @@ def build_merge_resolver_for_type(
                         # them ourselves against the berry field map.
                         _ac = bool(getattr(schema, '_auto_camel_case', False))
                         _nc = getattr(schema, '_name_converter', None)
-                        from .core.naming import map_graphql_to_python
                         for _rk_raw in _raw_replace:
                             if not isinstance(_rk_raw, str) or not _rk_raw:
                                 raise ValueError(
@@ -1343,6 +1418,9 @@ def build_merge_resolver_for_type(
                     child_model_r = getattr(child_btype_r, 'model', None) if child_btype_r else None
                     if child_btype_r is None or child_model_r is None:
                         continue
+                    await schema._policy_engine.require_operation(
+                        child_btype_r, info, 'delete'
+                    )
                     try:
                         child_pk_name_r = schema._get_pk_name(child_model_r)
                     except Exception:
@@ -1393,30 +1471,29 @@ def build_merge_resolver_for_type(
                             pass
                     # Apply relation-level scope predicate (same builder as queries/deletes)
                     _rel_scope = _rmeta.get('scope')
+                    _resolved_rel_scope = None
+                    _resolved_rel_expression = None
                     if _rel_scope is not None:
-                        _rv_scope = _resolve_scope_value(_rel_scope)
-                        if callable(_rv_scope):
-                            try:
-                                _rv_scope_res = _rv_scope(child_model_r, info)
-                                if inspect.isawaitable(_rv_scope_res):
-                                    _rv_scope_res = await _rv_scope_res  # type: ignore
-                                _rv_scope = _rv_scope_res
-                            except Exception:
-                                _rv_scope = None
-                        if _rel_scope is not None:
-                            try:
-                                _builder_r = RelationSQLBuilders(schema)
-                                del_stmt = _builder_r._apply_where_common(
-                                    del_stmt,
-                                    child_model_r,
-                                    _rel_scope,
-                                    strict=True,
-                                    to_where_dict=_to_where_dict,
-                                    expr_from_where_dict=_expr_from_where_dict,
-                                    info=info,
-                                )
-                            except Exception:
-                                pass
+                        _resolved_rel_scope = (
+                            await schema._predicate_compiler.resolve(
+                                _rel_scope,
+                                child_model_r,
+                                info,
+                                strict=True,
+                                trusted=True,
+                            )
+                        )
+                        _resolved_rel_expression = (
+                            schema._predicate_compiler.compile_sqlalchemy(
+                                _resolved_rel_scope,
+                                child_model_r,
+                                strict=True,
+                            )
+                        )
+                        if _resolved_rel_expression is not None:
+                            del_stmt = del_stmt.where(
+                                _resolved_rel_expression
+                            )
                     # Application-level cascade for grandchildren first (MSSQL FK safety)
                     try:
                         # Select PKs of children that WILL be deleted, then cascade their children
@@ -1428,6 +1505,11 @@ def build_merge_resolver_for_type(
                                     _sel_del = _sel_del.where(child_pk_col_obj_s.notin_(kept_pks))
                             except Exception:
                                 pass
+                        if _rel_scope is not None:
+                            if _resolved_rel_expression is not None:
+                                _sel_del = _sel_del.where(
+                                    _resolved_rel_expression
+                                )
                         _ids_res = await session.execute(_sel_del)
                         _to_delete_ids = [row[0] for row in _ids_res.fetchall()]
                     except Exception:

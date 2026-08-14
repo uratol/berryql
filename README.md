@@ -209,12 +209,17 @@ The rest of this README goes into the details of fields, relations, filters, JSO
 Dynamic field permissions
 -------------------------
 
-BerryQL can keep one stable GraphQL schema while resolving readable and writable
-field sets from an external authorization system for each request. Providers may
-be synchronous or asynchronous and receive ``(berry_type, info)``:
+BerryQL can keep one stable GraphQL schema while resolving field and operation
+capabilities from an external authorization system for each execution. Providers
+may be synchronous or asynchronous and receive ``(berry_type, info)``:
 
 ```python
-from berryql import BerrySchema, FieldPermissions, FieldSet
+from berryql import (
+    BerrySchema,
+    FieldPermissions,
+    FieldSet,
+    OperationPermissions,
+)
 
 
 async def resolve_fields(berry_type, info):
@@ -223,8 +228,17 @@ async def resolve_fields(berry_type, info):
         resource=berry_type.model.__tablename__,
     )
     return FieldPermissions(
-        read=FieldSet.only(grants.read_fields),
-        write=FieldSet.only(grants.write_fields),
+        select=FieldSet.only(grants.select_fields),
+        filter=FieldSet.only(grants.filter_fields),
+        order=FieldSet.only(grants.order_fields),
+        create=FieldSet.only(grants.create_fields),
+        update=FieldSet.only(grants.update_fields),
+        operations=OperationPermissions(
+            create=grants.can_create,
+            update=grants.can_update,
+            delete=grants.can_delete,
+            replace=grants.can_replace,
+        ),
     )
 
 
@@ -235,20 +249,32 @@ berry_schema = BerrySchema(field_permissions=resolve_fields)
 deny-list; ``FieldSet.all()`` and ``FieldSet.none()`` are also available. A
 type-specific provider can be added with
 ``@berry_schema.type(model=Post, field_permissions=resolve_post_fields)``.
-Schema-level and type-level permissions are intersected, and results are cached
-once per Berry type in the current request.
+Schema-level and type-level policies are intersected independently for every
+capability and operation. Results are resolved with concurrent single-flight and
+cached once per Berry type in the current GraphQL execution. Reusing a context
+for another execution does not reuse the previous policy.
 
-Unreadable scalar, single relation, custom, and aggregate fields resolve to
-``null``. Unreadable list relations remain non-null and resolve to ``[]``.
-Denied fields are pruned from SQL projections and relation/custom/aggregate
-pushdown. They also cannot be used in caller-provided ``where``, ``order_by``,
-``order_multi``, or declared filter arguments.
+``select`` controls returned values. Denied scalar, single relation, custom,
+aggregate, and ordinary nullable Strawberry fields resolve to ``null``; denied
+list relations and ordinary list fields resolve to ``[]``. Denied fields are
+pruned from SQL projections and relation/custom/aggregate pushdown.
+``filter`` controls caller-provided ``where`` and declared filter arguments;
+``order`` controls ``order_by`` and ``order_multi``. Both are always intersected
+with ``select`` so a hidden field cannot become a side channel.
 
-Unwritable payload fields are removed recursively before merge pre-hooks run.
-Primary keys remain usable as update selectors, while ``_Insert``, ``_Delete``,
-and ``_Replace`` remain operation controls outside the field mask. On updates,
-BerryQL logs a warning only when a denied scalar differs from an already-loaded
-old value; it never issues a query or lazy load solely to produce that warning.
+``create`` and ``update`` sanitize payload fields recursively before merge
+pre-hooks run. Primary keys remain usable as selectors without becoming writable
+values on existing rows. ``operations`` separately controls create, update,
+delete, and replace: ``_Insert: true`` requires create, ``_Insert: false``
+requires update, ``_Delete`` requires delete, and ``_Replace`` requires replace
+plus update access to its parent relation. Replace deletion also requires delete
+access on the child type. On updates, BerryQL logs a warning only when a denied
+scalar differs from an already-loaded old value; it never issues a query or lazy
+load solely to produce that warning.
+
+The former ``read=`` and ``write=`` constructor arguments are intentionally not
+supported; using either raises ``TypeError`` instead of silently migrating policy
+semantics.
 
 
 What queries look like (and what SQL runs)

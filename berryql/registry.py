@@ -58,12 +58,13 @@ from .core.utils import (
     coerce_where_value as _coerce_where_value,
     expr_from_where_dict as _expr_from_where_dict,
     to_where_dict as _to_where_dict,
-    scope_to_sql_expr as _scope_to_sql_expr,
-    normalize_order_multi_values as _norm_order_multi,
 )
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
-from .core.permissions import FieldPermissionResolver, FieldPermissions
+from .core.permissions import FieldPermissions
+from .core.policy import PolicyEngine, SelectGuardExtension
+from .core.predicates import PredicateCompiler
+from .core.ordering import OrderingCompiler
 from .core.naming import from_camel
 
 # Standard argument descriptions for default query parameters are generated dynamically
@@ -291,7 +292,9 @@ class BerrySchema:
         ):
             raise TypeError("field_permissions must be callable or FieldPermissions")
         self._field_permissions_provider = field_permissions
-        self._field_permission_resolver = FieldPermissionResolver(self)
+        self._policy_engine = PolicyEngine(self)
+        self._predicate_compiler = PredicateCompiler(self)
+        self._ordering_compiler = OrderingCompiler(self)
 
     @staticmethod
     def _coerce_pagination_config(
@@ -346,7 +349,7 @@ class BerrySchema:
         btype_cls: Type[BerryType],
         info: StrawberryInfo,
     ) -> FieldPermissions:
-        return await self._field_permission_resolver.resolve(btype_cls, info)
+        return await self._policy_engine.resolve(btype_cls, info)
 
     async def _field_read_allowed(
         self,
@@ -354,25 +357,16 @@ class BerrySchema:
         info: StrawberryInfo,
         field_name: str,
     ) -> bool:
-        permissions = await self._resolve_field_permissions(btype_cls, info)
-        return permissions.read.allows(field_name)
+        return await self._policy_engine.allows_field(
+            btype_cls, info, 'select', field_name
+        )
 
     def _permission_field_name(
         self,
         btype_cls: Type[BerryType],
         reference: str,
     ) -> str:
-        fields = getattr(btype_cls, '__berry_fields__', {}) or {}
-        if reference in fields:
-            return reference
-        candidate = from_camel(str(reference))
-        if candidate in fields:
-            return candidate
-        for field_name, field_def in fields.items():
-            meta = getattr(field_def, 'meta', {}) or {}
-            if meta.get('column') in {reference, candidate}:
-                return field_name
-        return candidate
+        return self._policy_engine.canonical_field_name(btype_cls, reference)
 
     async def _assert_readable_path(
         self,
@@ -380,26 +374,7 @@ class BerrySchema:
         info: StrawberryInfo,
         path: str,
     ) -> None:
-        current_type = btype_cls
-        for raw_part in str(path).split('.'):
-            part = raw_part.strip()
-            if not part:
-                continue
-            field_name = self._permission_field_name(current_type, part)
-            permissions = await self._resolve_field_permissions(current_type, info)
-            if not permissions.read.allows(field_name):
-                raise PermissionError(
-                    f"Field '{field_name}' is not readable on "
-                    f"{getattr(current_type, '__name__', current_type)}"
-                )
-            field_def = (getattr(current_type, '__berry_fields__', {}) or {}).get(field_name)
-            if field_def is None or getattr(field_def, 'kind', None) != 'relation':
-                break
-            target_name = (getattr(field_def, 'meta', {}) or {}).get('target')
-            target_type = self.types.get(target_name) if target_name else None
-            if target_type is None:
-                break
-            current_type = target_type
+        await self._policy_engine.require_path(btype_cls, info, 'select', path)
 
     async def _validate_query_field_controls(
         self,
@@ -408,6 +383,7 @@ class BerrySchema:
         *,
         where: Any = None,
         order_by: Any = None,
+        order_dir: Any = None,
         order_multi: Any = None,
         filter_specs: Optional[Dict[str, FilterSpec]] = None,
         filter_values: Optional[Dict[str, Any]] = None,
@@ -432,6 +408,7 @@ class BerrySchema:
 
         where = _resolve_argument_value(where)
         order_by = _resolve_argument_value(order_by)
+        order_dir = _resolve_argument_value(order_dir)
         if isinstance(order_multi, (list, tuple)):
             order_multi = [_resolve_argument_value(value) for value in order_multi]
         else:
@@ -441,33 +418,22 @@ class BerrySchema:
             for name, value in (filter_values or {}).items()
         }
         if where is not None:
-            model_cls = getattr(btype_cls, 'model', None)
-            where_dict = _to_where_dict(
-                where,
-                strict=True,
-                model_cls=model_cls,
-                auto_camel_case=bool(getattr(self, '_auto_camel_case', False)),
-            )
-            for column_name in (where_dict or {}).keys():
-                await self._assert_readable_path(
-                    btype_cls, info, str(column_name)
-                )
-        if isinstance(order_by, str) and order_by:
-            await self._assert_readable_path(btype_cls, info, order_by)
-        for segment in self._normalize_order_multi_values(order_multi):
-            column_name, _, _ = str(segment).partition(':')
-            if column_name:
-                await self._assert_readable_path(
-                    btype_cls, info, column_name
-                )
+            await self._policy_engine.validate_where_fields(btype_cls, info, where)
+        await self._ordering_compiler.validate_caller(
+            btype_cls,
+            info,
+            order_by=order_by,
+            order_dir=order_dir,
+            order_multi=order_multi,
+        )
         for argument_name, value in (filter_values or {}).items():
             if value is None:
                 continue
             spec = (filter_specs or {}).get(argument_name)
             column_name = getattr(spec, 'column', None) if spec is not None else None
             if column_name:
-                await self._assert_readable_path(
-                    btype_cls, info, str(column_name)
+                await self._policy_engine.require_path(
+                    btype_cls, info, 'filter', str(column_name)
                 )
 
     async def _prune_relation_permissions(
@@ -479,7 +445,9 @@ class BerrySchema:
         parent_permissions = await self._resolve_field_permissions(parent_btype, info)
         result: Dict[str, Dict[str, Any]] = {}
         for relation_name, relation_cfg in (relations or {}).items():
-            if not parent_permissions.read.allows(relation_name):
+            if not self._policy_engine.allows_resolved_field(
+                parent_btype, parent_permissions, 'select', relation_name
+            ):
                 continue
             cfg = dict(relation_cfg or {})
             target_name = cfg.get('target')
@@ -495,6 +463,7 @@ class BerrySchema:
                         if cfg.get('_has_explicit_order_by')
                         else None
                     ),
+                    order_dir=cfg.get('order_dir'),
                     order_multi=(
                         cfg.get('order_multi')
                         if cfg.get('_has_explicit_order_multi')
@@ -505,7 +474,9 @@ class BerrySchema:
                 )
                 cfg['fields'] = [
                     name for name in list(cfg.get('fields') or [])
-                    if target_permissions.read.allows(name)
+                    if self._policy_engine.allows_resolved_field(
+                        target_btype, target_permissions, 'select', name
+                    )
                 ]
                 cfg['nested'] = await self._prune_relation_permissions(
                     target_btype,
@@ -1307,7 +1278,7 @@ class BerrySchema:
 
     def _normalize_order_multi_values(self, multi: Any) -> List[str]:
         """Normalize a potentially heterogeneous order_multi list to a list[str] of 'col:dir'."""
-        return _norm_order_multi(multi)
+        return self._ordering_compiler.normalize_multi_values(multi)
 
     def _normalize_order_segment(self, btype_cls: Any, segment: str) -> str:
         """Normalize an order path segment, honoring auto-camel-case when enabled."""
@@ -1658,26 +1629,35 @@ class BerrySchema:
     async def _apply_python_relation_ordering(self, items: List[Any], session: Any, lock: Any, model_cls: Any, btype_cls: Any, order_by: Any, order_dir: Any, order_multi: Any):
         if not items:
             return items
-        specs: List[tuple[str, str]] = []
-        if order_multi:
-            norm_specs = self._normalize_order_multi_values(order_multi)
-            has_dotted = any('.' in str(spec).partition(':')[0] for spec in norm_specs)
-            for spec in norm_specs:
-                name, _, direction = str(spec).partition(':')
-                if has_dotted and isinstance(name, str) and name:
-                    specs.append((name, (direction or 'asc').lower()))
-        elif isinstance(order_by, str) and '.' in order_by:
-            specs.append((order_by, (_dir_value(order_dir) if order_dir is not None else 'asc')))
-        if not specs:
+        terms = self._ordering_compiler.parse(
+            order_by=order_by,
+            order_dir=order_dir,
+            order_multi=order_multi,
+            strict_multi=True,
+        )
+        if not terms:
             return items
-        ordered_items = list(items)
-        for name, direction in reversed(specs):
-            keyed: List[tuple[Any, Any]] = []
-            for item in ordered_items:
-                keyed.append((await self._resolve_order_value(session, lock, item, model_cls, btype_cls, name), item))
-            keyed.sort(key=lambda pair: (pair[0] is None, pair[0]), reverse=(direction == 'desc'))
-            ordered_items = [item for _, item in keyed]
-        return ordered_items
+
+        async def _resolve(item, path):
+            return await self._resolve_order_value(
+                session, lock, item, model_cls, btype_cls, path
+            )
+
+        try:
+            dialect_name = str(session.get_bind().dialect.name).lower()
+        except Exception:
+            dialect_name = 'sqlite'
+
+        def _nulls_first(direction):
+            if dialect_name in {'sqlite', 'mssql'}:
+                return direction == 'asc'
+            if dialect_name in {'postgresql', 'postgres'}:
+                return direction == 'desc'
+            return False
+
+        return await self._ordering_compiler.apply_python(
+            items, terms, _resolve, nulls_first=_nulls_first
+        )
 
     def _find_parent_fk_column_name(self, parent_model_cls: Any, child_model_cls: Any, rel_name: str) -> Optional[str]:
         """Return the name of the FK column on parent that references child, or a conventional '<rel>_id' fallback.
@@ -2013,6 +1993,7 @@ class BerrySchema:
                 info,
                 where=related_where,
                 order_by=order_by,
+                order_dir=order_dir,
                 order_multi=order_multi,
                 filter_specs=target_filters,
                 filter_values=_filter_args,
@@ -2093,24 +2074,14 @@ class BerrySchema:
                 if child_fk_to_parent is not None:
                     stmt = _select(child_model_cls).where(child_fk_to_parent == fallback_parent_id)
                     eff_scope = meta_copy.get('scope')
-                    if related_where is not None or eff_scope is not None:
-                        wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
-                        if wdict_arg:
-                            expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
-                            if expr is not None:
-                                stmt = stmt.where(expr)
-                        dwhere = eff_scope
-                        if dwhere is not None:
-                            if isinstance(dwhere, (dict, str)):
-                                wdict_def = _to_where_dict(dwhere, strict=True)
-                                if wdict_def:
-                                    expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=True)
-                                    if expr is not None:
-                                        stmt = stmt.where(expr)
-                            elif callable(dwhere):
-                                expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
-                                if expr is not None:
-                                    stmt = stmt.where(expr)
+                    stmt = await self._predicate_compiler.apply(
+                        stmt, child_model_cls, related_where, info,
+                        strict=True, trusted=False,
+                    )
+                    stmt = await self._predicate_compiler.apply(
+                        stmt, child_model_cls, eff_scope, info,
+                        strict=True, trusted=True,
+                    )
                     try:
                         tgt_b_for_type = self.types.get(target_name_i)
                         t_scope = getattr(tgt_b_for_type, '__type_scope__', None) if tgt_b_for_type is not None else None
@@ -2118,48 +2089,33 @@ class BerrySchema:
                             t_scope = getattr(tgt_b_for_type, 'scope', None)
                     except Exception:
                         t_scope = None
-                    if t_scope is not None:
-                        fragments = t_scope if isinstance(t_scope, list) else [t_scope]
-                        for frag in fragments:
-                            if isinstance(frag, (dict, str)):
-                                wdict_t = _to_where_dict(frag, strict=True)
-                                if wdict_t:
-                                    expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=True)
-                                    if expr_t is not None:
-                                        stmt = stmt.where(expr_t)
-                            elif callable(frag):
-                                expr_t = _scope_to_sql_expr(child_model_cls, frag(child_model_cls, info), info, strict=True)
-                                if expr_t is not None:
-                                    stmt = stmt.where(expr_t)
-                    try:
-                        allowed_order = [sf for sf, sd in self.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
-                    except Exception:
-                        allowed_order = []
-                    ordered_any = False
-                    if order_multi:
-                        for spec in order_multi:
-                            try:
-                                cn, _, dd = str(spec).partition(':')
-                                dd = dd or 'asc'
-                                if not allowed_order or cn in allowed_order:
-                                    col = child_model_cls.__table__.c.get(cn)
-                                    if col is not None:
-                                        stmt = stmt.order_by(col.desc() if dd.lower()=='desc' else col.asc())
-                                        ordered_any = True
-                            except Exception:
-                                pass
-                    if not ordered_any and order_by and (not allowed_order or order_by in allowed_order):
-                        col = child_model_cls.__table__.c.get(order_by)
-                        if col is not None:
-                            desc = _dir_value(order_dir) == 'desc' if order_dir is not None else False
-                            stmt = stmt.order_by(col.desc() if desc else col.asc())
-                            ordered_any = True
-                    if not ordered_any:
-                        try:
-                            pk_col_child = self._get_pk_column(child_model_cls)
-                            stmt = stmt.order_by(pk_col_child.asc())
-                        except Exception:
-                            pass
+                    stmt = await self._predicate_compiler.apply(
+                        stmt, child_model_cls, t_scope, info,
+                        strict=True, trusted=True,
+                    )
+                    target_btype = self.types[target_name_i]
+                    order_terms = self._ordering_compiler.parse(
+                        order_by=order_by,
+                        order_dir=order_dir,
+                        order_multi=order_multi,
+                        strict_multi=False,
+                    )
+
+                    def _resolve_single_order(statement, path, join_cache):
+                        return statement, self._resolve_order_expression(
+                            child_model_cls, target_btype, path
+                        )
+
+                    stmt = self._ordering_compiler.apply_sqlalchemy(
+                        stmt,
+                        model_cls=child_model_cls,
+                        berry_type=target_btype,
+                        terms=order_terms,
+                        resolve_expression=_resolve_single_order,
+                        info=info,
+                        add_pk_tiebreaker=True,
+                        fallback_pk=True,
+                    )
                     async with lock:
                         result = await session.execute(stmt.limit(1))
                     row = result.scalar_one_or_none()
@@ -2228,24 +2184,14 @@ class BerrySchema:
                 except Exception:
                     raise
                 eff_scope = meta_copy.get('scope')
-                if related_where is not None or eff_scope is not None:
-                    wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
-                    if wdict_arg:
-                        expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
-                        if expr is not None:
-                            stmt = stmt.where(expr)
-                    dwhere = eff_scope
-                    if dwhere is not None:
-                        if isinstance(dwhere, (dict, str)):
-                            wdict_def = _to_where_dict(dwhere, strict=True)
-                            if wdict_def:
-                                expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=True)
-                                if expr is not None:
-                                    stmt = stmt.where(expr)
-                        elif callable(dwhere):
-                            expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
-                            if expr is not None:
-                                stmt = stmt.where(expr)
+                stmt = await self._predicate_compiler.apply(
+                    stmt, child_model_cls, related_where, info,
+                    strict=True, trusted=False,
+                )
+                stmt = await self._predicate_compiler.apply(
+                    stmt, child_model_cls, eff_scope, info,
+                    strict=True, trusted=True,
+                )
                 try:
                     tgt_b_for_type2 = self.types.get(target_name_i)
                     t_scope2 = getattr(tgt_b_for_type2, '__type_scope__', None) if tgt_b_for_type2 is not None else None
@@ -2253,19 +2199,10 @@ class BerrySchema:
                         t_scope2 = getattr(tgt_b_for_type2, 'scope', None)
                 except Exception:
                     t_scope2 = None
-                if t_scope2 is not None:
-                    fragments2 = t_scope2 if isinstance(t_scope2, list) else [t_scope2]
-                    for frag2 in fragments2:
-                        if isinstance(frag2, (dict, str)):
-                            wdict_t2 = _to_where_dict(frag2, strict=True)
-                            if wdict_t2:
-                                expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=True)
-                                if expr_t2 is not None:
-                                    stmt = stmt.where(expr_t2)
-                        elif callable(frag2):
-                            expr_t2 = _scope_to_sql_expr(child_model_cls, frag2(child_model_cls, info), info, strict=True)
-                            if expr_t2 is not None:
-                                stmt = stmt.where(expr_t2)
+                stmt = await self._predicate_compiler.apply(
+                    stmt, child_model_cls, t_scope2, info,
+                    strict=True, trusted=True,
+                )
                 for arg_name, val in _filter_args.items():
                     if val is None:
                         continue
@@ -2588,25 +2525,14 @@ class BerrySchema:
         except Exception:
             pass
         eff_scope = meta_copy.get('scope')
-        if related_where is not None or eff_scope is not None:
-            if related_where is not None:
-                wdict = _to_where_dict(related_where, strict=True)
-                if wdict:
-                    expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
-                    if expr is not None:
-                        stmt = stmt.where(expr)
-            dwhere = eff_scope
-            if dwhere is not None:
-                if isinstance(dwhere, (dict, str)):
-                    wdict = _to_where_dict(dwhere, strict=True)
-                    if wdict:
-                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
-                        if expr is not None:
-                            stmt = stmt.where(expr)
-                elif callable(dwhere):
-                    expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
-                    if expr is not None:
-                        stmt = stmt.where(expr)
+        stmt = await self._predicate_compiler.apply(
+            stmt, child_model_cls, related_where, info,
+            strict=True, trusted=False,
+        )
+        stmt = await self._predicate_compiler.apply(
+            stmt, child_model_cls, eff_scope, info,
+            strict=True, trusted=True,
+        )
         try:
             tgt_b_for_type3 = self.types.get(target_name_i)
             t_scope3 = getattr(tgt_b_for_type3, '__type_scope__', None) if tgt_b_for_type3 is not None else None
@@ -2614,19 +2540,10 @@ class BerrySchema:
                 t_scope3 = getattr(tgt_b_for_type3, 'scope', None)
         except Exception:
             t_scope3 = None
-        if t_scope3 is not None:
-            fragments3 = t_scope3 if isinstance(t_scope3, list) else [t_scope3]
-            for frag3 in fragments3:
-                if isinstance(frag3, (dict, str)):
-                    wdict_t3 = _to_where_dict(frag3, strict=True)
-                    if wdict_t3:
-                        expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=True)
-                        if expr_t3 is not None:
-                            stmt = stmt.where(expr_t3)
-                elif callable(frag3):
-                    expr_t3 = _scope_to_sql_expr(child_model_cls, frag3(child_model_cls, info), info, strict=True)
-                    if expr_t3 is not None:
-                        stmt = stmt.where(expr_t3)
+        stmt = await self._predicate_compiler.apply(
+            stmt, child_model_cls, t_scope3, info,
+            strict=True, trusted=True,
+        )
         effective_order_by = order_by if order_by is not None else meta_copy.get('order_by')
         effective_order_dir = order_dir if order_dir is not None else meta_copy.get('order_dir')
         effective_order_multi = order_multi if order_multi is not None else meta_copy.get('order_multi')
@@ -2637,6 +2554,11 @@ class BerrySchema:
             order_by=effective_order_by,
             order_dir=effective_order_dir,
             order_multi=effective_order_multi,
+            info=info,
+            paginated=any(
+                value is not None
+                for value in self.normalize_pagination(limit, offset)
+            ),
         )
         if target_filters:
             for arg_name, val in _filter_args.items():
@@ -3616,6 +3538,7 @@ class BerrySchema:
                                 info,
                                 where=related_where,
                                 order_by=order_by,
+                                order_dir=order_dir,
                                 order_multi=order_multi,
                                 filter_specs=target_filters,
                                 filter_values=_filter_args,
@@ -3697,26 +3620,14 @@ class BerrySchema:
                                         # Apply where/default_where and filter args similarly to list path
                                         # Apply relation-level scope (default filter) and argument-provided where
                                         eff_scope = meta_copy.get('scope')
-                                        if related_where is not None or eff_scope is not None:
-                                            if related_where is not None:
-                                                wdict = _to_where_dict(related_where, strict=True)
-                                                if wdict:
-                                                    expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
-                                                    if expr is not None:
-                                                        stmt = stmt.where(expr)
-                                            # 'scope' replaces legacy 'where' for schema default filters
-                                            dwhere = eff_scope
-                                            if dwhere is not None:
-                                                if isinstance(dwhere, (dict, str)):
-                                                    wdict = _to_where_dict(dwhere, strict=True)
-                                                    if wdict:
-                                                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
-                                                        if expr is not None:
-                                                            stmt = stmt.where(expr)
-                                                elif callable(dwhere):
-                                                    expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
-                                                    if expr is not None:
-                                                        stmt = stmt.where(expr)
+                                        stmt = await schema_instance._predicate_compiler.apply(
+                                            stmt, child_model_cls, related_where, info,
+                                            strict=True, trusted=False,
+                                        )
+                                        stmt = await schema_instance._predicate_compiler.apply(
+                                            stmt, child_model_cls, eff_scope, info,
+                                            strict=True, trusted=True,
+                                        )
                                         # Also apply type-level scope when present
                                         try:
                                             tgt_b_for_type = schema_instance.types.get(target_name_i)
@@ -3725,49 +3636,34 @@ class BerrySchema:
                                                 t_scope = getattr(tgt_b_for_type, 'scope', None)
                                         except Exception:
                                             t_scope = None
-                                        if t_scope is not None:
-                                            fragments = t_scope if isinstance(t_scope, list) else [t_scope]
-                                            for frag in fragments:
-                                                if isinstance(frag, (dict, str)):
-                                                    wdict_t = _to_where_dict(frag, strict=True)
-                                                    if wdict_t:
-                                                        expr_t = _expr_from_where_dict(child_model_cls, wdict_t, strict=True)
-                                                        if expr_t is not None:
-                                                            stmt = stmt.where(expr_t)
-                                                elif callable(frag):
-                                                    expr_t = _scope_to_sql_expr(child_model_cls, frag(child_model_cls, info), info, strict=True)
-                                                    if expr_t is not None:
-                                                        stmt = stmt.where(expr_t)
+                                        stmt = await schema_instance._predicate_compiler.apply(
+                                            stmt, child_model_cls, t_scope, info,
+                                            strict=True, trusted=True,
+                                        )
                                         # Ordering: honor order_by/order_multi if provided; default by id
-                                        try:
-                                            allowed_order = [sf for sf, sd in schema_instance.types[target_name_i].__berry_fields__.items() if sd.kind == 'scalar']
-                                        except Exception:
-                                            allowed_order = []
-                                        ordered_any = False
-                                        if order_multi:
-                                            for spec in order_multi:
-                                                try:
-                                                    cn, _, dd = str(spec).partition(':')
-                                                    dd = dd or 'asc'
-                                                    if not allowed_order or cn in allowed_order:
-                                                        col = child_model_cls.__table__.c.get(cn)
-                                                        if col is not None:
-                                                            stmt = stmt.order_by(col.desc() if dd.lower()=='desc' else col.asc())
-                                                            ordered_any = True
-                                                except Exception:
-                                                    pass
-                                        if not ordered_any and order_by and (not allowed_order or order_by in allowed_order):
-                                            col = child_model_cls.__table__.c.get(order_by)
-                                            if col is not None:
-                                                desc = _dir_value(order_dir) == 'desc' if order_dir is not None else False
-                                                stmt = stmt.order_by(col.desc() if desc else col.asc())
-                                                ordered_any = True
-                                        if not ordered_any:
-                                            try:
-                                                pk_col_child = schema_instance._get_pk_column(child_model_cls)
-                                                stmt = stmt.order_by(pk_col_child.asc())
-                                            except Exception:
-                                                pass
+                                        target_btype = schema_instance.types[target_name_i]
+                                        order_terms = schema_instance._ordering_compiler.parse(
+                                            order_by=order_by,
+                                            order_dir=order_dir,
+                                            order_multi=order_multi,
+                                            strict_multi=False,
+                                        )
+
+                                        def _resolve_single_order(statement, path, join_cache):
+                                            return statement, schema_instance._resolve_order_expression(
+                                                child_model_cls, target_btype, path
+                                            )
+
+                                        stmt = schema_instance._ordering_compiler.apply_sqlalchemy(
+                                            stmt,
+                                            model_cls=child_model_cls,
+                                            berry_type=target_btype,
+                                            terms=order_terms,
+                                            resolve_expression=_resolve_single_order,
+                                            info=info,
+                                            add_pk_tiebreaker=True,
+                                            fallback_pk=True,
+                                        )
                                         async with lock:
                                             result = await session.execute(stmt.limit(1))
                                         row = result.scalar_one_or_none()
@@ -3841,25 +3737,14 @@ class BerrySchema:
                                         raise
                                     # Apply JSON where if provided (argument and schema default)
                                     eff_scope = meta_copy.get('scope')
-                                    if related_where is not None or eff_scope is not None:
-                                        # Strict for user-provided; permissive for schema default
-                                        wdict_arg = _to_where_dict(related_where, strict=True) if related_where is not None else None
-                                        if wdict_arg:
-                                            expr = _expr_from_where_dict(child_model_cls, wdict_arg, strict=True)
-                                            if expr is not None:
-                                                stmt = stmt.where(expr)
-                                        dwhere = eff_scope
-                                        if dwhere is not None:
-                                            if isinstance(dwhere, (dict, str)):
-                                                wdict_def = _to_where_dict(dwhere, strict=True)
-                                                if wdict_def:
-                                                    expr = _expr_from_where_dict(child_model_cls, wdict_def, strict=True)
-                                                    if expr is not None:
-                                                        stmt = stmt.where(expr)
-                                            elif callable(dwhere):
-                                                expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
-                                                if expr is not None:
-                                                    stmt = stmt.where(expr)
+                                    stmt = await schema_instance._predicate_compiler.apply(
+                                        stmt, child_model_cls, related_where, info,
+                                        strict=True, trusted=False,
+                                    )
+                                    stmt = await schema_instance._predicate_compiler.apply(
+                                        stmt, child_model_cls, eff_scope, info,
+                                        strict=True, trusted=True,
+                                    )
                                     # Also apply type-level scope when present
                                     try:
                                         tgt_b_for_type2 = schema_instance.types.get(target_name_i)
@@ -3868,19 +3753,10 @@ class BerrySchema:
                                             t_scope2 = getattr(tgt_b_for_type2, 'scope', None)
                                     except Exception:
                                         t_scope2 = None
-                                    if t_scope2 is not None:
-                                        fragments2 = t_scope2 if isinstance(t_scope2, list) else [t_scope2]
-                                        for frag2 in fragments2:
-                                            if isinstance(frag2, (dict, str)):
-                                                wdict_t2 = _to_where_dict(frag2, strict=True)
-                                                if wdict_t2:
-                                                    expr_t2 = _expr_from_where_dict(child_model_cls, wdict_t2, strict=True)
-                                                    if expr_t2 is not None:
-                                                        stmt = stmt.where(expr_t2)
-                                            elif callable(frag2):
-                                                expr_t2 = _scope_to_sql_expr(child_model_cls, frag2(child_model_cls, info), info, strict=True)
-                                                if expr_t2 is not None:
-                                                    stmt = stmt.where(expr_t2)
+                                    stmt = await schema_instance._predicate_compiler.apply(
+                                        stmt, child_model_cls, t_scope2, info,
+                                        strict=True, trusted=True,
+                                    )
                                     # Add filter where clauses
                                     for arg_name, val in _filter_args.items():
                                         if val is None:
@@ -4251,27 +4127,14 @@ class BerrySchema:
                                 pass
                             # Apply where from args and/or schema default
                             eff_scope = meta_copy.get('scope')
-                            if related_where is not None or eff_scope is not None:
-                                # Strictly validate and apply argument-provided where
-                                if related_where is not None:
-                                    wdict = _to_where_dict(related_where, strict=True)
-                                    if wdict:
-                                        expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
-                                        if expr is not None:
-                                            stmt = stmt.where(expr)
-                                # Default where from schema meta: enforce strict to surface issues
-                                dwhere = eff_scope
-                                if dwhere is not None:
-                                    if isinstance(dwhere, (dict, str)):
-                                        wdict = _to_where_dict(dwhere, strict=True)
-                                        if wdict:
-                                            expr = _expr_from_where_dict(child_model_cls, wdict, strict=True)
-                                            if expr is not None:
-                                                stmt = stmt.where(expr)
-                                    elif callable(dwhere):
-                                        expr = _scope_to_sql_expr(child_model_cls, dwhere(child_model_cls, info), info, strict=True)
-                                        if expr is not None:
-                                            stmt = stmt.where(expr)
+                            stmt = await schema_instance._predicate_compiler.apply(
+                                stmt, child_model_cls, related_where, info,
+                                strict=True, trusted=False,
+                            )
+                            stmt = await schema_instance._predicate_compiler.apply(
+                                stmt, child_model_cls, eff_scope, info,
+                                strict=True, trusted=True,
+                            )
                             # Combine with type-level default scope for list fallback
                             try:
                                 tgt_b_for_type3 = schema_instance.types.get(target_name_i)
@@ -4280,19 +4143,10 @@ class BerrySchema:
                                     t_scope3 = getattr(tgt_b_for_type3, 'scope', None)
                             except Exception:
                                 t_scope3 = None
-                            if t_scope3 is not None:
-                                fragments3 = t_scope3 if isinstance(t_scope3, list) else [t_scope3]
-                                for frag3 in fragments3:
-                                    if isinstance(frag3, (dict, str)):
-                                        wdict_t3 = _to_where_dict(frag3, strict=True)
-                                        if wdict_t3:
-                                            expr_t3 = _expr_from_where_dict(child_model_cls, wdict_t3, strict=True)
-                                            if expr_t3 is not None:
-                                                stmt = stmt.where(expr_t3)
-                                    elif callable(frag3):
-                                        expr_t3 = _scope_to_sql_expr(child_model_cls, frag3(child_model_cls, info), info, strict=True)
-                                        if expr_t3 is not None:
-                                            stmt = stmt.where(expr_t3)
+                            stmt = await schema_instance._predicate_compiler.apply(
+                                stmt, child_model_cls, t_scope3, info,
+                                strict=True, trusted=True,
+                            )
                             # Ad-hoc JSON where for relation list if present on selection (not used; keep future hook comment)
                             # Ordering (multi then single) if column whitelist permits
                             target_b_for_order = schema_instance.types.get(target_name_i)
@@ -4306,6 +4160,13 @@ class BerrySchema:
                                 order_by=effective_order_by,
                                 order_dir=effective_order_dir,
                                 order_multi=effective_order_multi,
+                                info=info,
+                                paginated=any(
+                                    value is not None
+                                    for value in schema_instance.normalize_pagination(
+                                        limit, offset
+                                    )
+                                ),
                             )
                             # Apply filters
                             if target_filters:
@@ -4688,14 +4549,57 @@ class BerrySchema:
                         continue
                     annotations[uf] = utype
                     try:
-                        setattr(st_cls, uf, getattr(bcls, uf))
+                        default_value = getattr(bcls, uf)
+                        base_resolver = getattr(default_value, 'base_resolver', None)
+                        resolver_fn = getattr(base_resolver, 'wrapped_func', None)
+                        guard = SelectGuardExtension(
+                            self._policy_engine, bcls, uf, utype
+                        )
+                        if hasattr(default_value, 'extensions'):
+                            import copy as _copy
+                            guarded_field = _copy.copy(default_value)
+                            guarded_field.extensions = [
+                                *(getattr(default_value, 'extensions', None) or []),
+                                guard,
+                            ]
+                            setattr(st_cls, uf, guarded_field)
+                        elif callable(resolver_fn):
+                            setattr(
+                                st_cls,
+                                uf,
+                                strawberry.field(
+                                    resolver=resolver_fn,
+                                    extensions=[guard],
+                                ),
+                            )
+                        else:
+                            setattr(
+                                st_cls,
+                                uf,
+                                strawberry.field(
+                                    default=default_value,
+                                    extensions=[guard],
+                                ),
+                            )
                     except Exception:
-                        pass
+                        setattr(
+                            st_cls,
+                            uf,
+                            strawberry.field(
+                                extensions=[
+                                    SelectGuardExtension(
+                                        self._policy_engine, bcls, uf, utype
+                                    )
+                                ]
+                            ),
+                        )
                 # 2) Copy @strawberry.field method-based resolvers
                 for uf, val in vars(bcls).items():
                     if uf in bcls.__berry_fields__:
                         continue
-                    if uf in annotations or hasattr(st_cls, uf):
+                    # Only fields already materialized directly on the
+                    # generated runtime class should be skipped here.
+                    if uf in annotations or uf in vars(st_cls):
                         continue
                     if uf.startswith('__') or uf.startswith('_'):
                         continue
@@ -4707,20 +4611,22 @@ class BerrySchema:
                             or hasattr(val, "base_resolver")
                         )
                         if looks_strawberry:
-                            # Rebuild a new strawberry.field bound to the generated class using the original resolver function
-                            fn = getattr(val, 'resolver', None)
-                            if fn is None:
-                                br = getattr(val, 'base_resolver', None)
-                                fn = getattr(br, 'func', None)
-                            if fn is None:
-                                fn = getattr(val, 'func', None)
-                            if callable(fn):
-                                # Let Strawberry infer the return type from the resolver; avoid injecting
-                                # potentially version-specific StrawberryAnnotation wrappers into __annotations__.
-                                setattr(st_cls, uf, strawberry.field(resolver=fn))
-                            else:
-                                # Fallback to copying as-is
-                                setattr(st_cls, uf, val)
+                            # Clone the original StrawberryField so its name,
+                            # description, arguments, permission classes and
+                            # user extensions remain intact.  Keep the select
+                            # guard last so it is the final output gate.
+                            import copy as _copy
+                            guarded_field = _copy.copy(val)
+                            guarded_field.extensions = [
+                                *(getattr(val, 'extensions', None) or []),
+                                SelectGuardExtension(
+                                    self._policy_engine,
+                                    bcls,
+                                    uf,
+                                    getattr(val, 'type_annotation', None),
+                                ),
+                            ]
+                            setattr(st_cls, uf, guarded_field)
                     except Exception:
                         # best-effort
                         pass
@@ -4876,26 +4782,43 @@ class BerrySchema:
                 )
                 requested_scalar_root = {
                     name for name in _plan.requested_scalar_root
-                    if root_permissions.read.allows(name)
+                    if self._policy_engine.allows_resolved_field(
+                        btype_cls, root_permissions, 'select', name
+                    )
                 }
                 requested_custom_root = {
                     name for name in _plan.requested_custom_root
-                    if root_permissions.read.allows(name)
+                    if self._policy_engine.allows_resolved_field(
+                        btype_cls, root_permissions, 'select', name
+                    )
                 }
                 requested_custom_obj_root = {
                     name for name in _plan.requested_custom_obj_root
-                    if root_permissions.read.allows(name)
+                    if self._policy_engine.allows_resolved_field(
+                        btype_cls, root_permissions, 'select', name
+                    )
                 }
                 requested_aggregates_root = {
                     name for name in _plan.requested_aggregates_root
-                    if root_permissions.read.allows(name)
+                    if self._policy_engine.allows_resolved_field(
+                        btype_cls, root_permissions, 'select', name
+                    )
                 }
-                requested_other_root = getattr(_plan, 'requested_other_root', set()) or set()
+                requested_other_root = {
+                    name
+                    for name in (
+                        getattr(_plan, 'requested_other_root', set()) or set()
+                    )
+                    if self._policy_engine.allows_resolved_field(
+                        btype_cls, root_permissions, 'select', name
+                    )
+                }
                 await self._validate_query_field_controls(
                     btype_cls,
                     info,
                     where=raw_where,
                     order_by=permission_order_by,
+                    order_dir=order_dir if permission_order_by is not None else None,
                     order_multi=permission_order_multi,
                     filter_specs=declared_filters,
                     filter_values=_passed_filter_args,
@@ -4913,6 +4836,7 @@ class BerrySchema:
                         or _plan.requested_custom_root
                         or _plan.requested_custom_obj_root
                         or _plan.requested_aggregates_root
+                        or getattr(_plan, 'requested_other_root', set())
                     )
                 ):
                     # A selection containing only denied fields still needs one
@@ -5240,6 +5164,11 @@ class BerrySchema:
                         order_by=order_by,
                         order_dir=order_dir,
                         order_multi=order_multi,
+                        info=info,
+                        paginated=any(
+                            value is not None
+                            for value in self.normalize_pagination(limit, offset)
+                        ),
                     )
                     stmt = RootSQLBuilders(self).apply_pagination(stmt, limit=limit, offset=offset)
                     async with lock:

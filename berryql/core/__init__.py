@@ -3,11 +3,11 @@ from .fields import FieldDef, FieldDescriptor, field, relation, aggregate, count
 from .filters import FilterSpec, OPERATOR_REGISTRY, register_operator, normalize_filter_spec
 from .selection import RelationSelectionExtractor, RootSelectionExtractor
 from .utils import Direction, dir_value, coerce_where_value
-from .permissions import FieldPermissions, FieldSet
+from .permissions import FieldPermissions, FieldSet, OperationPermissions
 
 __all__ = [
     'FieldDef','FieldDescriptor','field','relation','aggregate','count','custom','custom_object',
     'FilterSpec','OPERATOR_REGISTRY','register_operator','normalize_filter_spec',
     'RelationSelectionExtractor','RootSelectionExtractor','Direction','dir_value','coerce_where_value',
-    'FieldPermissions','FieldSet'
+    'FieldPermissions','FieldSet','OperationPermissions'
 ]

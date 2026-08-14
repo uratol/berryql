@@ -5,6 +5,7 @@ import logging
 from collections import Counter
 
 import pytest
+import strawberry
 from sqlalchemy import event, func, select
 
 from berryql import (
@@ -12,6 +13,7 @@ from berryql import (
     BerryType,
     FieldPermissions,
     FieldSet,
+    OperationPermissions,
     count,
     custom,
     field,
@@ -84,6 +86,18 @@ class PermissionPostQL(BerryType):
         returns=int,
     )
 
+    @strawberry.field
+    def plain_note(self) -> str | None:
+        return "plain"
+
+    @strawberry.field
+    def plain_tags(self) -> list[str] | None:
+        return ["plain"]
+
+    @strawberry.field
+    def plain_required(self) -> str:
+        return "plain"
+
     @permission_schema.pre
     def _capture_sanitized_payload(model_cls, info, data, context=None):
         (info.context or {}).setdefault("pre_payloads", []).append((model_cls.__name__, set((data or {}).keys())))
@@ -107,10 +121,14 @@ def _context(db_session, **values):
     return {"db_session": db_session, **values}
 
 
-def _permissions(*, read=None, write=None):
+def _permissions(*, select=None, filter=None, order=None, create=None, update=None, operations=None):
     return FieldPermissions(
-        read=read or FieldSet.all(),
-        write=write or FieldSet.all(),
+        select=select or FieldSet.all(),
+        filter=filter or FieldSet.all(),
+        order=order or FieldSet.all(),
+        create=create or FieldSet.all(),
+        update=update or FieldSet.all(),
+        operations=operations or OperationPermissions(),
     )
 
 
@@ -127,8 +145,114 @@ def test_field_set_constructors_and_intersection():
     assert not combined.allows("title")
     assert not combined.allows("content")
 
-    static_schema = BerrySchema(field_permissions=FieldPermissions(read=FieldSet.only("id")))
+    static_schema = BerrySchema(field_permissions=FieldPermissions(select=FieldSet.only("id")))
     assert isinstance(static_schema._field_permissions_provider, FieldPermissions)
+
+
+def test_field_and_operation_permission_intersections_and_legacy_rejection():
+    left = FieldPermissions(
+        select=FieldSet.only("id", "title", "content"),
+        filter=FieldSet.only("id", "content"),
+        order=FieldSet.all_except("content"),
+        create=FieldSet.only("title", "content"),
+        update=FieldSet.only("content"),
+        operations=OperationPermissions(
+            create=True, update=True, delete=False, replace=True
+        ),
+    )
+    right = FieldPermissions(
+        select=FieldSet.all_except("content"),
+        filter=FieldSet.all(),
+        order=FieldSet.only("id", "content"),
+        create=FieldSet.only("title"),
+        update=FieldSet.all_except("content"),
+        operations=OperationPermissions(
+            create=True, update=False, delete=True, replace=False
+        ),
+    )
+
+    combined = left.intersection(right)
+    assert combined.select.allows("id")
+    assert not combined.select.allows("content")
+    assert combined.filter.allows("id")
+    assert not combined.filter.allows("content")
+    assert combined.order.allows("id")
+    assert not combined.order.allows("content")
+    assert combined.create.allows("title")
+    assert not combined.create.allows("content")
+    assert not combined.update.allows("content")
+    assert combined.operations == OperationPermissions(
+        create=True, update=False, delete=False, replace=False
+    )
+
+    with pytest.raises(TypeError, match="read"):
+        FieldPermissions(read=FieldSet.all())
+    with pytest.raises(TypeError, match="write"):
+        FieldPermissions(write=FieldSet.all())
+
+
+@pytest.mark.asyncio
+async def test_plain_strawberry_scalar_and_list_use_final_select_guard(
+    db_session, populated_db
+):
+    context = _context(
+        db_session,
+        field_permissions={
+            "PermissionPostQL": _permissions(select=FieldSet.only("id"))
+        },
+    )
+    result = await permission_graphql_schema.execute(
+        "query { posts(limit: 1) { id plain_note plain_tags } }",
+        context_value=context,
+    )
+
+    assert result.errors is None
+    assert result.data["posts"] == [
+        {"id": populated_db["posts"][0].id, "plain_note": None, "plain_tags": []}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_denied_non_null_plain_strawberry_field_uses_graphql_null_bubbling(
+    db_session, populated_db
+):
+    result = await permission_graphql_schema.execute(
+        "query { posts(limit: 1) { id plain_required } }",
+        context_value=_context(
+            db_session,
+            field_permissions={
+                "PermissionPostQL": _permissions(select=FieldSet.only("id"))
+            },
+        ),
+    )
+
+    assert result.errors
+    assert "Cannot return null for non-nullable field" in str(result.errors[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "query"),
+    [
+        (
+            "filter",
+            'query { posts(where: "{\\"content\\": {\\"eq\\": \\"Hello world!\\"}}") { id content } }',
+        ),
+        ("order", 'query { posts(order_by: "content") { id content } }'),
+    ],
+)
+async def test_filter_and_order_capabilities_are_independent(
+    db_session, populated_db, capability, query
+):
+    masks = {capability: FieldSet.all_except("content")}
+    context = _context(
+        db_session,
+        field_permissions={"PermissionPostQL": _permissions(**masks)},
+    )
+    result = await permission_graphql_schema.execute(query, context_value=context)
+
+    assert result.errors
+    assert f"not allowed for {capability}" in str(result.errors[0])
 
 
 @pytest.mark.asyncio
@@ -142,7 +266,7 @@ async def test_read_allow_list_returns_null_and_empty_relations_without_extra_sq
     try:
         context = _context(
             db_session,
-            field_permissions={"PermissionPostQL": _permissions(read=FieldSet.only("id", "title"))},
+            field_permissions={"PermissionPostQL": _permissions(select=FieldSet.only("id", "title"))},
         )
         result = await permission_graphql_schema.execute(
             """
@@ -182,8 +306,8 @@ async def test_read_deny_list_and_nested_target_allow_list(db_session, populated
     context = _context(
         db_session,
         field_permissions={
-            "PermissionPostQL": _permissions(read=FieldSet.all_except("content")),
-            "PermissionCommentQL": _permissions(read=FieldSet.only("id")),
+            "PermissionPostQL": _permissions(select=FieldSet.all_except("content")),
+            "PermissionCommentQL": _permissions(select=FieldSet.only("id")),
         },
     )
     result = await permission_graphql_schema.execute(
@@ -222,22 +346,22 @@ async def test_unreadable_fields_cannot_be_used_for_where_order_or_filter_args(d
     context = _context(
         db_session,
         field_permissions={
-            "PermissionPostQL": _permissions(read=FieldSet.only("id", "post_comments")),
-            "PermissionCommentQL": _permissions(read=FieldSet.only("id")),
+            "PermissionPostQL": _permissions(select=FieldSet.only("id", "post_comments")),
+            "PermissionCommentQL": _permissions(select=FieldSet.only("id")),
         },
     )
     result = await permission_graphql_schema.execute(query, context_value=context)
 
     assert result.errors
-    assert "not readable" in str(result.errors[0])
+    assert "not allowed for" in str(result.errors[0])
 
 
 @pytest.mark.asyncio
 async def test_global_and_type_permissions_intersect_and_resolve_once_per_request(db_session, populated_db):
     context = _context(
         db_session,
-        field_permissions={"PermissionPostQL": _permissions(read=FieldSet.only("id", "title"))},
-        post_local_permissions=_permissions(read=FieldSet.all_except("title")),
+        field_permissions={"PermissionPostQL": _permissions(select=FieldSet.only("id", "title"))},
+        post_local_permissions=_permissions(select=FieldSet.all_except("title")),
     )
     result = await permission_graphql_schema.execute(
         "query { posts { id title content } }",
@@ -285,7 +409,7 @@ async def test_denied_scalar_write_is_ignored_before_hooks_and_warned_if_changed
     old_content = post.content
     context = _context(
         db_session,
-        field_permissions={"PermissionPostQL": _permissions(write=FieldSet.only("title"))},
+        field_permissions={"PermissionPostQL": _permissions(update=FieldSet.only("title"))},
     )
 
     with caplog.at_level(logging.WARNING, logger="berryql"):
@@ -324,7 +448,7 @@ async def test_same_or_unloaded_denied_value_does_not_warn(db_session, populated
     post = populated_db["posts"][0]
     context = _context(
         db_session,
-        field_permissions={"PermissionPostQL": _permissions(write=FieldSet.none())},
+        field_permissions={"PermissionPostQL": _permissions(update=FieldSet.none())},
     )
     with caplog.at_level(logging.WARNING, logger="berryql"):
         same_result = await permission_graphql_schema.execute(
@@ -348,7 +472,7 @@ async def test_same_or_unloaded_denied_value_does_not_warn(db_session, populated
 
     context = _context(
         db_session,
-        field_permissions={"PermissionPostQL": _permissions(write=FieldSet.none())},
+        field_permissions={"PermissionPostQL": _permissions(update=FieldSet.none())},
     )
     event.listen(engine.sync_engine, "before_cursor_execute", _capture)
     try:
@@ -381,8 +505,8 @@ async def test_denied_relation_write_ignores_entire_nested_payload(db_session, p
     context = _context(
         db_session,
         field_permissions={
-            "PermissionPostQL": _permissions(write=FieldSet.only("title")),
-            "PermissionCommentQL": _permissions(write=FieldSet.all()),
+            "PermissionPostQL": _permissions(update=FieldSet.only("title")),
+            "PermissionCommentQL": _permissions(update=FieldSet.all()),
         },
     )
     with caplog.at_level(logging.WARNING, logger="berryql"):
@@ -416,8 +540,8 @@ async def test_nested_write_applies_target_permissions_recursively(db_session, p
     context = _context(
         db_session,
         field_permissions={
-            "PermissionPostQL": _permissions(write=FieldSet.only("post_comments")),
-            "PermissionCommentQL": _permissions(write=FieldSet.only("rate")),
+            "PermissionPostQL": _permissions(update=FieldSet.only("post_comments")),
+            "PermissionCommentQL": _permissions(update=FieldSet.only("rate")),
         },
     )
     with caplog.at_level(logging.WARNING, logger="berryql"):
@@ -452,7 +576,7 @@ async def test_denied_field_on_create_is_ignored_without_warning(db_session, pop
     author = populated_db["users"][0]
     context = _context(
         db_session,
-        field_permissions={"PermissionPostQL": _permissions(write=FieldSet.only("title", "author_id"))},
+        field_permissions={"PermissionPostQL": _permissions(create=FieldSet.only("title", "author_id"))},
     )
     with caplog.at_level(logging.WARNING, logger="berryql"):
         result = await permission_graphql_schema.execute(
@@ -484,8 +608,8 @@ async def test_mutation_response_uses_read_not_write_permissions(db_session, pop
         db_session,
         field_permissions={
             "PermissionPostQL": _permissions(
-                read=FieldSet.all_except("content"),
-                write=FieldSet.only("content"),
+                select=FieldSet.all_except("content"),
+                update=FieldSet.only("content"),
             )
         },
     )
@@ -502,3 +626,267 @@ async def test_mutation_response_uses_read_not_write_permissions(db_session, pop
     assert result.errors is None
     assert post.content == "stored but hidden"
     assert result.data["merge_post"]["content"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_relation_payload", [False, True])
+async def test_denied_replace_relation_is_fully_ignored_before_hooks(
+    db_session, populated_db, include_relation_payload
+):
+    post = populated_db["posts"][0]
+    post_id = post.id
+    comments = [
+        comment
+        for comment in populated_db["post_comments"]
+        if comment.post_id == post_id
+    ]
+    original = [(comment.id, comment.content, comment.rate) for comment in comments]
+    payload = {"id": post_id, "_Replace": ["post_comments"]}
+    if include_relation_payload:
+        payload["post_comments"] = [
+            {"id": comments[0].id, "content": "must not be visible"}
+        ]
+    context = _context(
+        db_session,
+        field_permissions={
+            "PermissionPostQL": _permissions(
+                update=FieldSet.all_except("post_comments")
+            )
+        },
+    )
+
+    result = await permission_graphql_schema.execute(
+        """
+        mutation($payload: PermissionPostQLInput!) {
+          merge_post(payload: $payload) { id }
+        }
+        """,
+        variable_values={"payload": payload},
+        context_value=context,
+    )
+
+    assert result.errors is None
+    rows = (
+        await db_session.execute(
+            select(PostComment)
+            .where(PostComment.post_id == post_id)
+            .order_by(PostComment.id)
+        )
+    ).scalars().all()
+    assert [(row.id, row.content, row.rate) for row in rows] == original
+    post_payloads = [
+        keys for model_name, keys in context["pre_payloads"] if model_name == "Post"
+    ]
+    assert post_payloads
+    assert "post_comments" not in post_payloads[0]
+    assert "_Replace" not in post_payloads[0]
+    assert not any(
+        model_name == "PostComment" for model_name, _ in context["pre_payloads"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_replace_requires_child_delete_capability_and_rolls_back(
+    db_session, populated_db
+):
+    post = populated_db["posts"][0]
+    post_id = post.id
+    comments = [
+        comment
+        for comment in populated_db["post_comments"]
+        if comment.post_id == post_id
+    ]
+    original_ids = [comment.id for comment in comments]
+    context = _context(
+        db_session,
+        field_permissions={
+            "PermissionPostQL": _permissions(
+                update=FieldSet.only("post_comments")
+            ),
+            "PermissionCommentQL": _permissions(
+                operations=OperationPermissions(delete=False)
+            ),
+        },
+    )
+
+    result = await permission_graphql_schema.execute(
+        """
+        mutation($payload: PermissionPostQLInput!) {
+          merge_post(payload: $payload) { id }
+        }
+        """,
+        variable_values={
+            "payload": {
+                "id": post_id,
+                "post_comments": [{"id": comments[0].id}],
+                "_Replace": ["post_comments"],
+            }
+        },
+        context_value=context,
+    )
+
+    assert result.errors
+    assert "Operation 'delete' is not allowed" in str(result.errors[0])
+    remaining_ids = (
+        await db_session.execute(
+            select(PostComment.id)
+            .where(PostComment.post_id == post_id)
+            .order_by(PostComment.id)
+        )
+    ).scalars().all()
+    assert remaining_ids == original_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+async def test_replace_uses_resolved_scope_and_preserves_out_of_scope_rows(
+    db_session, populated_db, monkeypatch, is_async
+):
+    post = populated_db["posts"][0]
+    comments = [
+        comment
+        for comment in populated_db["post_comments"]
+        if comment.post_id == post.id
+    ]
+
+    if is_async:
+        async def scope(model_cls, info):
+            await asyncio.sleep(0)
+            return {"rate": {"gte": 2}}
+    else:
+        def scope(model_cls, info):
+            return {"rate": {"gte": 2}}
+
+    monkeypatch.setitem(
+        PermissionPostQL.__berry_fields__["post_comments"].meta,
+        "scope",
+        scope,
+    )
+    result = await permission_graphql_schema.execute(
+        """
+        mutation($payload: PermissionPostQLInput!) {
+          merge_post(payload: $payload) { id }
+        }
+        """,
+        variable_values={
+            "payload": {"id": post.id, "_Replace": ["post_comments"]}
+        },
+        context_value=_context(db_session),
+    )
+
+    assert result.errors is None
+    remaining = (
+        await db_session.execute(
+            select(PostComment.id, PostComment.rate)
+            .where(PostComment.post_id == post.id)
+            .order_by(PostComment.id)
+        )
+    ).all()
+    assert remaining == [(comments[1].id, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+async def test_throwing_replace_scope_rolls_back_entire_merge(
+    db_session, populated_db, monkeypatch, is_async
+):
+    post = populated_db["posts"][0]
+    old_title = post.title
+    original_ids = [
+        comment.id
+        for comment in populated_db["post_comments"]
+        if comment.post_id == post.id
+    ]
+
+    if is_async:
+        async def scope(model_cls, info):
+            await asyncio.sleep(0)
+            raise RuntimeError("replace scope failed")
+    else:
+        def scope(model_cls, info):
+            raise RuntimeError("replace scope failed")
+
+    monkeypatch.setitem(
+        PermissionPostQL.__berry_fields__["post_comments"].meta,
+        "scope",
+        scope,
+    )
+    result = await permission_graphql_schema.execute(
+        """
+        mutation($payload: PermissionPostQLInput!) {
+          merge_post(payload: $payload) { id }
+        }
+        """,
+        variable_values={
+            "payload": {
+                "id": post.id,
+                "title": "must roll back",
+                "_Replace": ["post_comments"],
+            }
+        },
+        context_value=_context(db_session),
+    )
+
+    assert result.errors
+    assert "replace scope failed" in str(result.errors[0])
+    await db_session.refresh(post)
+    assert post.title == old_title
+    remaining_ids = (
+        await db_session.execute(
+            select(PostComment.id)
+            .where(PostComment.post_id == post.id)
+            .order_by(PostComment.id)
+        )
+    ).scalars().all()
+    assert remaining_ids == original_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "operations", "expected_operation"),
+    [
+        (
+            {"id": 99999, "title": "blocked", "author_id": 1, "_Insert": True},
+            OperationPermissions(create=False),
+            "create",
+        ),
+        (
+            {"id": 1, "title": "blocked", "_Insert": False},
+            OperationPermissions(update=False),
+            "update",
+        ),
+        (
+            {"id": 1, "_Delete": True},
+            OperationPermissions(delete=False),
+            "delete",
+        ),
+        (
+            {"id": 1, "_Replace": ["post_comments"]},
+            OperationPermissions(replace=False),
+            "replace",
+        ),
+    ],
+)
+async def test_operation_capabilities_are_enforced_independently(
+    db_session, populated_db, payload, operations, expected_operation
+):
+    context = _context(
+        db_session,
+        field_permissions={
+            "PermissionPostQL": _permissions(operations=operations)
+        },
+    )
+    result = await permission_graphql_schema.execute(
+        """
+        mutation($payload: PermissionPostQLInput!) {
+          merge_post(payload: $payload) { id }
+        }
+        """,
+        variable_values={"payload": payload},
+        context_value=context,
+    )
+
+    assert result.errors
+    assert f"Operation '{expected_operation}' is not allowed" in str(
+        result.errors[0]
+    )

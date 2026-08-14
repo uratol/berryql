@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented here.
 
+## Unreleased
+### Added
+- Replaced `FieldPermissions(read=..., write=...)` with explicit `select`,
+  `filter`, `order`, `create`, and `update` field capabilities plus exported
+  `OperationPermissions` controls for create, update, delete, and replace. The
+  old constructor arguments are deliberately unsupported.
+- Added internal `PolicyEngine`, immutable-IR `PredicateCompiler`, and
+  `OrderingCompiler` components shared by root, relation, fallback, adapter,
+  and mutation paths.
+
+### Fixed
+- Closed `_Replace` authorization bypasses: relation names are normalized and
+  sanitized before hooks, denied relations cannot become delete-all commands,
+  parent replace/update and child delete capabilities are enforced, and the
+  same resolved relation scope is applied to ID discovery and deletion.
+- Made unsupported MSSQL scopes fail closed instead of issuing a broader query.
+- Added final select guards for ordinary nullable Strawberry scalar/object/list
+  fields declared on `BerryType`.
+- Made multi-order validation atomic and added primary-key tie-breakers to
+  paginated ordering, with dialect-aware null ordering in Python fallbacks.
+
 ## [0.4.1] - 2026-08-03
 ### Fixed
 - Made `_Insert: false` an explicit update-only mode. It now requires a
