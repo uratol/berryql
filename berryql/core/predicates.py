@@ -3,19 +3,20 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy import and_
 
-from .filters import OPERATOR_REGISTRY
+from .errors import AdapterUnsupported, InvalidPredicateError
+from .filters import FilterLimits, OperatorRegistry
 from .utils import coerce_where_value, to_where_dict
 
 
-class PredicateError(ValueError):
+class PredicateError(InvalidPredicateError):
     """Base error for predicate resolution or compilation."""
 
 
-class UnsupportedPredicateError(PredicateError):
+class UnsupportedPredicateError(PredicateError, AdapterUnsupported):
     """The selected adapter cannot enforce a predicate safely."""
 
 
@@ -80,6 +81,9 @@ class PredicateCompiler:
 
     def __init__(self, schema: Any):
         self.schema = schema
+        self.operators = OperatorRegistry(getattr(schema, "_operators", None))
+        limits = getattr(schema, "filter_limits", None)
+        self.limits = limits if isinstance(limits, FilterLimits) else FilterLimits()
 
     def _execution_cache(self, info: Any) -> Optional[Dict[Any, Any]]:
         context = getattr(info, "context", None)
@@ -147,6 +151,8 @@ class PredicateCompiler:
         if callable(value):
             return PredicateProvider(value)
         if isinstance(value, (list, tuple)):
+            if not trusted and self.limits.max_depth is not None:
+                self._validate_depth(value, self.limits.max_depth)
             return Conjunction(
                 tuple(
                     self.parse(
@@ -159,12 +165,19 @@ class PredicateCompiler:
                 )
             )
         if isinstance(value, (dict, str)):
+            if not trusted and self.limits.max_json_length is not None and isinstance(value, (str, bytes)):
+                if len(value) > self.limits.max_json_length:
+                    raise PredicateError(
+                        f"Where JSON exceeds max_json_length={self.limits.max_json_length}"
+                    )
             where_dict = to_where_dict(
                 value,
                 strict=strict,
                 model_cls=model_cls,
                 auto_camel_case=bool(getattr(self.schema, "_auto_camel_case", False)),
             )
+            if not trusted and self.limits.max_depth is not None:
+                self._validate_depth(where_dict, self.limits.max_depth)
             fragments = []
             for column_name, operator_map in (where_dict or {}).items():
                 if not isinstance(operator_map, dict):
@@ -172,11 +185,44 @@ class PredicateCompiler:
                         raise PredicateError(f"Where operators for '{column_name}' must be an object")
                     continue
                 for operator, operand in operator_map.items():
+                    self._validate_operand_shape(str(column_name), str(operator), operand)
                     fragments.append(ColumnPredicate(str(column_name), str(operator), operand))
+            if not trusted and self.limits.max_clauses is not None and len(fragments) > self.limits.max_clauses:
+                raise PredicateError(
+                    f"Where clause count {len(fragments)} exceeds max_clauses={self.limits.max_clauses}"
+                )
             return Conjunction(tuple(fragments))
         if not trusted:
             raise PredicateError("Caller where must be a JSON object or JSON string")
         return TrustedExpression(value)
+
+    def _validate_operand_shape(self, column: str, operator: str, operand: Any) -> None:
+        if operator in {"between", "not_between"}:
+            if not isinstance(operand, (list, tuple)) or len(operand) != 2:
+                raise PredicateError(
+                    f"Where operator '{operator}' for '{column}' requires exactly two values"
+                )
+        elif operator in {"in", "not_in"}:
+            if not isinstance(operand, (list, tuple, set)) or not operand:
+                raise PredicateError(
+                    f"Where operator '{operator}' for '{column}' requires a non-empty list"
+                )
+            if self.limits.max_in_items is not None and len(operand) > self.limits.max_in_items:
+                raise PredicateError(
+                    f"Where operator '{operator}' for '{column}' exceeds max_in_items={self.limits.max_in_items}"
+                )
+
+    @staticmethod
+    def _validate_depth(value: Any, maximum: int, depth: int = 0) -> None:
+        if depth > maximum:
+            raise PredicateError(f"Where nesting depth exceeds max_depth={maximum}")
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                PredicateCompiler._validate_depth(key, maximum, depth + 1)
+                PredicateCompiler._validate_depth(nested, maximum, depth + 1)
+        elif isinstance(value, (list, tuple, set)):
+            for nested in value:
+                PredicateCompiler._validate_depth(nested, maximum, depth + 1)
 
     async def resolve(
         self,
@@ -340,7 +386,7 @@ class PredicateCompiler:
             column = self._column(model_cls, predicate.column, strict)
             if column is None:
                 return None
-            operator = OPERATOR_REGISTRY.get(predicate.operator)
+            operator = self.operators.get(predicate.operator)
             if operator is None:
                 if strict:
                     raise PredicateError(f"Unknown where operator: {predicate.operator}")

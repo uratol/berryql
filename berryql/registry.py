@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, get_origin, get_args, Annotated
+from typing import Any, Callable, Dict, List, Mapping, Optional, Type, TypeVar, get_origin, get_args, Annotated
 from enum import Enum
 from datetime import datetime
 import asyncio
@@ -50,8 +50,8 @@ T = TypeVar('T')
 
 # DRY split: import core building blocks
 from .core.fields import FieldDef, FieldDescriptor, DomainDescriptor
-from .core.filters import FilterSpec, OPERATOR_REGISTRY, normalize_filter_spec as _normalize_filter_spec
-from .core.analyzer import QueryAnalyzer
+from .core.filters import FilterLimits, FilterSpec, OPERATOR_REGISTRY, normalize_filter_spec as _normalize_filter_spec
+from .core.analyzer import AuthorizedQueryPlan, QueryAnalyzer, SelectionPlan, ValueSource
 from .core.utils import (
     Direction,
     dir_value as _dir_value,
@@ -62,10 +62,13 @@ from .core.utils import (
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
 from .core.permissions import FieldPermissions
+from .core.declared_filters import DeclaredFilterCompiler
 from .core.policy import PolicyEngine, SelectGuardExtension
 from .core.predicates import PredicateCompiler
 from .core.ordering import OrderingCompiler
 from .core.naming import from_camel
+from .core.query_root import QueryRootAssembler
+from .core.relation_resolver import RelationResolverFactory
 
 # Standard argument descriptions for default query parameters are generated dynamically
 # based on the current schema naming (auto-camel-case) via BerrySchema._get_standard_arg_descriptions.
@@ -256,6 +259,8 @@ class BerrySchema:
         default_limit: Optional[int] = None,
         max_limit: Optional[int] = None,
         field_permissions: Any | None = None,
+        filter_limits: Optional[FilterLimits] = None,
+        operators: Optional[Mapping[str, Callable[[Any, Any], Any]]] = None,
     ):
         self.types: Dict[str, Type[BerryType]] = {}
         self._st_types: Dict[str, Any] = {}
@@ -281,6 +286,8 @@ class BerrySchema:
         # SQLAlchemy models are declared once at import time and never re-created.
         self._col_type_map_cache: Dict[int, Dict[str, Any]] = {}
         self._order_segment_cache: Dict[tuple, str] = {}
+        self._order_path_cache: Dict[tuple, Optional[str]] = {}
+        self._allowed_order_cache: Dict[tuple, tuple[str, ...]] = {}
         self._merge_hooks: Dict[str, List[Callable[..., Any]]] = {
             'before_merge': [],
             'before_commit': [],
@@ -292,9 +299,22 @@ class BerrySchema:
         ):
             raise TypeError("field_permissions must be callable or FieldPermissions")
         self._field_permissions_provider = field_permissions
+        if filter_limits is not None and not isinstance(filter_limits, FilterLimits):
+            if isinstance(filter_limits, dict):
+                filter_limits = FilterLimits(**filter_limits)
+            else:
+                raise TypeError("filter_limits must be a FilterLimits or dict")
+        self.filter_limits = filter_limits or FilterLimits()
+        self._operators = dict(operators or {})
         self._policy_engine = PolicyEngine(self)
         self._predicate_compiler = PredicateCompiler(self)
         self._ordering_compiler = OrderingCompiler(self)
+        self._declared_filter_compiler = DeclaredFilterCompiler(self)
+
+    def register_operator(self, name: str, implementation: Callable[[Any, Any], Any]) -> None:
+        """Register an operator for this schema without leaking to other schemas."""
+
+        self._predicate_compiler.operators.register(name, implementation)
 
     @staticmethod
     def _coerce_pagination_config(
@@ -430,8 +450,16 @@ class BerrySchema:
             if value is None:
                 continue
             spec = (filter_specs or {}).get(argument_name)
-            column_name = getattr(spec, 'column', None) if spec is not None else None
-            if column_name:
+            if spec is None:
+                from .core.errors import InvalidPredicateError
+                raise InvalidPredicateError(f"Unknown filter argument: {argument_name}")
+            dependencies = getattr(spec, 'dependencies', ())
+            if not dependencies and getattr(spec, 'builder', None):
+                # Compatibility: legacy builders without metadata remain valid,
+                # but declare no implicit field access. Builders that read model
+                # fields should opt into depends_on/fields.
+                dependencies = ()
+            for column_name in dependencies:
                 await self._policy_engine.require_path(
                     btype_cls, info, 'filter', str(column_name)
                 )
@@ -460,13 +488,17 @@ class BerrySchema:
                     where=cfg.get('where'),
                     order_by=(
                         cfg.get('order_by')
-                        if cfg.get('_has_explicit_order_by')
+                        if cfg.get('order_by_source') == ValueSource.CALLER
                         else None
                     ),
-                    order_dir=cfg.get('order_dir'),
+                    order_dir=(
+                        cfg.get('order_dir')
+                        if cfg.get('order_dir_source') == ValueSource.CALLER
+                        else None
+                    ),
                     order_multi=(
                         cfg.get('order_multi')
-                        if cfg.get('_has_explicit_order_multi')
+                        if cfg.get('order_multi_source') == ValueSource.CALLER
                         else None
                     ),
                     filter_specs=self._expand_filter_args(cfg.get('arg_specs')),
@@ -483,9 +515,44 @@ class BerrySchema:
                     dict(cfg.get('nested') or {}),
                     info,
                 )
-                cfg['_field_permissions_applied'] = True
             result[relation_name] = cfg
         return result
+
+    async def _authorize_query_plan(
+        self, plan: Any, info: StrawberryInfo
+    ) -> AuthorizedQueryPlan:
+        """Return an immutable authorized copy without mutating analysis IR."""
+
+        btype_cls = plan.berry_type
+        permissions = await self._resolve_field_permissions(btype_cls, info)
+        relations = await self._prune_relation_permissions(
+            btype_cls, plan.requested_relations, info
+        )
+
+        async def _allowed(names: Any, *, dependencies: bool = False) -> frozenset[str]:
+            allowed = []
+            for name in names:
+                if not self._policy_engine.allows_resolved_field(
+                    btype_cls, permissions, 'select', name
+                ):
+                    continue
+                if dependencies and not await self._policy_engine.dependencies_allowed(
+                    btype_cls, info, name
+                ):
+                    continue
+                allowed.append(name)
+            return frozenset(allowed)
+
+        selection = SelectionPlan(
+            relations=relations,
+            scalar_fields=await _allowed(plan.requested_scalar_root),
+            custom_fields=await _allowed(plan.requested_custom_root, dependencies=True),
+            custom_object_fields=await _allowed(plan.requested_custom_obj_root, dependencies=True),
+            aggregate_fields=await _allowed(plan.requested_aggregates_root, dependencies=True),
+            other_fields=await _allowed(plan.requested_other_root, dependencies=True),
+            required_fk_parent_cols=frozenset(plan.required_fk_parent_cols),
+        )
+        return AuthorizedQueryPlan(plan, selection, permissions)
 
     def mutation(self):
         """Decorator to declare the root Mutation using Strawberry fields.
@@ -1377,8 +1444,12 @@ class BerrySchema:
         """Normalize a dotted order path and verify that it only traverses single relations."""
         if not isinstance(order_name, str) or not order_name:
             return None
+        cache_key = (id(btype_cls), order_name, max_depth)
+        if cache_key in self._order_path_cache:
+            return self._order_path_cache[cache_key]
         parts = [part for part in order_name.split('.') if part]
         if not parts or len(parts) > max_depth:
+            self._order_path_cache[cache_key] = None
             return None
         current_btype = btype_cls
         normalized_parts: List[str] = []
@@ -1419,12 +1490,20 @@ class BerrySchema:
             normalized_parts.append(norm_part)
             target_name = meta.get('target')
             current_btype = self.types.get(target_name) if target_name else None
-        return '.'.join(normalized_parts)
+        result = '.'.join(normalized_parts)
+        self._order_path_cache[cache_key] = result
+        return result
 
     def _get_allowed_order_fields(self, btype_cls: Any, *, max_depth: int = 5, _seen: Optional[set[int]] = None) -> List[str]:
         """Return direct scalar and nested single-relation scalar paths allowed for ordering."""
         if btype_cls is None:
             return []
+        root_call = _seen is None
+        cache_key = (id(btype_cls), max_depth)
+        if root_call:
+            cached = self._allowed_order_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
         declared = getattr(btype_cls, '__ordering__', None)
         if declared is not None:
             out: List[str] = []
@@ -1457,6 +1536,8 @@ class BerrySchema:
             target_btype = self.types.get(target_name) if target_name else None
             for nested in self._get_allowed_order_fields(target_btype, max_depth=max_depth - 1, _seen=_seen):
                 out.append(f"{name}.{nested}")
+        if root_call:
+            self._allowed_order_cache[cache_key] = tuple(out)
         return out
 
     def _resolve_order_expression(self, model_cls: Any, btype_cls: Any, order_name: Any, *, max_depth: int = 5):
@@ -1638,10 +1719,94 @@ class BerrySchema:
         if not terms:
             return items
 
-        async def _resolve(item, path):
-            return await self._resolve_order_value(
-                session, lock, item, model_cls, btype_cls, path
-            )
+        # Resolve every dotted hop in batches. Query count is bounded by
+        # ordering depth/terms, never by the number of result rows.
+        resolved_values: Dict[tuple[int, str], Any] = {}
+        for term in terms:
+            if not isinstance(term.path, str):
+                continue
+            normalized = self._normalize_order_path(btype_cls, term.path)
+            if not normalized:
+                continue
+            parts = normalized.split('.')
+            current: Dict[int, Any] = {index: item for index, item in enumerate(items)}
+            current_model = model_cls
+            current_btype = btype_cls
+            for part in parts[:-1]:
+                fields = getattr(current_btype, '__berry_fields__', {}) or {}
+                fdef = fields.get(part)
+                meta = getattr(fdef, 'meta', {}) or {}
+                target_name = meta.get('target')
+                target_btype = self.types.get(target_name) if target_name else None
+                target_model = getattr(target_btype, 'model', None) if target_btype is not None else None
+                if target_model is None:
+                    current = {index: None for index in current}
+                    break
+                parent_fk_name = self._find_parent_fk_column_name(current_model, target_model, part)
+                next_values: Dict[int, Any] = {}
+                if parent_fk_name:
+                    ids_by_index = {
+                        index: self._value_from_order_container(container, parent_fk_name)
+                        for index, container in current.items()
+                    }
+                    identities = {value for value in ids_by_index.values() if value is not None}
+                    related_by_id: Dict[Any, Any] = {}
+                    if identities:
+                        pk_name = self._get_pk_name(target_model)
+                        statement = select(target_model).where(
+                            self._get_pk_column(target_model).in_(identities)
+                        )
+                        async with lock:
+                            result = await session.execute(statement)
+                        related_by_id = {
+                            getattr(row, pk_name): row for row in result.scalars().all()
+                        }
+                    next_values = {
+                        index: related_by_id.get(identity)
+                        for index, identity in ids_by_index.items()
+                    }
+                else:
+                    child_fk = self._find_child_fk_column(
+                        current_model, target_model, meta.get('fk_column_name')
+                    )
+                    parent_pk_name = self._get_pk_name(current_model)
+                    ids_by_index = {
+                        index: self._value_from_order_container(container, parent_pk_name)
+                        for index, container in current.items()
+                    }
+                    identities = {value for value in ids_by_index.values() if value is not None}
+                    related_by_parent: Dict[Any, Any] = {}
+                    if child_fk is not None and identities:
+                        statement = (
+                            select(target_model)
+                            .where(child_fk.in_(identities))
+                            .order_by(child_fk.asc(), self._get_pk_column(target_model).asc())
+                        )
+                        async with lock:
+                            result = await session.execute(statement)
+                        for row in result.scalars().all():
+                            parent_identity = getattr(row, child_fk.name)
+                            related_by_parent.setdefault(parent_identity, row)
+                    next_values = {
+                        index: related_by_parent.get(identity)
+                        for index, identity in ids_by_index.items()
+                    }
+                current = next_values
+                current_model = target_model
+                current_btype = target_btype
+            terminal = parts[-1]
+            terminal_def = (getattr(current_btype, '__berry_fields__', {}) or {}).get(terminal)
+            source_name = (getattr(terminal_def, 'meta', {}) or {}).get('column') or terminal
+            for index, container in current.items():
+                resolved_values[(index, normalized)] = self._value_from_order_container(
+                    container, terminal, source_name
+                )
+
+        item_indexes = {id(item): index for index, item in enumerate(items)}
+
+        def _resolve(item, path):
+            normalized = self._normalize_order_path(btype_cls, path) or path
+            return resolved_values.get((item_indexes[id(item)], normalized))
 
         try:
             dialect_name = str(session.get_bind().dialect.name).lower()
@@ -1881,7 +2046,7 @@ class BerrySchema:
                 return None
         return _resolver
 
-    def _create_relation_resolver(self, meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType]):
+    def _create_relation_resolver_impl_factory(self, meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType]):
         # Build filter specs exclusively from relation-specific arguments
         target_filters: Dict[str, FilterSpec] = {}
         # overlay relation-specific arguments
@@ -1898,7 +2063,7 @@ class BerrySchema:
             if arg_defs:
                 params += ', ' + ', '.join(arg_defs)
         else:
-            params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None'
+            params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, after=None, where=None'
             if arg_defs:
                 params += ', ' + ', '.join(arg_defs)
         
@@ -1910,9 +2075,9 @@ class BerrySchema:
             src += f"    _fa['{a}']={a}\n"
             
         if is_single_value:
-            src += "    return await _impl(schema_self, self, info, None, None, None, None, None, where, _fa, meta_copy, is_single_value, fname_local, parent_btype_local, target_filters)\n"
+            src += "    return await _impl(self, info, None, None, None, None, None, None, where, _fa, meta_copy, is_single_value, fname_local, parent_btype_local, target_filters)\n"
         else:
-            src += "    return await _impl(schema_self, self, info, limit, offset, order_by, order_dir, order_multi, where, _fa, meta_copy, is_single_value, fname_local, parent_btype_local, target_filters)\n"
+            src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, after, where, _fa, meta_copy, is_single_value, fname_local, parent_btype_local, target_filters)\n"
             
         env: Dict[str, Any] = {
             '_impl': self._relation_resolver_impl,
@@ -1943,6 +2108,7 @@ class BerrySchema:
                 'order_by': Annotated[Optional[str], strawberry.argument(description=_descs['order_by'])],
                 'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_descs['order_dir'])],
                 'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_descs['order_multi'])],
+                'after': Optional[str],
                 'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
             }
             
@@ -1961,7 +2127,7 @@ class BerrySchema:
         fn.__annotations__ = anns
         return fn
 
-    async def _relation_resolver_impl(self, root_self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any], meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType], target_filters: Dict[str, FilterSpec]):
+    async def _relation_resolver_impl(self, root_self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], after: Optional[str], related_where: Optional[Any], _filter_args: Dict[str, Any], meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType], target_filters: Dict[str, FilterSpec]):
         if not await self._field_read_allowed(
             parent_btype_local, info, fname_local
         ):
@@ -2152,7 +2318,10 @@ class BerrySchema:
                     try:
                         meta_map = getattr(root_self, '_pushdown_meta', None)
                         if isinstance(meta_map, dict):
-                            reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                            relation_meta = meta_map.get(fname_local)
+                            reason = getattr(
+                                getattr(relation_meta, 'decision', None), 'detail', None
+                            )
                     except Exception:
                         reason = None
                     if reason:
@@ -2203,40 +2372,14 @@ class BerrySchema:
                     stmt, child_model_cls, t_scope2, info,
                     strict=True, trusted=True,
                 )
-                for arg_name, val in _filter_args.items():
-                    if val is None:
-                        continue
-                    f_spec = target_filters.get(arg_name)
-                    if not f_spec:
-                        raise ValueError(f"Unknown filter argument: {arg_name}")
-                    expr = None
-                    if f_spec.transform:
-                        try:
-                            val = f_spec.transform(val)
-                        except Exception as e:
-                            raise ValueError(f"Filter transform failed for {arg_name}: {e}")
-                    if f_spec.builder:
-                        try:
-                            expr = f_spec.builder(child_model_cls, info, val)
-                        except Exception as e:
-                            raise ValueError(f"Filter builder failed for {arg_name}: {e}")
-                    elif f_spec.column:
-                        try:
-                            col = child_model_cls.__table__.c.get(f_spec.column)
-                        except Exception:
-                            col = None
-                        if col is None:
-                            raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
-                        op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
-                        if not op_fn:
-                            raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
-                        try:
-                            val2 = _coerce_where_value(col, val)
-                            expr = op_fn(col, val2)
-                        except Exception as e:
-                            raise ValueError(f"Filter operation failed for {arg_name}: {e}")
-                    if expr is not None:
-                        stmt = stmt.where(expr)
+                stmt = await self._declared_filter_compiler.apply(
+                    stmt,
+                    model_cls=child_model_cls,
+                    berry_type=target_btype,
+                    info=info,
+                    specs=target_filters,
+                    values=_filter_args,
+                )
                 async with lock:
                     result = await session.execute(stmt.limit(1))
                 row = result.scalar_one_or_none()
@@ -2246,7 +2389,10 @@ class BerrySchema:
                     try:
                         meta_map = getattr(root_self, '_pushdown_meta', None)
                         if isinstance(meta_map, dict):
-                            reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                            relation_meta = meta_map.get(fname_local)
+                            reason = getattr(
+                                getattr(relation_meta, 'decision', None), 'detail', None
+                            )
                     except Exception:
                         reason = None
                     if reason:
@@ -2508,7 +2654,10 @@ class BerrySchema:
             try:
                 meta_map = getattr(root_self, '_pushdown_meta', None)
                 if isinstance(meta_map, dict):
-                    reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                    relation_meta = meta_map.get(fname_local)
+                    reason = getattr(
+                        getattr(relation_meta, 'decision', None), 'detail', None
+                    )
             except Exception:
                 reason = None
             if reason:
@@ -2558,43 +2707,18 @@ class BerrySchema:
             paginated=any(
                 value is not None
                 for value in self.normalize_pagination(limit, offset)
-            ),
+            ) or after is not None,
+            after=after,
         )
         if target_filters:
-            for arg_name, val in _filter_args.items():
-                if val is None:
-                    continue
-                f_spec = target_filters.get(arg_name)
-                if not f_spec:
-                    raise ValueError(f"Unknown filter argument: {arg_name}")
-                expr = None
-                if f_spec.transform:
-                    try:
-                        val = f_spec.transform(val)
-                    except Exception as e:
-                        raise ValueError(f"Filter transform failed for {arg_name}: {e}")
-                if f_spec.builder:
-                    try:
-                        expr = f_spec.builder(child_model_cls, info, val)
-                    except Exception as e:
-                        raise ValueError(f"Filter builder failed for {arg_name}: {e}")
-                elif f_spec.column:
-                    try:
-                        col = child_model_cls.__table__.c.get(f_spec.column)
-                    except Exception:
-                        col = None
-                    if col is None:
-                        raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
-                    op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
-                    if not op_fn:
-                        raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
-                    try:
-                        val2 = _coerce_where_value(col, val)
-                        expr = op_fn(col, val2)
-                    except Exception as e:
-                        raise ValueError(f"Filter operation failed for {arg_name}: {e}")
-                if expr is not None:
-                    stmt = stmt.where(expr)
+            stmt = await self._declared_filter_compiler.apply(
+                stmt,
+                model_cls=child_model_cls,
+                berry_type=target_btype,
+                info=info,
+                specs=target_filters,
+                values=_filter_args,
+            )
         stmt = RootSQLBuilders(self).apply_pagination(stmt, limit=limit, offset=offset)
         async with lock:
             result = await session.execute(stmt)
@@ -3492,7 +3616,7 @@ class BerrySchema:
                             target_filters.update(self._expand_filter_args(rel_args_spec))
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
-                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
+                        async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], after: Optional[str], related_where: Optional[Any], _filter_args: Dict[str, Any]):
                             if not await schema_instance._field_read_allowed(
                                 parent_btype_local, info, fname_local
                             ):
@@ -3703,7 +3827,10 @@ class BerrySchema:
                                         try:
                                             meta_map = getattr(self, '_pushdown_meta', None)
                                             if isinstance(meta_map, dict):
-                                                reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                                                relation_meta = meta_map.get(fname_local)
+                                                reason = getattr(
+                                                    getattr(relation_meta, 'decision', None), 'detail', None
+                                                )
                                         except Exception:
                                             reason = None
                                         if reason:
@@ -3803,7 +3930,10 @@ class BerrySchema:
                                         try:
                                             meta_map = getattr(self, '_pushdown_meta', None)
                                             if isinstance(meta_map, dict):
-                                                reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                                                relation_meta = meta_map.get(fname_local)
+                                                reason = getattr(
+                                                    getattr(relation_meta, 'decision', None), 'detail', None
+                                                )
                                         except Exception:
                                             reason = None
                                         if reason:
@@ -4109,7 +4239,10 @@ class BerrySchema:
                                 try:
                                     meta_map = getattr(self, '_pushdown_meta', None)
                                     if isinstance(meta_map, dict):
-                                        reason = (meta_map.get(fname_local) or {}).get('skip_reason')
+                                        relation_meta = meta_map.get(fname_local)
+                                        reason = getattr(
+                                            getattr(relation_meta, 'decision', None), 'detail', None
+                                        )
                                 except Exception:
                                     reason = None
                                 if reason:
@@ -4166,44 +4299,19 @@ class BerrySchema:
                                     for value in schema_instance.normalize_pagination(
                                         limit, offset
                                     )
-                                ),
+                                ) or after is not None,
+                                after=after,
                             )
                             # Apply filters
                             if target_filters:
-                                for arg_name, val in _filter_args.items():
-                                    if val is None:
-                                        continue
-                                    f_spec = target_filters.get(arg_name)
-                                    if not f_spec:
-                                        raise ValueError(f"Unknown filter argument: {arg_name}")
-                                    if f_spec.transform:
-                                        try:
-                                            val = f_spec.transform(val)
-                                        except Exception as e:
-                                            raise ValueError(f"Filter transform failed for {arg_name}: {e}")
-                                    expr = None
-                                    if f_spec.builder:
-                                        try:
-                                            expr = f_spec.builder(child_model_cls, info, val)
-                                        except Exception as e:
-                                            raise ValueError(f"Filter builder failed for {arg_name}: {e}")
-                                    elif f_spec.column:
-                                        try:
-                                            col = child_model_cls.__table__.c.get(f_spec.column)
-                                        except Exception:
-                                            col = None
-                                        if col is None:
-                                            raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
-                                        op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
-                                        if not op_fn:
-                                            raise ValueError(f"Unknown filter operator: {f_spec.op or 'eq'} for argument {arg_name}")
-                                        try:
-                                            val2 = _coerce_where_value(col, val)
-                                            expr = op_fn(col, val2)
-                                        except Exception as e:
-                                            raise ValueError(f"Filter operation failed for {arg_name}: {e}")
-                                    if expr is not None:
-                                        stmt = stmt.where(expr)
+                                stmt = await schema_instance._declared_filter_compiler.apply(
+                                    stmt,
+                                    model_cls=child_model_cls,
+                                    berry_type=target_b_for_order,
+                                    info=info,
+                                    specs=target_filters,
+                                    values=_filter_args,
+                                )
                             stmt = RootSQLBuilders(schema_instance).apply_pagination(stmt, limit=limit, offset=offset)
                             async with lock:
                                 result = await session.execute(stmt)
@@ -4281,7 +4389,7 @@ class BerrySchema:
                             if arg_defs:
                                 params += ', ' + ', '.join(arg_defs)
                         else:
-                            params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None'
+                            params = 'self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, after=None, where=None'
                             if arg_defs:
                                 params += ', ' + ', '.join(arg_defs)
                         fname_inner = f"_rel_{fname_local}_resolver"
@@ -4291,9 +4399,9 @@ class BerrySchema:
                             src += f"    _fa['{a}']={a}\n"
                         if is_single_value:
                             # pass None for non-exposed params
-                            src += "    return await _impl(self, info, None, None, None, None, None, where, _fa)\n"
+                            src += "    return await _impl(self, info, None, None, None, None, None, None, where, _fa)\n"
                         else:
-                            src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, where, _fa)\n"
+                            src += "    return await _impl(self, info, limit, offset, order_by, order_dir, order_multi, after, where, _fa)\n"
                         env: Dict[str, Any] = {'_impl': _impl}
                         exec(src, env)
                         fn = env[fname_inner]
@@ -4315,6 +4423,7 @@ class BerrySchema:
                                 'order_by': Annotated[Optional[str], strawberry.argument(description=_descs['order_by'])],
                                 'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_descs['order_dir'])],
                                 'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_descs['order_multi'])],
+                                'after': Optional[str],
                                 'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
                             }
                         # crude type inference: map to Optional[str|int|bool|datetime] based on target model columns
@@ -4332,15 +4441,23 @@ class BerrySchema:
                                 anns[a] = Optional[base_t]
                         fn.__annotations__ = anns
                         return fn
+                    generated_relation_resolver = RelationResolverFactory(
+                        self
+                    ).create(
+                        meta_copy,
+                        single=is_single,
+                        field_name=fname,
+                        parent_type=bcls,
+                    )
                     # Attach resolver: if private, expose as plain method only; else as GraphQL field
                     if is_private:
-                        setattr(st_cls, fname, _make_relation_resolver())
+                        setattr(st_cls, fname, generated_relation_resolver)
                     else:
                         # Attach resolver with explicit argument annotations to make relation args visible in schema
                         if relation_description:
-                            setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver(), description=str(relation_description)))
+                            setattr(st_cls, fname, strawberry.field(resolver=generated_relation_resolver, description=str(relation_description)))
                         else:
-                            setattr(st_cls, fname, strawberry.field(resolver=_make_relation_resolver()))
+                            setattr(st_cls, fname, strawberry.field(resolver=generated_relation_resolver))
                 elif fdef.kind == 'aggregate':
                     if is_private:
                         # Skip exposing private aggregates
@@ -4677,9 +4794,9 @@ class BerrySchema:
         except Exception:
             pass
         # Hand off to builder that assembles the Query type and Schema
-        return self._build_query(strawberry_config=strawberry_config)
+        return QueryRootAssembler(self).build(strawberry_config=strawberry_config)
 
-    def _build_query(self, *, strawberry_config: Optional[StrawberryConfig] = None):
+    def _build_query_impl(self, *, strawberry_config: Optional[StrawberryConfig] = None):
         # Root query assembly: create class, then attach fields before decoration
         query_annotations: Dict[str, Any] = {}
         QueryPlain = type('Query', (), {'__doc__': 'Auto-generated Berry root query (prototype).'})
@@ -4739,6 +4856,7 @@ class BerrySchema:
                 order_by: Optional[str],
                 order_dir: Optional[Any],
                 order_multi: Optional[List[str]],
+                after: Optional[str],
                 _passed_filter_args: Dict[str, Any],
                 raw_where: Optional[Any] = None,
                 scope_where: Optional[Any] = None,
@@ -4774,45 +4892,14 @@ class BerrySchema:
                 select_columns: List[Any] = []
                 # Centralized query analysis: requested fields/relations and helper FKs
                 _plan = QueryAnalyzer(self).analyze(info, root_field_name, btype_cls)
-                root_permissions = await self._resolve_field_permissions(
-                    btype_cls, info
-                )
-                requested_relations = await self._prune_relation_permissions(
-                    btype_cls, _plan.requested_relations, info
-                )
-                requested_scalar_root = {
-                    name for name in _plan.requested_scalar_root
-                    if self._policy_engine.allows_resolved_field(
-                        btype_cls, root_permissions, 'select', name
-                    )
-                }
-                requested_custom_root = {
-                    name for name in _plan.requested_custom_root
-                    if self._policy_engine.allows_resolved_field(
-                        btype_cls, root_permissions, 'select', name
-                    )
-                }
-                requested_custom_obj_root = {
-                    name for name in _plan.requested_custom_obj_root
-                    if self._policy_engine.allows_resolved_field(
-                        btype_cls, root_permissions, 'select', name
-                    )
-                }
-                requested_aggregates_root = {
-                    name for name in _plan.requested_aggregates_root
-                    if self._policy_engine.allows_resolved_field(
-                        btype_cls, root_permissions, 'select', name
-                    )
-                }
-                requested_other_root = {
-                    name
-                    for name in (
-                        getattr(_plan, 'requested_other_root', set()) or set()
-                    )
-                    if self._policy_engine.allows_resolved_field(
-                        btype_cls, root_permissions, 'select', name
-                    )
-                }
+                _authorized_plan = await self._authorize_query_plan(_plan, info)
+                root_permissions = _authorized_plan.permissions
+                requested_relations = dict(_authorized_plan.selection.relations)
+                requested_scalar_root = set(_authorized_plan.selection.scalar_fields)
+                requested_custom_root = set(_authorized_plan.selection.custom_fields)
+                requested_custom_obj_root = set(_authorized_plan.selection.custom_object_fields)
+                requested_aggregates_root = set(_authorized_plan.selection.aggregate_fields)
+                requested_other_root = set(_authorized_plan.selection.other_fields)
                 await self._validate_query_field_controls(
                     btype_cls,
                     info,
@@ -4909,6 +4996,12 @@ class BerrySchema:
                     # initialize status entry
                     if rel_name not in rel_push_status:
                         rel_push_status[rel_name] = {'pushed': False, 'reason': None}
+                    if rel_cfg.get('after') is not None:
+                        rel_push_status[rel_name].update({
+                            'pushed': False,
+                            'reason': 'keyset pagination uses resolver fallback',
+                        })
+                        continue
                     # Allow pushdown even when relation 'where' or filter args are provided.
                     # Both JSON where and declared filter args are handled in the pushdown builders below.
                     target_name = rel_cfg.get('target')
@@ -5061,10 +5154,6 @@ class BerrySchema:
                                     requested_scalar_i = tmp
                             except Exception:
                                 pass
-                            if not requested_scalar_i and not rel_cfg.get('_field_permissions_applied'):
-                                for sf, sdef in target_b.__berry_fields__.items():
-                                    if sdef.kind == 'scalar':
-                                        requested_scalar_i.append(sf)
                             # FK from child to parent
                             try:
                                 explicit_child_fk = rel_cfg.get('fk_column_name')
@@ -5098,22 +5187,10 @@ class BerrySchema:
                                     rel_push_status[rel_name].update({'pushed': True, 'reason': None})
                                 except Exception:
                                     pass
-                                try:
-                                    rr_entry = requested_relations.get(rel_name, {})
-                                    rr_entry['from_pushdown'] = True
-                                    rr_entry['skip_reason'] = None
-                                except Exception:
-                                    pass
                             else:
                                 select_columns.append(nested_expr.label(f"_pushrel_{rel_name}"))
                                 try:
                                     rel_push_status[rel_name].update({'pushed': True, 'reason': None})
-                                except Exception:
-                                    pass
-                                try:
-                                    rr_entry = requested_relations.get(rel_name, {})
-                                    rr_entry['from_pushdown'] = True
-                                    rr_entry['skip_reason'] = None
                                 except Exception:
                                     pass
                         else:
@@ -5168,7 +5245,8 @@ class BerrySchema:
                         paginated=any(
                             value is not None
                             for value in self.normalize_pagination(limit, offset)
-                        ),
+                        ) or after is not None,
+                        after=after,
                     )
                     stmt = RootSQLBuilders(self).apply_pagination(stmt, limit=limit, offset=offset)
                     async with lock:
@@ -5227,9 +5305,9 @@ class BerrySchema:
                     full_params = "self, info, where=None"
             else:
                 if args_str:
-                    full_params = f"self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None, {args_str}"
+                    full_params = f"self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, after=None, where=None, {args_str}"
                 else:
-                    full_params = "self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, where=None"
+                    full_params = "self, info, limit=None, offset=None, order_by=None, order_dir=None, order_multi=None, after=None, where=None"
             src = f"async def {func_name}({full_params}):\n" \
                   f"    _fa = {{}}\n"
             for a in declared_filters.keys():
@@ -5242,13 +5320,13 @@ class BerrySchema:
             src += "    _sw = _defaults.get('where') if _defaults is not None else None\n"
             if is_single:
                 # No order/offset/limit args for single roots; enforce limit 1 internally
-                src += "    _rows = await _base_impl(info, 1, None, None, None, None, _fa, _rw, _sw, None, None)\n"
+                src += "    _rows = await _base_impl(info, 1, None, None, None, None, None, _fa, _rw, _sw, None, None)\n"
             else:
                 src += "    _ob = order_by if order_by is not None else (_defaults.get('order_by') if _defaults is not None else None)\n"
                 src += "    _od = order_dir if order_dir is not None else (_defaults.get('order_dir') if _defaults is not None else None)\n"
                 src += "    _om = order_multi if order_multi is not None else (_defaults.get('order_multi') if _defaults is not None else None)\n"
                 src += "    _lim = limit\n"
-                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw, _sw, order_by, order_multi)\n"
+                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, after, _fa, _rw, _sw, order_by, order_multi)\n"
             src += "    return (_rows[0] if _rows else None) if _is_single else _rows\n"
             ns: Dict[str, Any] = {'_base_impl': _base_impl, '_defaults': relation_defaults, '_is_single': bool(is_single)}
             ns.update({'Optional': Optional, 'List': List, 'datetime': datetime})
@@ -5271,6 +5349,7 @@ class BerrySchema:
                     'order_by': Annotated[Optional[str], strawberry.argument(description=_descs['order_by'])],
                     'order_dir': Annotated[Optional[Direction], strawberry.argument(description=_descs['order_dir'])],
                     'order_multi': Annotated[Optional[List[str]], strawberry.argument(description=_descs['order_multi'])],
+                    'after': Optional[str],
                     'where': Annotated[Optional[str], strawberry.argument(description=_descs['where'])],
                 }
             ann.update(filter_arg_types)

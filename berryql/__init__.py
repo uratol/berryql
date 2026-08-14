@@ -42,6 +42,12 @@ def __getattr__(name: str):  # PEP 562 lazy exports
     if name in {'FieldSet', 'FieldPermissions', 'OperationPermissions'}:
         from .core import permissions as _permissions
         return getattr(_permissions, name)
+    if name in {'FilterLimits', 'FilterSpec', 'OperatorRegistry', 'register_operator'}:
+        from .core import filters as _filters
+        return getattr(_filters, name)
+    if name in {'encode_cursor', 'decode_cursor'}:
+        from .core import pagination as _pagination
+        return getattr(_pagination, name)
     if name in {'MergeOperationContext', 'MergeNodeContext', 'DeferredValidation'}:
         _context = _importlib.import_module(__name__ + '.context')
         return getattr(_context, name)
@@ -61,6 +67,8 @@ def __getattr__(name: str):  # PEP 562 lazy exports
 __all__ = [
     'BerrySchema', 'BerryType', 'BerryDomain', 'PaginationConfig', 'StrawberryConfig',
     'FieldSet', 'FieldPermissions', 'OperationPermissions',
+    'FilterLimits', 'FilterSpec', 'OperatorRegistry', 'register_operator',
+    'encode_cursor', 'decode_cursor',
     'MergeOperationContext', 'MergeNodeContext', 'DeferredValidation',
     'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks', 'scope',
     'enum_column',

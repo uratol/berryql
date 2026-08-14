@@ -128,6 +128,17 @@ def compose_scope_with_guard(dom_cls: Any, desc_scope: Any):
         return (ds_val, g_val)
     return _inner
 
+
+def _combine_scope_values(*values: Any) -> Any:
+    """Return an AND tuple while preserving callable/provider values."""
+
+    present = tuple(value for value in values if value is not None)
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+    return present
+
 # --- Merge builder -------------------------------------------------------
 
 def build_merge_resolver_for_type(
@@ -654,11 +665,70 @@ def build_merge_resolver_for_type(
                 eff_scope = relation_scope
                 if parent_ctx is not None and relation_scope is not None:
                     eff_scope_inherited_from_parent = True
+            try:
+                type_scope_local = getattr(btype_local, '__type_scope__', None)
+                if type_scope_local is None:
+                    type_scope_local = getattr(btype_local, 'scope', None)
+            except (AttributeError, TypeError):
+                type_scope_local = None
+            # A relation/domain scope inherited from a parent is checked on
+            # that parent. The target type scope remains a row policy and must
+            # still be checked on the current row.
+            row_type_scope = type_scope_local if eff_scope_inherited_from_parent else None
+            if not eff_scope_inherited_from_parent:
+                eff_scope = _combine_scope_values(eff_scope, type_scope_local)
 
             # Application-level cascade: delete dependent rows first (handles MSSQL FK constraints).
             # Defined at _merge_single scope so both single-row _Delete and _Replace (relation
             # replace-semantics) paths can reuse it.
-            from sqlalchemy import select as _sa_select, delete as _sa_delete_cascade
+            from sqlalchemy import delete as _sa_delete_cascade
+            from sqlalchemy import select as _sa_select
+            from sqlalchemy import update as _sa_update_cascade
+
+            async def _cascade_table_foreign_keys(
+                parent_table: Any,
+                parent_pk_val: Any,
+                seen: Optional[set[tuple[str, Any]]] = None,
+            ) -> None:
+                """Cascade through SQLAlchemy metadata, including unexposed tables."""
+
+                seen = seen if seen is not None else set()
+                marker = (str(getattr(parent_table, 'fullname', parent_table)), parent_pk_val)
+                if marker in seen:
+                    return
+                seen.add(marker)
+                metadata = getattr(parent_table, 'metadata', None)
+                for child_table in (getattr(metadata, 'tables', {}) or {}).values():
+                    matching_fks = [
+                        fk
+                        for fk in getattr(child_table, 'foreign_keys', ())
+                        if getattr(getattr(fk, 'column', None), 'table', None) is parent_table
+                    ]
+                    for foreign_key in matching_fks:
+                        child_fk = foreign_key.parent
+                        if str(getattr(foreign_key, 'ondelete', '') or '').upper() == 'SET NULL':
+                            await session.execute(
+                                _sa_update_cascade(child_table)
+                                .where(child_fk == parent_pk_val)
+                                .values({child_fk.name: None})
+                            )
+                            continue
+                        primary_keys = list(getattr(child_table, 'primary_key', ()).columns)
+                        if primary_keys:
+                            child_pk = primary_keys[0]
+                            result = await session.execute(
+                                _sa_select(child_pk).where(child_fk == parent_pk_val)
+                            )
+                            for child_id in [row[0] for row in result.fetchall()]:
+                                await _cascade_table_foreign_keys(
+                                    child_table, child_id, seen
+                                )
+                        await session.execute(
+                            _sa_delete_cascade(child_table).where(
+                                child_fk == parent_pk_val
+                            )
+                        )
+
             async def _cascade_delete_children(parent_model_cls: Any, parent_btype_cls: Any, parent_pk_val: Any):
                 for rname, rdef, _ in _ordered_relation_entries(
                     parent_btype_cls
@@ -734,6 +804,9 @@ def build_merge_resolver_for_type(
                                     await session.delete(inst_c)
                     except Exception:
                         continue
+                parent_table = getattr(parent_model_cls, '__table__', None)
+                if parent_table is not None:
+                    await _cascade_table_foreign_keys(parent_table, parent_pk_val)
 
             # Early delete handling
             try:
@@ -811,8 +884,13 @@ def build_merge_resolver_for_type(
                         ok = await _enforce_scope(model_cls_local, instance_for_delete, eff_scope)
                         if not ok:
                             _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                            _attrs = _safe_attrs_dump(model_cls_local, instance_for_delete)
-                            raise PermissionError(f"Mutation out of scope for delete; model={_cls}; attrs={_attrs}")
+                            raise PermissionError(f"Mutation out of scope for delete; model={_cls}")
+                if row_type_scope is not None:
+                    ok_type = await _enforce_scope(
+                        model_cls_local, instance_for_delete, row_type_scope
+                    )
+                    if not ok_type:
+                        raise PermissionError("Mutation out of type scope for delete")
                 # Before deleting children, run type-level pre-callbacks with delete context
                 # so application hooks can perform cleanup while child rows still exist
                 data_local = await _maybe_call_pre_many(
@@ -879,10 +957,22 @@ def build_merge_resolver_for_type(
             pk_name_local = _get_pk_name_safe(model_cls_local)
             if eff_scope is not None:
                 try:
-                    v_scope = _resolve_scope_value(eff_scope)
-                    # Only handle dict/JSON forms for defaults; callables/expressions enforced below
+                    # Only dict/JSON equality fragments contribute defaults.
+                    # Combined scopes remain ANDed and are inspected one by one.
                     from .core.utils import to_where_dict as _to_where_dict
-                    wdict = _to_where_dict(v_scope, strict=False) if not isinstance(v_scope, dict) else v_scope
+
+                    wdict = {}
+                    for scope_fragment in (
+                        eff_scope if isinstance(eff_scope, (list, tuple)) else (eff_scope,)
+                    ):
+                        v_scope = _resolve_scope_value(scope_fragment)
+                        fragment_dict = (
+                            v_scope
+                            if isinstance(v_scope, dict)
+                            else _to_where_dict(v_scope, strict=False)
+                        )
+                        if isinstance(fragment_dict, dict):
+                            wdict.update(fragment_dict)
                 except Exception:
                     wdict = None
                 if isinstance(wdict, dict):
@@ -1118,9 +1208,8 @@ def build_merge_resolver_for_type(
                             changed_ignored_fields.append(ignored_name)
                 if changed_ignored_fields:
                     _logger.warning(
-                        "Ignored unauthorized write fields: type=%s pk=%r fields=%s",
+                        "Ignored unauthorized write fields: type=%s fields=%s",
                         getattr(btype_local, '__name__', str(btype_local)),
-                        pk_val,
                         sorted(changed_ignored_fields),
                     )
 
@@ -1168,8 +1257,11 @@ def build_merge_resolver_for_type(
                     ok = await _enforce_scope(model_cls_local, instance, eff_scope)
                     if not ok:
                         _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                        _attrs = _safe_attrs_dump(model_cls_local, instance)
-                        raise PermissionError(f"Mutation out of scope for update; model={_cls}; attrs={_attrs}")
+                        raise PermissionError(f"Mutation out of scope for update; model={_cls}")
+            if pk_val is not None and instance is not None and row_type_scope is not None:
+                ok_type = await _enforce_scope(model_cls_local, instance, row_type_scope)
+                if not ok_type:
+                    raise PermissionError("Mutation out of type scope for update")
 
             created_now = False
             if instance is None:
@@ -1338,8 +1430,11 @@ def build_merge_resolver_for_type(
                     ok2 = await _enforce_scope(model_cls_local, instance, eff_scope)
                     if not ok2:
                         _cls = getattr(model_cls_local, '__name__', str(model_cls_local))
-                        _attrs = _safe_attrs_dump(model_cls_local, instance)
-                        raise PermissionError(f"Mutation out of scope; model={_cls}; attrs={_attrs}")
+                        raise PermissionError(f"Mutation out of scope; model={_cls}")
+            if row_type_scope is not None:
+                ok_type_after = await _enforce_scope(model_cls_local, instance, row_type_scope)
+                if not ok_type_after:
+                    raise PermissionError("Mutation out of type scope")
 
             # Process relations
             # --- _Replace: replace-semantics for nested list relations ---

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+from .analyzer import HydrationRelationPlan, PushdownDecision, PushdownReason
 from .enum_utils import get_model_enum_cls, coerce_mapping_to_enum
 from datetime import datetime
 from .naming import from_camel
@@ -408,12 +409,13 @@ class Hydrator:
                     if meta_map is None:
                         meta_map = {}
                         setattr(inst, '_pushdown_meta', meta_map)
-                    meta_map[rel_name] = {
-                        'limit': rel_meta.get('limit'),
-                        'offset': rel_meta.get('offset'),
-                        'from_pushdown': True,
-                        'skip_reason': None,
-                    }
+                    meta_map[rel_name] = HydrationRelationPlan(
+                        rel_meta.get('limit'),
+                        rel_meta.get('offset'),
+                        PushdownDecision.success(),
+                        rel_meta.get('fk_column_name'),
+                        tuple(rel_meta.get('fields') or ()),
+                    )
                 except Exception:
                     pass
             else:
@@ -428,12 +430,16 @@ class Hydrator:
                         reason_txt = (rel_push_status.get(rel_name) or {}).get('reason') if rel_push_status else None
                     except Exception:
                         reason_txt = None
-                    meta_map[rel_name] = {
-                        'limit': rel_meta.get('limit'),
-                        'offset': rel_meta.get('offset'),
-                        'from_pushdown': False,
-                        'skip_reason': reason_txt,
-                    }
+                    meta_map[rel_name] = HydrationRelationPlan(
+                        rel_meta.get('limit'),
+                        rel_meta.get('offset'),
+                        PushdownDecision.fallback(
+                            PushdownReason.ADAPTER_UNSUPPORTED,
+                            reason_txt,
+                        ),
+                        rel_meta.get('fk_column_name'),
+                        tuple(rel_meta.get('fields') or ()),
+                    )
                 except Exception:
                     pass
 
@@ -495,12 +501,13 @@ class Hydrator:
                     meta_map_nested = {}
                     setattr(parent_inst, '_pushdown_meta', meta_map_nested)
                 src_meta = (nested_meta_src_map.get(nname_i) or {}) if isinstance(nested_meta_src_map, dict) else {}
-                meta_map_nested[nname_i] = {
-                    'limit': src_meta.get('limit'),
-                    'offset': src_meta.get('offset'),
-                    'from_pushdown': bool(src_meta.get('from_pushdown', True)),
-                    'skip_reason': src_meta.get('skip_reason'),
-                }
+                meta_map_nested[nname_i] = HydrationRelationPlan(
+                    src_meta.get('limit'),
+                    src_meta.get('offset'),
+                    PushdownDecision.success(),
+                    src_meta.get('fk_column_name'),
+                    tuple(src_meta.get('fields') or ()),
+                )
             except Exception:
                 pass
 

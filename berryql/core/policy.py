@@ -8,15 +8,16 @@ from typing import Any, Dict, Mapping, Optional, get_args, get_origin
 from strawberry.extensions.field_extension import FieldExtension
 
 from .naming import from_camel
-from .permissions import FieldPermissions
+from .errors import AuthorizationDenied, ConfigurationError
+from .permissions import FieldPermissions, FieldSet
 from .utils import to_where_dict
 
 
-class AuthorizationError(PermissionError):
+class AuthorizationError(AuthorizationDenied):
     """A caller requested a capability that the effective policy denies."""
 
 
-class PolicyConfigurationError(ValueError):
+class PolicyConfigurationError(ConfigurationError):
     """A field policy provider or capability reference is invalid."""
 
 
@@ -74,6 +75,17 @@ class _ExecutionPolicyCache:
     operation: Any
     variable_values: Any
     values: Dict[Any, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AuditContext:
+    """Value-free context for an authorization denial."""
+
+    type_name: str
+    capability: str
+    operation: str
+    field: Optional[str] = None
+    reason: str = "denied"
 
 
 class PolicyEngine:
@@ -149,10 +161,9 @@ class PolicyEngine:
         permissions = FieldPermissions.allow_all()
         for provider in providers:
             provided = await self._call_provider(provider, berry_type, info)
-            self._validate_permissions(berry_type, provided)
+            provided = self._normalize_permissions(berry_type, provided)
             permissions = permissions.intersection(provided)
-        self._validate_permissions(berry_type, permissions)
-        return permissions
+        return self._normalize_permissions(berry_type, permissions)
 
     @staticmethod
     def _declared_field_names(berry_type: Any) -> set[str]:
@@ -166,16 +177,65 @@ class PolicyEngine:
                 names.add(name)
         return names
 
-    def _validate_permissions(self, berry_type: Any, permissions: FieldPermissions) -> None:
+    def _canonical_reference(self, berry_type: Any, reference: str) -> Optional[str]:
         known = self._declared_field_names(berry_type)
+        raw = str(reference)
+        if raw in known:
+            return raw
+        candidate = from_camel(raw)
+        if candidate in known:
+            return candidate
+        fields = getattr(berry_type, "__berry_fields__", {}) or {}
+        for field_name, field_def in fields.items():
+            meta = getattr(field_def, "meta", {}) or {}
+            aliases = {
+                meta.get("alias"),
+                meta.get("graphql_name"),
+                meta.get("name"),
+                meta.get("column"),
+            }
+            if raw in aliases or candidate in aliases:
+                return field_name
+        converter = getattr(getattr(self.schema, "_name_converter", None), "apply_naming_config", None)
+        if callable(converter):
+            for field_name in known:
+                try:
+                    if converter(field_name) == raw:
+                        return field_name
+                except (TypeError, ValueError, AttributeError):
+                    continue
+        return None
+
+    def _normalize_permissions(self, berry_type: Any, permissions: FieldPermissions) -> FieldPermissions:
+        normalized: Dict[str, FieldSet] = {}
+        type_name = getattr(berry_type, "__name__", berry_type)
         for capability in self._FIELD_CAPABILITIES:
             mask = getattr(permissions, capability)
-            unknown = sorted(name for name in mask.fields if name not in known)
+            fields = []
+            unknown = []
+            for reference in mask.fields:
+                canonical = self._canonical_reference(berry_type, reference)
+                if canonical is None:
+                    unknown.append(str(reference))
+                else:
+                    fields.append(canonical)
             if unknown:
                 raise PolicyConfigurationError(
-                    f"Unknown canonical field(s) for {capability} on "
-                    f"{getattr(berry_type, '__name__', berry_type)}: {unknown}"
+                    f"Unknown field reference(s) for {capability} on {type_name}: {sorted(unknown)}"
                 )
+            normalized[capability] = FieldSet(mask.mode, frozenset(fields))
+        return FieldPermissions(
+            select=normalized["select"],
+            filter=normalized["filter"],
+            order=normalized["order"],
+            create=normalized["create"],
+            update=normalized["update"],
+            operations=permissions.operations,
+        )
+
+    def _validate_permissions(self, berry_type: Any, permissions: FieldPermissions) -> None:
+        # Kept as an internal compatibility hook for callers/tests that used it.
+        self._normalize_permissions(berry_type, permissions)
 
     async def resolve(self, berry_type: Any, info: Any) -> FieldPermissions:
         if berry_type is None:
@@ -201,24 +261,67 @@ class PolicyEngine:
         return resolved
 
     def canonical_field_name(self, berry_type: Any, reference: str) -> str:
-        fields = getattr(berry_type, "__berry_fields__", {}) or {}
-        if reference in fields:
-            return reference
-        candidate = from_camel(str(reference))
-        if candidate in fields:
-            return candidate
-        for field_name, field_def in fields.items():
-            meta = getattr(field_def, "meta", {}) or {}
-            if meta.get("column") in {reference, candidate}:
-                return field_name
-        # Plain Strawberry fields are canonicalized the same way even though
-        # they do not have a Berry descriptor.
-        annotations = getattr(berry_type, "__annotations__", {}) or {}
-        if reference in annotations:
-            return str(reference)
-        if candidate in annotations or hasattr(berry_type, candidate):
-            return candidate
-        return candidate
+        canonical = self._canonical_reference(berry_type, reference)
+        return canonical if canonical is not None else from_camel(str(reference))
+
+    @staticmethod
+    def field_dependencies(berry_type: Any, field_name: str) -> tuple[str, ...]:
+        field_def = (getattr(berry_type, "__berry_fields__", {}) or {}).get(field_name)
+        if field_def is None:
+            return ()
+        meta = getattr(field_def, "meta", {}) or {}
+        raw = meta.get("depends_on", meta.get("fields"))
+        if raw is None and getattr(field_def, "kind", None) == "aggregate":
+            raw = meta.get("source")
+        if raw is None:
+            return ()
+        if isinstance(raw, str):
+            return (raw,)
+        try:
+            return tuple(str(value) for value in raw)
+        except TypeError as exc:
+            raise PolicyConfigurationError(
+                f"Dependencies for field '{field_name}' must be a string or iterable"
+            ) from exc
+
+    async def dependencies_allowed(
+        self, berry_type: Any, info: Any, field_name: str, capability: str = "select"
+    ) -> bool:
+        for dependency in self.field_dependencies(berry_type, field_name):
+            current_type = berry_type
+            for index, part in enumerate(dependency.split(".")):
+                canonical = self._canonical_reference(current_type, part)
+                if canonical is None:
+                    raise PolicyConfigurationError(
+                        f"Unknown dependency '{dependency}' for field '{field_name}' on "
+                        f"{getattr(berry_type, '__name__', berry_type)}"
+                    )
+                if not await self.allows_field(current_type, info, capability, canonical):
+                    return False
+                if index < len(dependency.split(".")) - 1:
+                    field_def = (getattr(current_type, "__berry_fields__", {}) or {}).get(canonical)
+                    target = (getattr(field_def, "meta", {}) or {}).get("target") if field_def else None
+                    current_type = self.schema.types.get(target) if target else None
+                    if current_type is None:
+                        raise PolicyConfigurationError(
+                            f"Dependency '{dependency}' crosses an unknown relation target"
+                        )
+        return True
+
+    def _audit(self, info: Any, audit: AuditContext) -> None:
+        context = self._context(info)
+        if context is None:
+            return
+        try:
+            records = context.setdefault("_berryql_audit", []) if isinstance(context, dict) else getattr(
+                context, "_berryql_audit", None
+            )
+            if records is None:
+                records = []
+                setattr(context, "_berryql_audit", records)
+            records.append(audit)
+        except (AttributeError, TypeError):
+            return
 
     async def allows_field(self, berry_type: Any, info: Any, capability: str, field_name: str) -> bool:
         if capability not in self._FIELD_CAPABILITIES:
@@ -242,6 +345,7 @@ class PolicyEngine:
         canonical = self.canonical_field_name(berry_type, field_name)
         if not await self.allows_field(berry_type, info, capability, canonical):
             type_name = getattr(berry_type, "__name__", berry_type)
+            self._audit(info, AuditContext(str(type_name), capability, "field", canonical))
             raise AuthorizationError(f"Field '{canonical}' is not allowed for {capability} on {type_name}")
 
     async def require_path(self, berry_type: Any, info: Any, capability: str, path: str) -> None:
@@ -269,8 +373,10 @@ class PolicyEngine:
             raise PolicyConfigurationError(f"Unknown mutation operation '{operation}'")
         permissions = await self.resolve(berry_type, info)
         if not permissions.operations.allows(operation):
+            type_name = getattr(berry_type, "__name__", berry_type)
+            self._audit(info, AuditContext(str(type_name), operation, "mutation"))
             raise AuthorizationError(
-                f"Operation '{operation}' is not allowed on " f"{getattr(berry_type, '__name__', berry_type)}"
+                f"Operation '{operation}' is not allowed on " f"{type_name}"
             )
 
     async def sanitize_payload(
@@ -316,6 +422,7 @@ class PolicyEngine:
 
 __all__ = [
     "AuthorizationError",
+    "AuditContext",
     "PolicyConfigurationError",
     "PolicyEngine",
     "SelectGuardExtension",

@@ -4,8 +4,10 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Tuple
 
+from .errors import InvalidOrderingError
 
-class OrderingError(ValueError):
+
+class OrderingError(InvalidOrderingError):
     """Invalid or unsupported ordering input."""
 
 
@@ -13,6 +15,11 @@ class OrderingError(ValueError):
 class OrderTerm:
     path: Any
     direction: str
+    nulls: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.nulls not in {None, "first", "last"}:
+            raise OrderingError("nulls must be 'first', 'last', or None")
 
 
 class OrderingCompiler:
@@ -58,17 +65,29 @@ class OrderingCompiler:
             if not value:
                 raise OrderingError(f"Invalid empty order_multi term at index {index}")
             if ":" in value:
-                path, separator, direction = value.partition(":")
-                if not separator or not direction or ":" in direction:
-                    raise OrderingError(f"Invalid order_multi term '{value}'; expected 'field:direction'")
+                pieces = value.split(":")
+                if len(pieces) not in {2, 3} or not pieces[1]:
+                    raise OrderingError(
+                        f"Invalid order_multi term '{value}'; expected 'field:direction[:nulls_first|nulls_last]'"
+                    )
+                path, direction = pieces[0], pieces[1]
+                nulls = pieces[2] if len(pieces) == 3 else None
+                if nulls is not None:
+                    normalized_nulls = str(nulls).strip().lower()
+                    if normalized_nulls not in {"nulls_first", "nulls_last", "first", "last"}:
+                        raise OrderingError(
+                            f"Invalid null ordering '{nulls}'; expected nulls_first or nulls_last"
+                        )
+                    nulls = "first" if normalized_nulls in {"nulls_first", "first"} else "last"
             else:
                 if strict:
                     raise OrderingError(f"Invalid order_multi term '{value}'; expected 'field:direction'")
                 path, direction = value, default_direction
+                nulls = None
             path = path.strip()
             if not path or any(not part for part in path.split(".")):
                 raise OrderingError(f"Invalid order path '{path}'")
-            terms.append(OrderTerm(path, self.direction(direction, default=default_direction)))
+            terms.append(OrderTerm(path, self.direction(direction, default=default_direction), nulls))
         return tuple(terms)
 
     def parse(
@@ -153,9 +172,10 @@ class OrderingCompiler:
         info: Any = None,
         add_pk_tiebreaker: bool = False,
         fallback_pk: bool = False,
+        join_cache: Optional[dict[str, Any]] = None,
     ) -> Any:
         resolved_terms = tuple(terms)
-        join_cache: dict[str, Any] = {}
+        join_cache = join_cache if join_cache is not None else {}
         ordered_paths: list[str] = []
         applied = False
         for term in resolved_terms:
@@ -170,7 +190,12 @@ class OrderingCompiler:
                 expression = self._resolve_trusted_expression(term.path, model_cls, info)
             if expression is None:
                 raise OrderingError(f"Unable to resolve order expression {term.path!r}")
-            statement = statement.order_by(expression.desc() if term.direction == "desc" else expression.asc())
+            ordered_expression = expression.desc() if term.direction == "desc" else expression.asc()
+            if term.nulls == "first":
+                ordered_expression = ordered_expression.nulls_first()
+            elif term.nulls == "last":
+                ordered_expression = ordered_expression.nulls_last()
+            statement = statement.order_by(ordered_expression)
             applied = True
 
         pk_name = self.schema._get_pk_name(model_cls)
@@ -205,7 +230,11 @@ class OrderingCompiler:
                     non_null.append((value, item))
             non_null.sort(key=lambda pair: pair[0], reverse=term.direction == "desc")
             ordered_non_null = [item for _, item in non_null]
-            if nulls_first is not None and nulls_first(term.direction):
+            put_nulls_first = (
+                term.nulls == "first"
+                or (term.nulls is None and nulls_first is not None and nulls_first(term.direction))
+            )
+            if put_nulls_first:
                 ordered = null_items + ordered_non_null
             else:
                 ordered = ordered_non_null + null_items
@@ -214,7 +243,11 @@ class OrderingCompiler:
     def normalize_multi_values(self, values: Any) -> list[str]:
         """Compatibility facade used by internal relation configuration paths."""
 
-        return [f"{term.path}:{term.direction}" for term in self.parse_multi(values, strict=False)]
+        return [
+            f"{term.path}:{term.direction}"
+            + (f":nulls_{term.nulls}" if term.nulls else "")
+            for term in self.parse_multi(values, strict=False)
+        ]
 
 
 __all__ = ["OrderTerm", "OrderingCompiler", "OrderingError"]

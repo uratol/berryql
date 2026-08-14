@@ -2,15 +2,25 @@
 
 All notable changes to this project will be documented here.
 
-## Unreleased
+## [0.5.0] - 2026-08-14
 ### Added
-- Replaced `FieldPermissions(read=..., write=...)` with explicit `select`,
-  `filter`, `order`, `create`, and `update` field capabilities plus exported
-  `OperationPermissions` controls for create, update, delete, and replace. The
-  old constructor arguments are deliberately unsupported.
+- Introduced capability-based `FieldPermissions` with independent `select`,
+  `filter`, `order`, `create`, and `update` field masks, plus exported
+  `OperationPermissions` controls for create, update, delete, and replace.
 - Added internal `PolicyEngine`, immutable-IR `PredicateCompiler`, and
   `OrderingCompiler` components shared by root, relation, fallback, adapter,
   and mutation paths.
+- Added immutable typed query/selection/relation plans with typed provenance,
+  authorization copies, hydration metadata, and pushdown fallback reasons.
+- Added declared-filter dependency metadata, schema-local operator registries,
+  optional filter-cost limits, strict operator value-shape validation, and
+  uniform sync/async filter execution.
+- Added additive keyset pagination through the `after` argument and
+  `encode_cursor`/`decode_cursor`, optional `nulls_first`/`nulls_last` ordering,
+  and schema/type ordering caches.
+- Split query-root and relation-resolver orchestration behind dedicated internal
+  service modules and introduced typed configuration, predicate, ordering,
+  authorization, and adapter error categories.
 
 ### Fixed
 - Closed `_Replace` authorization bypasses: relation names are normalized and
@@ -22,6 +32,12 @@ All notable changes to this project will be documented here.
   fields declared on `BerryType`.
 - Made multi-order validation atomic and added primary-key tie-breakers to
   paginated ordering, with dialect-aware null ordering in Python fallbacks.
+- Canonicalized and validated every explicit `FieldSet` name, including deny
+  lists, before intersection; unknown names now fail closed with type/capability
+  context.
+- Applied type row scopes consistently to mutation create/update/delete/replace
+  paths and removed payload values from authorization diagnostics.
+- Replaced per-row dotted-order fallback loads with batched per-hop queries.
 
 ## [0.4.1] - 2026-08-03
 ### Fixed

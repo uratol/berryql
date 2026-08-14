@@ -272,9 +272,23 @@ access on the child type. On updates, BerryQL logs a warning only when a denied
 scalar differs from an already-loaded old value; it never issues a query or lazy
 load solely to produce that warning.
 
-The former ``read=`` and ``write=`` constructor arguments are intentionally not
-supported; using either raises ``TypeError`` instead of silently migrating policy
-semantics.
+``FieldPermissions`` is capability-based from its first public release: field
+access is declared independently through ``select``, ``filter``, ``order``,
+``create``, and ``update``, while mutation-wide grants are declared through
+``OperationPermissions``.
+
+Field policy and row scope solve different problems. `FieldPermissions` is a
+request/type policy and is cached once per Berry type for one GraphQL execution;
+it must not inspect a particular result row. A type-level `scope(...)` is a row
+policy and is ANDed with relation/domain scopes for root and nested reads and for
+create, update, delete, replace, and re-parent checks. Applications that need
+per-object decisions should express them as row scopes (or add an explicit
+object-policy layer), not as a field-permission provider.
+
+Policy, scope, predicate, ordering, and adapter failures are fail-closed. BerryQL
+never converts one of these failures into an unfiltered query or broader mutation.
+Authorization audit records contain only type, capability, operation, field, and
+reason metadata; payload values and secrets are not recorded.
 
 
 What queries look like (and what SQL runs)
@@ -297,7 +311,7 @@ Core concepts
 - field(): scalar column mapping.
 - relation(target, single=False, …): relation to another Berry type. Supports:
     - arguments: map GraphQL args to SQL filters (column+op or builder callable)
-    - where: default JSON-style where for the relation (dict or JSON string) or callable(model_cls, info)
+    - scope: trusted default JSON-style row scope for the relation (dict or JSON string) or callable(model_cls, info)
     - order_by/order_dir/order_multi, limit/offset
     - single=True for to-one
 - count(source): count aggregate of a relation.
@@ -319,6 +333,42 @@ Attach GraphQL args to a relation and map them to SQL with a simple spec:
     - lambda Model, info, value: Model.name.ilike(f"%{value}%")
 - Optional transform to coerce/parse the input.
 
+Builder filters can declare every field they read with `depends_on` (or the
+equivalent `fields` alias). BerryQL authorizes those dependencies before invoking
+the transform or builder. Legacy builders without dependency metadata remain
+valid and are treated as declaring no implicit field access; new builders should
+always declare dependencies.
+
+```python
+arguments={
+    "owned_by": FilterSpec(
+        builder=build_owner_filter,
+        arg_type=int,
+        depends_on=("owner_id", "tenant_id"),
+    )
+}
+```
+
+Caller query cost can be bounded without changing the historical permissive
+defaults:
+
+```python
+from berryql import BerrySchema, FilterLimits
+
+berry_schema = BerrySchema(
+    filter_limits=FilterLimits(
+        max_clauses=20,
+        max_in_items=100,
+        max_json_length=8_192,
+        max_depth=6,
+    )
+)
+```
+
+`BerrySchema(operators={...})` and `berry_schema.register_operator(...)` create
+schema-local operators. The module-level `register_operator` remains a
+compatibility default for schemas created afterwards.
+
 At runtime BerryQL validates columns, operators, and types and applies them in SQL. When relation pushdown is skipped (e.g., because of a ‘where’ argument), filters are still applied safely in resolvers.
 
 Supported operators include: eq, ne, lt, lte, gt, gte, like, ilike, in, between, contains, starts_with, ends_with. You can register more.
@@ -331,6 +381,12 @@ Ordering and pagination
 - order_dir: asc|desc
 - order_multi: ["created_at:desc", "id:asc"]
 - limit/offset: integers
+- after: an opaque keyset cursor created with `encode_cursor(...)`
+
+`order_multi` also accepts an optional null placement suffix, for example
+`"created_at:desc:nulls_last"`. Paginated ordering always receives a primary-key
+tie-breaker. Dotted single-relation fallback ordering batches each relation hop,
+so its SQL query count is bounded by ordering depth rather than result-row count.
 
 Invalid order_by values raise a GraphQL error with the allowed fields.
 
@@ -345,6 +401,16 @@ berry_schema = BerrySchema(
 ```
 
 When configured, generated list resolvers apply `default_limit` if the caller omits `limit`, cap oversized explicit limits to `max_limit`, and continue to honor `offset` for next-page reads. Leaving pagination unconfigured preserves BerryQL's historical unbounded behavior.
+
+Keyset pagination is additive; existing `limit`/`offset` calls are unchanged.
+The cursor values must match the effective ordering (including the automatic PK
+tie-breaker when the requested order does not already include it):
+
+```python
+from berryql import encode_cursor
+
+variables = {"after": encode_cursor(last_created_at, last_id)}
+```
 
 
 JSON where

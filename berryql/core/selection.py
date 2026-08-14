@@ -1,19 +1,27 @@
 from __future__ import annotations
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from .naming import (
     build_name_candidates,
     ensure_list,
     fields_map_for,
+    from_camel,
     map_graphql_to_python,
 )
 
-_REL_ARGS = {'limit', 'offset', 'order_by', 'order_dir', 'order_multi', 'where'}
-_ORDER_FLAGS = {
-    'order_by': '_has_explicit_order_by',
-    'order_dir': '_has_explicit_order_dir',
-    'order_multi': '_has_explicit_order_multi',
-}
+_REL_ARGS = {'limit', 'offset', 'order_by', 'order_dir', 'order_multi', 'after', 'where'}
+
+
+@dataclass
+class ArgumentProvenance:
+    caller: set[str] = field(default_factory=set)
+
+    def mark_caller(self, name: str) -> None:
+        self.caller.add(name)
+
+    def is_caller(self, name: str) -> bool:
+        return name in self.caller
 
 def _children_ast(node: Any) -> list[Any]:
     try:
@@ -52,13 +60,14 @@ def _name_ast(node: Any) -> Optional[str]:
 def _assign_rel_arg(cfg: Dict[str, Any], arg_name: Optional[str], value: Any) -> None:
     if not arg_name:
         return
+    arg_name = from_camel(str(arg_name))
     if arg_name == 'order_multi':
         value = ensure_list(value)
     if arg_name in _REL_ARGS:
         cfg[arg_name] = value
-        flag = _ORDER_FLAGS.get(arg_name)
-        if flag:
-            cfg[flag] = True
+        provenance = cfg.get('_provenance')
+        if isinstance(provenance, ArgumentProvenance):
+            provenance.mark_caller(arg_name)
     else:
         cfg['filter_args'][arg_name] = value
 
@@ -113,7 +122,7 @@ class RelationSelectionExtractor:
         except Exception:
             type_default_where = None
         return {
-            'fields': [], 'limit': None, 'offset': None,
+            'fields': [], 'limit': None, 'offset': None, 'after': None,
             'order_by': def_ob, 'order_dir': def_od, 'order_multi': list(def_om) if isinstance(def_om, (list, tuple)) else ([def_om] if def_om else []),
             'where': None,
             'default_where': meta.get('scope'),
@@ -121,10 +130,7 @@ class RelationSelectionExtractor:
             'single': single, 'target': target, 'nested': {}, 'skip_pushdown': False,
             'fk_column_name': fk_col_name,
             'filter_args': {}, 'arg_specs': meta.get('arguments'),
-            # Flags to distinguish explicit args from defaults (used for precedence rules)
-            '_has_explicit_order_by': False,
-            '_has_explicit_order_dir': False,
-            '_has_explicit_order_multi': False,
+            '_provenance': ArgumentProvenance(),
         }
 
     def _children(self, sel: Any) -> list[Any]:

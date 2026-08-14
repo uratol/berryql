@@ -399,19 +399,6 @@ class RelationSQLBuilders:
                 requested = tmp
         except Exception:
             pass
-        if not requested and not rel_cfg.get('_field_permissions_applied'):
-            try:
-                for sf, sdef in getattr(target_btype, '__berry_fields__', {}).items():
-                    if sdef.kind == 'scalar':
-                        # Exclude write-only helper scalars from SQL projections
-                        try:
-                            if (getattr(sdef, 'meta', {}) or {}).get('write_only'):
-                                continue
-                        except Exception:
-                            pass
-                        requested.append(sf)
-            except Exception:
-                requested = []
         if include_helper_fk_for_single_nested:
             try:
                 nested_requested = set((rel_cfg.get('nested') or {}).keys())
@@ -611,27 +598,40 @@ class RelationSQLBuilders:
 
     def _apply_filter_args_sqla(self, sel, model_cls, info, filter_args: Dict[str, Any] | None, expanded_specs: Dict[str, Any]):
         """Apply filter_args using SQLAlchemy expressions."""
+        import inspect
+
+        from ..core.errors import AdapterUnsupported
+
         if not filter_args:
             return sel
-        try:
-            from ..core.filters import OPERATOR_REGISTRY
-        except Exception:
-            OPERATOR_REGISTRY = {}
+        operators = self.registry._predicate_compiler.operators
         for arg_name, val in (filter_args or {}).items():
             f_spec = expanded_specs.get(arg_name)
             if not f_spec:
                 continue
             if getattr(f_spec, 'transform', None):
                 try:
+                    if inspect.iscoroutinefunction(f_spec.transform):
+                        raise AdapterUnsupported("Async filter transform requires resolver fallback")
                     val = f_spec.transform(val)
+                    if inspect.isawaitable(val):
+                        if inspect.iscoroutine(val):
+                            val.close()
+                        raise AdapterUnsupported("Async filter transform requires resolver fallback")
                 except Exception:
-                    continue
+                    raise
             expr = None
             if getattr(f_spec, 'builder', None):
                 try:
+                    if inspect.iscoroutinefunction(f_spec.builder):
+                        raise AdapterUnsupported("Async filter builder requires resolver fallback")
                     expr = f_spec.builder(model_cls, info, val)
+                    if inspect.isawaitable(expr):
+                        if inspect.iscoroutine(expr):
+                            expr.close()
+                        raise AdapterUnsupported("Async filter builder requires resolver fallback")
                 except Exception:
-                    expr = None
+                    raise
             elif getattr(f_spec, 'column', None):
                 try:
                     col = model_cls.__table__.c.get(f_spec.column)
@@ -639,7 +639,7 @@ class RelationSQLBuilders:
                     col = None
                 if col is None:
                     continue
-                op_fn = OPERATOR_REGISTRY.get(getattr(f_spec, 'op', None) or 'eq')
+                op_fn = operators.get(getattr(f_spec, 'op', None) or 'eq')
                 if not op_fn:
                     continue
                 try:
@@ -657,10 +657,7 @@ class RelationSQLBuilders:
         """
         if not filter_args:
             return where_parts
-        try:
-            from ..core.filters import OPERATOR_REGISTRY
-        except Exception:
-            OPERATOR_REGISTRY = {}
+        operators = self.registry._predicate_compiler.operators
 
         def _add(col_name: str, op_name: str, value: Any):
             v = value
@@ -687,7 +684,7 @@ class RelationSQLBuilders:
                 an = str(arg_name)
                 if '_' in an:
                     base, suffix = an.rsplit('_', 1)
-                    if suffix.lower() in OPERATOR_REGISTRY and base in model_cls.__table__.columns:
+                    if operators.get(suffix.lower()) is not None and base in model_cls.__table__.columns:
                         _add(base, suffix.lower(), val)
             except Exception:
                 pass
@@ -1130,7 +1127,12 @@ class RelationSQLBuilders:
         if not cfg:
             return None
         try:
-            if cfg.get('_has_explicit_order_by') and not cfg.get('_has_explicit_order_dir'):
+            from ..core.analyzer import ValueSource
+
+            if (
+                cfg.get('order_by_source') == ValueSource.CALLER
+                and cfg.get('order_dir_source') != ValueSource.CALLER
+            ):
                 return 'asc'
         except Exception:
             pass
@@ -1548,11 +1550,6 @@ class RelationSQLBuilders:
                             except Exception:
                                 n_json_scalar = n_single_select
                             out_json_args.extend([_text(f"'{nname}'"), n_json_scalar])
-                            try:
-                                ncfg['from_pushdown'] = True
-                                ncfg['skip_reason'] = None
-                            except Exception:
-                                pass
                         else:
                             # Build JSON array for nested rows, including deeper nested fields
                             n_subq = n_sel.subquery()
@@ -1576,19 +1573,9 @@ class RelationSQLBuilders:
                             except Exception:
                                 n_json_scalar = n_json_array
                             out_json_args.extend([_text(f"'{nname}'"), n_json_scalar])
-                            try:
-                                ncfg['from_pushdown'] = True
-                                ncfg['skip_reason'] = None
-                            except Exception:
-                                pass
                     except Exception:
-                        # Skip this nested branch on error
-                        try:
-                            ncfg['from_pushdown'] = False
-                            if not ncfg.get('skip_reason'):
-                                ncfg['skip_reason'] = 'builder error'
-                        except Exception:
-                            pass
+                        # Optional nested pushdown may fall back, but it never
+                        # mutates the authorized relation plan.
                         continue
                 return out_json_args
 
@@ -1604,16 +1591,6 @@ class RelationSQLBuilders:
                     requested_scalar_i = tmp
             except Exception:
                 pass
-            if not requested_scalar_i and not rel_cfg.get('_field_permissions_applied'):
-                for sf, sdef in target_b_i.__berry_fields__.items():
-                    if sdef.kind == 'scalar':
-                        # Filter out write-only helper scalars
-                        try:
-                            if (getattr(sdef, 'meta', {}) or {}).get('write_only'):
-                                continue
-                        except Exception:
-                            pass
-                        requested_scalar_i.append(sf)
             # Ensure FK helper columns for child's single nested relations are present
             try:
                 nested_requested = set((rel_cfg.get('nested') or {}).keys())
@@ -1654,7 +1631,7 @@ class RelationSQLBuilders:
                                     expanded[an] = spec.clone_with(op=op_name, ops=None)
                             else:
                                 expanded[spec.alias or key] = spec
-                        from ..core.filters import OPERATOR_REGISTRY
+                        operators = self.registry._predicate_compiler.operators
                         for arg_name, val in filter_args.items():
                             f_spec = expanded.get(arg_name)
                             if not f_spec:
@@ -1677,7 +1654,7 @@ class RelationSQLBuilders:
                                     col = None
                                 if col is None:
                                     continue
-                                op_fn = OPERATOR_REGISTRY.get(f_spec.op or 'eq')
+                                op_fn = operators.get(f_spec.op or 'eq')
                                 if not op_fn:
                                     continue
                                 try:
@@ -2014,7 +1991,13 @@ class RelationSQLBuilders:
                     # Determine effective order_dir for nested: ASC when order_by explicit and no explicit dir
                     n_effective_dir = self._resolve_graphql_value(info, ncfg.get('order_dir'))
                     try:
-                        if ncfg.get('_has_explicit_order_by') and not ncfg.get('_has_explicit_order_dir') and n_effective_dir is None:
+                        from ..core.analyzer import ValueSource
+
+                        if (
+                            ncfg.get('order_by_source') == ValueSource.CALLER
+                            and ncfg.get('order_dir_source') != ValueSource.CALLER
+                            and n_effective_dir is None
+                        ):
                             n_effective_dir = 'asc'
                     except Exception:
                         pass
@@ -2693,47 +2676,28 @@ class RootSQLBuilders:
             t_scope = None
         if t_scope is not None:
             await _apply_where_value(t_scope, trusted=True)
-        # filter args
-        from ..core.filters import OPERATOR_REGISTRY
-        for arg_name, value in (passed_filter_args or {}).items():
-            if value is None:
-                continue
-            f_spec = declared_filters.get(arg_name)
-            if not f_spec:
-                raise ValueError(f"Unknown filter argument: {arg_name}")
-            if getattr(f_spec, 'transform', None):
-                try:
-                    value = f_spec.transform(value)
-                except Exception as e:
-                    raise ValueError(f"Filter transform failed for {arg_name}: {e}")
-            expr = None
-            if getattr(f_spec, 'builder', None):
-                try:
-                    expr = f_spec.builder(model_cls, info, value)
-                    if inspect.isawaitable(expr):
-                        expr = await expr
-                except Exception as e:
-                    raise ValueError(f"Filter builder failed for {arg_name}: {e}")
-            elif getattr(f_spec, 'column', None):
-                try:
-                    col = model_cls.__table__.c.get(f_spec.column)
-                except Exception:
-                    col = None
-                if col is None:
-                    raise ValueError(f"Unknown filter column: {f_spec.column} for argument {arg_name}")
-                op_name = f_spec.op or 'eq'
-                op_fn = OPERATOR_REGISTRY.get(op_name)
-                if not op_fn:
-                    raise ValueError(f"Unknown filter operator: {op_name} for argument {arg_name}")
-                try:
-                    expr = op_fn(col, value)
-                except Exception as e:
-                    raise ValueError(f"Filter operation failed for {arg_name}: {e}")
-            if expr is not None:
-                stmt = stmt.where(expr)
-        return stmt
+        return await self.registry._declared_filter_compiler.apply(
+            stmt,
+            model_cls=model_cls,
+            berry_type=btype_cls,
+            info=info,
+            specs=declared_filters,
+            values=passed_filter_args,
+        )
 
-    def apply_ordering(self, stmt, *, model_cls, btype_cls, order_by, order_dir, order_multi, info=None, paginated: bool = False):
+    def apply_ordering(
+        self,
+        stmt,
+        *,
+        model_cls,
+        btype_cls,
+        order_by,
+        order_dir,
+        order_multi,
+        info=None,
+        paginated: bool = False,
+        after: Optional[str] = None,
+    ):
         effective_order_multi = order_multi
         effective_order_by = order_by
         effective_order_dir = order_dir
@@ -2755,7 +2719,14 @@ class RootSQLBuilders:
             ),
             strict_multi=True,
         )
+        if after is not None:
+            from ..core.ordering import OrderTerm
+
+            pk_name = self.registry._get_pk_name(model_cls)
+            if not any(term.path == pk_name for term in terms):
+                terms = tuple(terms) + (OrderTerm(pk_name, "asc"),)
         relation_builders = RelationSQLBuilders(self.registry)
+        join_cache: Dict[str, Any] = {}
 
         def _resolve(statement, path, join_cache):
             statement, expression = relation_builders._resolve_join_order_expr_sqla(
@@ -2767,6 +2738,25 @@ class RootSQLBuilders:
                 )
             return statement, expression
 
+        if after is not None:
+            from ..core.pagination import decode_cursor, keyset_predicate
+
+            expressions = []
+            directions = []
+            for term in terms:
+                if not isinstance(term.path, str):
+                    from ..core.errors import InvalidOrderingError
+
+                    raise InvalidOrderingError("Keyset pagination requires field-path ordering")
+                stmt, expression = _resolve(stmt, term.path, join_cache)
+                if expression is None:
+                    from ..core.errors import InvalidOrderingError
+
+                    raise InvalidOrderingError(f"Unable to resolve keyset ordering field '{term.path}'")
+                expressions.append(expression)
+                directions.append(term.direction)
+            stmt = stmt.where(keyset_predicate(expressions, directions, decode_cursor(after)))
+
         return self.registry._ordering_compiler.apply_sqlalchemy(
             stmt,
             model_cls=model_cls,
@@ -2776,6 +2766,7 @@ class RootSQLBuilders:
             info=info,
             add_pk_tiebreaker=paginated,
             fallback_pk=not bool(terms),
+            join_cache=join_cache,
         )
 
     def apply_pagination(self, stmt, *, limit, offset):

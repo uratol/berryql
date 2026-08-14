@@ -251,6 +251,8 @@ def custom(
     returns: Any | None = None,
     comment: Optional[str] = None,
     read_only: bool = True,
+    depends_on: Any | None = None,
+    fields: Any | None = None,
 ) -> FieldDescriptor:
     """Declare a custom computed scalar backed by a builder function.
 
@@ -288,9 +290,20 @@ def custom(
     # Normalize read_only flag for downstream registry/builders. By default,
     # custom scalars are read-only and thus should not appear in mutation inputs.
     meta['read_only'] = bool(read_only)
+    if depends_on is not None:
+        meta['depends_on'] = depends_on
+    if fields is not None:
+        meta['fields'] = fields
     return FieldDescriptor(kind='custom', **meta)
 
-def custom_object(builder: Callable[..., Any], *, returns: Any, comment: Optional[str] = None) -> FieldDescriptor:
+def custom_object(
+    builder: Callable[..., Any],
+    *,
+    returns: Any,
+    comment: Optional[str] = None,
+    depends_on: Any | None = None,
+    fields: Any | None = None,
+) -> FieldDescriptor:
     """Declare a custom computed object with a fixed shape.
 
     Similar to :func:`custom` but returns multiple named columns bundled into a
@@ -322,6 +335,10 @@ def custom_object(builder: Callable[..., Any], *, returns: Any, comment: Optiona
     meta: Dict[str, Any] = {'builder': builder, 'returns': returns}
     if comment is not None:
         meta['comment'] = comment
+    if depends_on is not None:
+        meta['depends_on'] = depends_on
+    if fields is not None:
+        meta['fields'] = fields
     return FieldDescriptor(kind='custom_object', **meta)
 
 # --- Domains (namespacing) ---
