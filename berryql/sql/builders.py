@@ -399,7 +399,7 @@ class RelationSQLBuilders:
                 requested = tmp
         except Exception:
             pass
-        if not requested:
+        if not requested and not rel_cfg.get('_field_permissions_applied'):
             try:
                 for sf, sdef in getattr(target_btype, '__berry_fields__', {}).items():
                     if sdef.kind == 'scalar':
@@ -1684,7 +1684,7 @@ class RelationSQLBuilders:
                     requested_scalar_i = tmp
             except Exception:
                 pass
-            if not requested_scalar_i:
+            if not requested_scalar_i and not rel_cfg.get('_field_permissions_applied'):
                 for sf, sdef in target_b_i.__berry_fields__.items():
                     if sdef.kind == 'scalar':
                         # Filter out write-only helper scalars

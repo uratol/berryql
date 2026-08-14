@@ -491,6 +491,35 @@ def build_merge_resolver_for_type(
                 ),
             )
 
+            # Apply field permissions to the consumer payload before any
+            # application pre-hook sees it. Hooks remain trusted server code
+            # and may derive internal fields from the sanitized payload.
+            ignored_write_values: Dict[str, Any] = {}
+            if isinstance(data_local, dict):
+                field_permissions = await schema._resolve_field_permissions(
+                    btype_local, info
+                )
+                try:
+                    identity_name = schema._get_pk_name(model_cls_local)
+                except Exception:
+                    identity_name = 'id'
+                declared_fields = getattr(btype_local, '__berry_fields__', {}) or {}
+                sanitized_data: Dict[str, Any] = {}
+                for input_name, input_value in data_local.items():
+                    field_def = declared_fields.get(input_name)
+                    is_control = input_name in {'_Delete', '_Replace', '_Insert'}
+                    is_identity = input_name == identity_name
+                    if (
+                        is_control
+                        or is_identity
+                        or field_def is None
+                        or field_permissions.write.allows(input_name)
+                    ):
+                        sanitized_data[input_name] = input_value
+                    else:
+                        ignored_write_values[input_name] = input_value
+                data_local = sanitized_data
+
             def _hook_context(*, delete: bool = False):
                 node_context.delete = delete
                 return MergeHookContext({
@@ -980,6 +1009,44 @@ def build_merge_resolver_for_type(
                     instance = await session.get(model_cls_local, pk_val)
                 except Exception:
                     instance = None
+
+            # Warn only when the normal mutation path has already loaded an
+            # existing instance and the old scalar value is present in its
+            # __dict__.  Never use getattr/refresh/select here: deferred or
+            # unloaded attributes and relations are silently skipped.
+            if instance is not None and ignored_write_values:
+                changed_ignored_fields: List[str] = []
+                loaded_values = getattr(instance, '__dict__', {})
+                if isinstance(loaded_values, dict):
+                    declared_fields = getattr(btype_local, '__berry_fields__', {}) or {}
+                    for ignored_name, new_value in ignored_write_values.items():
+                        ignored_def = declared_fields.get(ignored_name)
+                        if ignored_def is None or getattr(ignored_def, 'kind', None) != 'scalar':
+                            continue
+                        ignored_meta = getattr(ignored_def, 'meta', {}) or {}
+                        storage_name = ignored_meta.get('column') or ignored_name
+                        if storage_name not in loaded_values:
+                            continue
+                        old_value = loaded_values.get(storage_name)
+                        try:
+                            enum_cls = get_model_enum_cls(model_cls_local, storage_name)
+                            if enum_cls is not None:
+                                new_value = coerce_input_to_storage_value(enum_cls, new_value)
+                        except Exception:
+                            pass
+                        try:
+                            changed = new_value != old_value
+                        except Exception:
+                            changed = False
+                        if changed:
+                            changed_ignored_fields.append(ignored_name)
+                if changed_ignored_fields:
+                    _logger.warning(
+                        "Ignored unauthorized write fields: type=%s pk=%r fields=%s",
+                        getattr(btype_local, '__name__', str(btype_local)),
+                        pk_val,
+                        sorted(changed_ignored_fields),
+                    )
 
             if _require_existing and instance is None:
                 _cls = getattr(model_cls_local, '__name__', str(model_cls_local))

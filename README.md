@@ -206,6 +206,51 @@ At a high level you will:
 The rest of this README goes into the details of fields, relations, filters, JSON where, custom scalars/objects, domains, merge mutations, and subscriptions.
 
 
+Dynamic field permissions
+-------------------------
+
+BerryQL can keep one stable GraphQL schema while resolving readable and writable
+field sets from an external authorization system for each request. Providers may
+be synchronous or asynchronous and receive ``(berry_type, info)``:
+
+```python
+from berryql import BerrySchema, FieldPermissions, FieldSet
+
+
+async def resolve_fields(berry_type, info):
+    grants = await info.context["acl"].fields_for(
+        actor=info.context["current_user"],
+        resource=berry_type.model.__tablename__,
+    )
+    return FieldPermissions(
+        read=FieldSet.only(grants.read_fields),
+        write=FieldSet.only(grants.write_fields),
+    )
+
+
+berry_schema = BerrySchema(field_permissions=resolve_fields)
+```
+
+``FieldSet.only(...)`` is an allow-list. ``FieldSet.all_except(...)`` is a
+deny-list; ``FieldSet.all()`` and ``FieldSet.none()`` are also available. A
+type-specific provider can be added with
+``@berry_schema.type(model=Post, field_permissions=resolve_post_fields)``.
+Schema-level and type-level permissions are intersected, and results are cached
+once per Berry type in the current request.
+
+Unreadable scalar, single relation, custom, and aggregate fields resolve to
+``null``. Unreadable list relations remain non-null and resolve to ``[]``.
+Denied fields are pruned from SQL projections and relation/custom/aggregate
+pushdown. They also cannot be used in caller-provided ``where``, ``order_by``,
+``order_multi``, or declared filter arguments.
+
+Unwritable payload fields are removed recursively before merge pre-hooks run.
+Primary keys remain usable as update selectors, while ``_Insert``, ``_Delete``,
+and ``_Replace`` remain operation controls outside the field mask. On updates,
+BerryQL logs a warning only when a denied scalar differs from an already-loaded
+old value; it never issues a query or lazy load solely to produce that warning.
+
+
 What queries look like (and what SQL runs)
 
 - Only selected columns are fetched for each table.

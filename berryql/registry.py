@@ -63,6 +63,8 @@ from .core.utils import (
 )
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
+from .core.permissions import FieldPermissionResolver, FieldPermissions
+from .core.naming import from_camel
 
 # Standard argument descriptions for default query parameters are generated dynamically
 # based on the current schema naming (auto-camel-case) via BerrySchema._get_standard_arg_descriptions.
@@ -246,7 +248,14 @@ class PaginationConfig:
 class BerrySchema:
     """Registry + dynamic Strawberry schema builder.
     """
-    def __init__(self, *, pagination: Optional[PaginationConfig] = None, default_limit: Optional[int] = None, max_limit: Optional[int] = None):
+    def __init__(
+        self,
+        *,
+        pagination: Optional[PaginationConfig] = None,
+        default_limit: Optional[int] = None,
+        max_limit: Optional[int] = None,
+        field_permissions: Any | None = None,
+    ):
         self.types: Dict[str, Type[BerryType]] = {}
         self._st_types: Dict[str, Any] = {}
         self.pagination = self._coerce_pagination_config(
@@ -277,6 +286,12 @@ class BerrySchema:
             'after_commit': [],
             'on_error': [],
         }
+        if field_permissions is not None and not (
+            callable(field_permissions) or isinstance(field_permissions, FieldPermissions)
+        ):
+            raise TypeError("field_permissions must be callable or FieldPermissions")
+        self._field_permissions_provider = field_permissions
+        self._field_permission_resolver = FieldPermissionResolver(self)
 
     @staticmethod
     def _coerce_pagination_config(
@@ -309,11 +324,197 @@ class BerrySchema:
 
     # No external registration method; use @berry_schema.pre/@berry_schema.post on the type.
 
-    def type(self, *, model: Optional[Type] = None):
+    def type(
+        self,
+        *,
+        model: Optional[Type] = None,
+        field_permissions: Any | None = None,
+    ):
+        if field_permissions is not None and not (
+            callable(field_permissions) or isinstance(field_permissions, FieldPermissions)
+        ):
+            raise TypeError("field_permissions must be callable or FieldPermissions")
         def deco(cls: Type[BerryType]):
             cls.model = model
+            if field_permissions is not None:
+                setattr(cls, '__field_permissions_provider__', field_permissions)
             return self.register(cls)
         return deco
+
+    async def _resolve_field_permissions(
+        self,
+        btype_cls: Type[BerryType],
+        info: StrawberryInfo,
+    ) -> FieldPermissions:
+        return await self._field_permission_resolver.resolve(btype_cls, info)
+
+    async def _field_read_allowed(
+        self,
+        btype_cls: Type[BerryType],
+        info: StrawberryInfo,
+        field_name: str,
+    ) -> bool:
+        permissions = await self._resolve_field_permissions(btype_cls, info)
+        return permissions.read.allows(field_name)
+
+    def _permission_field_name(
+        self,
+        btype_cls: Type[BerryType],
+        reference: str,
+    ) -> str:
+        fields = getattr(btype_cls, '__berry_fields__', {}) or {}
+        if reference in fields:
+            return reference
+        candidate = from_camel(str(reference))
+        if candidate in fields:
+            return candidate
+        for field_name, field_def in fields.items():
+            meta = getattr(field_def, 'meta', {}) or {}
+            if meta.get('column') in {reference, candidate}:
+                return field_name
+        return candidate
+
+    async def _assert_readable_path(
+        self,
+        btype_cls: Type[BerryType],
+        info: StrawberryInfo,
+        path: str,
+    ) -> None:
+        current_type = btype_cls
+        for raw_part in str(path).split('.'):
+            part = raw_part.strip()
+            if not part:
+                continue
+            field_name = self._permission_field_name(current_type, part)
+            permissions = await self._resolve_field_permissions(current_type, info)
+            if not permissions.read.allows(field_name):
+                raise PermissionError(
+                    f"Field '{field_name}' is not readable on "
+                    f"{getattr(current_type, '__name__', current_type)}"
+                )
+            field_def = (getattr(current_type, '__berry_fields__', {}) or {}).get(field_name)
+            if field_def is None or getattr(field_def, 'kind', None) != 'relation':
+                break
+            target_name = (getattr(field_def, 'meta', {}) or {}).get('target')
+            target_type = self.types.get(target_name) if target_name else None
+            if target_type is None:
+                break
+            current_type = target_type
+
+    async def _validate_query_field_controls(
+        self,
+        btype_cls: Type[BerryType],
+        info: StrawberryInfo,
+        *,
+        where: Any = None,
+        order_by: Any = None,
+        order_multi: Any = None,
+        filter_specs: Optional[Dict[str, FilterSpec]] = None,
+        filter_values: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        def _resolve_argument_value(value: Any) -> Any:
+            kind = str(getattr(value, 'kind', '') or '').lower()
+            if 'variable' in kind:
+                name_obj = getattr(value, 'name', None)
+                variable_name = getattr(name_obj, 'value', None) or name_obj
+                raw_info = getattr(info, '_raw_info', None) or info
+                variable_values = getattr(info, 'variable_values', None)
+                if not isinstance(variable_values, dict):
+                    variable_values = getattr(raw_info, 'variable_values', None)
+                if isinstance(variable_values, dict) and variable_name in variable_values:
+                    return variable_values[variable_name]
+            if hasattr(value, 'value'):
+                try:
+                    return getattr(value, 'value')
+                except Exception:
+                    pass
+            return value
+
+        where = _resolve_argument_value(where)
+        order_by = _resolve_argument_value(order_by)
+        if isinstance(order_multi, (list, tuple)):
+            order_multi = [_resolve_argument_value(value) for value in order_multi]
+        else:
+            order_multi = _resolve_argument_value(order_multi)
+        filter_values = {
+            name: _resolve_argument_value(value)
+            for name, value in (filter_values or {}).items()
+        }
+        if where is not None:
+            model_cls = getattr(btype_cls, 'model', None)
+            where_dict = _to_where_dict(
+                where,
+                strict=True,
+                model_cls=model_cls,
+                auto_camel_case=bool(getattr(self, '_auto_camel_case', False)),
+            )
+            for column_name in (where_dict or {}).keys():
+                await self._assert_readable_path(
+                    btype_cls, info, str(column_name)
+                )
+        if isinstance(order_by, str) and order_by:
+            await self._assert_readable_path(btype_cls, info, order_by)
+        for segment in self._normalize_order_multi_values(order_multi):
+            column_name, _, _ = str(segment).partition(':')
+            if column_name:
+                await self._assert_readable_path(
+                    btype_cls, info, column_name
+                )
+        for argument_name, value in (filter_values or {}).items():
+            if value is None:
+                continue
+            spec = (filter_specs or {}).get(argument_name)
+            column_name = getattr(spec, 'column', None) if spec is not None else None
+            if column_name:
+                await self._assert_readable_path(
+                    btype_cls, info, str(column_name)
+                )
+
+    async def _prune_relation_permissions(
+        self,
+        parent_btype: Type[BerryType],
+        relations: Dict[str, Dict[str, Any]],
+        info: StrawberryInfo,
+    ) -> Dict[str, Dict[str, Any]]:
+        parent_permissions = await self._resolve_field_permissions(parent_btype, info)
+        result: Dict[str, Dict[str, Any]] = {}
+        for relation_name, relation_cfg in (relations or {}).items():
+            if not parent_permissions.read.allows(relation_name):
+                continue
+            cfg = dict(relation_cfg or {})
+            target_name = cfg.get('target')
+            target_btype = self.types.get(target_name) if target_name else None
+            if target_btype is not None:
+                target_permissions = await self._resolve_field_permissions(target_btype, info)
+                await self._validate_query_field_controls(
+                    target_btype,
+                    info,
+                    where=cfg.get('where'),
+                    order_by=(
+                        cfg.get('order_by')
+                        if cfg.get('_has_explicit_order_by')
+                        else None
+                    ),
+                    order_multi=(
+                        cfg.get('order_multi')
+                        if cfg.get('_has_explicit_order_multi')
+                        else None
+                    ),
+                    filter_specs=self._expand_filter_args(cfg.get('arg_specs')),
+                    filter_values=cfg.get('filter_args'),
+                )
+                cfg['fields'] = [
+                    name for name in list(cfg.get('fields') or [])
+                    if target_permissions.read.allows(name)
+                ]
+                cfg['nested'] = await self._prune_relation_permissions(
+                    target_btype,
+                    dict(cfg.get('nested') or {}),
+                    info,
+                )
+                cfg['_field_permissions_applied'] = True
+            result[relation_name] = cfg
+        return result
 
     def mutation(self):
         """Decorator to declare the root Mutation using Strawberry fields.
@@ -1781,6 +1982,10 @@ class BerrySchema:
         return fn
 
     async def _relation_resolver_impl(self, root_self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any], meta_copy: Dict[str, Any], is_single_value: bool, fname_local: str, parent_btype_local: Type[BerryType], target_filters: Dict[str, FilterSpec]):
+        if not await self._field_read_allowed(
+            parent_btype_local, info, fname_local
+        ):
+            return None if is_single_value else []
         prefetch_attr = f'_{fname_local}_prefetched'
         if hasattr(root_self, prefetch_attr):
             prefetched = getattr(root_self, prefetch_attr)
@@ -1801,6 +2006,17 @@ class BerrySchema:
             return val
         target_name_i = meta_copy.get('target')
         target_cls_i = self._st_types.get(target_name_i)
+        target_btype = self.types.get(target_name_i) if target_name_i else None
+        if target_btype is not None:
+            await self._validate_query_field_controls(
+                target_btype,
+                info,
+                where=related_where,
+                order_by=order_by,
+                order_multi=order_multi,
+                filter_specs=target_filters,
+                filter_values=_filter_args,
+            )
         parent_model = getattr(root_self, '_model', None)
         if not target_cls_i:
             return None if is_single_value else []
@@ -2528,8 +2744,14 @@ class BerrySchema:
         return results_list
 
     def _create_aggregate_resolver(self, meta_copy: Dict[str, Any], bcls_local: Type[BerryType]):
+        schema_self = self
         async def aggregate_resolver(self, info: StrawberryInfo):
             """Resolve aggregate values."""
+            field_name = meta_copy.get('field_name')
+            if field_name and not await schema_self._field_read_allowed(
+                bcls_local, info, field_name
+            ):
+                return None
             cache = getattr(self, '_agg_cache', None)
             is_count_local = meta_copy.get('op') == 'count' or 'count' in meta_copy.get('ops', [])
             if is_count_local and cache is not None:
@@ -2605,8 +2827,18 @@ class BerrySchema:
             return val
         return aggregate_resolver
 
-    def _create_custom_resolver(self, meta_copy: Dict[str, Any], fname_local: str):
+    def _create_custom_resolver(
+        self,
+        meta_copy: Dict[str, Any],
+        fname_local: str,
+        btype_local: Type[BerryType],
+    ):
+        schema_self = self
         async def custom_resolver(self, info: StrawberryInfo):  # noqa: D401
+            if not await schema_self._field_read_allowed(
+                btype_local, info, fname_local
+            ):
+                return None
             # Fast-path: if root query already populated attribute (no N+1), return it.
             # Important: avoid accidentally returning the bound resolver method itself
             # when the attribute isn't set on the instance (__dict__).
@@ -2775,8 +3007,18 @@ class BerrySchema:
             return result_obj
         return custom_resolver
 
-    def _create_custom_obj_resolver(self, fname_local: str, meta_copy: Optional[Dict[str, Any]] = None):
+    def _create_custom_obj_resolver(
+        self,
+        fname_local: str,
+        meta_copy: Optional[Dict[str, Any]] = None,
+        btype_local: Optional[Type[BerryType]] = None,
+    ):
+        schema_self = self
         async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+            if btype_local is not None and not await schema_self._field_read_allowed(
+                btype_local, info, fname_local
+            ):
+                return None
             # Prefer pre-hydrated values; no N+1 fallback
             pre_json = getattr(self, f"_{fname_local}_prefetched", None)
             if pre_json is not None:
@@ -3049,8 +3291,16 @@ class BerrySchema:
             # column type mapping
             column_type_map: Dict[str, Any] = self._build_column_type_map(getattr(bcls, 'model', None))
             # Helper: build a safe scalar resolver that reads from the attached model
-            def _make_scalar_resolver(fname_local: str, src_col_name: Optional[str] = None):
-                def _resolver(self, info: StrawberryInfo):  # noqa: D401
+            def _make_scalar_resolver(
+                fname_local: str,
+                src_col_name: Optional[str] = None,
+                btype_local: Type[BerryType] = bcls,
+            ):
+                async def _resolver(self, info: StrawberryInfo):  # noqa: D401
+                    if not await schema_instance._field_read_allowed(
+                        btype_local, info, fname_local
+                    ):
+                        return None
                     # Prefer an explicitly set value on the Strawberry instance first.
                     # This allows from_model() or custom resolvers to override values when needed.
                     try:
@@ -3321,6 +3571,10 @@ class BerrySchema:
                         # Build dynamic resolver with filter args + limit/offset
                         # Determine python types for target columns (if available) for future use (not required for arg defs now)
                         async def _impl(self, info: StrawberryInfo, limit: Optional[int], offset: Optional[int], order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], related_where: Optional[Any], _filter_args: Dict[str, Any]):
+                            if not await schema_instance._field_read_allowed(
+                                parent_btype_local, info, fname_local
+                            ):
+                                return None if is_single_value else []
                             prefetch_attr = f'_{fname_local}_prefetched'
                             # Simplified: no special handling for 'source' wrapper
                             if hasattr(self, prefetch_attr):
@@ -3357,6 +3611,15 @@ class BerrySchema:
                             target_btype = schema_instance.types.get(target_name_i)
                             if not target_btype or not target_btype.model:
                                 return None if is_single_value else []
+                            await schema_instance._validate_query_field_controls(
+                                target_btype,
+                                info,
+                                where=related_where,
+                                order_by=order_by,
+                                order_multi=order_multi,
+                                filter_specs=target_filters,
+                                filter_values=_filter_args,
+                            )
                             child_model_cls = target_btype.model
                             if is_single_value:
                                 candidate_fk_val = None
@@ -4234,7 +4497,11 @@ class BerrySchema:
                     # assign cache key for count aggregates
                     if is_count:
                         meta_copy['cache_key'] = meta_copy.get('cache_key') or fdef.meta.get('source') + ':count'
-                    def _make_aggregate_resolver(meta_copy=meta_copy, bcls_local=bcls):
+                    def _make_aggregate_resolver(
+                        meta_copy=meta_copy,
+                        bcls_local=bcls,
+                        fname_local=fname,
+                    ):
                         async def aggregate_resolver(self, info: StrawberryInfo):  # noqa: D401
                             """Resolve aggregate values.
 
@@ -4244,6 +4511,10 @@ class BerrySchema:
                             if available (e.g., "id") so that count(...) works consistently for nested
                             pushdown results.
                             """
+                            if not await schema_instance._field_read_allowed(
+                                bcls_local, info, fname_local
+                            ):
+                                return None
                             cache = getattr(self, '_agg_cache', None)
                             is_count_local = meta_copy.get('op') == 'count' or 'count' in meta_copy.get('ops', [])
                             if is_count_local and cache is not None:
@@ -4358,9 +4629,9 @@ class BerrySchema:
                     except Exception:
                         c_comment = None
                     if c_comment:
-                        setattr(st_cls, fname, strawberry.field(self._create_custom_resolver(meta_copy, fname), description=str(c_comment)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_resolver(meta_copy, fname, bcls), description=str(c_comment)))
                     else:
-                        setattr(st_cls, fname, strawberry.field(self._create_custom_resolver(meta_copy, fname)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_resolver(meta_copy, fname, bcls)))
                 elif fdef.kind == 'custom_object':
                     if is_private:
                         # Skip exposing private custom object fields
@@ -4398,9 +4669,9 @@ class BerrySchema:
                     except Exception:
                         co_comment = None
                     if co_comment:
-                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname, meta_copy), description=str(co_comment)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname, meta_copy, bcls), description=str(co_comment)))
                     else:
-                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname, meta_copy)))
+                        setattr(st_cls, fname, strawberry.field(self._create_custom_obj_resolver(fname, meta_copy, bcls)))
             # Merge in any user-declared strawberry fields that are not part of Berry field defs.
             # Strategy:
             # 1) Copy attributes explicitly annotated on the BerryType subclass (classic dataclass-like fields).
@@ -4555,7 +4826,19 @@ class BerrySchema:
                 else:
                     filter_arg_types[arg_name] = Optional[base_type]
 
-            async def _base_impl(info: StrawberryInfo, limit: int | None, offset: int | None, order_by: Optional[str], order_dir: Optional[Any], order_multi: Optional[List[str]], _passed_filter_args: Dict[str, Any], raw_where: Optional[Any] = None, scope_where: Optional[Any] = None):
+            async def _base_impl(
+                info: StrawberryInfo,
+                limit: int | None,
+                offset: int | None,
+                order_by: Optional[str],
+                order_dir: Optional[Any],
+                order_multi: Optional[List[str]],
+                _passed_filter_args: Dict[str, Any],
+                raw_where: Optional[Any] = None,
+                scope_where: Optional[Any] = None,
+                permission_order_by: Optional[str] = None,
+                permission_order_multi: Optional[List[str]] = None,
+            ):
                 out = []
                 session = _get_db(info)
                 if session is None:
@@ -4585,12 +4868,57 @@ class BerrySchema:
                 select_columns: List[Any] = []
                 # Centralized query analysis: requested fields/relations and helper FKs
                 _plan = QueryAnalyzer(self).analyze(info, root_field_name, btype_cls)
-                requested_relations = _plan.requested_relations
-                requested_scalar_root = _plan.requested_scalar_root
-                requested_custom_root = _plan.requested_custom_root
-                requested_custom_obj_root = _plan.requested_custom_obj_root
-                requested_aggregates_root = _plan.requested_aggregates_root
+                root_permissions = await self._resolve_field_permissions(
+                    btype_cls, info
+                )
+                requested_relations = await self._prune_relation_permissions(
+                    btype_cls, _plan.requested_relations, info
+                )
+                requested_scalar_root = {
+                    name for name in _plan.requested_scalar_root
+                    if root_permissions.read.allows(name)
+                }
+                requested_custom_root = {
+                    name for name in _plan.requested_custom_root
+                    if root_permissions.read.allows(name)
+                }
+                requested_custom_obj_root = {
+                    name for name in _plan.requested_custom_obj_root
+                    if root_permissions.read.allows(name)
+                }
+                requested_aggregates_root = {
+                    name for name in _plan.requested_aggregates_root
+                    if root_permissions.read.allows(name)
+                }
                 requested_other_root = getattr(_plan, 'requested_other_root', set()) or set()
+                await self._validate_query_field_controls(
+                    btype_cls,
+                    info,
+                    where=raw_where,
+                    order_by=permission_order_by,
+                    order_multi=permission_order_multi,
+                    filter_specs=declared_filters,
+                    filter_values=_passed_filter_args,
+                )
+                if (
+                    not requested_scalar_root
+                    and not requested_relations
+                    and not requested_custom_root
+                    and not requested_custom_obj_root
+                    and not requested_aggregates_root
+                    and not requested_other_root
+                    and (
+                        _plan.requested_scalar_root
+                        or _plan.requested_relations
+                        or _plan.requested_custom_root
+                        or _plan.requested_custom_obj_root
+                        or _plan.requested_aggregates_root
+                    )
+                ):
+                    # A selection containing only denied fields still needs one
+                    # lightweight row per matching entity so GraphQL can return
+                    # the corresponding null/empty values.  Select only the PK.
+                    requested_scalar_root.add(self._get_pk_name(model_cls))
                 # Coercion of JSON where values moved to core.utils.coerce_where_value
                 # Helper calls to RelationSQLBuilders are instantiated inline where needed
                 # Prepare pushdown COUNT aggregates (centralized)
@@ -4809,7 +5137,7 @@ class BerrySchema:
                                     requested_scalar_i = tmp
                             except Exception:
                                 pass
-                            if not requested_scalar_i:
+                            if not requested_scalar_i and not rel_cfg.get('_field_permissions_applied'):
                                 for sf, sdef in target_b.__berry_fields__.items():
                                     if sdef.kind == 'scalar':
                                         requested_scalar_i.append(sf)
@@ -4985,13 +5313,13 @@ class BerrySchema:
             src += "    _sw = _defaults.get('where') if _defaults is not None else None\n"
             if is_single:
                 # No order/offset/limit args for single roots; enforce limit 1 internally
-                src += "    _rows = await _base_impl(info, 1, None, None, None, None, _fa, _rw, _sw)\n"
+                src += "    _rows = await _base_impl(info, 1, None, None, None, None, _fa, _rw, _sw, None, None)\n"
             else:
                 src += "    _ob = order_by if order_by is not None else (_defaults.get('order_by') if _defaults is not None else None)\n"
                 src += "    _od = order_dir if order_dir is not None else (_defaults.get('order_dir') if _defaults is not None else None)\n"
                 src += "    _om = order_multi if order_multi is not None else (_defaults.get('order_multi') if _defaults is not None else None)\n"
                 src += "    _lim = limit\n"
-                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw, _sw)\n"
+                src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, _fa, _rw, _sw, order_by, order_multi)\n"
             src += "    return (_rows[0] if _rows else None) if _is_single else _rows\n"
             ns: Dict[str, Any] = {'_base_impl': _base_impl, '_defaults': relation_defaults, '_is_single': bool(is_single)}
             ns.update({'Optional': Optional, 'List': List, 'datetime': datetime})
