@@ -8,8 +8,17 @@ from typing import Any, Dict, Optional, Tuple
 from sqlalchemy import and_
 
 from .errors import AdapterUnsupported, InvalidPredicateError
-from .filters import FilterLimits, OperatorRegistry
+from .filters import FilterLimits, OperatorRegistry, _is_sql_operand
 from .utils import coerce_where_value, to_where_dict
+
+
+def _operand_has_sql(value: Any) -> bool:
+    """True when an operator operand is, or contains, a SQL construct."""
+    if _is_sql_operand(value):
+        return True
+    if isinstance(value, (list, tuple, set)):
+        return any(_is_sql_operand(item) for item in value)
+    return False
 
 
 class PredicateError(InvalidPredicateError):
@@ -185,7 +194,9 @@ class PredicateCompiler:
                         raise PredicateError(f"Where operators for '{column_name}' must be an object")
                     continue
                 for operator, operand in operator_map.items():
-                    self._validate_operand_shape(str(column_name), str(operator), operand)
+                    self._validate_operand_shape(
+                        str(column_name), str(operator), operand, trusted=trusted
+                    )
                     fragments.append(ColumnPredicate(str(column_name), str(operator), operand))
             if not trusted and self.limits.max_clauses is not None and len(fragments) > self.limits.max_clauses:
                 raise PredicateError(
@@ -196,18 +207,35 @@ class PredicateCompiler:
             raise PredicateError("Caller where must be a JSON object or JSON string")
         return TrustedExpression(value)
 
-    def _validate_operand_shape(self, column: str, operator: str, operand: Any) -> None:
+    def _validate_operand_shape(
+        self, column: str, operator: str, operand: Any, *, trusted: bool = False
+    ) -> None:
         if operator in {"between", "not_between"}:
+            # The container must be a sequence of exactly two values; the items
+            # themselves may be SQL expressions (e.g. correlated subqueries).
             if not isinstance(operand, (list, tuple)) or len(operand) != 2:
                 raise PredicateError(
                     f"Where operator '{operator}' for '{column}' requires exactly two values"
                 )
         elif operator in {"in", "not_in"}:
+            # SQL selectables/expressions (trusted scope subqueries such as
+            # {'business_id': {'in': select(...).scalar_subquery()}}) are valid
+            # operands with no list-length semantics.  Callers can only supply
+            # plain JSON values, so this exemption is not reachable from
+            # client-supplied filters and opens no injection surface.
+            if _is_sql_operand(operand):
+                return
             if not isinstance(operand, (list, tuple, set)) or not operand:
                 raise PredicateError(
                     f"Where operator '{operator}' for '{column}' requires a non-empty list"
                 )
-            if self.limits.max_in_items is not None and len(operand) > self.limits.max_in_items:
+            # Cost limits govern caller filters; trusted scopes are exempt
+            # (see FilterLimits docstring).
+            if (
+                not trusted
+                and self.limits.max_in_items is not None
+                and len(operand) > self.limits.max_in_items
+            ):
                 raise PredicateError(
                     f"Where operator '{operator}' for '{column}' exceeds max_in_items={self.limits.max_in_items}"
                 )
@@ -479,7 +507,28 @@ class PredicateCompiler:
         if isinstance(predicate, ColumnPredicate):
             # Validate with the SQLAlchemy compiler first, then let the adapter
             # produce its native literal form.
-            self.compile_sqlalchemy(predicate, model_cls, strict=strict)
+            expression = self.compile_sqlalchemy(predicate, model_cls, strict=strict)
+            if _operand_has_sql(predicate.value):
+                # SQL operands cannot be rendered by the adapter's literal
+                # translation (where_from_dict only understands plain value
+                # lists), which previously dropped such conditions silently.
+                # Compile through the SQLAlchemy MSSQL dialect instead so the
+                # predicate fails closed rather than being skipped.
+                try:
+                    from sqlalchemy.dialects import mssql
+
+                    return [
+                        str(
+                            expression.compile(
+                                dialect=mssql.dialect(),
+                                compile_kwargs={"literal_binds": True},
+                            )
+                        )
+                    ]
+                except Exception as exc:
+                    raise UnsupportedPredicateError(
+                        "MSSQL adapter cannot safely compile SQLAlchemy predicate"
+                    ) from exc
             return adapter.where_from_dict(
                 model_cls,
                 {predicate.column: {predicate.operator: predicate.value}},

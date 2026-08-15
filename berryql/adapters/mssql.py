@@ -170,6 +170,9 @@ class MSSQLAdapter(BaseAdapter):
                 elif op_name == 'in' and isinstance(val, (list, tuple)):
                     vals = ', '.join([self._render_literal(col, v) for v in val])
                     parts.append(f"{tgt} IN ({vals})")
+                elif op_name == 'not_in' and isinstance(val, (list, tuple)):
+                    vals = ', '.join([self._render_literal(col, v) for v in val])
+                    parts.append(f"{tgt} NOT IN ({vals})")
                 elif op_name == 'between' and isinstance(val, (list, tuple)) and len(val) >= 2:
                     a = self._render_literal(col, val[0])
                     b = self._render_literal(col, val[1])

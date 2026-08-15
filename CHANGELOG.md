@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.1] - 2026-08-15
+### Fixed
+- Restored support for SQLAlchemy SQL operands in where-dict scopes:
+  `{'business_id': {'in': select(...).scalar_subquery()}}` — the documented
+  multi-tenant scope form — was rejected by 0.5.0's operand-shape validation
+  with `Where operator 'in' for '<column>' requires a non-empty list`,
+  breaking every scoped query and mutation in consumer apps.
+- `in`/`not_in` now pass SQL selectables/expressions to `column.in_()`
+  unwrapped, so plain `Select` operands compile to `col IN (SELECT ...)`
+  instead of raising SQLAlchemy's `IN expression list, SELECT construct, or
+  bound parameter object expected`.
+- `coerce_where_value` no longer type-coerces SQL constructs (previously a
+  `Select` bound to a boolean column could be coerced to `True`).
+- The MSSQL predicate path now compiles SQL-operand predicates through the
+  SQLAlchemy dialect instead of silently dropping the condition, and
+  `where_from_dict` renders `not_in` list conditions instead of skipping them.
+- Trusted scopes are no longer subject to `max_in_items` caller cost limits,
+  aligning enforcement with the documented `FilterLimits` contract
+  (shape validation still applies; caller filters are unchanged).
+
 ## [0.5.0] - 2026-08-14
 ### Added
 - Introduced capability-based `FieldPermissions` with independent `select`,

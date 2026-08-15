@@ -9,7 +9,7 @@ from typing import Any, Optional, Dict, List
 import strawberry
 from sqlalchemy.sql.sqltypes import Integer, Boolean, DateTime, Float, Numeric
 from sqlalchemy import and_ as _and
-from .filters import OPERATOR_REGISTRY
+from .filters import OPERATOR_REGISTRY, _is_sql_operand
 from .naming import from_camel
 
 # Try to import UUID types
@@ -39,6 +39,11 @@ def dir_value(order_dir: Any) -> str:
         return 'asc'
 
 def coerce_where_value(col, val):
+    # SQL operands (subqueries, column expressions) must pass through
+    # untouched: coercing them against the column's python type could turn a
+    # Select into bool(val)/float(val) and corrupt the predicate.
+    if _is_sql_operand(val):
+        return val
     if isinstance(val, (list, tuple)):
         return [coerce_where_value(col, v) for v in val]
     

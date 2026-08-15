@@ -2,6 +2,42 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from sqlalchemy import func
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import Select
+
+
+def _is_sql_operand(value: Any) -> bool:
+    """True when ``value`` is a SQLAlchemy selectable or column expression.
+
+    Trusted scopes may embed SQL constructs as operator operands, e.g.
+    ``{'business_id': {'in': select(...).scalar_subquery()}}``.  Such operands
+    must reach ``column.in_()`` unwrapped and carry no list-length semantics.
+    Values arriving from GraphQL callers are always plain JSON types and can
+    never satisfy this check.
+    """
+    if isinstance(value, (list, tuple, set, dict, str, bytes)):
+        return False
+    if isinstance(value, (Select, ColumnElement)):
+        return True
+    # Duck-typing fallback for dialect-specific wrappers and similar
+    # constructs that are not direct subclasses of the public types.
+    return callable(getattr(value, "self_group", None)) and callable(getattr(value, "compile", None))
+
+
+def _in_value(value: Any) -> Any:
+    """Normalize an ``in``/``not_in`` operand for ``column.in_()``.
+
+    - sequences pass through unchanged,
+    - SQL selectables/expressions pass through unwrapped so SQLAlchemy renders
+      ``col IN (SELECT ...)`` (wrapping a plain ``Select`` in a list raises
+      ``ArgumentError: IN expression list, SELECT construct, or bound parameter
+      object expected``),
+    - scalars are wrapped into a single-element list (legacy behavior).
+    """
+    if isinstance(value, (list, tuple, set)) or _is_sql_operand(value):
+        return value
+    return [value]
+
 
 # Global operator registry (extensible)
 OPERATOR_REGISTRY: Dict[str, Callable[[Any, Any], Any]] = {
@@ -15,8 +51,8 @@ OPERATOR_REGISTRY: Dict[str, Callable[[Any, Any], Any]] = {
     'not_like': lambda col, v: ~col.like(v),
     'ilike': lambda col, v: getattr(col, 'ilike', lambda x: func.lower(col).like(func.lower(x)))(v),
     'not_ilike': lambda col, v: ~getattr(col, 'ilike', lambda x: func.lower(col).like(func.lower(x)))(v),
-    'in': lambda col, v: col.in_(v if isinstance(v, (list, tuple, set)) else [v]),
-    'not_in': lambda col, v: ~col.in_(v if isinstance(v, (list, tuple, set)) else [v]),
+    'in': lambda col, v: col.in_(_in_value(v)),
+    'not_in': lambda col, v: ~col.in_(_in_value(v)),
     'between': lambda col, v: col.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None,
     'not_between': lambda col, v: ~col.between(v[0], v[1]) if isinstance(v, (list, tuple)) and len(v) >= 2 else None,
     'contains': lambda col, v: col.contains(v),

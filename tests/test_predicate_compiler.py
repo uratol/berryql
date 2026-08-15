@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
+from berryql import FilterLimits
 from berryql.adapters.mssql import MSSQLAdapter
 from berryql.core.predicates import (
     Conjunction,
@@ -178,3 +179,98 @@ def test_mssql_adapter_applies_compiled_expression_instead_of_dropping_it():
     )
 
     assert "posts.id = 1" in sql
+
+
+# ---------------------------------------------------------------------------
+# Regression: SQL operands in where-dicts (trusted scopes)
+#
+# 0.5.0's operand-shape validation rejected
+# {'author_id': {'in': select(...).scalar_subquery()}} — the documented
+# multi-tenant scope form (see mutations._enforce_scope docstring) — with
+# "Where operator 'in' for '<column>' requires a non-empty list".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trusted_scope_dict_with_scalar_subquery_operand_compiles():
+    compiler = _compiler()
+    subquery = select(User.id).where(User.name == "alice").scalar_subquery()
+    scope = {"author_id": {"in": subquery}}
+
+    predicate = await compiler.resolve(scope, Post, _Info(), trusted=True)
+    expression = compiler.compile_sqlalchemy(predicate, Post)
+    sql = str(select(Post.id).where(expression))
+
+    assert "posts.author_id IN" in sql
+    assert "(SELECT users.id" in sql
+
+
+@pytest.mark.asyncio
+async def test_in_and_not_in_accept_plain_select_operands_unwrapped():
+    compiler = _compiler()
+    plain = select(User.id).where(User.name == "alice")
+
+    for op, expected in (("in", "IN"), ("not_in", "NOT IN")):
+        predicate = await compiler.resolve(
+            {"author_id": {op: plain}}, Post, _Info(), trusted=True
+        )
+        expression = compiler.compile_sqlalchemy(predicate, Post)
+        sql = str(select(Post.id).where(expression))
+        # The Select must reach col.in_() unwrapped; wrapping it in a list
+        # raises "IN expression list, SELECT construct, or bound parameter
+        # object expected".
+        assert f"{expected} (SELECT users.id" in sql
+
+
+@pytest.mark.asyncio
+async def test_between_accepts_sql_expression_items():
+    compiler = _compiler()
+    upper = select(User.id).where(User.id == 1).scalar_subquery()
+
+    predicate = await compiler.resolve(
+        {"id": {"between": [1, upper]}}, Post, _Info(), trusted=True
+    )
+    expression = compiler.compile_sqlalchemy(predicate, Post)
+    sql = str(select(Post.id).where(expression))
+
+    assert "BETWEEN" in sql
+    assert "SELECT" in sql
+
+
+def test_caller_empty_in_list_still_rejected():
+    compiler = _compiler()
+
+    with pytest.raises(PredicateError, match="non-empty"):
+        compiler.parse({"id": {"in": []}}, Post, trusted=False)
+    with pytest.raises(PredicateError, match="non-empty"):
+        compiler.parse({"id": {"not_in": []}}, Post, trusted=False)
+
+
+def test_caller_in_cost_limits_enforced_but_trusted_scopes_exempt():
+    schema = SimpleNamespace(
+        filter_limits=FilterLimits(max_in_items=2),
+        _operators=None,
+        _auto_camel_case=False,
+    )
+    compiler = PredicateCompiler(schema)
+
+    with pytest.raises(PredicateError, match="max_in_items"):
+        compiler.parse({"id": {"in": [1, 2, 3]}}, Post, trusted=False)
+
+    # Trusted scopes are validated for shape but not subject to caller cost
+    # limits (FilterLimits contract).
+    compiler.parse({"id": {"in": [1, 2, 3]}}, Post, trusted=True)
+
+
+def test_mssql_compiles_sql_operand_predicates_instead_of_dropping_them():
+    compiler = _compiler()
+    adapter = MSSQLAdapter()
+    subquery = select(User.id).where(User.id == 1).scalar_subquery()
+
+    parts = compiler.compile_mssql_sync(
+        {"author_id": {"in": subquery}}, Post, adapter, _Info()
+    )
+
+    assert len(parts) == 1
+    assert "IN" in parts[0].upper()
+    assert "SELECT" in parts[0].upper()
