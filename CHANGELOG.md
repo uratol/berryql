@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.2] - 2026-08-19
+### Added
+- Exception interception mechanism for translating runtime errors into
+  client-friendly GraphQL errors: register handlers on the schema via
+  `berry_schema.register_error_handler(handler, *exc_types)` or the
+  `@berry_schema.error_handler(ExcType)` / bare `@berry_schema.error_handler`
+  decorators. Handlers can be sync or async, accept `(exc)`,
+  `(exc, context)`, or `(exc, context, gql_error)`, and control the outcome by
+  returning `None` (keep the original error), a message string, or a
+  replacement exception whose message and `extensions` become the GraphQL
+  error payload (e.g. translating a SQLAlchemy `IntegrityError` into
+  "This email address is already registered" with `extensions.code`).
+- New `UserFacingError` exception (exported from `berryql`) designed to be
+  returned from error handlers; carries a `code` plus arbitrary `extensions`.
+- Type-specific handlers always take precedence over catch-all fallbacks;
+  handler failures are logged and never mask the original error. Translation
+  applies to queries, mutations, and subscriptions executed through the schema
+  returned by `to_strawberry()` (which now instantiates a
+  `BerryStrawberrySchema` subclass of `strawberry.Schema`), including the
+  synchronous `execute_sync` path; validation errors are left untouched.
+
 ## [0.5.1] - 2026-08-15
 ### Fixed
 - Restored support for SQLAlchemy SQL operands in where-dict scopes:

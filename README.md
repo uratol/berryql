@@ -648,6 +648,54 @@ failure is logged without masking that original error. `after_commit` runs
 only after a successful commit and therefore must not be used for validation
 that depends on rollback.
 
+### Exception interception (translating errors for clients)
+
+Runtime exceptions raised inside resolvers (queries, mutations, subscriptions)
+can be intercepted and translated into clean, client-facing GraphQL errors —
+for example, turning a raw SQLAlchemy `IntegrityError` into a friendly message
+instead of leaking driver details.
+
+Register handlers on the schema:
+
+```python
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from berryql import UserFacingError
+
+@berry_schema.error_handler(IntegrityError)
+def translate_integrity(exc, context):
+    return UserFacingError(
+        "This email address is already registered",
+        code="EMAIL_TAKEN",
+    )
+
+@berry_schema.error_handler  # catch-all fallback (no exception classes)
+def translate_unexpected(exc, context):
+    if isinstance(exc, SQLAlchemyError):
+        return UserFacingError("Database error", code="DB_ERROR")
+    return None  # keep the original error
+```
+
+Equivalently, `berry_schema.register_error_handler(handler, ExcType, ...)`
+registers programmatically, before or after `to_strawberry()` is called.
+
+- Handlers may be sync or async and accept `(exc)`, `(exc, context)`, or
+  `(exc, context, gql_error)` where `context` is the operation's
+  `context_value` and `gql_error` is the final `graphql.GraphQLError`.
+- Return values control the translation: `None` keeps the original error, a
+  `str` replaces the error message, and an exception instance (typically
+  `UserFacingError`) replaces the message and attaches its `extensions`
+  (exposed as `extensions` on the GraphQL error, e.g. `{"code": "EMAIL_TAKEN"}`).
+- Type-specific handlers always take precedence over catch-all fallbacks,
+  regardless of registration order; within each tier the earliest
+  registration wins.
+- Exceptions raised by a broken handler are logged and never mask the original
+  error; validation errors (which have no original exception) are never
+  translated.
+
+The mechanism is built into the schema returned by `to_strawberry()` and works
+with any Strawberry-compatible server (FastAPI `GraphQLRouter`, ASGI views,
+direct `schema.execute(...)` calls, and the synchronous `execute_sync` path).
+
 ### Mutation payload control flags
 
 Every generated input type carries optional control flags (underscore-prefixed) to tweak merge behavior:

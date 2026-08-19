@@ -62,6 +62,7 @@ from .core.utils import (
 from .sql.builders import RelationSQLBuilders, RootSQLBuilders
 from .core.hydration import Hydrator
 from .core.permissions import FieldPermissions
+from .core.error_interceptor import BerryStrawberrySchema, ErrorInterceptor
 from .core.declared_filters import DeclaredFilterCompiler
 from .core.policy import PolicyEngine, SelectGuardExtension
 from .core.predicates import PredicateCompiler
@@ -294,6 +295,9 @@ class BerrySchema:
             'after_commit': [],
             'on_error': [],
         }
+        # Exception interception: user handlers translating raised exceptions
+        # (e.g. SQL errors) into clean, client-facing GraphQL errors.
+        self._error_interceptor = ErrorInterceptor()
         if field_permissions is not None and not (
             callable(field_permissions) or isinstance(field_permissions, FieldPermissions)
         ):
@@ -699,8 +703,68 @@ class BerrySchema:
                 self._merge_hooks[phase].append(callback)
         return self
 
+    # ---------- Exception interception (error translation) ----------
+    def register_error_handler(self, handler: Any, *exc_types: type) -> Any:
+        """Register a handler intercepting exceptions raised during execution.
 
-    
+        The handler is invoked whenever an exception raised inside a resolver
+        (query, mutation or subscription) matches ``exc_types`` (``isinstance``
+        semantics). Registered without exception types it becomes a catch-all
+        fallback that only applies when no earlier registration matched.
+
+        The handler may be sync or async and accept 1-3 positional arguments:
+
+        - ``(exc)`` — the original exception;
+        - ``(exc, context)`` — plus the operation's ``context_value``;
+        - ``(exc, context, gql_error)`` — plus the final ``graphql.GraphQLError``.
+
+        Return values control the translation:
+
+        - ``None`` — keep the original error unchanged;
+        - ``str`` — replace the GraphQL error message;
+        - an exception instance (e.g. ``UserFacingError``) — its ``str()``
+          becomes the message and its ``extensions`` dict (if any) is attached
+          to the error payload.
+
+        Exceptions raised by the handler itself are logged and ignored, so a
+        broken handler can never mask the original error.
+
+        The mechanism works for every operation executed through the schema
+        returned by ``to_strawberry()``; handlers may be registered before or
+        after the schema is built.
+        """
+        self._error_interceptor.register(handler, *exc_types)
+        return handler
+
+    def error_handler(self, *exc_types: type):
+        """Decorator form of :meth:`register_error_handler`.
+
+        Works with exception classes, without arguments (catch-all), or as a
+        bare decorator on a catch-all handler::
+
+            @berry_schema.error_handler(IntegrityError)
+            def translate_integrity(exc, context):
+                return UserFacingError("Email already registered", code="EMAIL_TAKEN")
+
+            @berry_schema.error_handler()  # or just @berry_schema.error_handler
+            def translate_unexpected(exc, context):
+                return None if isinstance(exc, KeyError) else "Internal error"
+        """
+        # Bare decorator usage: @berry.error_handler applied directly to a
+        # catch-all handler (no parentheses, no exception classes).
+        if (
+            len(exc_types) == 1
+            and callable(exc_types[0])
+            and not (
+                isinstance(exc_types[0], type)
+                and issubclass(exc_types[0], BaseException)
+            )
+        ):
+            return self.register_error_handler(exc_types[0])
+
+        def deco(fn):
+            return self.register_error_handler(fn, *exc_types)
+        return deco
 
     # ---------- Input/Mutation helpers ----------
     def _get_standard_arg_descriptions(self) -> Dict[str, str]:
@@ -6226,13 +6290,14 @@ class BerrySchema:
             except Exception:
                 pass
             # Finally, construct schema with config
-            # Build base schema
+            # Build base schema (BerryStrawberrySchema routes execution errors
+            # through the schema's ErrorInterceptor for user-facing translation)
             if Mutation is not None and Subscription is not None:
-                _inner_schema = strawberry.Schema(Query, mutation=Mutation, subscription=Subscription, config=strawberry_config)  # type: ignore[arg-type]
+                _inner_schema = BerryStrawberrySchema(Query, mutation=Mutation, subscription=Subscription, config=strawberry_config, berry_error_interceptor=self._error_interceptor)  # type: ignore[arg-type]
             elif Mutation is not None:
-                _inner_schema = strawberry.Schema(Query, mutation=Mutation, config=strawberry_config)  # type: ignore[arg-type]
+                _inner_schema = BerryStrawberrySchema(Query, mutation=Mutation, config=strawberry_config, berry_error_interceptor=self._error_interceptor)  # type: ignore[arg-type]
             else:
-                _inner_schema = strawberry.Schema(Query, config=strawberry_config)  # type: ignore[arg-type]
+                _inner_schema = BerryStrawberrySchema(Query, config=strawberry_config, berry_error_interceptor=self._error_interceptor)  # type: ignore[arg-type]
             return _inner_schema
 
 # --- Module-level helpers (public) ---------------------------------------------
