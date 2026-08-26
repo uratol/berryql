@@ -643,10 +643,13 @@ before_merge
 ```
 
 Any exception before commit explicitly rolls back the full mutation, then runs
-`on_error` after rollback and re-raises the original exception. An `on_error`
-failure is logged without masking that original error. `after_commit` runs
-only after a successful commit and therefore must not be used for validation
-that depends on rollback.
+`on_error` after rollback and re-raises the original exception. It also runs
+for failed custom `@strawberry.mutation` resolvers; because those resolvers do
+not have a merge operation context, the hook receives `None` for `operation`
+and transaction handling remains the custom resolver's responsibility. An
+`on_error` failure is logged without masking that original error.
+`after_commit` runs only after a successful commit and therefore must not be
+used for validation that depends on rollback.
 
 ### Exception interception (translating errors for clients)
 

@@ -681,10 +681,12 @@ class BerrySchema:
         after_commit: Any | None = None,
         on_error: Any | None = None,
     ):
-        """Incrementally register schema-level hooks for every merge operation.
+        """Incrementally register schema-level mutation lifecycle hooks.
 
         A hook value may be one callable or a list/tuple of callables. Hooks
         preserve registration order and are not replaced by later calls.
+        Merge operations support every phase; ``on_error`` also runs for
+        failed custom Strawberry mutation resolvers, with no operation context.
         """
 
         supplied = {
@@ -6048,6 +6050,8 @@ class BerrySchema:
                                     anns['return'] = mapped_type
                             except Exception:
                                 pass
+                        if callable(fn):
+                            fn = _mut.wrap_custom_mutation_resolver(self, fn)
                         # Attach as a regular strawberry.field using the resolver
                         setattr(MPlain, uf, strawberry.field(resolver=fn))
                     except Exception:

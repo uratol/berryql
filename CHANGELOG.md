@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.3] - 2026-08-27
+### Fixed
+- Extended schema-level `on_error` hooks to user-authored root and
+  domain-scoped `@strawberry.mutation` resolvers. Custom mutations pass
+  `None` as the operation context and remain responsible for their own
+  transaction handling; failures inside an `on_error` hook are logged without
+  masking the resolver's original exception.
+
 ## [0.5.2] - 2026-08-19
 ### Added
 - Exception interception mechanism for translating runtime errors into

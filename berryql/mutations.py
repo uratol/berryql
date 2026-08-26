@@ -1,4 +1,5 @@
 from __future__ import annotations
+from functools import wraps
 import inspect
 import logging
 import uuid
@@ -101,6 +102,45 @@ async def _run_on_error_hooks(schema, info, operation, exception):
             _logger.exception(
                 "BerryQL on_error hook failed while handling %r", exception
             )
+
+
+def wrap_custom_mutation_resolver(schema, resolver):
+    """Run schema ``on_error`` hooks for a user-authored mutation resolver.
+
+    Custom mutations do not have a :class:`MergeOperationContext`, so hooks
+    receive ``None`` as their operation argument.  The resolver's original
+    exception is always re-raised; a failing error hook is logged by
+    ``_run_on_error_hooks`` and cannot replace it.
+    """
+
+    if not callable(resolver):
+        return resolver
+
+    try:
+        resolver_signature = inspect.signature(resolver)
+    except (TypeError, ValueError):
+        resolver_signature = None
+
+    @wraps(resolver)
+    async def _wrapped(*args, **kwargs):
+        try:
+            result = resolver(*args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        except BaseException as exc:
+            info = kwargs.get("info")
+            if info is None and resolver_signature is not None:
+                try:
+                    info = resolver_signature.bind_partial(
+                        *args, **kwargs
+                    ).arguments.get("info")
+                except (TypeError, ValueError):
+                    pass
+            await _run_on_error_hooks(schema, info, None, exc)
+            raise
+
+    return _wrapped
 
 
 def compose_scope_with_guard(dom_cls: Any, desc_scope: Any):
@@ -2219,6 +2259,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                     _fn_eff = getattr(br, 'wrapped_func', None) or getattr(br, 'func', None)
                 if _fn_eff is None:
                     _fn_eff = getattr(fval, 'func', None)
+                _fn_eff = wrap_custom_mutation_resolver(schema, _fn_eff)
             except Exception:
                 _fn_eff = fn
             try:
