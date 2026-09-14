@@ -264,7 +264,8 @@ def custom(
         builder: Callable invoked as ``builder(model_cls)`` (and may receive
             additional adapter-provided context). Must return a selectable or
             expression producing the scalar.
-        returns: Optional Python type for GraphQL schema generation (e.g. ``int``).
+        returns: Optional Python type for GraphQL schema generation (e.g. ``int``),
+            or ``strawberry.scalars.JSON`` for structured JSON values.
             When omitted, the adapter may try to infer it.
         read_only: When True (default), the field is excluded from mutation input
             types and only exposed on query output types. This mirrors the

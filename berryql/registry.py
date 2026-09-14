@@ -4662,6 +4662,8 @@ class BerrySchema:
                             annotations[fname] = Optional[float]
                         elif ann_type in (bool, 'bool', 'Bool', 'Boolean'):
                             annotations[fname] = Optional[bool]
+                        elif ann_type is ST_JSON:
+                            annotations[fname] = Optional[ST_JSON]
                         else:
                             annotations[fname] = Optional[str]
                     except Exception:

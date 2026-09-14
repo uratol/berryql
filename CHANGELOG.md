@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.4] - 2026-09-14
+### Fixed
+- Preserve `strawberry.scalars.JSON` return types on `custom` fields instead of
+  declaring them as GraphQL String. SQL projections can return structured JSON
+  or null without per-row resolver queries.
+
 ## [0.5.3] - 2026-08-27
 ### Fixed
 - Extended schema-level `on_error` hooks to user-authored root and
