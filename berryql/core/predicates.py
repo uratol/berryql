@@ -300,14 +300,28 @@ class PredicateCompiler:
 
             if cache is None:
                 return await _invoke()
-            task = asyncio.create_task(_invoke())
-            cache[key] = task
+            # Resolve in this coroutine: a synchronous provider (including
+            # synchronous provider chains) must finish before a sibling field
+            # enters nested sync compilation. Scheduling _invoke as a Task
+            # creates an artificial pending entry even when no I/O is needed.
+            pending = asyncio.get_running_loop().create_future()
+            cache[key] = pending
             try:
-                resolved = await task
-            except BaseException:
-                if cache.get(key) is task:
+                resolved = await _invoke()
+            except BaseException as exc:
+                if cache.get(key) is pending:
                     cache.pop(key, None)
+                if not pending.done():
+                    if isinstance(exc, asyncio.CancelledError):
+                        pending.cancel()
+                    else:
+                        pending.set_exception(exc)
+                        # The initiating caller receives the original error;
+                        # consume it here when there are no concurrent waiters.
+                        pending.exception()
                 raise
+            if not pending.done():
+                pending.set_result(resolved)
             cache[key] = resolved
             return resolved
         if isinstance(predicate, Conjunction):

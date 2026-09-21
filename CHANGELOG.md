@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.5] - 2026-09-21
+### Fixed
+- Resolve synchronous predicate providers without scheduling an artificial
+  pending task. A shared permission scope now works in combined root and nested
+  SQL queries while preserving single invocation, async fallback, and error and
+  cancellation propagation.
+
 ## [0.5.4] - 2026-09-14
 ### Fixed
 - Preserve `strawberry.scalars.JSON` return types on `custom` fields instead of

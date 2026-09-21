@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -274,3 +275,96 @@ def test_mssql_compiles_sql_operand_predicates_instead_of_dropping_them():
     assert len(parts) == 1
     assert "IN" in parts[0].upper()
     assert "SELECT" in parts[0].upper()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["expression", "dict", "provider_chain"])
+async def test_sync_scope_is_shared_by_async_root_and_nested_sync_compilation(kind):
+    compiler, info = _compiler(), _Info()
+    calls = 0
+
+    def scope(model_cls, provided_info):
+        nonlocal calls
+        calls += 1
+        if kind == "dict":
+            return {"id": {"eq": 1}}
+        if kind == "provider_chain":
+            return lambda child_model, child_info: child_model.id == 1
+        return model_cls.id == 1
+
+    async def nested():
+        return compiler.resolve_sync(scope, Post, info)
+
+    root, child = await asyncio.gather(compiler.resolve(scope, Post, info), nested())
+    assert calls == 1
+    assert child is root
+    assert compiler.compile_sqlalchemy(root, Post) is not None
+
+
+@pytest.mark.asyncio
+async def test_async_scope_still_shares_a_single_inflight_invocation():
+    compiler, info = _compiler(), _Info()
+    calls = 0
+
+    async def scope(model_cls, provided_info):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return model_cls.id == 1
+
+    first, second = await asyncio.gather(
+        compiler.resolve(scope, Post, info), compiler.resolve(scope, Post, info),
+    )
+    assert calls == 1
+    assert second is first
+
+
+@pytest.mark.asyncio
+async def test_failed_async_scope_delivers_original_error_and_clears_cache():
+    compiler, info = _compiler(), _Info()
+    error = TypeError("provider failure")
+    calls = 0
+
+    async def scope(model_cls, provided_info):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        raise error
+
+    failures = await asyncio.gather(
+        compiler.resolve(scope, Post, info), compiler.resolve(scope, Post, info),
+        return_exceptions=True,
+    )
+    assert calls == 1
+    assert all(failure is error for failure in failures)
+    with pytest.raises(TypeError, match="provider failure"):
+        await compiler.resolve(scope, Post, info)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_scope_clears_inflight_cache_and_propagates():
+    compiler, info = _compiler(), _Info()
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    calls = 0
+
+    async def scope(model_cls, provided_info):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await finish.wait()
+        return model_cls.id == 1
+
+    first = asyncio.create_task(compiler.resolve(scope, Post, info))
+    await entered.wait()
+    second = asyncio.create_task(compiler.resolve(scope, Post, info))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    finish.set()
+    assert await compiler.resolve(scope, Post, info) is not None
+    assert calls == 2
