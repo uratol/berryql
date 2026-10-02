@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.6] - 2026-10-02
+### Fixed
+- Convert SQLAlchemy `Numeric`/`Decimal` values to Python `float` at the
+  output boundary of generated GraphQL `Float` fields, fixing
+  `Float cannot represent non numeric value: <Decimal instance>` with
+  GraphQL-core 3.3. Covers ORM objects, `from_model`, SQL projections,
+  nested relations, custom/native fields, Float lists and mutation responses.
+  Decimal values in ORM state and input coercion remain unchanged; existing
+  field permissions and rejection of non-finite Float values are preserved.
+
 ## [0.5.5] - 2026-09-21
 ### Fixed
 - Resolve synchronous predicate providers without scheduling an artificial

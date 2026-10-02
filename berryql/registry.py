@@ -4837,6 +4837,24 @@ class BerrySchema:
                     self._st_types[name] = strawberry.type(cls, description=desc)  # type: ignore
                 else:
                     self._st_types[name] = strawberry.type(cls)  # type: ignore
+        # Normalize Decimal at the output boundary of generated Float fields.
+        # Field extensions cover ORM, hydrated projection and mutation values,
+        # including custom/native fields and nested Float lists, without
+        # changing ORM state, input coercion or the global GraphQL Float scalar.
+        from .core.scalar_output import FloatOutputExtension, has_float_output
+        from strawberry.types.base import StrawberryObjectDefinition
+        for cls in self._st_types.values():
+            definition = getattr(cls, '__strawberry_definition__', None)
+            if not isinstance(definition, StrawberryObjectDefinition) or definition.is_input:
+                continue
+            for output_field in definition.fields:
+                if has_float_output(output_field.type) and not any(
+                    isinstance(extension, FloatOutputExtension)
+                    for extension in output_field.extensions
+                ):
+                    # Keep existing policy guards outermost so denied fields
+                    # never resolve or normalize their underlying values.
+                    output_field.extensions = [FloatOutputExtension(), *output_field.extensions]
         # Post-decoration safety net: directly set the description on the Strawberry definitions
         # using the cached map (more reliable than reading attributes from the decorated class).
         try:
