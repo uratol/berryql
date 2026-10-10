@@ -4986,6 +4986,9 @@ class BerrySchema:
                 requested_custom_obj_root = set(_authorized_plan.selection.custom_object_fields)
                 requested_aggregates_root = set(_authorized_plan.selection.aggregate_fields)
                 requested_other_root = set(_authorized_plan.selection.other_fields)
+                if (relation_defaults or {}).get('post_process') is not None:
+                    # Preserve identity for batch callbacks, even for computed-only selections.
+                    requested_scalar_root.add(self._get_pk_name(model_cls))
                 await self._validate_query_field_controls(
                     btype_cls,
                     info,
@@ -5413,8 +5416,20 @@ class BerrySchema:
                 src += "    _om = order_multi if order_multi is not None else (_defaults.get('order_multi') if _defaults is not None else None)\n"
                 src += "    _lim = limit\n"
                 src += "    _rows = await _base_impl(info, _lim, offset, _ob, _od, _om, after, _fa, _rw, _sw, order_by, order_multi)\n"
-            src += "    return (_rows[0] if _rows else None) if _is_single else _rows\n"
-            ns: Dict[str, Any] = {'_base_impl': _base_impl, '_defaults': relation_defaults, '_is_single': bool(is_single)}
+            async def _finish(rows, info):
+                import inspect
+                value = (rows[0] if rows else None) if is_single else rows
+                post_process = (relation_defaults or {}).get('post_process')
+                if post_process is not None:
+                    # Run once after SQL pagination, hydration and cursor release.
+                    # Callbacks may perform bulk reads; failures must reach GraphQL.
+                    value = post_process(value, info)
+                    if inspect.isawaitable(value):
+                        value = await value
+                return value
+
+            src += "    return await _finish(_rows, info)\n"
+            ns: Dict[str, Any] = {'_base_impl': _base_impl, '_defaults': relation_defaults, '_is_single': bool(is_single), '_finish': _finish}
             ns.update({'Optional': Optional, 'List': List, 'datetime': datetime})
             exec(src, ns)
             generated_fn = ns[func_name]
@@ -5461,15 +5476,17 @@ class BerrySchema:
                     'order_dir': fdef.meta.get('order_dir'),
                     'order_multi': fdef.meta.get('order_multi') or [],
                     'where': fdef.meta.get('scope'),
-                    'arguments': fdef.meta.get('arguments')
+                    'arguments': fdef.meta.get('arguments'),
+                    'post_process': fdef.meta.get('post_process'),
                 }
                 is_single_root = bool(fdef.meta.get('single'))
                 root_resolver = _make_root_resolver(target_b.model, target_st, target_b, fname, relation_defaults=rel_defaults, is_single=is_single_root)
-                # Annotations
+                # Match nested relations: returns describes the callback's output element.
+                return_type = fdef.meta.get('returns') or target_st
                 if is_single_root:
-                    query_annotations[fname] = Optional[self._st_types[target_name]]  # type: ignore
+                    query_annotations[fname] = Optional[return_type]  # type: ignore
                 else:
-                    query_annotations[fname] = List[self._st_types[target_name]]  # type: ignore
+                    query_annotations[fname] = List[return_type]  # type: ignore
                 # Determine description: explicit relation meta comment on Query field or target model docstring/table comment
                 root_desc = None
                 try:
@@ -5635,7 +5652,8 @@ class BerrySchema:
                             'order_dir': fdef.meta.get('order_dir'),
                             'order_multi': fdef.meta.get('order_multi') or [],
                             'where': fdef.meta.get('scope'),
-                            'arguments': fdef.meta.get('arguments')
+                            'arguments': fdef.meta.get('arguments'),
+                            'post_process': fdef.meta.get('post_process'),
                         }
                         try:
                             guard = getattr(dom_cls, '__domain_guard__', None)
@@ -5645,10 +5663,11 @@ class BerrySchema:
                             defaults['where'] = guard
                         is_single = bool(fdef.meta.get('single'))
                         resolver = _make_root_resolver(target_b.model, target_st, target_b, fname, relation_defaults=defaults, is_single=is_single)
+                        return_type = fdef.meta.get('returns') or target_st
                         if is_single:
-                            ann_local[fname] = Optional[target_st]  # type: ignore
+                            ann_local[fname] = Optional[return_type]  # type: ignore
                         else:
-                            ann_local[fname] = List[target_st]  # type: ignore
+                            ann_local[fname] = List[return_type]  # type: ignore
                         # Description for domain relations
                         d_desc = None
                         try:

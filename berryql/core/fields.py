@@ -127,6 +127,9 @@ def relation(target: Any = None, *, single: bool | None = None, fk_column_name: 
                                 single=True:  fn(child_instance, info) -> Any
                                 single=False: fn(list_of_child_instances, info) -> Any
                             The callable may be sync or async.
+                            Query/Domain roots also invoke it once after SQL pagination
+                            and hydration, including empty lists or a missing single
+                            result (None). Root callback errors propagate to GraphQL.
                         - returns: Optional Python type for the GraphQL field when using
                             post_process to return a non-target type (e.g., str). For list
                             relations, provide the element type (e.g., str); the schema will

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.7] - 2026-10-11
+### Fixed
+- Honor synchronous and asynchronous `post_process` callbacks on Query and Domain
+  root relations, once per hydrated SQL page (including empty results), after
+  releasing the database cursor and session lock. Callback failures propagate to
+  GraphQL instead of returning incomplete metadata.
+- Honor the `returns` element type on Query and Domain root relations, including
+  single results and scalar outputs.
+
 ## [0.5.6] - 2026-10-02
 ### Fixed
 - Convert SQLAlchemy `Numeric`/`Decimal` values to Python `float` at the
