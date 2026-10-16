@@ -548,6 +548,79 @@ class Mutation:
 
 Merge mutations accept `payload` arguments inferred from the Berry type’s fields (including write-only helpers such as `author_email`) and return BerryQL objects that include read-only fields.
 
+### Required fields in merge
+
+Create and update share a nullable input type, so partial updates remain valid.
+Use runtime requirements to request answers before creating a record:
+
+```python
+class WorkerQL(BerryType):
+    id = field()
+    first_name = field(required="create")  # required=True means the same
+    worker_type = field(required="create")
+    employment_category = field(
+        required_when=lambda w: w.worker_type == "EMPLOYEE",
+        rule="Required for EMPLOYEE: FULL_TIME, PART_TIME or CASUAL.",
+    )
+    abn = field(
+        required_when=lambda w: w.worker_type == "CONTRACTOR",
+        rule="Required for CONTRACTOR: 11-digit ABN.",
+    )
+    tfn = field(required="create", allow_unknown=True)
+```
+
+`required="create"` (or `True`) rejects omission and null on create, and
+rejects explicit null on update. `allow_unknown=True` accepts an explicit null
+as an answer; it still rejects omission on create and needs nullable storage.
+Unchanged required fields can be omitted from updates.
+
+By default, writable NOT NULL columns without a Python or server default are
+required on create. Generated primary keys, identity and computed columns are
+exempt. `required=False` disables this inference; an explicit requirement
+overrides defaults. BerryQL never picks an enum member to fill a missing answer.
+
+`required_when` runs for both create and update after pre-hooks and foreign-key
+derivation. Its argument is a scalar snapshot: existing row values overlaid
+with changes, using Berry field names (including column aliases). Python enum
+values are exposed as their `.value`. Predicates must be synchronous and read
+only fields on that record; use pre-hooks for database-dependent checks.
+Every predicate needs a non-empty, human-readable `rule`.
+
+Failures roll back the complete merge, including earlier batch items and
+nested records, and return public GraphQL field names:
+
+```json
+{
+  "message": "Missing required fields",
+  "extensions": {
+    "code": "VALIDATION",
+    "fields": ["employmentCategory"],
+    "rules": {
+      "employmentCategory": "Required for EMPLOYEE: FULL_TIME, PART_TIME or CASUAL."
+    }
+  }
+}
+```
+
+Input descriptions preserve existing comments and append `BerryQL validation:`
+followed by JSON with `requiredOnCreate`, `allowUnknown`, `rule`, and (for
+conditional requirements) `requiredWhen`. The same JSON-safe keys are available
+on Strawberry input-field `metadata` and graphql-core input-field `extensions`.
+Schema tools such as an application's `graphql_schema_get` can expose these
+keys directly; ordinary GraphQL introspection exposes them in `description`.
+
+Pre-hooks can return the same error format for complex rules:
+
+```python
+from berryql import ValidationError
+
+raise ValidationError(
+    "ABN is already registered",
+    fields=["abn"],
+    rules={"abn": "ABN must be unique."},
+)
+```
+
 ### Merge order, operation context, and lifecycle
 
 Sibling relations are merged in their owning `BerryType` declaration order.

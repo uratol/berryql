@@ -907,7 +907,7 @@ class BerrySchema:
                 # Compute description from field meta comment or SQLAlchemy Column.comment
                 desc: str | None = None
                 try:
-                    desc = (getattr(fdef, 'meta', {}) or {}).get('comment')
+                    desc = (getattr(fdef, 'meta', {}) or {}).get('comment') or (fdef.meta or {}).get('description')
                 except Exception:
                     desc = None
                 if not desc:
@@ -918,20 +918,15 @@ class BerrySchema:
                             desc = getattr(col_obj, 'comment', None)
                     except Exception:
                         pass
-                # Use strawberry.field to attach description while keeping UNSET semantics
-                try:
-                    if desc:
-                        setattr(InPlain, fname, strawberry.field(default=UNSET, description=desc))  # type: ignore[arg-type]
-                    else:
-                        setattr(InPlain, fname, UNSET)
-                except Exception:
-                    try:
-                        if desc:
-                            setattr(InPlain, fname, strawberry.field(default=None, description=desc))  # type: ignore[arg-type]
-                        else:
-                            setattr(InPlain, fname, None)
-                    except Exception:
-                        setattr(InPlain, fname, None)
+                # Keep every shared create/update input nullable. Requirements
+                # are runtime rules, also published for introspection clients.
+                from .core.required_fields import field_requirement
+                requirement = field_requirement(fname, fdef, col_obj_map.get(src_col or fname))
+                setattr(InPlain, fname, strawberry.field(
+                    default=UNSET,
+                    description=requirement.describe(desc),
+                    metadata=requirement.metadata,
+                ))
             elif fdef.kind == 'custom':
                 # Include custom fields in input when explicitly marked writable (read_only=False)
                 try:
@@ -6341,6 +6336,8 @@ class BerrySchema:
                 _inner_schema = BerryStrawberrySchema(Query, mutation=Mutation, config=strawberry_config, berry_error_interceptor=self._error_interceptor)  # type: ignore[arg-type]
             else:
                 _inner_schema = BerryStrawberrySchema(Query, config=strawberry_config, berry_error_interceptor=self._error_interceptor)  # type: ignore[arg-type]
+            from .core.required_fields import publish_input_requirements
+            publish_input_requirements(_inner_schema)
             return _inner_schema
 
 # --- Module-level helpers (public) ---------------------------------------------

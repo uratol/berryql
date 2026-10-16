@@ -14,6 +14,7 @@ from sqlalchemy.types import Date as _SADate, DateTime as _SADateTime
 from .sql.builders import RelationSQLBuilders
 from .core.enum_utils import get_model_enum_cls, coerce_input_to_storage_value, normalize_instance_enums
 from .core.naming import map_graphql_to_python
+from .core.required_fields import validate_required_fields
 
 if TYPE_CHECKING:  # pragma: no cover
     from .registry import BerrySchema, BerryType, BerryDomain
@@ -1342,6 +1343,14 @@ def build_merge_resolver_for_type(
                     pass
                 session.add(instance)
 
+            # Use the actual create/update decision after pre-hooks and nested
+            # FK derivation. Validation failure reaches the root rollback,
+            # including any previously flushed parents or batch items.
+            await validate_required_fields(
+                schema, btype_local, instance, scalar_vals,
+                creating=created_now, session=session,
+            )
+
             # Assign scalar fields; allow explicit None to clear nullable fields.
             # Do not overwrite primary key with None/empty.
             # Enum-aware coercion via SAEnum: accept NAME strings and coerce to enum.value before assignment.
@@ -1354,6 +1363,9 @@ def build_merge_resolver_for_type(
                             continue
                     except Exception:
                         pass
+                    # Berry field aliases refer to storage attributes, rather
+                    # than arbitrary transient attributes on the ORM object.
+                    k = fmeta.get('column') or k
                     # Primary key guard
                     if k == pk_name and (v is None or v == ''):
                         continue
@@ -1453,6 +1465,10 @@ def build_merge_resolver_for_type(
             except Exception:
                 pass
             await session.flush()
+            await validate_required_fields(
+                schema, btype_local, instance, scalar_vals,
+                creating=created_now, session=session, final=True,
+            )
             operation.record_touched(
                 model_cls_local, getattr(instance, pk_name_local, None)
             )

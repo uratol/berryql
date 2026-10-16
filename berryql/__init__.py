@@ -42,7 +42,7 @@ def __getattr__(name: str):  # PEP 562 lazy exports
     if name in {'FieldSet', 'FieldPermissions', 'OperationPermissions'}:
         from .core import permissions as _permissions
         return getattr(_permissions, name)
-    if name in {'UserFacingError', 'BerryQLError', 'ConfigurationError', 'AuthorizationDenied'}:
+    if name in {'UserFacingError', 'ValidationError', 'BerryQLError', 'ConfigurationError', 'AuthorizationDenied'}:
         from .core import errors as _errors
         return getattr(_errors, name)
     if name in {'ErrorInterceptor', 'BerryStrawberrySchema'}:
@@ -76,7 +76,7 @@ __all__ = [
     'FilterLimits', 'FilterSpec', 'OperatorRegistry', 'register_operator',
     'encode_cursor', 'decode_cursor',
     'MergeOperationContext', 'MergeNodeContext', 'DeferredValidation',
-    'UserFacingError', 'BerryQLError', 'ConfigurationError', 'AuthorizationDenied',
+    'UserFacingError', 'ValidationError', 'BerryQLError', 'ConfigurationError', 'AuthorizationDenied',
     'ErrorInterceptor', 'BerryStrawberrySchema',
     'field', 'relation', 'aggregate', 'count', 'custom', 'custom_object', 'domain', 'mutation', 'hooks', 'scope',
     'enum_column',

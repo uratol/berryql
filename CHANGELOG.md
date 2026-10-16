@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.8] - 2026-10-16
+### Added
+- Runtime merge requirements via `field(required=..., required_when=..., rule=...,
+  allow_unknown=...)`, with NOT NULL/default inference, scalar record snapshots
+  for update predicates, and atomic `VALIDATION` errors with `fields` and `rules`.
+- Discoverable input requirements in GraphQL descriptions, Strawberry metadata,
+  and graphql-core extensions; public `ValidationError` for application hooks.
+
+### Fixed
+- Assign scalar field aliases to their mapped storage columns during merge.
+
 ## [0.5.7] - 2026-10-11
 ### Fixed
 - Honor synchronous and asynchronous `post_process` callbacks on Query and Domain

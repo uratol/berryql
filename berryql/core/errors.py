@@ -68,6 +68,24 @@ class UserFacingError(BerryQLError):
         self.extensions = merged
 
 
+class ValidationError(UserFacingError):
+    """Reject a merge or application pre-hook with field-level guidance.
+
+    ``fields`` and the keys of ``rules`` should use public GraphQL field names.
+    """
+
+    default_code = "VALIDATION"
+
+    def __init__(
+        self,
+        message: str = "Missing required fields",
+        *,
+        fields: list[str],
+        rules: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(message, extensions={"fields": list(fields), "rules": dict(rules or {})})
+
+
 __all__ = [
     "AdapterUnsupported",
     "AuthorizationDenied",
@@ -76,4 +94,5 @@ __all__ = [
     "InvalidOrderingError",
     "InvalidPredicateError",
     "UserFacingError",
+    "ValidationError",
 ]

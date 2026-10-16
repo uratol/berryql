@@ -57,6 +57,10 @@ def field(
     comment: Optional[str] = None,
     read_only: Optional[bool] = None,
     write_only: Optional[bool] = None,
+    required: bool | str | None = None,
+    required_when: Callable[[Any], bool] | None = None,
+    rule: str | None = None,
+    allow_unknown: bool = False,
     **meta,
 ) -> FieldDescriptor:
     """Declare a scalar field on a Berry type.
@@ -75,6 +79,14 @@ def field(
         - write_only: When True, the field is only exposed on mutation input types
             and never exposed on query output types. Useful for helper inputs processed
             in pre-hooks (e.g., author_email -> author_id) without persisting directly.
+        - required: True or "create" requires a value on create and forbids
+            clearing it on update. None infers this from a NOT NULL column
+            without a default; False disables inference.
+        - required_when: Synchronous predicate over the record's scalar state,
+            including existing values on update. Requires a human-readable rule.
+        - rule: Text published in input descriptions and validation errors.
+        - allow_unknown: Accept explicit null as an answer; omission on create
+            is still rejected. Use with a nullable storage column.
 
     Examples:
         class PostQL(BerryType):
@@ -88,6 +100,21 @@ def field(
     Returns:
         FieldDescriptor: A descriptor captured by the registry.
     """
+    from .errors import ConfigurationError
+    import inspect
+
+    if required is not None and required is not True and required is not False and required != 'create':
+        raise ConfigurationError('required must be True, False, "create", or None')
+    if rule is not None and (not isinstance(rule, str) or not rule.strip()):
+        raise ConfigurationError('rule must be a non-empty string')
+    if required_when is not None:
+        if not callable(required_when) or inspect.iscoroutinefunction(required_when):
+            raise ConfigurationError('required_when must be a synchronous predicate')
+        if rule is None:
+            raise ConfigurationError('required_when requires a human-readable rule')
+    if not isinstance(allow_unknown, bool):
+        raise ConfigurationError('allow_unknown must be a boolean')
+    meta.update(required=required, required_when=required_when, rule=rule, allow_unknown=allow_unknown)
     if column is not None:
         meta['column'] = column
     if comment is not None:
