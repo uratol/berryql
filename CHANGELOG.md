@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.9] - 2026-10-17
+### Added
+- JSON-serializable application metadata on merge mutation descriptors via
+  `mutation(..., metadata=...)`, validated at declaration time.
+- Publish arbitrary mutation metadata in graphql-core field extensions for root
+  and domain merge mutations and native Strawberry mutations, preserving existing
+  extension keys without changing descriptions or SDL.
+
 ## [0.5.8] - 2026-10-16
 ### Added
 - Runtime merge requirements via `field(required=..., required_when=..., rule=...,

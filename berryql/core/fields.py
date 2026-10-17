@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, Mapping, Optional, Type
 
 @dataclass
 class FieldDef:
@@ -210,7 +210,15 @@ class MutationDescriptor:
             posts = relation('PostQL')
             merge_posts = mutation('PostQL')
     """
-    def __init__(self, *, target: Any, single: Optional[bool] = None, scope: Any | None = None, comment: Optional[str] = None):
+    def __init__(
+        self,
+        *,
+        target: Any,
+        single: Optional[bool] = None,
+        scope: Any | None = None,
+        comment: Optional[str] = None,
+        metadata: Mapping[str, Any] | None = None,
+    ):
         self.meta: Dict[str, Any] = {
             'target': target.__name__ if hasattr(target, '__name__') and not isinstance(target, str) else target,
             'single': single,
@@ -218,6 +226,18 @@ class MutationDescriptor:
         }
         if comment is not None:
             self.meta['comment'] = comment
+        if metadata is not None:
+            import json
+            from .errors import ConfigurationError
+
+            try:
+                if not isinstance(metadata, Mapping) or any(not isinstance(key, str) for key in metadata):
+                    raise TypeError('metadata must be a mapping with string keys')
+                metadata = dict(metadata)
+                json.dumps(metadata, allow_nan=False)
+            except (TypeError, ValueError, RecursionError) as exc:
+                raise ConfigurationError('mutation metadata must be a JSON-serializable mapping with string keys') from exc
+            self.meta['metadata'] = metadata
         self.name: str | None = None
 
     def __set_name__(self, owner, name):  # pragma: no cover - trivial
@@ -227,12 +247,21 @@ class MutationDescriptor:
         return FieldDef(name=self.name or '', kind='mutation', meta=self.meta)
 
 
-def mutation(target: Any, *, single: Optional[bool] = None, scope: Any | None = None, comment: Optional[str] = None) -> MutationDescriptor:
+def mutation(
+    target: Any,
+    *,
+    single: Optional[bool] = None,
+    scope: Any | None = None,
+    comment: Optional[str] = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> MutationDescriptor:
     """Declare a merge mutation for a Berry type.
 
     Args:
         target: Berry type (class or its name string) to merge.
         single: When True, the payload is a single object; when False/None, payload is a list.
+        metadata: JSON-serializable application metadata published in graphql-core
+            field extensions without changing descriptions or SDL.
     scope: Optional where-like guard to restrict which rows can be mutated. Accepts
         a dict/JSON string/SQLAlchemy expression or a callable ``fn(model_cls, info)``
         returning any of those. When provided on a domain mutation, it will be applied
@@ -240,7 +269,7 @@ def mutation(target: Any, *, single: Optional[bool] = None, scope: Any | None = 
 
     The attribute name is the GraphQL mutation field name. Example: ``merge_posts``.
     """
-    return MutationDescriptor(target=target, single=single, scope=scope, comment=comment)
+    return MutationDescriptor(target=target, single=single, scope=scope, comment=comment, metadata=metadata)
 
 def aggregate(source: str, *, comment: Optional[str] = None, **meta) -> FieldDescriptor:
     """Declare an aggregate derived from a relation.

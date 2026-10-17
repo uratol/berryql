@@ -548,6 +548,33 @@ class Mutation:
 
 Merge mutations accept `payload` arguments inferred from the Berry type’s fields (including write-only helpers such as `author_email`) and return BerryQL objects that include read-only fields.
 
+### Mutation metadata
+
+Attach JSON-serializable application metadata to a merge mutation on the root
+mutation class or a domain:
+
+```python
+merge_worker = mutation("WorkerQL", single=True, metadata={"requiredSkills": ["workforce.hire"]})
+```
+
+BerryQL publishes these keys in graphql-core `field.extensions` after building
+the schema. For example, with the default naming configuration:
+
+```python
+schema = berry_schema.to_strawberry()
+skills = schema._schema.mutation_type.fields["merge_worker"].extensions["requiredSkills"]
+# ["workforce.hire"]
+```
+
+For a domain, inspect the field on its generated mutation domain type, for example
+`schema._schema.get_type("WorkforceDomainMutType").fields["merge_worker"].extensions`.
+The same publication applies to `@strawberry.mutation(metadata=...)` on root
+mutation classes and in domains. Existing extension keys are preserved. Metadata
+keys are application-defined; BerryQL assigns no special meaning to `requiredSkills`.
+Invalid merge metadata raises `ConfigurationError` during declaration. Metadata
+does not change descriptions or SDL and is not exposed by standard GraphQL
+introspection; schema discovery tools can read it directly from graphql-core.
+
 ### Required fields in merge
 
 Create and update share a nullable input type, so partial updates remain valid.

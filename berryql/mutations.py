@@ -193,6 +193,7 @@ def build_merge_resolver_for_type(
     payload_is_list: bool | None = None,
     return_is_list: bool | None = None,
     description: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ):
     """Return (fname, strawberry.field, st_return) implementing recursive merge for a BerryType.
 
@@ -1948,8 +1949,8 @@ def build_merge_resolver_for_type(
         except Exception:
             eff_desc = None
     if eff_desc:
-        return fname, strawberry.field(resolver=_resolver, description=str(eff_desc)), ann_return
-    return fname, strawberry.field(resolver=_resolver), ann_return
+        return fname, strawberry.field(resolver=_resolver, description=str(eff_desc), metadata=metadata), ann_return
+    return fname, strawberry.field(resolver=_resolver, metadata=metadata), ann_return
 
 # --- Domain mutation support ---------------------------------------------
 
@@ -2278,12 +2279,15 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 _fn_eff = wrap_custom_mutation_resolver(schema, _fn_eff)
             except Exception:
                 _fn_eff = fn
+            _metadata = getattr(fval, 'metadata', None)
             try:
                 # Preserve original GraphQL field name if available (e.g., name="import")
-                if _gql_name:
-                    fld = strawberry.field(name=str(_gql_name), resolver=_fn_eff, description=str(_desc)) if _desc else strawberry.field(name=str(_gql_name), resolver=_fn_eff)
-                else:
-                    fld = strawberry.field(resolver=_fn_eff, description=str(_desc)) if _desc else strawberry.field(resolver=_fn_eff)
+                fld = strawberry.field(
+                    name=str(_gql_name) if _gql_name else None,
+                    resolver=_fn_eff,
+                    description=str(_desc) if _desc else None,
+                    metadata=_metadata,
+                )
                 # If GraphQL name is provided, also attach the field under that attribute name to ensure
                 # Strawberry uses it verbatim when decorating the container type.
                 attr_name_to_set = str(_gql_name) if _gql_name else fname
@@ -2291,7 +2295,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
             except Exception:
                 # Fallback without description/name
                 attr_name_to_set = str(_gql_name) if _gql_name else fname
-                setattr(DomSt_local, attr_name_to_set, strawberry.field(resolver=_fn_eff))
+                setattr(DomSt_local, attr_name_to_set, strawberry.field(resolver=_fn_eff, metadata=_metadata))
             # If we could compute an effective return type, force the strawberry field
             # to use it by overriding its type_annotation. This prevents Strawberry from
             # failing to resolve forward-ref/lazy annotations on dynamically attached fields.
@@ -2374,6 +2378,7 @@ def ensure_mutation_domain_type(schema: 'BerrySchema', dom_cls: Type['BerryDomai
                 field_name=attr_name,
                 relation_scope=eff_scope,
                 description=(meta.get('comment') if isinstance(meta, dict) else None),
+                metadata=meta.get('metadata'),
                 payload_is_list=(not is_single),
                 return_is_list=(not is_single),
             )
@@ -2515,6 +2520,7 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                             pre_callback=meta.get('pre'),
                             post_callback=meta.get('post'),
                             description=(meta.get('comment') if isinstance(meta, dict) else None),
+                            metadata=meta.get('metadata'),
                             payload_is_list=(not bool(meta.get('single'))),
                             return_is_list=(not bool(meta.get('single'))),
                         )
@@ -2537,6 +2543,25 @@ def add_mutation_domains(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
 
 
 # --- Top-level merges ----------------------------------------------------
+
+def publish_mutation_metadata(graphql_schema, domain_types=()):
+    """Copy Strawberry metadata to mutation field extensions, preserving existing keys."""
+    from graphql import GraphQLObjectType
+    from strawberry.schema.schema_converter import GraphQLCoreConverter
+
+    core_schema = graphql_schema._schema
+    domain_types = set(domain_types)
+    for gql_type in core_schema.type_map.values():
+        if not isinstance(gql_type, GraphQLObjectType):
+            continue
+        definition = (gql_type.extensions or {}).get(GraphQLCoreConverter.DEFINITION_BACKREF)
+        if gql_type is not core_schema.mutation_type and getattr(definition, 'origin', None) not in domain_types:
+            continue
+        for field in gql_type.fields.values():
+            definition = (field.extensions or {}).get(GraphQLCoreConverter.DEFINITION_BACKREF)
+            for key, value in (getattr(definition, 'metadata', None) or {}).items():
+                field.extensions.setdefault(key, value)
+
 
 def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, Any]) -> None:
     """Attach explicitly declared merge mutations at the root Mutation class.
@@ -2575,6 +2600,7 @@ def add_top_level_merges(schema: 'BerrySchema', MPlain: type, anns_m: Dict[str, 
                 pre_callback=meta.get('pre'),
                 post_callback=meta.get('post'),
                 description=(meta.get('comment') if isinstance(meta, dict) else None),
+                metadata=meta.get('metadata'),
                 payload_is_list=pl_list,
                 return_is_list=rt_list,
             )

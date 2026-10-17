@@ -6087,7 +6087,7 @@ class BerrySchema:
                         if callable(fn):
                             fn = _mut.wrap_custom_mutation_resolver(self, fn)
                         # Attach as a regular strawberry.field using the resolver
-                        setattr(MPlain, uf, strawberry.field(resolver=fn))
+                        setattr(MPlain, uf, strawberry.field(resolver=fn, metadata=getattr(val, 'metadata', None)))
                     except Exception:
                         pass
                 # Attach explicitly declared top-level merge mutations via mutations module
@@ -6338,6 +6338,11 @@ class BerrySchema:
                 _inner_schema = BerryStrawberrySchema(Query, config=strawberry_config, berry_error_interceptor=self._error_interceptor)  # type: ignore[arg-type]
             from .core.required_fields import publish_input_requirements
             publish_input_requirements(_inner_schema)
+            from .mutations import publish_mutation_metadata
+            publish_mutation_metadata(
+                _inner_schema,
+                (st_type for name, st_type in self._st_types.items() if name.endswith('MutType')),
+            )
             return _inner_schema
 
 # --- Module-level helpers (public) ---------------------------------------------
