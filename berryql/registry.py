@@ -70,6 +70,7 @@ from .core.ordering import OrderingCompiler
 from .core.naming import from_camel
 from .core.query_root import QueryRootAssembler
 from .core.relation_resolver import RelationResolverFactory
+from .core.selection import included_field_selections
 
 # Standard argument descriptions for default query parameters are generated dynamically
 # based on the current schema naming (auto-camel-case) via BerrySchema._get_standard_arg_descriptions.
@@ -347,6 +348,7 @@ class BerrySchema:
 
     def register(self, cls: Type[BerryType]):
         self.types[cls.__name__] = cls
+        self._policy_engine.clear_field_metadata()
         return cls
 
     # No external registration method; use @berry_schema.pre/@berry_schema.post on the type.
@@ -2558,9 +2560,7 @@ class BerrySchema:
                 raw_info = getattr(info, '_raw_info', None) or info
                 fnodes = list(getattr(raw_info, 'field_nodes', []) or [])
                 if fnodes:
-                    node = fnodes[0]
-                    selset = getattr(node, 'selection_set', None)
-                    sels = list(getattr(selset, 'selections', []) or []) if selset is not None else []
+                    sels = included_field_selections(info)
                     for s in sels:
                         nm = None
                         try:
@@ -3356,6 +3356,7 @@ class BerrySchema:
             self._name_converter = None
         # Always rebuild Strawberry runtime classes fresh per call to honor config changes
         # and avoid stale definitions across multiple to_strawberry invocations.
+        self._policy_engine.clear_field_metadata()
         self._st_types = {}
         # Keep a mapping of type name -> description to enforce on the final Strawberry definitions
         type_descriptions: Dict[str, str] = {}
@@ -4113,9 +4114,7 @@ class BerrySchema:
                                     raw_info = getattr(info, '_raw_info', None) or info
                                     fnodes = list(getattr(raw_info, 'field_nodes', []) or [])
                                     if fnodes:
-                                        node = fnodes[0]
-                                        selset = getattr(node, 'selection_set', None)
-                                        sels = list(getattr(selset, 'selections', []) or []) if selset is not None else []
+                                        sels = included_field_selections(info)
                                         for s in sels:
                                             nm = None
                                             try:
@@ -5303,7 +5302,9 @@ class BerrySchema:
                         # so ORDER BY and correlated subselects can reference the parent table.
                         stmt = select(*base_root_cols, *select_columns).select_from(model_cls)
                     else:
-                        stmt = select(model_cls)
+                        # A typename-only or fully excluded selection still needs
+                        # one row per result, without loading the entire entity.
+                        stmt = select(self._get_pk_column(model_cls)).select_from(model_cls)
                 except Exception:
                     stmt = select(model_cls)
                 else:

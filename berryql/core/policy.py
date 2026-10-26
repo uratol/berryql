@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, get_args, get_origin
 
 from strawberry.extensions.field_extension import FieldExtension
 
-from .naming import from_camel
 from .errors import AuthorizationDenied, ConfigurationError
+from .naming import from_camel
 from .permissions import FieldPermissions, FieldSet
 from .utils import to_where_dict
 
@@ -78,6 +79,13 @@ class _ExecutionPolicyCache:
 
 
 @dataclass(frozen=True)
+class _FieldMetadata:
+    names: frozenset[str]
+    aliases: Mapping[str, tuple[int, str]]
+    converted_names: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class AuditContext:
     """Value-free context for an authorization denial."""
 
@@ -103,6 +111,11 @@ class PolicyEngine:
 
     def __init__(self, schema: Any):
         self.schema = schema
+        self._field_metadata: Dict[Any, _FieldMetadata] = {}
+
+    def clear_field_metadata(self) -> None:
+        """Invalidate static metadata when the schema is registered or rebuilt."""
+        self._field_metadata.clear()
 
     @staticmethod
     def _context(info: Any) -> Any:
@@ -177,34 +190,46 @@ class PolicyEngine:
                 names.add(name)
         return names
 
-    def _canonical_reference(self, berry_type: Any, reference: str) -> Optional[str]:
-        known = self._declared_field_names(berry_type)
-        raw = str(reference)
-        if raw in known:
-            return raw
-        candidate = from_camel(raw)
-        if candidate in known:
-            return candidate
+    def _metadata_for(self, berry_type: Any) -> _FieldMetadata:
+        cached = self._field_metadata.get(berry_type)
+        if cached is not None:
+            return cached
+        known = frozenset(self._declared_field_names(berry_type))
+        aliases: Dict[str, tuple[int, str]] = {}
         fields = getattr(berry_type, "__berry_fields__", {}) or {}
-        for field_name, field_def in fields.items():
+        for index, (field_name, field_def) in enumerate(fields.items()):
             meta = getattr(field_def, "meta", {}) or {}
-            aliases = {
-                meta.get("alias"),
-                meta.get("graphql_name"),
-                meta.get("name"),
-                meta.get("column"),
-            }
-            if raw in aliases or candidate in aliases:
-                return field_name
+            for key in ("alias", "graphql_name", "name", "column"):
+                alias = meta.get(key)
+                if isinstance(alias, str):
+                    aliases.setdefault(alias, (index, field_name))
+        converted: Dict[str, str] = {}
         converter = getattr(getattr(self.schema, "_name_converter", None), "apply_naming_config", None)
         if callable(converter):
             for field_name in known:
                 try:
-                    if converter(field_name) == raw:
-                        return field_name
+                    converted_name = converter(field_name)
+                    if isinstance(converted_name, str):
+                        converted.setdefault(converted_name, field_name)
                 except (TypeError, ValueError, AttributeError):
                     continue
-        return None
+        metadata = _FieldMetadata(known, MappingProxyType(aliases), MappingProxyType(converted))
+        self._field_metadata[berry_type] = metadata
+        return metadata
+
+    def _canonical_reference(self, berry_type: Any, reference: str) -> Optional[str]:
+        metadata = self._metadata_for(berry_type)
+        raw = str(reference)
+        if raw in metadata.names:
+            return raw
+        candidate = from_camel(raw)
+        if candidate in metadata.names:
+            return candidate
+        matches = [metadata.aliases[name] for name in (raw, candidate) if name in metadata.aliases]
+        if matches:
+            # Preserve declaration-order precedence when raw/camel aliases overlap.
+            return min(matches)[1]
+        return metadata.converted_names.get(raw)
 
     def _normalize_permissions(self, berry_type: Any, permissions: FieldPermissions) -> FieldPermissions:
         normalized: Dict[str, FieldSet] = {}
@@ -303,9 +328,7 @@ class PolicyEngine:
                     target = (getattr(field_def, "meta", {}) or {}).get("target") if field_def else None
                     current_type = self.schema.types.get(target) if target else None
                     if current_type is None:
-                        raise PolicyConfigurationError(
-                            f"Dependency '{dependency}' crosses an unknown relation target"
-                        )
+                        raise PolicyConfigurationError(f"Dependency '{dependency}' crosses an unknown relation target")
         return True
 
     def _audit(self, info: Any, audit: AuditContext) -> None:
@@ -313,8 +336,10 @@ class PolicyEngine:
         if context is None:
             return
         try:
-            records = context.setdefault("_berryql_audit", []) if isinstance(context, dict) else getattr(
-                context, "_berryql_audit", None
+            records = (
+                context.setdefault("_berryql_audit", [])
+                if isinstance(context, dict)
+                else getattr(context, "_berryql_audit", None)
             )
             if records is None:
                 records = []
@@ -375,9 +400,7 @@ class PolicyEngine:
         if not permissions.operations.allows(operation):
             type_name = getattr(berry_type, "__name__", berry_type)
             self._audit(info, AuditContext(str(type_name), operation, "mutation"))
-            raise AuthorizationError(
-                f"Operation '{operation}' is not allowed on " f"{type_name}"
-            )
+            raise AuthorizationError(f"Operation '{operation}' is not allowed on " f"{type_name}")
 
     async def sanitize_payload(
         self,

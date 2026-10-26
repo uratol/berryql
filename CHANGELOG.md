@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.10] - 2026-10-26
+### Fixed
+- Cache immutable field names, aliases, and name-converter mappings per schema
+  and type instead of rediscovering them for each resolved scalar. Rebuild this
+  metadata when types are registered or the Strawberry schema is rebuilt;
+  request-dependent permissions remain isolated per execution.
+- Honor `@include` and `@skip` when projecting root and nested selections into
+  SQL, including variable defaults, named and inline fragments, custom fields,
+  custom objects, aggregates, and relations. Excluded data and expressions are
+  no longer fetched only to be discarded during GraphQL serialization.
+- Merge selections from all occurrences of a root field, preserving included
+  fields and aliases while excluding conditional selections.
+- Select only row identity for typename-only or fully excluded root selections
+  instead of falling back to loading the entire entity.
+
 ## [0.5.9] - 2026-10-17
 ### Added
 - JSON-serializable application metadata on merge mutation descriptors via

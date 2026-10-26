@@ -1,6 +1,9 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+
+from graphql import GraphQLIncludeDirective, GraphQLSkipDirective, get_directive_values
 
 from .naming import (
     build_name_candidates,
@@ -32,47 +35,96 @@ def _children_ast(node: Any) -> list[Any]:
         pass
     return []
 
-def _resolve_ast_fragments(nodes: list[Any], fragments: dict) -> list[Any]:
-    """Expand FragmentSpreadNode and InlineFragmentNode into their field selections."""
+
+def _selection_included(node: Any, info: Any) -> bool:
+    """Evaluate executable directives on GraphQL AST or Strawberry selections."""
+    directives = getattr(node, "directives", None)
+    if not directives:
+        return True
+    if isinstance(directives, dict):
+        # Strawberry has already resolved literal and variable argument values.
+        skip = directives.get("skip", {}).get("if")
+        include = directives.get("include", {}).get("if")
+        return skip is not True and include is not False
+    raw_info = getattr(info, "_raw_info", None) or info
+    variables = getattr(raw_info, "variable_values", None) or {}
+    skip = get_directive_values(GraphQLSkipDirective, node, variables)
+    if skip and skip["if"]:
+        return False
+    include = get_directive_values(GraphQLIncludeDirective, node, variables)
+    return not include or include["if"]
+
+
+def _resolve_ast_fragments(
+    nodes: list[Any],
+    fragments: dict,
+    info: Any = None,
+    visited: frozenset[str] = frozenset(),
+) -> list[Any]:
+    """Expand included AST/Strawberry fragment wrappers into field selections."""
     result: list[Any] = []
     for node in nodes:
-        kind_s = str(getattr(node, 'kind', '') or '')
-        if 'fragment_spread' in kind_s or 'FragmentSpread' in kind_s:
+        if not _selection_included(node, info):
+            continue
+        kind_s = str(getattr(node, "kind", "") or "")
+        if "fragment_spread" in kind_s or "FragmentSpread" in kind_s:
             frag_name = _name_ast(node)
             frag_def = (fragments or {}).get(frag_name)
-            if frag_def:
-                result.extend(_resolve_ast_fragments(_children_ast(frag_def), fragments))
-        elif 'inline_fragment' in kind_s or 'InlineFragment' in kind_s:
-            result.extend(_resolve_ast_fragments(_children_ast(node), fragments))
+            if frag_def and frag_name is not None and frag_name not in visited:
+                result.extend(
+                    _resolve_ast_fragments(
+                        _children_ast(frag_def),
+                        fragments,
+                        info,
+                        visited | {frag_name},
+                    )
+                )
+        elif "inline_fragment" in kind_s or "InlineFragment" in kind_s:
+            result.extend(_resolve_ast_fragments(_children_ast(node), fragments, info, visited))
+        elif hasattr(node, "type_condition"):
+            result.extend(_resolve_ast_fragments(list(node.selections), fragments, info, visited))
         else:
             result.append(node)
     return result
 
+
 def _name_ast(node: Any) -> Optional[str]:
     try:
-        n = getattr(node, 'name', None)
-        if hasattr(n, 'value'):
-            return getattr(n, 'value', None)
+        n = getattr(node, "name", None)
+        if hasattr(n, "value"):
+            return getattr(n, "value", None)
         return n
     except Exception:
         return None
+
+
+def included_field_selections(info: Any) -> list[Any]:
+    """Collect included children for a resolver without root pushdown metadata."""
+    raw_info = getattr(info, '_raw_info', None) or info
+    nodes = getattr(raw_info, 'field_nodes', None) or []
+    fragments = getattr(raw_info, 'fragments', None) or {}
+    children = [child for node in nodes if _selection_included(node, info) for child in _children_ast(node)]
+    return _resolve_ast_fragments(children, fragments, info)
+
 
 def _assign_rel_arg(cfg: Dict[str, Any], arg_name: Optional[str], value: Any) -> None:
     if not arg_name:
         return
     arg_name = from_camel(str(arg_name))
-    if arg_name == 'order_multi':
+    if arg_name == "order_multi":
         value = ensure_list(value)
     if arg_name in _REL_ARGS:
         cfg[arg_name] = value
-        provenance = cfg.get('_provenance')
+        provenance = cfg.get("_provenance")
         if isinstance(provenance, ArgumentProvenance):
             provenance.mark_caller(arg_name)
     else:
-        cfg['filter_args'][arg_name] = value
+        cfg["filter_args"][arg_name] = value
+
 
 class RelationSelectionExtractor:
     def __init__(self, registry: Any | None = None):
+        self._info: Any = None
         self.registry = registry or getattr(self, 'registry', None)
         self._name_converter = getattr(getattr(self.registry, '_name_converter', None), 'apply_naming_config', None)
         self._auto_camel = bool(getattr(self.registry, '_auto_camel_case', False))
@@ -157,7 +209,7 @@ class RelationSelectionExtractor:
             # Resolve GraphQL variable references to concrete values using info.variable_values
             try:
                 kind = getattr(node, 'kind', None)
-                is_var = bool(kind and 'Variable' in str(kind))
+                is_var = str(kind).lower() == 'variable'
             except Exception:
                 is_var = False
             if is_var:
@@ -206,12 +258,7 @@ class RelationSelectionExtractor:
                 return
             # Infer the btype from cfg when available; fallback to scanning by names at runtime
             # We accept that fields list is filled as we walk
-            for sub in sub_children:
-                # Handle Strawberry FragmentSpread / InlineFragment wrappers
-                if hasattr(sub, 'type_condition'):
-                    fake = type('_FragSel', (), {'selections': getattr(sub, 'selections', [])})()
-                    _collect_nested(fake, parent_btype, cfg)
-                    continue
+            for sub in _resolve_ast_fragments(sub_children, {}, self._info):
                 sub_name = getattr(getattr(sub, 'name', None), 'value', None) or getattr(sub, 'name', None)
                 if not sub_name or str(sub_name).startswith('__'):
                     continue
@@ -241,12 +288,7 @@ class RelationSelectionExtractor:
                         pass
                     # recurse deeper
                     _collect_nested(sub, ncfg.get('target') and self.registry.types.get(ncfg.get('target')), ncfg)
-        for child in self._children(sel):
-            # Handle Strawberry FragmentSpread / InlineFragment wrappers
-            if hasattr(child, 'type_condition'):
-                fake = type('_FragSel', (), {'selections': getattr(child, 'selections', [])})()
-                self._walk_selected(fake, btype, out)
-                continue
+        for child in _resolve_ast_fragments(self._children(sel), {}, self._info):
             name = getattr(getattr(child, 'name', None), 'value', None) or getattr(child, 'name', None)
             if not name or name.startswith('__'):
                 continue
@@ -287,11 +329,10 @@ class RelationSelectionExtractor:
         try:
             fields = getattr(info, 'selected_fields', None)
             for f in (fields or []):
-                if getattr(f, 'name', None) in candidates:
+                if getattr(f, 'name', None) in candidates and _selection_included(f, info):
                     fake = type('Sel2', (), {})()
                     setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
                     self._walk_selected(fake, btype, out)
-                    break
         except Exception:
             pass
 
@@ -307,10 +348,11 @@ class RelationSelectionExtractor:
             field_nodes = None
         if field_nodes:
             try:
-                root_nodes = [n for n in field_nodes if _name_ast(n) in candidates]
+                root_nodes = [n for n in field_nodes if _name_ast(n) in candidates and _selection_included(n, info)]
                 if root_nodes:
-                    root_node = root_nodes[0]
-                    for rel_node in _children_ast(root_node):
+                    ast_fragments = getattr(raw_info, 'fragments', None) or {}
+                    root_children = [child for node in root_nodes for child in _children_ast(node)]
+                    for rel_node in _resolve_ast_fragments(root_children, ast_fragments, info):
                         rname = _name_ast(rel_node)
                         if not rname or rname.startswith('__'):
                             continue
@@ -338,7 +380,7 @@ class RelationSelectionExtractor:
                             tgt_b = None
                         ast_fragments = getattr(raw_info, 'fragments', None) or {}
                         try:
-                            for sub in _resolve_ast_fragments(_children_ast(rel_node), ast_fragments):
+                            for sub in _resolve_ast_fragments(_children_ast(rel_node), ast_fragments, info):
                                 sub_name = _name_ast(sub)
                                 if not sub_name or sub_name.startswith('__'):
                                     continue
@@ -355,7 +397,7 @@ class RelationSelectionExtractor:
                         tgt_b = self.registry.types.get(fdef.meta.get('target')) if fdef.meta.get('target') else None
                         # Recursive AST nested collection
                         def _collect_nested_ast(parent_node: Any, parent_b: Any, parent_cfg: Dict[str, Any]):
-                            for sub in _resolve_ast_fragments(_children_ast(parent_node), ast_fragments):
+                            for sub in _resolve_ast_fragments(_children_ast(parent_node), ast_fragments, info):
                                 sub_name = _name_ast(sub)
                                 if not sub_name or sub_name.startswith('__'):
                                     continue
@@ -418,18 +460,8 @@ class RootSelectionExtractor:
             return getattr(n, 'value', None)
         return n
 
-    def _walk(self, sel_node: Any, out: dict[str, set[str]], btype: Any, fragments: dict | None):
-        for child in self._children(sel_node):
-            kind = getattr(child, 'kind', None)
-            if kind and 'InlineFragment' in str(kind):
-                self._walk(child, out, btype, fragments)
-                continue
-            if kind and 'FragmentSpread' in str(kind):
-                frag_name = self._name_of(child)
-                if frag_name and fragments and frag_name in fragments:
-                    frag_def = fragments[frag_name]
-                    self._walk(frag_def, out, btype, fragments)
-                continue
+    def _walk(self, sel_node: Any, out: dict[str, set[str]], btype: Any, fragments: dict | None, info: Any = None):
+        for child in _resolve_ast_fragments(self._children(sel_node), fragments or {}, info):
             name = self._name_of(child)
             if not name or name.startswith('__'):
                 continue
@@ -476,11 +508,10 @@ class RootSelectionExtractor:
             except Exception:
                 frags = None
             for f in (fields or []):
-                if getattr(f, 'name', None) in candidates:
+                if getattr(f, 'name', None) in candidates and _selection_included(f, info):
                     fake = type('Sel', (), {})()
                     setattr(fake, 'selections', getattr(f, 'selections', []) or getattr(f, 'children', []))
-                    self._walk(fake, out, btype, frags)
-                    break
+                    self._walk(fake, out, btype, frags, info)
         except Exception:
             pass
         if not any(out.values()):
@@ -488,35 +519,11 @@ class RootSelectionExtractor:
                 raw_info = getattr(info, '_raw_info', None)
                 field_nodes = getattr(raw_info, 'field_nodes', None) if raw_info is not None else None
                 if field_nodes:
-                    root_nodes = [n for n in field_nodes if _name_ast(n) in candidates]
+                    root_nodes = [n for n in field_nodes if _name_ast(n) in candidates and _selection_included(n, info)]
                     if root_nodes:
-                        root_node = root_nodes[0]
-                        for child in _children_ast(root_node):
-                            name = _name_ast(child)
-                            if not name or name.startswith('__'):
-                                continue
-                            try:
-                                fields_map = fields_map_for(btype)
-                                py_name = self._map_name(str(name), fields_map)
-                                fdef = fields_map.get(py_name)
-                                if fdef:
-                                    name = py_name
-                            except Exception:
-                                fdef = None
-                            if not fdef:
-                                out['other'].add(str(name))
-                                continue
-                            k = fdef.kind
-                            if k == 'scalar':
-                                out['scalars'].add(name)
-                            elif k == 'relation':
-                                out['relations'].add(name)
-                            elif k == 'custom':
-                                out['custom'].add(name)
-                            elif k == 'custom_object':
-                                out['custom_object'].add(name)
-                            elif k == 'aggregate':
-                                out['aggregate'].add(name)
+                        fragments = getattr(raw_info, 'fragments', None) or {}
+                        for node in root_nodes:
+                            self._walk(node, out, btype, fragments, info)
             except Exception:
                 pass
         return out
