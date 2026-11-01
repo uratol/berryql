@@ -2584,6 +2584,10 @@ class BerrySchema:
             cols.append(pk_expr.label('id'))
         try:
             scalars_on_target = set()
+            customs_on_target = {
+                name for name, definition in target_btype.__berry_fields__.items()
+                if definition.kind == 'custom'
+            }
             for sf, sd in self.types[target_name_i].__berry_fields__.items():
                 if sd.kind == 'scalar':
                     try:
@@ -2592,8 +2596,9 @@ class BerrySchema:
                     except Exception:
                         pass
                     scalars_on_target.add(sf)
+            projected_names = scalars_on_target | customs_on_target
             def _to_python_name(gql_name: str) -> str:
-                if gql_name in scalars_on_target:
+                if gql_name in projected_names:
                     return gql_name
                 try:
                     if getattr(self, '_auto_camel_case', False):
@@ -2604,14 +2609,14 @@ class BerrySchema:
                                 out.append('_')
                             out.append(ch.lower())
                         snake = ''.join(out)
-                        if snake in scalars_on_target:
+                        if snake in projected_names:
                             return snake
                 except Exception:
                     pass
                 try:
                     name_conv = getattr(getattr(self, '_name_converter', None), 'apply_naming_config', None)
                     if callable(name_conv):
-                        for py in scalars_on_target:
+                        for py in projected_names:
                             try:
                                 if name_conv(py) == gql_name:
                                     return py
@@ -2622,6 +2627,8 @@ class BerrySchema:
                 return str(gql_name)
         except Exception:
             scalars_on_target = set()
+            customs_on_target = set()
+            projected_names = set()
         mapped_requested = []
         try:
             for _fn in requested_fields:
@@ -2629,8 +2636,25 @@ class BerrySchema:
                 mapped_requested.append(mapped)
         except Exception:
             mapped_requested = list(requested_fields)
-        for fn in mapped_requested:
+        for fn in dict.fromkeys(mapped_requested):
             if fn == 'id':
+                continue
+            if fn in customs_on_target:
+                # Native parent resolvers have no planned relation pushdown.
+                # Project computed scalars in this list SELECT as well, using
+                # the same builders and authorization as planned root queries.
+                if not await self._field_read_allowed(target_btype, info, fn):
+                    continue
+                if not await self._policy_engine.dependencies_allowed(target_btype, info, fn):
+                    continue
+                expression = RelationSQLBuilders(self).build_custom_scalar_pushdown(
+                    model_cls=child_model_cls,
+                    field_name=fn,
+                    builder=target_btype.__berry_fields__[fn].meta.get('builder'),
+                    info=info,
+                )
+                if expression is not None:
+                    cols.append(expression)
                 continue
             if scalars_on_target and fn not in scalars_on_target:
                 continue

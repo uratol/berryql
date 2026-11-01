@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.11] - 2026-11-01
+### Fixed
+- Project SQL-backed custom scalar fields when nested list relations use
+  per-parent fallback loading, including children of native Strawberry resolvers.
+  Computed values, zero and null are returned in the list query without
+  additional per-row queries.
+- Resolve computed field names with camel-case naming, aliases, fragments and
+  executable directives, and deduplicate repeated projections.
+- Apply field permissions and declared dependency permissions before invoking
+  computed-field builders on this fallback path.
+
 ## [0.5.10] - 2026-10-26
 ### Fixed
 - Cache immutable field names, aliases, and name-converter mappings per schema
