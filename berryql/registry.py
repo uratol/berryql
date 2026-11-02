@@ -1486,7 +1486,7 @@ class BerrySchema:
         for name, fdef in fields.items():
             kind = getattr(fdef, 'kind', None)
             meta = getattr(fdef, 'meta', None) or {}
-            if kind != 'scalar' or meta.get('write_only'):
+            if kind not in ('scalar', 'custom') or meta.get('write_only'):
                 continue
             out.append(name)
         model_cls = getattr(btype_cls, 'model', None)
@@ -1537,7 +1537,7 @@ class BerrySchema:
             kind = getattr(fdef, 'kind', None)
             meta = getattr(fdef, 'meta', {}) or {}
             if index == len(parts) - 1:
-                if kind != 'scalar':
+                if kind not in ('scalar', 'custom'):
                     return None
                 try:
                     if meta.get('write_only'):
@@ -1603,7 +1603,37 @@ class BerrySchema:
             self._allowed_order_cache[cache_key] = tuple(out)
         return out
 
-    def _resolve_order_expression(self, model_cls: Any, btype_cls: Any, order_name: Any, *, max_depth: int = 5):
+    def _resolve_custom_order_expression(self, model_cls, field_name, meta, info):
+        """Build a computed ordering scalar without async work or request caching."""
+        import inspect
+        from sqlalchemy.sql.elements import ColumnElement
+        from .core.ordering import OrderingError
+
+        builder = meta.get('builder')
+        if not callable(builder) or inspect.iscoroutinefunction(builder):
+            raise OrderingError(f"Ordering field '{field_name}' requires a synchronous SQL builder")
+        params = list(inspect.signature(builder).parameters.values())
+        if len(params) == 1:
+            value = builder(model_cls)
+        elif len(params) == 2 and params[1].name in ('info', 'ctx', 'context'):
+            value = builder(model_cls, info)
+        else:
+            raise OrderingError(f"Unsupported SQL builder signature for ordering field '{field_name}'")
+        if inspect.isawaitable(value):
+            if inspect.iscoroutine(value):
+                value.close()
+            raise OrderingError(f"Ordering field '{field_name}' requires a synchronous SQL builder")
+        expression = RelationSQLBuilders(self).build_custom_scalar_pushdown(
+            model_cls=model_cls,
+            field_name=field_name,
+            builder=lambda model: value,
+            info=info,
+        )
+        if not isinstance(expression, ColumnElement):
+            raise OrderingError(f"Ordering field '{field_name}' must produce a scalar SQL expression")
+        return expression
+
+    def _resolve_order_expression(self, model_cls: Any, btype_cls: Any, order_name: Any, *, max_depth: int = 5, info: Any = None):
         """Resolve a direct or dotted order field path to a SQLAlchemy expression."""
         normalized = self._normalize_order_path(btype_cls, order_name, max_depth=max_depth)
         if not normalized:
@@ -1612,9 +1642,9 @@ class BerrySchema:
         if declared is not None and normalized not in declared:
             return None
         parts = normalized.split('.')
-        return self._resolve_order_expression_parts(model_cls, btype_cls, parts, max_depth=max_depth)
+        return self._resolve_order_expression_parts(model_cls, btype_cls, parts, max_depth=max_depth, info=info)
 
-    def _resolve_order_expression_parts(self, model_cls: Any, btype_cls: Any, parts: List[str], *, max_depth: int = 5):
+    def _resolve_order_expression_parts(self, model_cls: Any, btype_cls: Any, parts: List[str], *, max_depth: int = 5, info: Any = None):
         if not parts or btype_cls is None or model_cls is None or max_depth <= 0:
             return None
         try:
@@ -1630,6 +1660,8 @@ class BerrySchema:
         kind = getattr(fdef, 'kind', None)
         meta = getattr(fdef, 'meta', {}) or {}
         if len(parts) == 1:
+            if kind == 'custom':
+                return self._resolve_custom_order_expression(model_cls, current, meta, info)
             if kind != 'scalar':
                 return None
             try:
@@ -1650,7 +1682,7 @@ class BerrySchema:
         target_model = getattr(target_btype, 'model', None) if target_btype is not None else None
         if target_model is None:
             return None
-        nested_expr = self._resolve_order_expression_parts(target_model, target_btype, parts[1:], max_depth=max_depth - 1)
+        nested_expr = self._resolve_order_expression_parts(target_model, target_btype, parts[1:], max_depth=max_depth - 1, info=info)
         if nested_expr is None:
             return None
         parent_fk_name = self._find_parent_fk_column_name(model_cls, target_model, current)
@@ -2332,7 +2364,7 @@ class BerrySchema:
 
                     def _resolve_single_order(statement, path, join_cache):
                         return statement, self._resolve_order_expression(
-                            child_model_cls, target_btype, path
+                            child_model_cls, target_btype, path, info=info
                         )
 
                     stmt = self._ordering_compiler.apply_sqlalchemy(
@@ -3861,7 +3893,7 @@ class BerrySchema:
 
                                         def _resolve_single_order(statement, path, join_cache):
                                             return statement, schema_instance._resolve_order_expression(
-                                                child_model_cls, target_btype, path
+                                                child_model_cls, target_btype, path, info=info
                                             )
 
                                         stmt = schema_instance._ordering_compiler.apply_sqlalchemy(
@@ -5131,7 +5163,7 @@ class BerrySchema:
                     # Only validate against allowed field names when order_by is a string.
                     # Callables and SQLAlchemy expressions are allowed and handled later.
                     if isinstance(ob_rel, str) and ob_rel:
-                        if self._resolve_order_expression(target_b.model, target_b, ob_rel) is None:
+                        if self._resolve_order_expression(target_b.model, target_b, ob_rel, info=info) is None:
                             raise ValueError(f"Invalid order_by '{ob_rel}'. Allowed: {allowed_fields_rel}")
                     try:
                         has_nested_relation_order = isinstance(ob_rel, str) and '.' in ob_rel

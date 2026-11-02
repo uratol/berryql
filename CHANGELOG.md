@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.12] - 2026-11-02
+### Added
+- Order by SQL-backed custom scalar fields, including camel-case and dotted
+  paths, request-aware builders, pagination and ordering without projection.
+- Preserve field ordering permissions and reject async or non-SQL builders.
+
+### Fixed
+- Compile computed ordering expressions in nested MSSQL JSON relations instead
+  of treating GraphQL field names as physical columns. Pass request context
+  through nested `orderBy` and `orderMulti` resolution.
+
 ## [0.5.11] - 2026-11-01
 ### Fixed
 - Project SQL-backed custom scalar fields when nested list relations use

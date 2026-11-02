@@ -128,12 +128,12 @@ class RelationSQLBuilders:
                 out.append((src, name))
         return out
 
-    def _resolve_order_expr_for_model(self, model_cls, order_name):
+    def _resolve_order_expr_for_model(self, model_cls, order_name, *, info=None):
         """Resolve a direct field or dotted single-relation path for ordering."""
         btype = self._get_btype_for_model(model_cls)
         if btype is None:
             return None
-        return self.registry._resolve_order_expression(model_cls, btype, order_name)
+        return self.registry._resolve_order_expression(model_cls, btype, order_name, info=info)
 
     def _resolve_scalar_source_name(self, model_cls, btype_cls, field_name):
         """Resolve the physical column name for a scalar Berry field."""
@@ -327,7 +327,7 @@ class RelationSQLBuilders:
             return None
         return f"{current_ident}.[{source_name}]"
 
-    def _mssql_map_order_name(self, adapter, model_cls, name, *, join_cache=None, join_clauses=None, base_ident: str | None = None):
+    def _mssql_map_order_name(self, adapter, model_cls, name, *, info=None, join_cache=None, join_clauses=None, base_ident: str | None = None):
         """Map an MSSQL order token to either a join-based expression or the legacy fallback."""
         mapped = None
         if isinstance(name, str):
@@ -339,16 +339,19 @@ class RelationSQLBuilders:
                 join_clauses=join_clauses,
                 base_ident=base_ident,
             )
-        return mapped if mapped is not None else self._mssql_order_term(model_cls, name)
+        return mapped if mapped is not None else self._mssql_order_term(model_cls, name, info=info)
 
-    def _mssql_order_term(self, model_cls, order_name):
+    def _mssql_order_term(self, model_cls, order_name, *, info=None):
         """Map an order token to a physical MSSQL column or compiled SQL expression."""
         if not isinstance(order_name, str) or not order_name:
             return order_name
-        if '.' not in order_name:
+        btype = self._get_btype_for_model(model_cls)
+        normalized = self.registry._normalize_order_path(btype, order_name)
+        field_def = (getattr(btype, '__berry_fields__', {}) or {}).get(normalized)
+        if '.' not in order_name and getattr(field_def, 'kind', None) != 'custom':
             pairs = self._mssql_map_columns_pairs(model_cls, [order_name]) or [(order_name, order_name)]
             return pairs[0][0]
-        expr = self._resolve_order_expr_for_model(model_cls, order_name)
+        expr = self._resolve_order_expr_for_model(model_cls, order_name, info=info)
         if expr is None:
             return order_name
         try:
@@ -790,6 +793,7 @@ class RelationSQLBuilders:
                     adapter,
                     model_cls_local,
                     name,
+                    info=info,
                     join_cache=nested_join_cache,
                     join_clauses=nested_order_joins,
                 )
@@ -1107,7 +1111,7 @@ class RelationSQLBuilders:
             )
             if expression is None:
                 expression = self.registry._resolve_order_expression(
-                    model_cls, btype, path
+                    model_cls, btype, path, info=info
                 )
             return statement, expression
 
@@ -1508,7 +1512,7 @@ class RelationSQLBuilders:
 
                         def _resolve_nested_order(statement, path, join_cache):
                             return statement, self.registry._resolve_order_expression(
-                                grand_model, nb, path
+                                grand_model, nb, path, info=info
                             )
 
                         n_sel = self.registry._ordering_compiler.apply_sqlalchemy(
@@ -1697,7 +1701,7 @@ class RelationSQLBuilders:
 
             def _resolve_child_order(statement, path, join_cache):
                 return statement, self.registry._resolve_order_expression(
-                    child_model_cls_i, target_b_i, path
+                    child_model_cls_i, target_b_i, path, info=info
                 )
 
             inner_sel_i = self.registry._ordering_compiler.apply_sqlalchemy(
@@ -1872,6 +1876,7 @@ class RelationSQLBuilders:
                                 adapter,
                                 model_cls_local,
                                 name,
+                                info=info,
                                 join_cache=nested_join_cache_i,
                                 join_clauses=nested_order_joins_i,
                             )
@@ -2009,6 +2014,7 @@ class RelationSQLBuilders:
                             adapter,
                             model_cls_local,
                             name,
+                            info=info,
                             join_cache=nested_join_cache2,
                             join_clauses=nested_order_joins2,
                         )
@@ -2113,6 +2119,7 @@ class RelationSQLBuilders:
                                 adapter,
                                 child_model_cls,
                                 ob_resolved,
+                                info=info,
                                 join_cache=mssql_join_cache,
                                 join_clauses=mssql_order_joins,
                             )
@@ -2125,6 +2132,7 @@ class RelationSQLBuilders:
                         adapter,
                         child_model_cls,
                         cn,
+                        info=info,
                         join_cache=mssql_join_cache,
                         join_clauses=mssql_order_joins,
                     )
@@ -2250,6 +2258,7 @@ class RelationSQLBuilders:
                     adapter,
                     child_model_cls,
                     ob_resolved2,
+                    info=info,
                     join_cache=mssql_join_cache2,
                     join_clauses=mssql_order_joins2,
                 )
@@ -2260,6 +2269,7 @@ class RelationSQLBuilders:
                         adapter,
                         child_model_cls,
                         raw_order_name2,
+                        info=info,
                         join_cache=mssql_join_cache2,
                         join_clauses=mssql_order_joins2,
                     )
@@ -2270,6 +2280,7 @@ class RelationSQLBuilders:
                     adapter,
                     child_model_cls,
                     cn,
+                    info=info,
                     join_cache=mssql_join_cache2,
                     join_clauses=mssql_order_joins2,
                 )
@@ -2734,7 +2745,7 @@ class RootSQLBuilders:
             )
             if expression is None:
                 expression = self.registry._resolve_order_expression(
-                    model_cls, btype_cls, path
+                    model_cls, btype_cls, path, info=info
                 )
             return statement, expression
 
