@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.13] - 2026-11-04
+### Fixed
+- Preserve ORM models for native Strawberry fields inside nested list and single
+  relations, including queries that omit the entity ID and other model columns.
+- Use relation fallback when an included native field requires an ORM model;
+  retain requested scalar and computed projections alongside the loaded entity.
+- Preserve aliases, fragments, pagination and access controls on this path.
+  Skipped and denied native fields keep the existing relation pushdown behavior.
+
 ## [0.5.12] - 2026-11-02
 ### Added
 - Order by SQL-backed custom scalar fields, including camel-case and dotted

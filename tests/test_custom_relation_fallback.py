@@ -46,11 +46,20 @@ class CustomFallbackParentQL(BerryType):
     id = field()
     children = relation("CustomFallbackChildQL", order_by="id")
 
+    @strawberry.field
+    def model_id(self) -> int:
+        return self._model.id
+
 
 @berry.type(model=Child)
 class CustomFallbackChildQL(BerryType):
     id = field()
     amount = field()
+    parent = relation("CustomFallbackParentQL", single=True, fk_column_name="parent_id")
+
+    @strawberry.field
+    async def native_amount(self) -> int | None:
+        return self._model.amount
     direct_value = custom(lambda M: M.amount, returns=int)
     selected_value = custom(lambda M: select(M.amount), returns=int)
     scalar_value = custom(
@@ -64,6 +73,8 @@ class CustomFallbackChildQL(BerryType):
 
 @berry.query()
 class Query:
+    parents = relation("CustomFallbackParentQL", order_by="id")
+
     @strawberry.field
     def source(self, info: strawberry.Info) -> Annotated[
         "CustomFallbackParentQL", strawberry.lazy("berryql.registry"),
@@ -158,3 +169,56 @@ async def test_fallback_does_not_project_denied_custom_fields_or_dependencies(sa
     assert len(queries) == 1
     assert "dependent_value" not in queries[0]
     assert "unused_value" not in queries[0]
+
+
+@pytest.mark.parametrize("root", ["source", "parents(limit: 1)"])
+async def test_nested_native_field_receives_model_without_selected_columns(sample, root):
+    context, queries = sample
+    result = await schema.execute(
+        "{ " + root + " { children { nativeAmount } } }", context_value=context,
+    )
+    assert result.errors is None, result.errors
+    parent = result.data["source"] if root == "source" else result.data["parents"][0]
+    assert parent["children"] == [{"nativeAmount": value} for value in [2, 0, None]]
+    assert len(queries) == (1 if root == "source" else 2)
+
+
+async def test_native_field_below_single_and_list_relations_receives_model(sample):
+    context, _ = sample
+    result = await schema.execute("""
+        { parents(limit: 1) { children { parent { modelId } } } }
+    """, context_value=context)
+    assert result.errors is None, result.errors
+    assert result.data["parents"] == [{"children": [{"parent": {"modelId": 1}}] * 3}]
+
+
+async def test_nested_native_field_alias_fragment_and_pagination(sample):
+    context, _ = sample
+    result = await schema.execute("""
+        { parents(limit: 1) { children(limit: 1, offset: 1) { ...Native } } }
+        fragment Native on CustomFallbackChildQL { value: nativeAmount directValue }
+    """, context_value=context)
+    assert result.errors is None, result.errors
+    assert result.data["parents"] == [{"children": [{"value": 0, "directValue": 0}]}]
+
+
+async def test_skipped_native_field_keeps_relation_pushdown(sample):
+    context, queries = sample
+    result = await schema.execute("""
+        { parents(limit: 1) { children { id nativeAmount @skip(if: true) } } }
+    """, context_value=context)
+    assert result.errors is None, result.errors
+    assert result.data["parents"] == [{"children": [{"id": i} for i in [1, 2, 3]]}]
+    assert len(queries) == 1
+
+
+async def test_denied_native_field_is_not_called(sample):
+    context, _ = sample
+    context["permissions"] = FieldPermissions(select=FieldSet.only("id", "direct_value"))
+    result = await schema.execute("""
+        { parents(limit: 1) { children { id nativeAmount } } }
+    """, context_value=context)
+    assert result.errors is None, result.errors
+    assert result.data["parents"] == [{"children": [
+        {"nativeAmount": None, "id": value} for value in [1, 2, 3]
+    ]}]

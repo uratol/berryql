@@ -2106,6 +2106,17 @@ class BerrySchema:
                     pass
         return inst
 
+    def _relation_needs_orm_model(self, config: Mapping[str, Any]) -> bool:
+        """Native Strawberry fields need an ORM row, including below JSON relations."""
+        target = self.types.get(config.get('target'))
+        fields = getattr(target, '__berry_fields__', {})
+        if any(name not in fields for name in config.get('fields') or ()):
+            return True
+        return any(
+            self._relation_needs_orm_model(child)
+            for child in (config.get('nested') or {}).values()
+        )
+
     def _create_scalar_resolver(self, fname_local: str, src_col_name: Optional[str] = None):
         def _resolver(root_self, info: StrawberryInfo):  # noqa: D401
             # Prefer an explicitly set value on the Strawberry instance first.
@@ -2758,6 +2769,9 @@ class BerrySchema:
                         cols.append(fk_col_obj.label(label_name))
                 except Exception:
                     pass
+        needs_model = any(name not in target_btype.__berry_fields__ for name in mapped_requested)
+        if needs_model:
+            cols.insert(0, child_model_cls)
         if cols:
             stmt = _select(*cols).select_from(child_model_cls).where(fk_col == parent_id_val)
         else:
@@ -2886,10 +2900,8 @@ class BerrySchema:
                 list(getattr(inst, '__dict__', {}).keys()),
                 list(init_kwargs.keys()),
             )
-            try:
-                setattr(inst, '_model', None)
-            except Exception:
-                pass
+            model_instance = mapping_obj.get(child_model_cls) if needs_model else None
+            setattr(inst, '_model', model_instance)
             results_list.append(inst)
         try:
             pp = meta_copy.get('post_process')
@@ -5156,6 +5168,12 @@ class BerrySchema:
                             rel_push_status[rel_name].update({'pushed': False, 'reason': 'target model missing'})
                         except Exception:
                             pass
+                        continue
+                    if self._relation_needs_orm_model(rel_cfg):
+                        rel_push_status[rel_name].update({
+                            'pushed': False,
+                            'reason': 'native Strawberry field requires ORM model',
+                        })
                         continue
                     # Early validation of relation order_by for pushdown path
                     allowed_fields_rel = self._get_allowed_order_fields(target_b)
