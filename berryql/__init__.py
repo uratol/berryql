@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.5.13"
+__version__ = "0.5.14"
 
 _ACTIVE_SCHEMA: Any = None
 

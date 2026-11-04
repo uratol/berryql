@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.14] - 2026-11-04
+### Fixed
+- Log intentional ORM fallback for native Strawberry fields at DEBUG instead
+  of emitting a warning for every parent row. Preserve warnings for unexpected
+  adapter or query-plan fallbacks and retain the fallback reason in diagnostics.
+
 ## [0.5.13] - 2026-11-04
 ### Fixed
 - Preserve ORM models for native Strawberry fields inside nested list and single

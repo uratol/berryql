@@ -51,7 +51,7 @@ T = TypeVar('T')
 # DRY split: import core building blocks
 from .core.fields import FieldDef, FieldDescriptor, DomainDescriptor
 from .core.filters import FilterLimits, FilterSpec, OPERATOR_REGISTRY, normalize_filter_spec as _normalize_filter_spec
-from .core.analyzer import AuthorizedQueryPlan, QueryAnalyzer, SelectionPlan, ValueSource
+from .core.analyzer import AuthorizedQueryPlan, PushdownReason, QueryAnalyzer, SelectionPlan, ValueSource
 from .core.utils import (
     Direction,
     dir_value as _dir_value,
@@ -2782,23 +2782,29 @@ class BerrySchema:
                 return []
         try:
             reason = None
-            try:
-                meta_map = getattr(root_self, '_pushdown_meta', None)
-                if isinstance(meta_map, dict):
-                    relation_meta = meta_map.get(fname_local)
-                    reason = getattr(
-                        getattr(relation_meta, 'decision', None), 'detail', None
-                    )
-            except Exception:
-                reason = None
+            reason_code = None
+            meta_map = getattr(root_self, '_pushdown_meta', None)
+            if isinstance(meta_map, dict):
+                decision = getattr(meta_map.get(fname_local), 'decision', None)
+                reason = getattr(decision, 'detail', None)
+                reason_code = getattr(decision, 'reason', None)
+            if reason_code is None and needs_model:
+                reason_code = PushdownReason.NATIVE_STRAWBERRY_FIELD
+                reason = 'native Strawberry field requires ORM model'
+            # Native resolvers intentionally need the ORM path. Keep diagnostics
+            # at DEBUG without silencing warnings for unsupported query plans.
+            log_fallback = (
+                _logger.debug if reason_code == PushdownReason.NATIVE_STRAWBERRY_FIELD
+                else _logger.warning
+            )
             if reason:
-                _logger.warning(
+                log_fallback(
                     "berryql: falling back to per-parent query for relation '%s' (reason=%s)",
                     fname_local,
                     reason,
                 )
             else:
-                _logger.warning(
+                log_fallback(
                     "berryql: falling back to per-parent query for relation '%s' (no lateral pushdown)",
                     fname_local,
                 )
@@ -5173,6 +5179,7 @@ class BerrySchema:
                         rel_push_status[rel_name].update({
                             'pushed': False,
                             'reason': 'native Strawberry field requires ORM model',
+                            'reason_code': PushdownReason.NATIVE_STRAWBERRY_FIELD,
                         })
                         continue
                     # Early validation of relation order_by for pushdown path

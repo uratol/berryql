@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "berryql"
-version = "0.5.13"
+version = "0.5.14"
 description = "A powerful GraphQL query optimization library for Strawberry GraphQL and SQLAlchemy"
 readme = "README.md"
 license = "MIT"

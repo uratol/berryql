@@ -24,6 +24,7 @@ class PushdownReason(str, Enum):
     COMPUTED_SOURCE = "computed_source"
     ADAPTER_UNSUPPORTED = "adapter_unsupported"
     BUILDER_UNSUPPORTED = "builder_unsupported"
+    NATIVE_STRAWBERRY_FIELD = "native_strawberry_field"
 
 
 @dataclass(frozen=True)

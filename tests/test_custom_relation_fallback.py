@@ -1,4 +1,5 @@
 """Computed scalars must survive list loading below a native resolver."""
+import logging
 from typing import Annotated
 
 import pytest
@@ -11,6 +12,9 @@ from berryql import (
     BerrySchema, BerryType, FieldPermissions, FieldSet, StrawberryConfig,
     custom, field, relation,
 )
+
+
+from berryql.core.analyzer import HydrationRelationPlan, PushdownDecision, PushdownReason
 
 
 Base = declarative_base()
@@ -222,3 +226,42 @@ async def test_denied_native_field_is_not_called(sample):
     assert result.data["parents"] == [{"children": [
         {"nativeAmount": None, "id": value} for value in [1, 2, 3]
     ]}]
+
+
+@pytest.mark.parametrize("root", ["source", "parents"])
+async def test_intentional_native_fallback_logs_at_debug(sample, caplog, root):
+    context, queries = sample
+    with caplog.at_level(logging.DEBUG, logger="berryql"):
+        result = await schema.execute(
+            "{ " + root + " { children { nativeAmount } } }", context_value=context,
+        )
+    assert result.errors is None, result.errors
+    parents = [result.data["source"]] if root == "source" else result.data["parents"]
+    assert parents[0]["children"] == [{"nativeAmount": value} for value in [2, 0, None]]
+    if root == "parents":
+        assert parents[1]["children"] == [{"nativeAmount": 999}]
+    records = [record for record in caplog.records if "falling back to per-parent" in record.getMessage()]
+    assert len(records) == len(parents)
+    assert all(record.levelno == logging.DEBUG for record in records)
+    assert all("native Strawberry field requires ORM model" in record.getMessage() for record in records)
+    # This logging change preserves the existing ORM query strategy.
+    assert len(queries) == (1 if root == "source" else 3)
+
+
+async def test_unexpected_fallback_still_logs_warning(sample, caplog):
+    context, _ = sample
+    context["source"]._pushdown_meta = {"children": HydrationRelationPlan(
+        None, None,
+        PushdownDecision.fallback(PushdownReason.ADAPTER_UNSUPPORTED, "adapter cannot project relation"),
+        fields=("nativeAmount",),
+    )}
+    with caplog.at_level(logging.DEBUG, logger="berryql"):
+        result = await schema.execute(
+            "{ source { children { nativeAmount } } }", context_value=context,
+        )
+    assert result.errors is None, result.errors
+    assert result.data["source"]["children"] == [{"nativeAmount": value} for value in [2, 0, None]]
+    records = [record for record in caplog.records if "falling back to per-parent" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "adapter cannot project relation" in records[0].getMessage()

@@ -434,7 +434,9 @@ class Hydrator:
                         rel_meta.get('limit'),
                         rel_meta.get('offset'),
                         PushdownDecision.fallback(
-                            PushdownReason.ADAPTER_UNSUPPORTED,
+                            (rel_push_status.get(rel_name) or {}).get(
+                                'reason_code', PushdownReason.ADAPTER_UNSUPPORTED,
+                            ) if rel_push_status else PushdownReason.ADAPTER_UNSUPPORTED,
                             reason_txt,
                         ),
                         rel_meta.get('fk_column_name'),
