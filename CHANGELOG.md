@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.15] - 2026-11-06
+### Fixed
+- Reuse prefetched SQL NULL custom scalar values instead of treating them as
+  unloaded fields and rerunning their builders and database queries. Preserve
+  lazy resolution for unloaded fields and field permission checks.
+
 ## [0.5.14] - 2026-11-04
 ### Fixed
 - Log intentional ORM fallback for native Strawberry fields at DEBUG instead

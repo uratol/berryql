@@ -3015,6 +3015,7 @@ class BerrySchema:
         btype_local: Type[BerryType],
     ):
         schema_self = self
+        unloaded = object()
         async def custom_resolver(self, info: StrawberryInfo):  # noqa: D401
             if not await schema_self._field_read_allowed(
                 btype_local, info, fname_local
@@ -3023,18 +3024,18 @@ class BerrySchema:
             # Fast-path: if root query already populated attribute (no N+1), return it.
             # Important: avoid accidentally returning the bound resolver method itself
             # when the attribute isn't set on the instance (__dict__).
-            pre_value = None
+            pre_value = unloaded
             try:
                 # Prefer instance dict value if present (set by hydration)
                 if hasattr(self, '__dict__') and fname_local in getattr(self, '__dict__', {}):
                     pre_value = self.__dict__[fname_local]
                 else:
                     # Fallback to explicit prefetched marker used by hydrators
-                    pre_value = getattr(self, f"_{fname_local}_prefetched", None)
+                    pre_value = getattr(self, f"_{fname_local}_prefetched", unloaded)
             except Exception:
-                pre_value = None
-            # Only short-circuit when we have a real value (and not a callable)
-            if pre_value is not None and not callable(pre_value):
+                pre_value = unloaded
+            # A loaded SQL NULL is a value too; only absent or callable fields need fallback.
+            if pre_value is not unloaded and not callable(pre_value):
                 return pre_value
             parent_model = getattr(self, '_model', None)
             if parent_model is None:
